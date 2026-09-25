@@ -1,0 +1,161 @@
+---
+title: "Contact sync"
+description: "Monitor Quo and Resend contact sync, and build marketing segments that update automatically."
+---
+
+The **Contact sync** page keeps Yelo user profiles in sync with two outside tools:
+
+- **Quo**, for phone-based contacts.
+- **Resend**, for email contacts and marketing audiences.
+
+Use this page to check how far each sync has progressed, find out why a sync is blocked, and manage marketing segments in Resend.
+
+## Prerequisites
+
+- You need an admin account. Other dashboard roles get a `401` or `403` response and cannot open the page.
+- To manage marketing segments, an engineer must first enable Resend contact sync.
+
+To open the page, go to **Administration** → **Contact sync** in the dashboard sidebar.
+
+The page refreshes every 15 seconds while the browser tab is active. Click **Refresh** to update it right away. If a refresh fails, the page keeps showing the last successful snapshot and displays an error banner.
+
+## Sync progress
+
+The top of the page shows when the status was last updated. It also shows how many source changes are waiting to be dispatched. Below that, each provider has its own card.
+
+### Provider states
+
+The badge on each card shows the provider's mode.
+
+| Badge | Meaning |
+| --- | --- |
+| **Sync enabled** | Shared contact sync is running. The card shows full progress. |
+| **Legacy sync** | The existing Quo worker is still handling contacts. Quo starts in this mode. The card shows only how many contacts are linked. Progress and remote checks appear after Quo moves to shared sync. A linked contact is not a freshness check. |
+| **Paused** | An operator paused sync. The card shows the last recorded counts. |
+| **Not configured** | The provider is not registered for contact sync. |
+| **Needs attention** | Sync is blocked at the provider level. The card shows the reason and the time of the next retry. |
+
+When a provider is blocked, the card shows a message such as **Sync is blocked: schema unavailable** or **Sync is blocked: provider configuration**. Yelo pauses the provider for about five minutes and then retries on its own.
+
+### Progress and counts
+
+For providers with sync enabled or paused, the card shows the percentage of current users processed. Processed users are users who were synced or skipped. The percentage covers every current user, including users that have not been scanned yet. Deleted users and test users are not counted.
+
+New profile changes add pending work, so the percentage can go down.
+
+| Count | Meaning |
+| --- | --- |
+| **Synced** | Users whose contact matches their latest Yelo profile. |
+| **Skipped** | Users without an eligible contact. For example, Resend skips users with a missing or invalid email address. |
+| **Pending** | Users with changes waiting to sync. This count includes blocked work and contact removals. |
+| **Blocked** | Pending users that cannot sync until someone reviews them. |
+| **Not scanned** | Users that sync has not checked yet. |
+| **In progress** | Users being synced right now. |
+
+The bottom of the card shows **Latest remote check**, **Last scan completed**, and **Next scan due**.
+
+<Note>
+  Progress shows the latest recorded sync state in Yelo. It does not show email delivery or marketing consent.
+</Note>
+
+### Blocked contacts
+
+Yelo stops retrying a contact and counts it as **Blocked** in these cases:
+
+- **Invalid contact**: the provider rejected the contact details.
+- **Identity conflict**: the contact clashes with another user's contact.
+- **Subscription review required**: Yelo would have to recreate a Resend contact, but it has no record of the user opting out. See [Subscriptions and opt-outs](#subscriptions-and-opt-outs).
+- **Retry exhausted**: the sync failed on every allowed attempt.
+
+## Subscriptions and opt-outs
+
+Profile data and subscription state are kept separate. Yelo never changes a contact's subscription state when it updates the contact in Resend.
+
+- When Yelo reads a Resend contact, it records whether that contact has unsubscribed. Once Yelo sees an opt-out, it keeps it.
+- If a user has opted out before, or has had a Resend contact before, Yelo creates any new contact for them as unsubscribed.
+- If Yelo would need to recreate a contact and it cannot confirm an opt-out, it blocks the contact with **subscription review required**. This stops Yelo from subscribing someone again by mistake.
+
+Segment membership follows the same rule. Adding a contact to a segment or removing it does not change the contact's subscription preferences.
+
+## Marketing segments
+
+Marketing segments are Resend audiences built from rules on Yelo profile data. Yelo checks each segment again on a schedule. People are added to or removed from the segment as they start or stop matching its rules.
+
+If Resend contact sync is not enabled, this section shows **Enable Resend contact sync to manage marketing segments.**
+
+### Create a segment
+
+<Steps>
+  <Step title="Open the editor">
+    Under **Marketing segments**, click **New segment**.
+  </Step>
+  <Step title="Name the segment">
+    Enter a **Segment name** of 1 to 100 characters, such as `Recently active riders`. You cannot rename a segment after you create it.
+  </Step>
+  <Step title="Choose how rules combine">
+    Set **Match** to one of these options:
+
+    - **All of these rules (AND)**: a user must match every rule.
+    - **Any of these rules (OR)**: a user must match at least one rule.
+  </Step>
+  <Step title="Add rules">
+    Each rule has a field, an operator, and a value. The first rule defaults to **Last Seen At** within the last `30` days. Click **Add filter** to add more rules. A segment can have 1 to 20 rules.
+  </Step>
+  <Step title="Preview the audience">
+    Click **Preview audience** to see how many users match the rules right now.
+  </Step>
+  <Step title="Save">
+    Click **Create segment**. Yelo creates the segment in Resend and starts adding members shortly after.
+  </Step>
+</Steps>
+
+### Rule fields and operators
+
+The available fields match the profile properties that Yelo syncs to Resend. Each field type supports its own set of operators.
+
+| Field type | Fields | Operators |
+| --- | --- | --- |
+| Choice | **Account Type** (`student`, `community`), **Account Status** (`active`, `banned`), **Driver Status** (`none`, `applicant`, `active`, `inactive`), **Profile Completed** (`true`, `false`) | is, is not |
+| Number | **Ride Count**, **Drive Count** | is, is not, greater than, at least, less than, at most |
+| Date | **Joined At**, **Driver Joined At**, **Last Ride At**, **Last Drive At**, **Last Seen At** | before, after, within the last _N_ days, more than _N_ days ago, has a value, has no value |
+| Text | **User Id**, **Community Id**, **Community Name**, **Home Community Id**, **Home Community Name**, **School Id**, **School Name**, **Acquisition Source** | is, is not, contains, has a value, has no value |
+
+Rule values follow these limits:
+
+- Text values can be 1 to 256 characters. Text matching ignores case, and **contains** matches part of a value.
+- Number values and day counts must be whole numbers from 0 to 365000. Relative date rules need at least 1 day.
+- **before** and **after** take a calendar date. The date starts at midnight UTC.
+- **has a value** and **has no value** do not take a value.
+- A user with no value for a field never matches that field's comparison rules. For example, a user who has never ridden does not match **Last Ride At** more than 90 days ago.
+- Users with no acquisition source have the value `unknown`.
+
+For example, this rule set targets students who used to ride but have not taken a trip in the last 60 days:
+
+```text
+Match: All of these rules (AND)
+  Account Type   is                 student
+  Ride Count     at least           1
+  Last Ride At   more than 60 days ago
+```
+
+### Monitor segments
+
+The segments table lists every segment with these columns:
+
+- **Segment**: the name, match mode, number of rules, and number of matching users.
+- **Status**: one of the statuses below.
+- **Members**: contacts that are currently in the segment in Resend.
+- **Pending**: membership changes that have not been applied yet. This count includes matching users whose Resend contact does not exist yet. Normal contact sync creates those contacts.
+- **Last checked**: when Yelo last checked the segment. It shows **Awaiting first sync** until the first check finishes.
+
+| Status | Meaning |
+| --- | --- |
+| **Syncing** | Membership changes are pending, or the first check has not finished. |
+| **Up to date** | Resend membership matches the rules. |
+| **Needs attention** | The last check failed. The row shows the error, such as **sync failed**, and the time of the next check. |
+| **Removing** | Yelo is deleting the segment from Resend. |
+
+### Edit or remove a segment
+
+- To change a segment's rules or match mode, click the pencil icon, update the rules, and click **Save rules**. Yelo checks the segment again right away.
+- To delete a segment, click the trash icon and then **Confirm removal**. Yelo deletes the segment from Resend. The contacts stay in Resend.

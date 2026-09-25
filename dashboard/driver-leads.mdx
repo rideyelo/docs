@@ -1,0 +1,168 @@
+---
+title: "Driver leads pipeline"
+description: "Track driver leads from first contact to activation, review applications, import leads from spreadsheets, and activate drivers after a background check."
+---
+
+The driver leads pipeline is a kanban board in the Yelo dashboard. Use it to follow each prospective driver from first contact through application review, background check, and first ride.
+
+Open it from **Drivers** in the sidebar, then select the **Pipeline** tab. The old `/leads` URL redirects to this page.
+
+## Prerequisites
+
+- An `admin` or `intern` dashboard role. Fleet managers see only the **Drivers** tab.
+- Some actions are admin-only: editing referral credit and tags, viewing license photos, activating drivers, and disqualifying leads.
+
+## Pipeline stages
+
+Yelo places each lead in a column based on their account and application state. You can't drag leads between columns.
+
+| Column | Meaning |
+| --- | --- |
+| **New leads** | The lead hasn't started an application. |
+| **Application** | The application is in progress. |
+| **Pending approval** | Submitted requirements are ready for review. |
+| **Background check** | The application is approved and waits for manual background clearance. |
+| **0 drives** | The driver is ready for their first ride. |
+
+The board refreshes every 30 seconds.
+
+### Filter and sort the board
+
+- **Search** by name, phone, source, or referrer.
+- **All communities** filters the board to leads in one community. Use it to work one market's pipeline at a time.
+- **All tags** filters by a dashboard user tag.
+- **Sort each column by** orders cards by **Pending items**, **Completed items**, or **Last contacted**. Toggle **Ascending** or **Descending**.
+
+Each column shows 15 cards at first. Select **Show N more** to expand it.
+
+## Review a lead
+
+Select a card to open the lead sheet. The sheet shows:
+
+- **Lead source** and **Referral credit**. Admins can edit the referral credit.
+- **Tags**. These are the same tags used for dashboard users.
+- **Recent Quo messages**. See [Quo messages](#quo-messages).
+- **Pipeline stage** and the linked **Yelo account**, if the lead has signed up.
+- **Application evidence**, such as the profile picture and license photos.
+- **Application review**, with the status of each requirement.
+- **Activity log** and **Last correspondence**.
+
+### Application review
+
+The application has four required steps and one optional step:
+
+- Profile picture
+- License photos
+- Vehicle. This shows as **Vehicle provided by fleet** when the driver's fleet supplies the vehicle.
+- Stripe
+- Student verification (optional)
+
+When the profile picture, license, or vehicle step is **Pending**:
+
+- For a lead with a linked Yelo account, select **Review evidence** to review the submitted documents.
+- For a lead without a linked account, select **Approve** or **Reject**.
+
+### Notes
+
+The activity log is internal and append-only. Type in **Add a note to the timeline…** and select **Add note**. You can't edit or delete notes.
+
+### Quo messages
+
+The Quo panel shows the latest texts with the lead across Yelo's Quo numbers. Select **Open contact in Quo** to view the full thread, or the refresh button to reload messages.
+
+The panel shows one of these states:
+
+| Message | Meaning |
+| --- | --- |
+| **No linked Quo contact yet.** | The lead has no Quo contact. |
+| **No Quo messages found for this phone number.** | Quo has no texts for this number. |
+| **The phone number on file isn't a valid number, so Quo messages can't be loaded.** | Quo can't look up the lead's phone number. Correct the phone number to load messages. |
+| **Messages are unavailable. Open Quo to view the full thread.** | Yelo couldn't load messages from Quo. |
+
+### Disqualify a lead
+
+Admins can select **Disqualify lead**, enter a reason, and confirm. Yelo removes the lead from the active pipeline, moves it to the **Disqualified** tab, and records the reason in the activity log.
+
+## Activate a driver
+
+Approving an application doesn't activate a driver. After the background check clears, an admin must activate the driver manually.
+
+<Steps>
+  <Step title="Clear the background check">
+    Complete the background check outside Yelo.
+  </Step>
+  <Step title="Open the lead">
+    Open a lead in the **Background check** column. The lead must have a linked Yelo account.
+  </Step>
+  <Step title="Activate">
+    Select **Activate driver**, then **Confirm activation**.
+  </Step>
+</Steps>
+
+Yelo activates the driver, assigns their fleet, and adds the note "Driver activated by admin after manual background review." to the activity log.
+
+Activation fails with an error in the dialog when:
+
+- The lead is disqualified.
+- The lead has no linked driver account.
+- Any required application step isn't approved.
+- The driver still doesn't meet application or payout requirements. Activation never bypasses these requirements.
+
+### Fleet tags
+
+Yelo adds a `Fleet: <fleet name>` tag to drivers who belong to an active fleet. This tag only appears once the driver's application is activated. A driver who joins a fleet before activation keeps their fleet membership but gets the tag only after you activate them. Manual tags aren't affected.
+
+## Import leads
+
+Select **Import leads** to open the **Import driver leads** dialog. Choose **Individual lead** to add one lead, or **CSV / spreadsheet** to add many.
+
+### Import from a CSV or spreadsheet
+
+<Steps>
+  <Step title="Add your data">
+    Upload a CSV or TSV file, or expand **Or paste spreadsheet rows** and paste rows with a header row. Leave **Delimiter** on **Auto detect** or choose comma, tab, or semicolon.
+  </Step>
+  <Step title="Set defaults">
+    Enter a **Default source**. It's required and applies to rows without a source. Optionally set a **Default community** and **Default referral credit**.
+  </Step>
+  <Step title="Map columns">
+    Match each file column to a lead field. Yelo suggests a mapping from common header names, such as `Phone`, `Mobile`, `Market`, or `Referred by`. Set any unused field to **Not mapped**.
+  </Step>
+  <Step title="Preview and import">
+    Check the preview, then select **Import**. Each row shows its result.
+  </Step>
+</Steps>
+
+You can map these fields:
+
+| Field | Notes |
+| --- | --- |
+| Phone number | Required. One number, without an extension. |
+| Full name | Split into first and last name if those aren't mapped. |
+| First name | |
+| Last name | |
+| Community name or ID | |
+| Source | Required per row, or set a default source. |
+| Referral credit | |
+| Tags | Separate multiple tags with `,`, `;`, or `\|`. |
+| Last contacted | `YYYY-MM-DD` or an ISO timestamp with a timezone. Can't be in the future. |
+
+Example file:
+
+```csv
+Phone,Name,Market,Source,Tags,Last contacted
++1 555 010 0001,Jordan Lee,Austin,Uber outreach,EDU;Weekend,2026-09-01
++1 555 010 0002,Sam Rivera,Austin,Event,,2026-09-10T15:30:00Z
+```
+
+Import limits:
+
+- Files up to 2 MB and 2,000 rows.
+- Up to 100 columns.
+- Every row must have the same number of fields as the header.
+
+### Retry failed rows
+
+Yelo matches leads by phone number. A row with an existing phone number merges into that lead and shows **Saved / matched by phone**.
+
+If an import is interrupted, Yelo keeps completed rows. Fix any failed rows, then select **Retry N remaining rows**. Retrying is safe because matching phone numbers merge instead of creating duplicates.
