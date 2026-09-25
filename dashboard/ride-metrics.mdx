@@ -1,0 +1,80 @@
+---
+title: "Ride metrics"
+description: "Definitions for the ride request, completion, cancellation, and uncompleted ride metrics shown on the Yelo dashboard"
+---
+
+The dashboard shows the same core ride metrics in three places. Use this page to understand what each metric counts so you can compare them correctly across communities, fleets, and time periods.
+
+| Location | Where to find it |
+| --- | --- |
+| **Community overview** | The **Overview** page for the selected community. |
+| **Ride KPIs** | **Rides** > **KPIs** tab. |
+| **Fleet overview** | The **Overview** tab on a fleet's page. |
+
+## How metrics are counted
+
+- Every metric counts rides by the time the rider made the request. A ride requested inside the selected period counts toward that period, even if it finished later.
+- Each metric card compares the selected period with the prior period of the same length. The card shows the change as a delta and, for counts, a percentage change.
+- Community overview and ride KPIs count rides in the selected community. Fleet overview counts rides for the selected fleet.
+
+## Ride requests and confirmed requests
+
+The dashboard shows two request counts side by side. They measure different things.
+
+| Metric | What it counts |
+| --- | --- |
+| **Ride Requests** | Every ride request that moved past the initial requested state. This includes searches the rider canceled before confirming. |
+| **Confirmed Requests** | Requests the rider confirmed. Searches that were superseded by a newer search from the same rider are excluded. |
+
+Use **Ride Requests** to track overall demand and search volume. Use **Confirmed Requests** to track how many riders committed to a ride. **Confirmed Requests** is the basis for the completion rate.
+
+<Note>
+  **Ride Requests** is always greater than or equal to **Confirmed Requests**. A large gap means many riders searched but didn't confirm.
+</Note>
+
+## Completed rides and completion rate
+
+| Metric | Definition |
+| --- | --- |
+| **Completed Rides** | Rides that reached the completed state, including rides waiting for the rider's rating. Canceled rides are never counted as completed. |
+| **Completion Rate** | Completed confirmed rides divided by confirmed requests, shown as a percentage. |
+
+The completion rate formula is:
+
+```text
+Completion Rate = (completed confirmed rides / confirmed requests) × 100
+```
+
+Both the numerator and the denominator only include confirmed rides and exclude superseded searches. Unconfirmed searches no longer lower the completion rate. When a period has no confirmed requests, the completion rate is `0`.
+
+For example, if riders make 120 ride requests, confirm 84 of them, and 63 of the confirmed rides complete, the completion rate is 75.0%.
+
+## Cancelled rides
+
+**Cancelled Rides** counts rides that were canceled after a driver was assigned. Cancellations before a driver matched count toward uncompleted rides instead.
+
+## Uncompleted rides
+
+**Uncompleted Rides** (shown as **Rides Uncomplete** on the community and fleet overviews) counts confirmed rides that never matched with a driver. A ride counts as uncompleted only when all of these are true:
+
+- The rider confirmed the request.
+- The request wasn't superseded by a newer search.
+- No driver was ever assigned or matched to the ride.
+
+Unconfirmed searches and rides that had a driver assigned don't count as uncompleted.
+
+### Uncompleted ride outcomes
+
+Each uncompleted ride is classified into exactly one outcome. The **Rides** > **Issues** tab shows these outcomes in the **Category** column and the **By Category** breakdown.
+
+| Category | Meaning |
+| --- | --- |
+| `no_drivers_available` | Yelo found no driver for the ride. |
+| `match_timeout` | Yelo automatically canceled the ride because no driver matched in time. |
+| `rider_cancel` | The rider canceled before a driver matched. |
+| `driver_cancel` | A driver canceled before the ride matched. |
+| `unknown_cancel` | The ride was canceled before a driver matched, but the canceling party wasn't recorded. |
+| `stale_in_flight` | The ride is still in progress without a driver, wasn't canceled, and was requested more than one hour before the end of the selected period. |
+| `other` | The ride doesn't fit any of the categories above. |
+
+The four cancel categories replace the previous single `pre_match_cancel` category. Rides with a `no_drivers_available` outcome count only in that category. They no longer also count as `stale_in_flight`, so the **Stale In-Flight** share and **Avg Stale Age** only reflect rides that are actually stuck.
