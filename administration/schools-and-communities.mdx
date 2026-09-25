@@ -1,0 +1,104 @@
+---
+title: "Schools and communities"
+description: "Understand how Yelo assigns schools to communities from campus coordinates, and preview school changes before you edit a community."
+---
+
+Yelo assigns each school to a community automatically. It uses the school's campus coordinates and the bounding boxes of your active communities. You don't add or remove schools from a community by hand.
+
+Use this page when you manage schools or community bounds in the Yelo dashboard. It explains why a school belongs to its community, how to find schools that need attention, and what happens to schools when you change a community.
+
+## How automatic mapping works
+
+Yelo recalculates a school's community whenever one of these changes:
+
+- The school's latitude or longitude.
+- A community's bounding box.
+- A community's active, archived, or test status.
+
+For each school with usable coordinates, Yelo picks the community like this:
+
+1. Yelo considers only communities that are active, not archived, not test, and not the default community.
+2. A school is inside a community when its campus point falls within the bounding box. Edges count as inside. Yelo doesn't add a buffer around the box.
+3. If the school falls inside more than one bounding box, the community with the smallest box area wins. Community ID breaks any remaining tie.
+4. If the school falls outside every eligible box, Yelo assigns it to the default community.
+
+Schools without usable coordinates keep their legacy fallback community. Coordinates are unusable when they are missing, out of range, or exactly `0, 0`.
+
+<Note>
+  Mapping a school to a community doesn't move any users. Riders' current community still follows their location. See [Student verification](#student-verification).
+</Note>
+
+## Review school mappings
+
+The **Schools** page shows each school's campus coordinates, school email domains, and automatic community assignment.
+
+The **Mapping & coordinates** column shows, for each school:
+
+- **Reason.** Why the school belongs to its community:
+  - **Inside active community bounds.** The campus point is inside one eligible community.
+  - **Overlapping bounds · smallest area wins.** The campus point is inside several eligible communities. Yelo picked the smallest.
+  - **Outside active bounds · default fallback.** The campus point is outside every eligible community, so the school maps to the default community.
+  - **Missing coordinates · legacy fallback.** The school has no usable coordinates, so it keeps its fallback community.
+- **Coordinates.** The campus latitude and longitude, or **Campus coordinates needed** if they are missing.
+- **Source.** Where the coordinates came from, with the source year and accuracy. The source links to the original record when one is available. If no source exists, the column shows **Coordinate source not recorded**.
+- **Recorded.** The date Yelo recorded the coordinates.
+- **Catalog identity.** The school's IPEDS unit ID and catalog year, when the school matches the national catalog.
+- **Protected.** Schools in a test community show **Test school · excluded from catalog backfill**.
+
+### Filter schools by mapping
+
+Use the **Mapping filter** menu on the **Schools** page to narrow the list:
+
+| Filter | Shows |
+| --- | --- |
+| **All schools** | Every school. |
+| **Missing coordinates** | Schools without usable campus coordinates. These schools use the legacy fallback community. |
+| **Outside active bounds** | Schools with coordinates outside every eligible community. These schools map to the default community. |
+| **Protected test schools** | Schools that belong to a test community. |
+
+Start with **Missing coordinates** to find schools that Yelo can't map automatically.
+
+## Edit a school's coordinates
+
+When you create or edit a school, its campus coordinates determine its community.
+
+- If you enter valid latitude and longitude, Yelo manages the community for you. The **Legacy fallback community** field is disabled.
+- If you clear both latitude and longitude, you can pick a **Legacy fallback community**. Choose **Default (automatic)** to use the default community.
+- Enter both values or neither. The dashboard rejects a school with only one coordinate or with out-of-range values.
+
+Editing a school's coordinates clears its previous source details, because the old provenance no longer applies.
+
+## Preview school changes before editing a community
+
+When you create or edit a community, the **Automatic school mapping** panel previews how your change affects schools. The preview updates as you edit the bounding box or the active status. It doesn't change anything until you save.
+
+The preview shows:
+
+- How many schools the community **gained** and **dropped**, and how many schools **changed** community overall.
+- How many schools are **inside bounds**.
+- A table of affected schools, with each school's current community and its community after save. Rows that will move are marked **Will change**.
+- How many schools across all communities have missing or invalid coordinates. Those schools keep their legacy fallback.
+- A map of campus pins, when maps are configured for your dashboard. Blue pins are unchanged. Orange pins change community. Pins show campus coordinates, not student locations.
+
+When you save, Yelo reassigns the affected schools automatically.
+
+<Warning>
+  The preview is a snapshot, not a reservation. If another admin edits a community or school at the same time, the saved result can differ. The table lists up to 500 schools, but the totals include every school.
+</Warning>
+
+If the preview shows **Preview unavailable**, nothing has changed. Click **Retry preview** to try again.
+
+## Student verification
+
+Student verification and community assignment are separate.
+
+A rider can verify as a student with any of these methods:
+
+- School email
+- Google
+- Microsoft
+- StudID
+
+A successful verification links the rider to their school and gives them student status. It doesn't move the rider into the school's community. The rider's current community keeps following their location. Verifying with a school Google or Microsoft account also doesn't replace the email on the rider's Yelo account.
+
+Changing a community's bounds or status also doesn't change any rider's location, current community, or student status. It only reassigns schools.
