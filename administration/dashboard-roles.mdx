@@ -1,0 +1,123 @@
+---
+title: "Dashboard roles and access"
+description: "Learn what admins, interns, and fleet managers can see and do in the Yelo dashboard, and where each page lives in the sidebar."
+---
+
+Every Yelo dashboard account has one role. The role decides which sidebar pages you see and which communities, fleets, and leads you can work with. Yelo reads the role and its assignments from your Clerk account, and the Yelo API enforces the same limits on every dashboard request.
+
+Use this page to check whether a task is available to your role, or to decide which role to give a new teammate.
+
+## Roles
+
+| Role | Clerk role value | Scope |
+| --- | --- | --- |
+| **Admin** | `admin` | Every community, fleet, lead, and configuration page. |
+| **Intern** | `intern` | One assigned community. |
+| **Fleet manager** | `fleet` | One or more assigned fleets, each tied to a community. |
+
+### Admin
+
+Admins have global access. Only admins can:
+
+- Create or import driver leads.
+- View the global fleet roster, and edit fleets and vehicles.
+- Edit pricing, notification templates, and driver activation messaging.
+- Manage communities and schools.
+- Open **Administration** pages, such as **Access**, **Jobs**, and [**Contact sync**](/administration/contact-sync).
+
+### Intern
+
+Interns work inside the single community assigned to their account. The community selector only lists that community. Yelo ignores any other community that an intern requests.
+
+Interns can open these pages:
+
+- **Drivers**, including the driver leads pipeline
+- **Users**
+- **Rides**
+- **Community**
+- **Events**
+- **Map**
+- **Searches**
+
+For [driver leads](/dashboard/driver-leads), interns can see only leads in their community. This applies to lead lists, lead details, messages, and notes. Opening a lead from another community returns `401 Unauthorized`. Lead details for interns don't include the linked user's full profile or license photos.
+
+### Fleet manager
+
+Fleet managers work with the fleets assigned to their account. One account can have more than one assignment. Each assignment pairs a fleet with a community.
+
+Fleet managers can open these pages:
+
+- **Fleet**, for their assigned fleets
+- **Drivers**, which shows only the **Drivers** tab
+- **Rides**, for rides in their assigned fleets
+
+The community selector lists only communities from the manager's assignments. When a manager has more than one fleet in the selected community, the **Drivers** page shows a **Fleet** selector. Fleet lists, driver rosters, pricing parameters, and ride lists only include assigned fleets. Fleet managers can't see community-wide analytics, because those include other operators.
+
+## Assign a role
+
+Set the role and its assignments in the user's Clerk public metadata. An intern needs a `community_id`. A fleet manager needs a `fleet_assignments` list, where each entry has both a `fleet_id` and a `community_id`.
+
+<CodeGroup>
+
+```json Intern
+{
+  "role": "intern",
+  "community_id": "3f1c2a9e-5b7d-4e8a-9c21-6d0f4b8e7a13"
+}
+```
+
+```json Fleet manager with two fleets
+{
+  "role": "fleet",
+  "fleet_assignments": [
+    {
+      "fleet_id": "8a2d4c6e-1f3b-4a5c-9e7d-2b4f6a8c0e11",
+      "community_id": "3f1c2a9e-5b7d-4e8a-9c21-6d0f4b8e7a13"
+    },
+    {
+      "fleet_id": "c7e9a1b3-5d2f-4e6a-8b0c-4d6e8f0a2b35",
+      "community_id": "3f1c2a9e-5b7d-4e8a-9c21-6d0f4b8e7a13"
+    }
+  ]
+}
+```
+
+</CodeGroup>
+
+When a role or assignment changes, the dashboard clears its cached data and reloads with the new scope.
+
+### Missing or malformed assignments
+
+Yelo denies dashboard access when an account's assignment is missing or malformed. The API returns `401 Unauthorized` when:
+
+- The role is missing or isn't `admin`, `intern`, or `fleet`.
+- An intern has no `community_id`, or the value isn't a valid ID.
+- A fleet manager has no assignment with both a valid `fleet_id` and a valid `community_id`.
+
+If a teammate can sign in but sees no data, check their Clerk metadata against the examples above.
+
+## Sidebar layout
+
+Admins see the full sidebar. Other roles see only the pages listed for their role.
+
+| Group | Pages |
+| --- | --- |
+| **Global** | KPI, Drivers, Users, Rides, Supply & Demand, Pricing, Telemetry |
+| **Community** | Map, Events, Community, Fleet |
+| **Configuration** | Fleets, Vehicles, Notifications, Communities |
+| **Administration** | Access, Jobs, and other admin tools |
+
+The **Administration** group sits at the bottom of the sidebar and starts collapsed. The **Light**, **Dark**, and **System** theme buttons are in the sidebar footer.
+
+### Moved pages
+
+Several pages now live inside other pages. Old links redirect to the new location.
+
+| Old page | New location | Old URL |
+| --- | --- | --- |
+| **Leads** | **Drivers** page, **Pipeline** tab | `/leads` |
+| **Activation** | **Notifications** page, **Activation** tab | `/activation` |
+| **Schools** | **Communities** page, **Schools** tab | `/schools` |
+| **Settings** | **Administration** → **Access** | `/settings` |
+
+The **Drivers** page groups driver operations into tabs: **Pipeline**, **Next action queue**, **Referral payouts**, **Disqualified**, and **Drivers**.
