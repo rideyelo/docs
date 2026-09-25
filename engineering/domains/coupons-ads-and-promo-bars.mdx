@@ -1,0 +1,241 @@
+---
+title: "Coupons, ads, promo bars, and ride discounts"
+description: "Claim rules and stock accounting for venue coupons, ad selection by community, tier, size, and shape, impression and click logging, promo bar delivery, and how destination discounts are handed to pricing."
+---
+
+Yelo has four promotional surfaces. None has a dashboard editor or write endpoint. Every row is inserted by hand in Postgres.
+
+| Surface | What it is | Affects fare |
+| --- | --- | --- |
+| Coupons | Limited-stock deals from local venues | No |
+| Ads | Sponsored media with impression and click logging | No |
+| Promo bars | Per-community banners | No |
+| Ride discounts | Automatic percentage off rides to a matching destination address | Yes |
+
+There is no promo code a rider can enter to change a fare. Coupons are claim tickets for venues, not fare discounts.
+
+For the product view, see [Growth features](/concepts/growth-features). For fare math, see [Pricing](/concepts/pricing). For feed layout, see [Events and the community feed](/concepts/events-and-feed).
+
+## Data touched
+
+| Table | Key columns | Notes |
+| --- | --- | --- |
+| `Coupons` | `community_id`, `enterprise_id`, `venue_id` (NOT NULL), `title`, `description`, `photo_url`, `num_total`, `num_available` (default 0), `preview_at`, `release_at`, `expire_at` (nullable) | Index on `expire_at`. `num_per_user` was dropped in migration 000150. |
+| `CouponClaims` | `coupon_id`, `user_id`, `code` (uuid, `gen_random_uuid()`), `redeemed` (default false), `redeemed_at` | `coupon_claims_user_coupon_unique` on `(coupon_id, user_id)` |
+| `Ads` | `enterprise_account_id`, `community_ids` (`uuid[]`), `start_time`, `end_time`, `link`, `media_url`, `media_type`, `tier` (integer), `size`, `shape`, `height`, `width` | No check constraints on the enum columns |
+| `AdImpressions` | `ad_id` (no FK), `user_id` (FK to `Users`), `start_time`, `duration`, `location`, `clicks`, `impression_type` | Index on `ad_id` |
+| `PromoBars` | `community_id`, `text`, `text_color`, `url`, `background_url`, `background_color` | All display columns nullable |
+| `PromoBanners` | `community_id`, `image_url`, `link`, `is_pinned` | Separate, older table. Returned inside the community payload as `promo_banners`. |
+| `Discounts` | `target_address`, `discount_rate` (real), `discount_type`, `start_time`, `end_time`, `sponsor_id`, `community_id` | `community_id` defaults to a fixed UUID and is never read |
+
+No Redis keys are involved. Ad IDs do enter the community feed cache as feed items.
+
+## Endpoints
+
+All routes use `getValidateJWTMiddleware` and `getRequireRoleMiddleware(["user"])`. `/promobar` and `/ad` hang off `authenticatedGroup`; `/coupon` has its own `couponAuthGroup` in `router.go`. The community comes from the JWT (`GetRequestUserCommunity`), never from the request.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/coupon/` | JWT + role `user` | `CouponHandler.GetCoupons`. Every coupon in the caller's community, with `claimed` and `redeemed` for the caller. |
+| `GET` | `/coupon/i/{couponId}/available` | JWT + role `user` | `GetNumAvailableCoupons`. Returns `num_available`. |
+| `POST` | `/coupon/i/{couponId}/claim` | JWT + role `user` | `ClaimCoupon`. Returns `claimed: true` on success. |
+| `GET` | `/ad/` | JWT + role `user` | `AdHandler.GetAd`. Query `tier`, `size`, `shape`, all required. Returns one random active ad or `ad: null`. |
+| `GET` | `/ad/{id}` | JWT + role `user` | `GetAdById`. Returns the ad regardless of community or schedule. |
+| `POST` | `/ad/impression` | JWT + role `user` | `AddImpression`. Writes one `AdImpressions` row; responds 201. |
+| `GET` | `/promobar/` | JWT + role `user` | `PromobarHandler.GetPromobar`. All promo bars for the caller's community. |
+
+`AdService.CreateAd`, `UpdateAd`, and `GetCommunityAds` are on the service interface but have no route. `requests.ValidateCouponRequest` and `requests.GetCouponsRequest` are unused.
+
+## Coupons
+
+### Listing
+
+`ListCouponsForCommunity` (`queries/education_commerce.sql`) selects every coupon where `community_id` matches. It left-joins `Venues` and the caller's `CouponClaims` row. `claimed` is true when a claim row exists; `redeemed` is the claim's `redeemed` flag.
+
+The query doesn't filter on `preview_at`, `release_at`, or `expire_at`, and has no `ORDER BY`. Clients must hide coupons that aren't previewable yet or have expired.
+
+### Claim rules
+
+`sqlCouponRepository.ClaimCoupon` runs one transaction:
+
+<Steps>
+  <Step title="Read claim info">
+    `GetCouponClaimInfo` returns `num_total`, `num_available`, the total claim count, and whether the caller has claimed. A missing coupon returns 404 "This coupon code doesn't exist or has expired."
+  </Step>
+  <Step title="Validate">
+    `validateCouponClaimable` rejects a repeat claim with 400 "You have already claimed this coupon". It rejects with 400 "Coupon is out of stock" when `num_available` is 0 or less, or the claim count is at least `num_total`.
+  </Step>
+  <Step title="Decrement">
+    `DecrementCouponAvailability` runs `UPDATE ... SET num_available = num_available - 1 WHERE id = $1 AND num_available > 0`. Zero rows affected returns 400 "This coupon is no longer available."
+  </Step>
+  <Step title="Insert the claim">
+    `InsertCouponClaim` inserts `(coupon_id, user_id)`. Postgres fills `code` with a random UUID. A unique violation on `coupon_claims_user_coupon_unique` returns 400 "Already Claimed".
+  </Step>
+  <Step title="Commit">
+    Any earlier failure rolls back, so the decrement never survives without a claim.
+  </Step>
+</Steps>
+
+The step 1 read doesn't lock the row. Concurrency safety comes from the conditional decrement and the unique constraint.
+
+**Worked example.** A coupon has `num_total = 50` and `num_available = 50`. After 50 successful claims, `num_available` is 0 and the claim count is 50. Claim 51 fails in step 2. If an operator later sets `num_available = 10` without raising `num_total`, claims still fail, because the claim count (50) is at least `num_total` (50).
+
+### What claiming doesn't check
+
+- The caller's community. Any user can claim any coupon by ID.
+- `preview_at`, `release_at`, or `expire_at`.
+- Nothing ever sets `redeemed` or `redeemed_at`. No endpoint returns the claim `code`.
+
+### Stacking and fares
+
+Coupons never reach pricing. Nothing in `internal/utilities/pricing` or `internal/service/ride` reads `Coupons` or `CouponClaims`. There is no stacking between coupons and ride discounts, and a ride can carry at most one `discount_id`.
+
+## Ride discounts
+
+Ride discounts are the only promotional input to the fare. This section covers selection and hand-off. The formulas belong to [Pricing](/concepts/pricing).
+
+### Eligibility
+
+`GetBestDiscount` (`queries/education_commerce.sql`):
+
+```sql
+SELECT id, sponsor_id, discount_rate, discount_type, target_address, start_time, end_time
+FROM "Discounts"
+WHERE target_address = $1 AND start_time <= $2 AND end_time >= $2
+ORDER BY discount_rate DESC
+LIMIT 1;
+```
+
+- The destination address must equal `target_address` exactly. Case, whitespace, and formatting matter.
+- The window is inclusive at both ends.
+- If several discounts match, the highest `discount_rate` wins. Ties have no defined order.
+- `community_id` and `discount_type` aren't used for selection.
+- No match returns `ErrorTypeNotFound`, which callers treat as "no discount".
+
+### Where it is resolved
+
+| Call site | Timestamp | Function |
+| --- | --- | --- |
+| Ride creation | `time.Now()` | `RideService.prepareCreateRide` in `service/ride/rider.go` |
+| Ride confirmation | `ride.RequestTime` | `RideService.determineEffectiveRidePrice`, before `determineRidePriceAndFleet` |
+
+Confirmation re-resolves with the original request time. A discount that ends between request and confirm still applies.
+
+### Hand-off to pricing
+
+The resolved `*models.Discount` is passed to `pricing.GetRidePrice`, `GetDefaultRidePrice`, or `RideService.buildPricesFromCache`. Each vehicle option then gets:
+
+| Field | Value with a discount |
+| --- | --- |
+| `IsDiscounted` | `true` |
+| `DiscountId` | The discount's ID |
+| `Price` | The display (anchor) price |
+| `DiscountedPrice` | `FinalizeFare(max(base × (1 − discount_rate), 0), adjustment)` |
+
+`base` is the adjusted price (`jitter.Price`), or the raw pre-rounding price when the adjustment mode is `rounded`. An empty mode means `jitter`. `GetDefaultRidePrice` uses `TruncCents` on the jittered price instead. The ride stores `is_discounted`, `discounted_price`, and `discount_id`. Charging uses `discounted_price` when set; see [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
+
+**Worked example.** Rounded mode, raw price $11.37, `discount_rate = 0.25`:
+
+1. Display price is `ceil(11.37)` = $12.
+2. Base is the raw $11.37.
+3. 11.37 × 0.75 = 8.5275.
+4. `FinalizeFare` in rounded mode takes the ceiling: $9.
+
+The rider sees $12 struck through and pays $9. On confirmation, dashboard test accounts are then overridden to a price of 0.
+
+### Other discount readers
+
+| Reader | Window test | Purpose |
+| --- | --- | --- |
+| `ListLocationsByAddresses` (`queries/places.sql`) | `start_time` less than now and `end_time` greater than now (strict) | Marks places as discounted with the sponsor's `EnterpriseAccounts` name |
+| Event queries in `queries/engagement.sql` | Discount window strictly contains the event's `start_time` | Sets `is_discounted` on events whose venue address matches |
+| `IsAddressDiscounted` | Now | On the repository interface; no caller |
+
+## Ads
+
+### Selection
+
+`GetRandomActiveAd` (`queries/engagement.sql`):
+
+- The caller's community must be in `community_ids`.
+- `tier >= $tier`. The query parameter is a **minimum** tier, and higher-tier ads also qualify.
+- `size` and `shape` must match exactly.
+- `NOW() BETWEEN start_time AND end_time`.
+- `ORDER BY RANDOM() LIMIT 1`. There is no weighting, frequency cap, or per-user deduplication.
+
+Request validation (`requests.GetAdRequest.Validate`) only checks that `tier` is greater than 0 and that `size` and `shape` are non-empty. Unknown enum values pass and simply match nothing. When nothing matches, the handler swallows the 404 and returns 200 with `ad: null`.
+
+| Enum | Values |
+| --- | --- |
+| `AdMediaType` | `image`, `video`, `lottie` |
+| `AdSize` | `small`, `medium`, `large` |
+| `AdShape` | `horizontal_rectangle`, `vertical_rectangle`, `square` |
+
+`models.Ad.Tier` is a string in JSON. `adFromSQLC` formats the integer column with `strconv.FormatInt`.
+
+### Feed placement
+
+`generateCommunityFeed` (`service/community/feed_logic.go`) loads ads with `GetCommunityAds`. It inserts one ad after each group of 1 to 3 moves (bumps and rides), in the query's order: `tier DESC, RANDOM()`. Events are currently disabled (an empty slice), so only the moves branch places ads. The app then fetches each ad with `GET /ad/{id}`.
+
+### Impressions and clicks
+
+`POST /ad/impression` takes:
+
+| Field | Validation | Stored as |
+| --- | --- | --- |
+| `ad_id` | Not nil UUID | `ad_id` |
+| `location` | Non-empty | `location` |
+| `start_time` | None | `start_time` |
+| `duration_ms` | None (uint32) | `duration` |
+| `clicks` | None (uint32) | `clicks` |
+| `impression_type` | None | `impression_type` |
+
+The user comes from the JWT. Each call is a new row; there is no upsert or aggregation.
+
+Mobile senders in `yelo-frontend`:
+
+| Sender | When | Payload |
+| --- | --- | --- |
+| `components/ImpressionTracker.tsx` | Item leaves view or screen blurs | Measured `duration_ms`; skipped when under 250 ms and not a click |
+| `components/feed/Ad.tsx` | Tap on an image ad | `duration_ms: 1000`, `clicks: 1`, `impression_type: "ad"`, then opens `ad.link` |
+| `components/feed/EventItem.tsx` | Tap on an event | `ad_id` set to the **event** ID, `impression_type: "event"` |
+
+`Ad.tsx` renders only `image` ads. `video` and `lottie` ads render nothing.
+
+## Promo bars
+
+`GetCommunityPromobars` returns `text`, `text_color`, `url`, `background_url`, and `background_color` for every row matching the caller's community. There is no ordering, schedule, active flag, or ID in the response. The response is always an array, never `null`.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Coupon HTTP | `internal/server/http/coupon/coupon_routes.go`, `coupon_handler.go` | `RegisterAuthenticatedRoutes`, `CouponHandler` |
+| Coupon service | `internal/service/coupon/coupon.go` | `CouponService` |
+| Coupon claim transaction | `internal/data/repository/coupon.go` | `ClaimCoupon`, `validateCouponClaimable`, `decrementCouponAvailability`, `insertCouponClaim` |
+| Coupon SQL | `internal/data/repository/queries/education_commerce.sql` | `ListCouponsForCommunity`, `GetCouponClaimInfo`, `DecrementCouponAvailability`, `InsertCouponClaim` |
+| Coupon models | `internal/models/coupon.go` | `Coupon`, `CouponClaim`, `CouponWithClaim` |
+| Ad HTTP | `internal/server/http/ad/ad_routes.go`, `ad_handler.go`, `requests/` | `GetAd`, `GetAdById`, `AddImpression` |
+| Ad data | `internal/service/ad/ad.go`, `internal/data/repository/ad.go` | `AdService`, `sqlAdRepository` |
+| Ad SQL | `internal/data/repository/queries/engagement.sql` | `GetRandomActiveAd`, `GetCommunityAds`, `AddAdImpression`, `GetAdByID` |
+| Ad models | `internal/models/ad.go` | `Ad`, `AdImpression`, enums |
+| Feed placement | `internal/service/community/feed_logic.go` | `generateCommunityFeed` |
+| Promo bars | `internal/service/promobar/promobar.go`, `internal/data/repository/promobar.go` | `GetPromobar`, `GetPromobars` |
+| Discount lookup | `internal/data/repository/discount.go` | `GetBestDiscount`, `IsAddressDiscounted` |
+| Discount hand-off | `internal/utilities/pricing/pricing.go`, `service/ride/rider.go` | `GetRidePrice`, `GetDefaultRidePrice`, `buildPricesFromCache` |
+| Discount model | `internal/models/discount.go` | `Discount` |
+
+## Gotchas and edge cases
+
+- **One bad coupon breaks the list.** `GetCoupons` returns 500 if any row has a null `expire_at` or a missing venue. `expire_at` is nullable in the schema.
+- **Unknown coupon IDs report zero stock.** `GetNumAvailableCoupons` maps "no rows" to 0, so the documented 404 never happens.
+- **Stock has two sources of truth.** `num_available` and the `CouponClaims` count can drift after manual edits. Both must allow a claim.
+- **`GET /ad/{id}` has no filters.** It returns expired, future, and other-community ads. A missing ID returns 500, not the documented 404, because `GetById` wraps "no rows" as a server error.
+- **The feed ignores ad schedules.** `GetCommunityAds` has no time filter, so expired and future ads appear in the feed. The `limit` argument is ignored.
+- **Ride matching likely never shows an ad.** `app/(app)/ride/3-ride-matching.tsx` requests `shape: 'rectangle'`, which no valid ad has. The API returns `ad: null`.
+- **Impression `start_time` is the session start.** All three senders send `SessionProvider.startTime`, not when the ad appeared.
+- **`AdImpressions` mixes ads and events.** Event taps are stored with an event ID in `ad_id`. Filter on `impression_type` in analytics.
+- **Impressions are unverified.** The API accepts any `ad_id`, any count of `clicks`, and any `duration_ms`.
+- **Discounts are global.** `GetBestDiscount` ignores `Discounts.community_id`. A matching address in any community gets the discount.
+- **Discount windows differ by reader.** Pricing uses inclusive bounds; places and events use strict bounds. A place can show no badge at the exact start instant while a ride still gets the discount.
+- **Push prices can ignore the discount.** See [Activation tiers](/engineering/matching/activation-tiers) for where T0 uses the undiscounted `price`.

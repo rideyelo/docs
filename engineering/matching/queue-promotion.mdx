@@ -1,0 +1,185 @@
+---
+title: "Queue promotion and recovery"
+description: "How a driver's queue is ordered, the two promotion paths and their different guards, idle recovery with the advisory lock, offline unqueue timing, and the cached queue summaries and ETAs."
+---
+
+A driver's queue is every ride with `driver_id = driver` and `status = 'queued'`. Rides enter it through a manual accept while the driver is busy, or through auto-queue. They leave it through promotion to `driver_en_route`, cancellation, requeue, or offline unqueue.
+
+For the product view, see [Matching and auto-queue](/concepts/matching-and-auto-queue#queue-promotion-and-recovery).
+
+## Queue order
+
+Every queue query uses the same order:
+
+```sql
+ORDER BY COALESCE(match_time, request_time), id
+```
+
+`match_time` is set to `now()` by `AssignAcceptedRideToDriver`. The queue is first-assigned, first-served. It isn't ordered by confirm time, pickup distance, or fare. `request_time` only matters for rows with no `match_time`, which the assignment path never produces.
+
+## How rides enter the queue
+
+`AssignAcceptedRideToDriver` in `queries/ride_lifecycle.sql` decides the status:
+
+```sql
+status = CASE WHEN NOT sqlc.arg(auto_queued)::boolean AND sqlc.arg(queue_length)::bigint = 0
+    THEN 'driver_en_route' ELSE 'queued' END,
+```
+
+`queue_length` comes from `GetRideAcceptingDriver` and counts every ride assigned to the driver that isn't `complete` or `pending_rider_rating`. That includes the active ride.
+
+| Path | Driver has no rides | Driver has rides |
+| --- | --- | --- |
+| Manual accept | `driver_en_route` | `queued` |
+| Auto-queue | `queued`, then promoted by `RecoverIdleQueue` | `queued` |
+
+A manual accept while busy routes the pickup from the driver's `NextAvailableLatitude` and `NextAvailableLongitude` (`pickupRoute` in `promotion_route.go`). The user projection in `queries/user_profile.sql` computes these as the destination of the driver's most recently matched non-terminal ride, or the driver's position when there's none. A manual accept also authorizes payment immediately. Auto-queue does neither until promotion.
+
+## The two promotion paths
+
+There are two SQL statements that move a queued ride to `driver_en_route`. They have different guards.
+
+| | `PromoteNextQueuedRide` | `PromoteAutoQueuedRide` |
+| --- | --- | --- |
+| Called from | `Ride.Complete`, `Ride.Cancel`, `Ride.RequeueAfterCancel`, inside their transactions | `Ride.PromoteQueuedRide`, from `prepareAndPromoteQueuedRide` |
+| Picks | Queue head for the driver | The given ride, only if it's the queue head |
+| No active ride | Yes | Yes |
+| Driver online | — | `is_online_driver` |
+| Recent ping | — | `last_pinged_driver` within 5 minutes (`OfflineGraceInterval`) |
+| Session | — | Exactly one open session, matching the ride's vehicle and fleet |
+| Payment and route | Done afterward, outside the transaction | Done before, then committed with the promotion |
+
+### After complete, cancel, or requeue
+
+The promotion commits in the same transaction as the parent command. The service then runs `advanceQueuedRide` in a detached goroutine (`async.Go` with `DetachedBackground`):
+
+1. `prepareActiveRide` rereads the ride and driver, computes the pickup route from the driver's current position (the ride is now `driver_en_route`), and writes it with `UpdatePickupRoute`.
+2. `authorizeRidePickup` runs `processRidePayment` when the effective price is above 0.
+3. `notifyQueuePromotion` pushes the rider (`NotifyRiderRideConfirmed` with `driver_en_route`) and records `queue_promoted`.
+4. A deferred `recalculateDriverQueueSummary` runs on every exit.
+
+The ride is published as active before its route and payment exist. If any step fails, the error is logged and the ride stays `driver_en_route` without a new pickup route or a fresh authorization.
+
+### Idle recovery
+
+`RideService.RecoverIdleQueue` handles a queue with no active ride. It's called from `AutoAssignRide` right after assignment and from `RefreshQueueSummaries` every 3 minutes for every driver with queued rides, 10 at a time.
+
+<Steps>
+  <Step title="Check for an active ride">
+    `GetDriverActiveRideInfo` returns `nil` error when an active ride exists, and recovery stops. Only a `NotFound` continues.
+  </Step>
+  <Step title="Take the advisory lock on the queue head">
+    `Ride.AcquireLock(queueHeadID)` takes a session-level `pg_advisory_lock` on a dedicated pool connection. The key is the first 8 bytes of the ride UUID as a signed `int64`. This blocks until the lock is free. There's no timeout beyond the caller's context.
+  </Step>
+  <Step title="Preflight">
+    `PromoteQueuedRide(rideID, nil)` runs the full `PromoteAutoQueuedRide` update under ride-command locks, then rolls it back and returns `ErrRidePreparationRequired`. Any other input error, such as "not queued" or a failed guard, ends recovery quietly with `nil`.
+  </Step>
+  <Step title="Prepare">
+    `prepareRidePickup` routes from the driver's current GPS and authorizes payment. It captures the ride's `lifecycle_revision` as `ExpectedRevision`.
+  </Step>
+  <Step title="Promote for real">
+    `PromoteQueuedRide(rideID, preparation)` reruns every guard, rejects a revision mismatch as a conflict, writes the pickup route, runs the revision finalizer, and commits.
+  </Step>
+  <Step title="Notify">
+    It refreshes the queue summary, pushes the rider, records `queue_promoted`, and sends the driver a silent `ride_status_changed` for `driver_en_route`.
+  </Step>
+</Steps>
+
+If the second `PromoteQueuedRide` returns an input error, `releaseCancelledQueueAuthorization` cancels the new Stripe authorization, but only when the ride was terminally cancelled from `queued` in the meantime. A ride that is still queued keeps its hold for the next retry.
+
+<Note>
+The advisory lock is released with `context.WithoutCancel`, so a cancelled request can't skip the unlock. If `pg_advisory_unlock` itself fails, the error is logged and the connection goes back to the pool still holding the session lock. The next caller that draws that connection can re-enter it, and every other connection blocks on that ride until the connection is recycled.
+</Note>
+
+### Stranded queues
+
+`PromoteAutoQueuedRide` refuses to promote when the driver's session doesn't match the ride's `driver_vehicle_id` and `fleet_id`, or when the driver has zero or several open sessions. Nothing else moves such a ride:
+
+- The expiry sweep only touches `confirmed` rides.
+- Offline unqueue only runs when the driver has no presence and hasn't pinged for 5 minutes.
+
+A driver who is online but switched vehicle or fleet keeps a stranded queued ride until they go offline long enough to be unqueued, or until the rider cancels.
+
+## Offline unqueue
+
+`UserService.handleQueuedDriverOfflineGrace` runs at the end of `PurgeOfflineDrivers` on every `Operational` tick. For each driver with queued rides:
+
+| Condition | Action |
+| --- | --- |
+| `presence:{driverId}` exists | Delete `driver:offline_grace:{driverId}`, keep the queue |
+| Presence missing, grace key present | Wait |
+| Presence missing, no grace key, last ping under 5 minutes ago | Set the grace key with a 5-minute TTL, wait |
+| Presence missing, no grace key, last ping 5 minutes or more ago | `unqueueOfflineDriverRides` |
+
+The grace key doesn't reset the clock. Its TTL is only a throttle. If the driver's last ping was 1 minute old when the key was set, unqueue happens when the key expires, 6 minutes after the last ping. Unqueue happens between 5 and 10 minutes after the last ping, plus up to one 30-second tick.
+
+`Ride.UnqueueDriverRides` locks the driver's participants, rechecks `last_pinged_driver` under lock, and runs:
+
+```sql
+UPDATE "Rides" SET
+    status = 'confirmed', driver_id = NULL, match_time = NULL,
+    auto_queued = FALSE, driver_vehicle_id = NULL, fleet_id = NULL
+WHERE driver_id = sqlc.arg(driver_id)::uuid AND status = 'queued'
+RETURNING id, community_id;
+```
+
+The service then deletes the queue summary and ETAs and calls `rideBoard.AddRide` for each ride. It doesn't push anyone.
+
+<Warning>
+Unqueued rides lose their fleet and keep their original `confirm_time`, payment intent, and `declined_drivers`. Because `fleet_id` is null, the fleet-filtered board hides them and T0 skips them. Because `confirm_time` is unchanged, a ride confirmed more than 10 minutes ago is expired by the next `CancelUnmatchedRides` sweep. If a payment intent was authorized at accept, a different driver's accept fails in `reuseRideAuthorization` because the previous driver isn't in `declined_drivers`.
+</Warning>
+
+## Queue summaries
+
+`QueueSummaryService` in `internal/service/activation/queue_summary.go` owns two Redis keys per driver, both with a 30-minute TTL:
+
+| Key | Contents |
+| --- | --- |
+| `driver:queue_summary:{driverId}` | Hash: `ride_count`, `total_fare_cents`, `total_minutes`, `total_miles`, `last_dropoff_lat`, `last_dropoff_lng`, `calculated_at` |
+| `driver:queue_ride_etas:{driverId}` | JSON list of `ride_id`, `position`, `estimated_start_minutes`, `deadhead_minutes`, `ride_minutes` |
+
+`CalculateAndCacheQueueSummary` walks the queue in order:
+
+| Leg | Origin | Destination | Source |
+| --- | --- | --- | --- |
+| Deadhead for position 1 | Active ride's dropoff, else driver's stored position | Pickup | Mapbox `GetDistance`, 0 on error or `(0, 0)` origin |
+| Deadhead for position n | Previous queued ride's dropoff | Pickup | Mapbox |
+| Ride leg | Pickup | Destination | Stored `Rides.distance` and `duration` |
+
+```
+EstimatedStartMinutes[n] = cumulative + deadhead[n]
+cumulative += deadhead[n] + rideMinutes[n] + 2
+TotalMinutes = sum(rideMinutes) + sum(deadhead) + 2 * rideCount
+```
+
+`TotalMinutes` excludes the active ride's remaining time. Estimated start times are relative to when the driver becomes free, not to now. All minute values use integer division of seconds.
+
+### Reads validate against Postgres
+
+`QueueSummaryService.Read` always loads the queue from Postgres first. It serves cached ETAs only if the cached ride IDs match the queue exactly, in order. Any mismatch rebuilds through `RefreshRides`. The auto-queue pass reads the hash directly without this check.
+
+`Refresh` is called after every queue mutation: accept, auto-assign, promotion, cancel of a queued ride, requeue without promotion, and on the 3-minute loop.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Accept status decision | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`AssignAcceptedRideToDriver`, `GetRideAcceptingDriver`) |
+| In-transaction promotion | `queries/ride_lifecycle.sql` (`PromoteNextQueuedRide`), `yelo-api/internal/data/repository/ride_lifecycle.go` (`Complete`, `Cancel`, `RequeueAfterCancel`) |
+| Guarded promotion | `queries/ride_matching.sql` (`PromoteAutoQueuedRide`), `yelo-api/internal/data/repository/ride_matching.go` (`PromoteQueuedRide`) |
+| Recovery and preparation | `yelo-api/internal/service/ride/driver.go` (`RecoverIdleQueue`, `prepareAndPromoteQueuedRide`, `prepareRidePickup`, `advanceQueuedRide`, `releaseCancelledQueueAuthorization`) |
+| Pickup routing | `yelo-api/internal/service/ride/promotion_route.go` |
+| Advisory lock | `yelo-api/internal/data/repository/ride.go` (`AcquireLock`), `queries/ride_driver.sql` |
+| Offline unqueue | `yelo-api/internal/service/user/user.go` (`handleQueuedDriverOfflineGrace`, `unqueueOfflineDriverRides`), `ride_matching.go` (`UnqueueDriverRides`) |
+| Summaries | `yelo-api/internal/service/activation/queue_summary.go`, `yelo-api/internal/data/redis/queue_cache.go` |
+| Recovery loop | `yelo-api/internal/service/activation/activation.go` (`RefreshQueueSummaries`) |
+
+## Gotchas and edge cases
+
+- **Two promotion paths, two rule sets.** A queue advanced by completing a ride promotes even if the driver's session changed. A queue advanced by recovery refuses.
+- **Promoted before prepared.** After complete or cancel, the rider sees `driver_en_route` before the pickup route and payment authorization exist. A crash in the goroutine leaves the ride active with stale pickup fields.
+- **Recovery is silent on guard failures.** When a guard fails, the preflight returns an input error and recovery returns `nil`. The only signal is that the ride stays `queued`.
+- **Advisory lock collisions share a lock.** Two rides whose UUIDs share the first 8 bytes serialize against each other. With random v4 UUIDs this is negligible.
+- **The 3-minute loop does N Mapbox calls per driver.** `RefreshQueueSummaries` rebuilds every summary with one `GetDistance` per queued ride, whether or not anything changed.
+- **Auto-queue reads unvalidated summaries.** A summary written before a cancel can linger until the next refresh. Auto-queue may overestimate or underestimate a driver's load until then.
+- **Payment failure during promotion can requeue the ride.** When cloning the payment method or creating the intent fails, `processRidePayment` calls `RideService.Cancel` with the request's user. In recovery, and in promotion after the same driver completes or cancels, that user is the assigned driver. For a `queued` or `driver_en_route` ride, `isReQueueEligible` is true, so the ride goes back to `confirmed` and the driver is added to `declined_drivers`. When a rider's cancel triggered the promotion, the request user is that rider, `Cancel` rejects them as unauthorized, and the ride stays active without an authorization.

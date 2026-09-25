@@ -1,0 +1,129 @@
+---
+title: "Onboard a community"
+description: "End-to-end checklist for launching a new Yelo market: service area, schools, fleet, pricing, hours, map content, drivers, and go-live checks"
+---
+
+This checklist launches a market from nothing to live rides. Each step names the dashboard control or tool that does it. All steps need the `admin` dashboard role unless noted.
+
+New communities start **inactive** with **rides disabled**, so you can configure everything before riders see it.
+
+## Before you start
+
+- You have the `admin` role. See [Dashboard roles and access](/administration/dashboard-roles).
+- You know the service area, the schools it should cover, the launch fleet and its payment model, and the vehicle types and prices.
+- The vehicle types you need exist in the catalog. See [Vehicle types](/dashboard/vehicles).
+
+## Checklist
+
+<Steps>
+  <Step title="Create the community">
+    Open **Communities** and select **Add Community**. Enter a **Name**, select **Draw box** under **Geography**, and drag across the service area. Check the automatic **Timezone** and the **Automatic school mapping** preview, then select **Create Community**. See [Create a community](/dashboard/communities#create-a-community).
+
+    The bounding box is the service area for ride requests and for drivers going online. Draw it to cover every pickup and dropoff you want to allow.
+  </Step>
+  <Step title="Check schools">
+    Schools map to communities by campus coordinates, and only active communities count. Before you turn the community on, review which schools it will take. See [Review school mappings](/administration/schools-and-communities#review-school-mappings) and [Edit a school's coordinates](/administration/schools-and-communities#edit-a-schools-coordinates).
+
+    If a school is missing from the catalog, preview the catalog sync. Both of these are read-only:
+
+    ```bash
+    scripts/school-catalog-dry-run.sh
+    go run ./cmd/sync-school-catalog --catalog-only
+    ```
+
+    Applying it is `go run ./cmd/sync-school-catalog --dry-run=false --report-file=school-sync.json`. It only adds new schools inside an active production community, and it's capped by `--max-created-schools`.
+  </Step>
+  <Step title="Create the launch fleet">
+    Follow [Onboard a fleet](/runbooks/onboard-fleet) with this community as the fleet's home community. Creating the fleet also creates its service row for the community.
+  </Step>
+  <Step title="Set the ride configuration">
+    In the community workspace, under **Ride configuration**, set **Primary Vehicle Type** and **Primary Fleet**. Select **Save Changes**.
+
+    The primary fleet is the fallback ride option when no driver is online and no pricing config is **Always shown**. It's also the default fleet for new drivers without one.
+  </Step>
+  <Step title="Add pricing">
+    On **Pricing Management**, click **Add pricing config** for each fleet and vehicle type in the community. Turn on **Always shown** for every option riders should see before drivers come online. See [Create or edit a pricing config](/dashboard/ride-pricing#create-or-edit-a-pricing-config).
+
+    Without an open pricing config for the community, quotes use platform default fares. For zone-based prices, draw zones first. See [Manage zones](/dashboard/community-map#manage-zones).
+  </Step>
+  <Step title="Review activation">
+    The community uses the default activation tiers until you save your own. Adjust **Delay**, **Radius**, and **Drivers** for the market's size if needed. See [Activation](/dashboard/activation).
+  </Step>
+  <Step title="Set operating hours">
+    Pick one:
+
+    - **Community hours.** On the **Community** page, use the **Operating Hours** card and turn on **Limited hours**. See [Operating hours](/dashboard/communities#operating-hours).
+    - **Fleet calendar.** Attach the primary fleet's Google Calendar. The community then inherits those hours. See [Fleet operating hours](/admin/operating-hours).
+
+    Hours only drive the **LIVE** and **OFF-PEAK** status. They don't block requests.
+  </Step>
+  <Step title="Add map content">
+    - **Places and zones.** Add them on the **Map** page, or import a KML or CSV file there. See [Import locations and zones](/dashboard/community-map#import-locations-and-zones). For a large POI list, the CLI can do it too. It dry-runs by default:
+
+      ```bash
+      go run ./cmd/import-pois --community <community-id> --file places.csv
+      go run ./cmd/import-pois --community <community-id> --file places.csv --apply
+      ```
+
+    - **Top locations.** Choose up to four featured places. See [Community top locations](/guides/community-top-locations).
+    - **Transit.** Add GBFS or GTFS-RT feeds. See [Manage mobility feeds](/dashboard/community-map#manage-mobility-feeds).
+    - **Feed.** Publish events and set **The Spot**. See [Feed and events](/dashboard/feed-and-events).
+  </Step>
+  <Step title="Recruit and activate drivers">
+    Import and work leads on **Drivers** → **Pipeline**, review applications on **Drivers**, and **Activate driver** after the background check. Send the fleet's invitation link to drivers. See [Driver leads](/dashboard/driver-leads) and [Fleet driver invitations](/fleets/driver-invitations).
+  </Step>
+  <Step title="Test before launch">
+    Keep **Rides Disabled** on while the community is **Active** and **Hidden**. Mark a staff rider and a staff driver as **Test account** on their user detail sheets. Test accounts get free rides and are excluded from production KPIs. Hidden communities can't be joined by hand, except by test users.
+
+    Then switch **Rides Disabled** off and run one full ride: request, confirm, accept, arrive, pick up, complete, and rate.
+
+    <Note>
+    **Hidden** only stops manual switching. Once the community is **Active**, users inside the service area are assigned to it by location, and its schools are remapped to it. **Rides Disabled** applies to test accounts too, so any rider in the area can request during your test ride. Keep the test window short.
+    </Note>
+  </Step>
+  <Step title="Go live">
+    In the community workspace, keep **Active** on, turn **Hidden** off, and make sure **Rides Disabled** is off. Select **Save Changes**. Announce the launch to drivers with **Notify Drivers** on **Supply & Demand** or **Send Notification** on **Notifications**.
+  </Step>
+</Steps>
+
+## Verify
+
+**Read-only:**
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+
+SELECT name, is_active, is_hidden, rides_disabled, archived_at, time_zone,
+       primary_fleet_id, primary_vehicle_type, limited_hours_enabled
+FROM "Communities" WHERE id = '<community-id>';
+
+SELECT fleet_id, community_name FROM "ActiveFleetCommunityServices"
+WHERE community_id = '<community-id>';
+
+SELECT fleet_id, vehicle_type, pricing_type, is_featured, display_name
+FROM "RidePriceParameters"
+WHERE community_id = '<community-id>' AND end_time IS NULL;
+
+SELECT count(*) AS schools FROM "Schools" WHERE community_id = '<community-id>';
+
+ROLLBACK;
+```
+
+- The community is active and not archived, with rides enabled.
+- At least one fleet appears in `ActiveFleetCommunityServices`.
+- Every rider-facing option has an open pricing row, with `is_featured` on where needed.
+- The test ride's timeline on **Rides** shows every step, and the `price_calculated` event has `used_default_pricing: false`.
+- A test driver can go online inside the service area.
+
+## Common gaps
+
+| Missed step | Symptom |
+| --- | --- |
+| **Rides Disabled** still on | Riders see **COMING** and third-party options only. |
+| No **Primary Fleet** and nothing **Always shown** | Riders see no useful option until a driver comes online. |
+| No pricing config | Quotes use platform default fares. |
+| Fleet service retired, or fleet inactive | The fleet's prices don't reach riders. |
+| Bounding box too small | **Pickup Outside Service Area** for riders, **Outside Service Area** for drivers. |
+| Fleet not payout-ready | Drivers see **Payment Setup Required**. See [Payout issues](/runbooks/payout-issues). |
+
+For the diagnosis of each, see [Rider can't request](/runbooks/rider-cannot-request) and [Driver can't go online](/runbooks/driver-cannot-go-online).

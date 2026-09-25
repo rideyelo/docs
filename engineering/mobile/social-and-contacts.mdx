@@ -1,0 +1,194 @@
+---
+title: "Social and contacts"
+description: "How the mobile app handles friends, contact sync and matching, friend bumps, invites and referral attribution, rideshare account connections, deals, events, QR scanning, and the World Cup claim."
+---
+
+This page covers the social and growth surfaces of `yelo-frontend`. For the product rules behind them, see [Growth features](/concepts/growth-features) and [Events and feed](/concepts/events-and-feed). For the OS permission side of contacts, see [Permissions](/engineering/mobile/permissions-and-device#contacts).
+
+## Friends
+
+### Data sources
+
+| Data | Endpoint | Owner | Cadence |
+| --- | --- | --- | --- |
+| Friend list | `GET /user/friends` | `FriendsProvider` (query key `['friends', jwt]`) | 60 s stale time, 5-minute convergence poll |
+| Friend map positions | `GET /map/friends` | `useFriendLocations({ poll: true })` in the map layout | 60 s, only while the map is focused |
+| Add a friend by invite code | `POST /user/friends/connect` with `referral_code` | `invite/[code]` | On tap |
+| Location sharing toggle | `PUT /user/location-sharing` | `components/profile/LocationSharingRow.tsx` | On toggle |
+
+Friendships come from two places: accepting an invite link, and mutual contact matches (see [Contacts sync](#contacts-sync)). There is no in-app friend request or accept flow.
+
+`FriendsProvider` also keeps three per-user AsyncStorage records:
+
+| Key prefix | Holds |
+| --- | --- |
+| Sent phones | Phone numbers the user already texted an invite to |
+| Bump stats | Per-friend bump count and last bump time, used to rank friends in the bump sheet |
+| Favorites prompt dismissed | Whether the "invite your three favorite people" prompt is hidden |
+
+### Surfaces
+
+- **Friends hub** (`components/bottom-sheets/FriendsHubBottomSheet.tsx`). Opened from the map feed, the profile, Settings (**Refer a friend**), and driver signup's submitted screen. It shows a search box, "Checking contacts…" while a sync runs, Yelo friends, invitable contacts, an **Apps** row, and an invite-favorites row ("Yelo is better with friends" / "Invite your three favorite people", or "Pick your best friends").
+- **Apps row** (`friends-hub/AppsSection.tsx`). Snapchat (`https://www.snapchat.com/share?link=…`), Messages (`expo-sms` with no recipient and the invite message), and a generic share sheet (`react-native-share`).
+- **Friends rail** on the map feed (`MapFeedFriendsRail`) and the **friends** see-all route (`map/friends`).
+- **Friend detail** (`map/friend/[friendId]`). Avatar, "[X] MI AWAY · [N] MIN WALK" or "Location unavailable", and "LAST SEEN …" for friends who aren't live. **Bump** opens the request sheet in bump mode.
+- **Friend markers** (`components/map/FriendsLayer.tsx`). `MarkerView`-based, so they render above native layers and stay visible on the request screen.
+
+## Contacts sync
+
+`components/ContactMatchSync.tsx` is a headless controller mounted next to `<Slot />` in the root layout. It keeps one complete, account-scoped contact snapshot on the server.
+
+### What is sent
+
+<Steps>
+  <Step title="Read phone numbers">
+    Background triggers read only the `phones` field (`CONTACT_PHONE_FIELDS`). Manual and permission triggers read full contacts so the UI can render names and photos.
+  </Step>
+  <Step title="Build the snapshot">
+    `buildContactSnapshot` in `lib/contacts/contacts.ts` trims each number, drops anything longer than 32 characters, de-duplicates, and caps the list at 5,000 numbers (`CONTACT_SNAPSHOT_LIMIT`). Over the cap, `truncated` is true.
+  </Step>
+  <Step title="Digest for change detection">
+    `digestContactSnapshot` takes a SHA-256 of the sorted, de-duplicated numbers plus the device region (`expo-localization` `regionCode`). This digest never leaves the device.
+  </Step>
+  <Step title="Upload raw numbers">
+    `POST /user/friends/contacts` with `phone_numbers` (the raw strings from the address book), `default_region`, and `snapshot_complete: false` only when truncated.
+  </Step>
+</Steps>
+
+<Note>
+The client does not hash phone numbers. Hashing happens on the server: `MatchContacts` in `yelo-api/internal/service/user/contacts.go` normalizes each number to E.164 with the region, drops the caller's own number, and stores an HMAC-SHA256 with the `CONTACT_HASH_PEPPER` secret. Raw numbers are never persisted.
+</Note>
+
+The server replaces the caller's snapshot, creates a friendship only for **mutual** contacts (each user holds the other's number), and returns `matches` (user id plus the submitted number forms) and `matched_phone_numbers`. It rate-limits to 30 uploads per user per hour in Redis, failing open if Redis is down.
+
+### Triggers and the change-detection loop
+
+| Trigger | When | Skips if digest unchanged? |
+| --- | --- | --- |
+| `account` | User id resolves, after loading stored metadata | Yes |
+| `permission` | Contact permission becomes granted, or the iOS limited selection changes | No |
+| `permission_revoked` | Status becomes `denied`. Uploads an empty list to clear the server snapshot. | No |
+| `contacts_changed` | `Contacts.addContactsChangeListener`, debounced 800 ms | Yes |
+| `foreground` | App becomes active and the last success is 15+ minutes old | No |
+| `friends_changed` | The friend id set changed since the last run | Yes |
+| `manual` | **Refresh contacts** in the profile contacts sheet | No |
+
+`friends_changed` deliberately does not force an upload. A successful upload creates friends, which changes the friend list, which would trigger another upload.
+
+Runs are serialized per account. Work that arrives mid-run is merged (`mergeContactSyncWork`): a permission change always wins, then `manual`. A generation counter cancels in-flight work on sign-out or account switch.
+
+Metadata (`snapshotDigest`, `lastSuccessfulSyncAt`) persists in AsyncStorage under `contacts:sync:<userId>`. Matches do not persist, so the first trigger after a cold launch uploads once to rehydrate them.
+
+Retries use `withContactMatchRetry`: 3 attempts for network errors and 5xx only, backing off 750 ms, 1.5 s, 3 s (capped at 4 s) plus up to 250 ms jitter. 429 and other 4xx fail immediately. Every run emits `contacts_snapshot_sync` with `trigger`, `submitted_count`, `truncated`, `matched_user_count`, `duration_ms`, and an `outcome` of `success`, `unchanged`, `contacts_read`, `network`, `server`, `validation`, `rate_limited`, `incomplete_snapshot`, or `unknown`.
+
+### Contacts settings
+
+`components/profile/ContactsSettingsSheet.tsx` shows the access level (**Full access**, **Selected contacts**, **Access off**, **Not shared**), platform-specific instructions for changing it, and **Refresh contacts** with "Last synced [time]".
+
+## Friend bumps
+
+A bump tells friends where you're heading. `components/bottom-sheets/BumpFriendsBottomSheet.tsx` opens from the request sheet, both matching screens, the active ride, event detail, and friend detail.
+
+- **Recipients.** Only Yelo friends can be bumped, up to 10 at a time ("You can bump up to 10 friends at once."). Friends are ranked with local bump stats.
+- **Location and time.** The sheet carries the destination (a search suggestion or a custom event) and an arrival time. Pre-departure screens pass a live `arrivalInSeconds`. The active ride passes a fixed `arrivalTime`.
+- **Preview.** `GET /notification/bump/preview` returns the SMS body. It is cached per sender for 24 hours (up to 20 entries) and persisted across launches. On error: "Message preview unavailable. You can still bump your friends."
+- **Send.** `POST /notification/bump` with `recipient_user_ids`, `destination_name`, `destination_poi_id` (`yelo:<place id>`, a Mapbox id, or an event POI id), coordinates, `arrival_label`, and an `idempotency_key` that stays stable across retries. 15-second timeout. The server delivers by push and SMS (`channel: push_sms` in analytics).
+- **Invite non-users.** Contacts not on Yelo show an invite action. It opens the SMS composer with the sender's referral link. On iOS only a `sent` result counts. On Android any composer close counts, because the result is always `unknown`.
+
+`bumpErrorMessage` in `api/helpers/bump.ts` maps failures: timeout, offline, 401 or 403 ("Your session expired…"), 429 ("You've sent a lot of bumps recently…"), other 4xx ("Your friend list may have changed."), and 5xx.
+
+## Invites and referral attribution
+
+### Invite links
+
+`https://join.yelo.link/<code>` and `https://invite.yelo.link/<code>` rewrite to `/invite/<code>` (see [Navigation](/engineering/mobile/navigation#deep-links)). `app/(app)/invite/[code].tsx`:
+
+| State | UI |
+| --- | --- |
+| Loading | Spinner |
+| No preview (error or bad code) | "You're invited to Yelo" with **Continue to Yelo** and **Try again** |
+| Signed out | "[Name] invited you to Yelo". **Get started** saves the code and goes to `/(auth-v3)`. |
+| Signed in, own link | "This is your invite link" with **Go home** |
+| Signed in, already friends | "You're already friends with [Name]" with **Go home** |
+| Signed in, new | **Add friend** (`POST /user/friends/connect`, then a snackbar "You and [Name] are now friends") or **Not now** |
+
+The preview comes from `GET /referral/invite/{code}` with a 10-second timeout.
+
+### Deferred attribution
+
+`components/ReferralCaptureObserver.tsx` runs once per cold start, 750 ms after the app is interactive. It calls Dub's `trackOpen()` and inspects the resolved link:
+
+- A fleet code saves a pending fleet join and navigates to `/fleet-join/<code>`.
+- Otherwise the Dub link `key` (or the last URL path segment) is saved as the referral code.
+
+Codes live in AsyncStorage under `@yelo/referral_code` (`lib/storage/referralAttribution.ts`). The Auth v3 **Finish profile** step submits it. See [Auth and onboarding](/engineering/mobile/auth-and-onboarding#exchange-profile-permissions).
+
+### Sharing your link
+
+`useReferralLink()` returns the personalized link from `GET /referral/link`, or a static App Store link while loading. `QRBottomSheet` only encodes the personalized link. The `referral-share` screen (from **Bring your group** in the friends hub) renders a share card.
+
+## Connect Uber, Lyft, and Empower
+
+These screens feed the rideshare price aggregator. All three redirect to **Experiments** unless `rideshare-price-aggregator` is enabled, and the experiment requires accepting `PRICE_AGGREGATOR_DISCLAIMER` (`lib/ride/aggregatorDisclosure.ts`) first. That disclosure states the feature is experimental, that Yelo collects diagnostics excluding credentials, and that Yelo is not affiliated with the providers.
+
+| Provider | Screen | How it signs in | Callback |
+| --- | --- | --- | --- |
+| Uber | `connect-uber.tsx` | `WebBrowser.openAuthSessionAsync` to `auth.uber.com` with PKCE. iOS offers **Try a fresh sign-in** (ephemeral session) after a failure. | `uberauth://`, rewritten to `/connect-uber` on Android |
+| Lyft | `connect-lyft.tsx` | Native phone, 6-digit SMS OTP, then an optional email challenge, all against `api.lyft.com`. No web view. | none |
+| Empower | `connect-empower.tsx` | Auth session against Empower's Azure B2C page (phone plus SMS OTP there) | `rideyazam://` |
+
+All three share `ProviderAccountView` for signed-out, error, and signed-in states. Tokens live in SecureStore under `ride_tokens_<provider>` (`lib/ride/tokenStore.ts`). Refreshes are single-flighted per provider because Uber and Lyft rotate refresh tokens. The **Accounts** screen (`profile/accounts?mode=rideshare`) lists connection status.
+
+## Deals and events
+
+| Route | Data | Behavior |
+| --- | --- | --- |
+| `events/[eventId]` | `GET /event/{id}`, `GET /event/{id}/attendees` | Hero, attendee faces, venue, and a drive ETA (prompts for location). **Get tickets** opens `ticket_url` in an in-app browser. **Send** opens the bump sheet. **Get a ride** pushes the request sheet with the venue as dropoff. **Save** is a TODO. |
+| `deals/[dealId]` | none | Hard-coded placeholder data (see gotchas) |
+
+`routeToFeedItem` in `components/map/feed/routeToFeedItem.ts` sends any feed event tagged `deal` to the deals route and everything else to the events route. Upcoming events come from `GET /event/upcoming` and are persisted for first paint.
+
+## QR scanning
+
+- `scan-qr` uses `CameraView` with `barcodeTypes: ['qr']`. The first scan wins. If `Linking.canOpenURL(data)` is true it opens the URL, else it alerts **Cannot open this code** with the raw text. It always navigates back afterward.
+- `QRBottomSheet` (from the active ride and profile) shows your referral QR, **Save** (shares a PNG), **Copy**, **Scan**, and **Upload**, which decodes a QR from a library image with `Camera.scanFromURLAsync`.
+- `StatusGuard` and the rider lifecycle hook both leave `/scan-qr` and `/tip/` alone, so a rider can scan a driver's tip code mid-ride. `tip/[slug]` opens the web tip page in an in-app browser.
+
+## World Cup claim
+
+The only World Cup UI is a verification nudge. A user who signed up on the web World Cup page has a pending education claim (`getPendingWorldCupClaim` in `api/helpers/worldCup.ts`).
+
+- On app open, `app/(app)/_layout.tsx` pushes `post-signup/14-student` once per claim id, unless the claim was dismissed or the path contains `/tip/`.
+- The screen reads **Verify your World Cup point** / "[email] is counting for [school]. Choose how you want to verify it." **Choose verification method** opens `verify/1-oauth` with the claim email.
+- **Verify later** confirms "[school] already has your point. Verification confirms it belongs to you." and calls `PATCH /world-cup/education-claim/prompt-dismissed`.
+
+The standings and activity endpoints (`/world-cup/standings`, `/world-cup/activity`) are generated but not used by any screen.
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Friends | `providers/FriendsProvider.tsx`, `hooks/useFriendList.ts`, `hooks/useFriendLocations.ts`, `hooks/useYeloFriends.ts` |
+| Friends hub | `components/bottom-sheets/FriendsHubBottomSheet.tsx`, `components/bottom-sheets/friends-hub/` |
+| Contacts sync | `components/ContactMatchSync.tsx`, `lib/contacts/`, `stores/contactMatchStore.ts` |
+| Server matching | `yelo-api/internal/service/user/contacts.go`, `internal/server/http/user/user_routes.go` |
+| Bumps | `components/bottom-sheets/BumpFriendsBottomSheet.tsx`, `components/bottom-sheets/bump-friends/`, `api/helpers/bump.ts`, `api/helpers/bumpPreview.ts` |
+| Invites | `app/(app)/invite/[code].tsx`, `components/ReferralCaptureObserver.tsx`, `lib/storage/referralAttribution.ts`, `hooks/useReferralLink.ts` |
+| Provider accounts | `app/(app)/connect-*.tsx`, `lib/ride/uberProvider.ts`, `lyftProvider.ts`, `empowerProvider.ts`, `tokenStore.ts`, `providerConfig.ts` |
+| Events and deals | `app/(app)/events/[eventId]/index.tsx`, `app/(app)/deals/[dealId]/index.tsx`, `components/map/feed/routeToFeedItem.ts` |
+| QR | `app/(app)/scan-qr.tsx`, `components/bottom-sheets/QRBottomSheet.tsx`, `app/(app)/tip/[slug].tsx` |
+| World Cup | `app/(app)/post-signup/14-student.tsx`, `api/helpers/worldCup.ts` |
+
+## Gotchas and edge cases
+
+- **Every "deal" is the same fake deal.** `deals/[dealId]/index.tsx:27` ignores `dealId` and renders a hard-coded "$5 Off Cover" at Knight Library in Kitchener with a `wygo.world` link. Any event tagged `deal` reaches it.
+- **Scanning opens any URL.** `scan-qr.tsx:27` has no allowlist. A QR for any `https://` site, `tel:`, or another app's scheme opens directly. The same applies to uploaded QR images.
+- **Third-party tokens survive sign-out.** `SessionProvider.signOut` doesn't clear `ride_tokens_<provider>`, so the next Yelo account on the device inherits connected Uber, Lyft, and Empower sessions.
+- **Empower may not return on Android.** Only `uberauth` has an Android intent filter. The `connect-uber.tsx` comment notes Custom Tabs can't intercept an unregistered scheme, and `rideyazam://` isn't registered.
+- **Empower failures are silent.** `connect-empower.tsx` logs and reports but shows no alert, unlike Uber and Lyft.
+- **Friend bumps don't preselect the friend.** The **Bump** button on a friend's detail opens the generic bump flow with no recipient, by design.
+- **The friends query embeds the JWT** in its key (`['friends', jwt]`) and polls without `refetchIntervalInBackground: false` (`FriendsProvider.tsx:221-224`). That contradicts the conventions in [State and data](/engineering/mobile/state-and-data#query-keys).
+- **The World Cup prompt ignores ride state.** It is suppressed only on `/tip/`, so it can push over an active ride or the drive screen.
+- **Truncated snapshots never skip.** Over 5,000 numbers, every trigger uploads, and failures are reported as `incomplete_snapshot`.
+- **Event "Get a ride" double-encodes the dropoff.** `events/[eventId]/index.tsx:148` wraps the JSON in `encodeURIComponent`, while `request.tsx` calls `JSON.parse` on the param directly. Other callers pass raw JSON. Verify on device before relying on it.
+- **The Snapchat share link isn't URL-encoded.** `AppsSection` interpolates the invite link straight into `?link=`.

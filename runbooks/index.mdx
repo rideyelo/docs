@@ -1,0 +1,172 @@
+---
+title: "Runbooks"
+description: "Triage table, conventions, and an inventory of every admin, internal, and CLI tool the Yelo codebase supports for production operations"
+---
+
+These runbooks cover incidents that Yelo's code can detect and repair. Every step maps to a dashboard control, an API endpoint, a script, a make target, a GitHub workflow, or SQL against real tables. When no tool exists, the runbook says so. It doesn't invent one.
+
+<Note>
+The runbooks link to the concept, dashboard, and engineering pages for background instead of repeating them. Read [Ride lifecycle](/concepts/ride-lifecycle), [Payments and payouts](/concepts/payments-and-payouts), and [Background jobs](/engineering/api/background-jobs) once before you go on call.
+</Note>
+
+## Triage
+
+Start from what the user or the alert reports.
+
+| Symptom | Look first at | Runbook |
+| --- | --- | --- |
+| Rider or driver app is stuck on a ride screen, or a rider sees "Existing ride in progress" | **Rides** → **Trips** → **Active**, then **Ride Details** | [Stuck or ghost ride](/runbooks/stuck-ride) |
+| Driver sees an error when going online, or is online but gets no rides | **Driver Ops** driver card, user detail sheet **Driver Info** | [Driver can't go online](/runbooks/driver-cannot-go-online) |
+| Rider sees no Yelo ride options, **COMING**, or an error at request or confirm | **Communities** workspace, **Pricing Management** | [Rider can't request](/runbooks/rider-cannot-request) |
+| Accept fails with a payment error, a hold wasn't released, a fee is disputed | **Ride Details** timeline, `RideEvents` | [Payment failures and holds](/runbooks/payment-issues) |
+| Driver or fleet shows **Payment Setup Required**, **Stripe Account Restricted**, or a failed payout | Fleet editor **Operations** tab | [Payout issues](/runbooks/payout-issues) |
+| A user didn't get a push | **Notifications** → **History**, user **Recent Notifications** | [Push notifications not delivered](/runbooks/push-notifications) |
+| Sign-in code never arrives, "Try Again Later", or Apple and Google sign-in fails | `otp_delivery_status_total`, `AuthPhoneAttempts` | [SMS, OTP, and sign-in failures](/runbooks/sms-and-sign-in) |
+| A release broke production | Cloud Run revisions, Slack deploy message | [Deploy rollback](/runbooks/deploy-rollback) |
+| **Release API** failed at **Migrate database** | Cloud Build log, `schema_migrations` | [Failed migration](/runbooks/failed-migration) |
+| Recurring work stopped, jobs pile up or are discarded | **Jobs** page (River UI), `river_job` | [River job failures](/runbooks/river-jobs) |
+| Log line "Redis circuit breaker opened", or presence and queues look empty | Cloud Logging, `circuit.breaker.state` | [Redis outage](/runbooks/redis-outage) |
+| Mobile E2E runs fail on fixtures, leases, or a drifted API | `make pool-status`, **Release E2E API** workflow | [E2E environment reset](/runbooks/e2e-environment-reset) |
+| Launching a new market | **Communities**, **Fleets** (Configuration), **Pricing Management** | [Onboard a community](/runbooks/onboard-community) |
+| Launching a new fleet | **Fleets** (Configuration), **Access** | [Onboard a fleet](/runbooks/onboard-fleet) |
+
+## Conventions
+
+- **Dashboard.** Control names are bold and match the UI. Most controls need the `admin` role. See [Dashboard roles and access](/administration/dashboard-roles).
+- **Logs.** The production API is the Cloud Run service `yelo-api-testflight` in project `prod-yelo`, region `us-central1`. Logs are JSON in Cloud Logging. Filter on `resource.labels.service_name="yelo-api-testflight"` and `jsonPayload.message`, the same way the release pipeline reads the `Server is ready` line. Structured fields such as `driver_id` and `ride_id` appear under `jsonPayload`.
+- **Metrics.** The API exports OpenTelemetry metrics at `GET /metrics`. See [Observability](/engineering/observability).
+- **SQL.** Tables use quoted PascalCase names such as `"Rides"` and `"Users"`. Wrap every diagnostic in a read-only transaction, the way the repository's own preflight scripts do:
+
+  ```sql
+  BEGIN TRANSACTION READ ONLY;
+  -- diagnostic queries here
+  ROLLBACK;
+  ```
+
+  Runbooks label each query as **read-only** or **write**. Writes are rare, and each one comes with a warning.
+
+<Warning>
+Several tables hold secrets or contact data: `AuthPhoneAttempts.otp_code` and `phone_number`, `PaymentIntents.client_secret` and `ephemeral_key`, and `Users` contact fields. Select only the columns a runbook names. Don't paste user rows into tickets or chat.
+</Warning>
+
+## Tooling inventory
+
+This is every operational tool in `yelo-api`, `yelo-web`, and `yelo-frontend` on `main`. Anything missing from this list has no supported tool.
+
+### API endpoints outside the app
+
+| Endpoint | Auth | Purpose | Writes? |
+| --- | --- | --- | --- |
+| `GET /healthcheck` | None | Liveness. Returns `data: "OK"`. | No |
+| `GET /healthcheck/deep` | None | Postgres ping and pool stats, disk, and runtime. Returns 503 when Postgres or disk is unhealthy. It doesn't check Redis. | No |
+| `GET /update-required?version=` | None | Returns 426 when the native app version is below `minimumFrontendVersion`. | No |
+| `GET /metrics` | Bearer `METRICS_AUTH_TOKEN` when set | Prometheus metrics. | No |
+| `/debug/pprof/` | Same as `/metrics` | Go profiling. Mounted only when `PPROF_ENABLED=true`. | No |
+| `GET /internal/context/user?phone=` or `?user_id=` | `X-Internal-Key` header, matched against `INTERNAL_API_KEY` | Onboarding, community, driver, and Quo context for one user. Returns `found: false` when there's no match. Built for n8n SMS automation. | No |
+| `/riverui/` and `POST /riverui/session` | Clerk `admin` | Embedded River UI. Use it through the dashboard **Jobs** page. | Yes, through River UI actions |
+| `POST /internal/e2e/runs`, `GET` and `DELETE /internal/e2e/runs/{id}`, `POST /internal/e2e/runs/{id}/ride-transition` | `X-E2e-Key` header | E2E fixtures. Registered only on the isolated E2E service. | Yes, E2E database only |
+| `DELETE /ride/` | App JWT | Drops all rides. Refused unless `ENVIRONMENT=dev`. | Yes, local only |
+
+The `/internal/context/user` endpoint is the fastest read-only support lookup. It reports `phone_verified`, `profile_completed`, `is_banned`, `is_deleted`, `is_test`, the community's `market_status` and `rides_disabled`, and the driver's status, steps, and `is_online`.
+
+### Dashboard actions used in these runbooks
+
+| Action | Where | Endpoint | Role |
+| --- | --- | --- | --- |
+| **Rides Disabled**, **Active**, **Hidden**, **Primary Fleet** | **Communities** workspace | `PATCH /dashboard/manage/{id}` | admin |
+| **Operating Hours** | **Community** page | `PUT /dashboard/manage/{id}/operating-windows` | admin |
+| **Reset to Defaults** for activation tiers | **Notifications** → **Activation** tab | `POST /dashboard/manage/{id}/activation-config/reset` | admin |
+| **Always shown**, **Enabled** on a pricing config | **Pricing Management** | `POST` and `PATCH /dashboard/communities/{id}/price-parameters` | admin |
+| Surge slider, **Notify Drivers**, **Notify Riders**, **Ping driver**, **Ping rider** | **Supply & Demand** | `/dashboard/supply-demand/...` | admin |
+| **Ping** | **Driver Ops** | `POST /dashboard/supply-demand/drivers/{id}/ping` | admin |
+| **Edit profile** (phone, active and home community) | User detail sheet | `PUT /dashboard/users/detail/{id}/profile` | admin |
+| **Assign active payout fleet** | User detail sheet, **Driver fleet enrollment** | `PUT /dashboard/users/detail/{id}/fleet` | admin |
+| **Test account** switch | User detail sheet, **Operations** | `PUT /dashboard/users/detail/{id}/test-status` | admin |
+| **Move to Yelo** | User detail sheet | `POST /dashboard/users/detail/{id}/move-to-yelo` | admin |
+| **Activate driver** | **Drivers** → **Pipeline** | `POST /dashboard/leads/drivers/{id}/activate` | admin |
+| Application step review | **Drivers** | `POST /dashboard/drivers/review` | admin |
+| **Refresh Link**, **Open Stripe dashboard**, **Unlink Stripe Account** | Fleet editor **Operations** | `/dashboard/communities/{id}/fleets/{fleet_id}/stripe/...` | admin |
+| Service community **Retire** and **Restore** | Fleet editor **Service communities** | `PUT /dashboard/fleets/services/{fleet_id}/{community_id}` | admin |
+| **Send test** | **Notifications** → **Templates** | `POST /dashboard/notifications/templates/{code}/{locale}/test-send` | admin |
+| Retry, cancel, delete jobs | **Jobs** (River UI) | `/riverui/` | admin |
+
+Two fleet endpoints have no dashboard control. `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist` adds an email to a fleet's auto-join whitelist, and `POST /dashboard/fleet/{fleet_id}/drivers` adds a driver to a fleet. You can only call them with a dashboard Clerk session token.
+
+### Command-line tools in `yelo-api/cmd`
+
+Each tool reads `DSN` and provider keys from `.env` in the working directory, the same as `make run`. Point `.env` at the database you intend to change.
+
+| Tool | Default | Writes when | Purpose |
+| --- | --- | --- | --- |
+| `go run ./cmd/import-pois --community <uuid> --file <csv-or-kml>` | Dry run | `--apply` | Upserts community POIs into `Locations` with `show_on_map = true`. `--category` sets a default category. |
+| `go run ./cmd/sync-school-catalog` | `--dry-run=true` | `--dry-run=false` | Merges NCES and domain sources into `Schools`. Guards include `--max-created-schools` (500) and `--max-coordinate-changes` (5000). `--catalog-only` skips the database. |
+| `go run ./cmd/backfill-categories` | `--dry-run=true` | `--dry-run=false` | Re-resolves POI categories from Mapbox. `--histogram` writes nothing but still spends one Mapbox call per row. |
+| `go run ./cmd/contact-sync --provider quo\|resend --account <alias> --action status\|pause\|activate\|replay` | `status` | `pause`, `activate`, `replay` | Controls durable contact sync. It never sends campaigns. `--user` selects the user for `replay`. |
+| `go run ./cmd/api` | n/a | n/a | The API server. Flags: `-port`, `-limiter-burst`, `-limiter-enabled`, `-stripe-key`. |
+
+### Scripts
+
+| Script | Type | Purpose |
+| --- | --- | --- |
+| `yelo-api/docs/ride-cardinality-preflight.sql` | Read-only | Lists duplicate live bookings, duplicate active trips, requested drafts next to live bookings, and session or vehicle ownership conflicts. |
+| `yelo-api/scripts/auth-v3-user-preflight.sql` | Read-only | Auth v3 compatibility counts, including duplicate phone groups. Emits user IDs only. |
+| `yelo-api/scripts/fix_driver_fleet_status.sql` | Diagnostics, then writes | Four diagnostics for activated drivers without a usable fleet or with incomplete steps. **FIX 1 is not commented out**, so running the whole file inserts `FleetDrivers` rows. FIX 2 is commented out. |
+| `yelo-api/scripts/backfill-yelo-community.sql` | Write, ends in `ROLLBACK` | One-time repair that moves ordinary users out of the reserved Yelo community. You preview by running it as-is, then change `ROLLBACK` to `COMMIT`. |
+| `yelo-api/scripts/school-catalog-dry-run.sh` | Read-only | Builds the checkout and compares school sources with the configured database. Never applies changes. |
+| `yelo-api/scripts/release/*.sh` | CI | Release pipeline helpers: `check-migrations.sh`, `migration-required.sh`, `release-required.sh`, `run-migrations.sh`, `smoke-candidate.sh`, and others. |
+| `yelo-api/scripts/create_payment_link` | Writes to Stripe | One-off Go program that creates a product, price, and payment link on a **hard-coded** connected account using `STRIPE_API_KEY` from `.env`. It isn't a general tool. |
+| `yelo-api/scripts/poi-replay/` | Analysis | Replays captured POI lookup failures. |
+| `yelo-api/scripts/setup_clickhouse_tables.sql` | DDL | ClickHouse search tracking tables. |
+
+### Make targets that touch shared environments
+
+| Repository | Target | Effect |
+| --- | --- | --- |
+| `yelo-api` | `make migrate` | Shows the version, lists pending files, asks `[y/N]`, then runs `migrate up` against `DSN` in `.env`. |
+| `yelo-api` | `make migrate-down` | Asks `[y/N]`, then reverts **one** migration against `DSN` in `.env`. Meant for local databases. |
+| `yelo-api` | `make migration-check` | Validates migration file names, pairs, and gaps. Read-only. |
+| `yelo-api` | `make gcp-tunnel` | Opens an IAP tunnel from `localhost:6379` through `yelo-dev-iap` in `prod-yelo`. |
+| `yelo-web` | `make deploy-<site>`, `make deploy-all` | Builds and deploys to Firebase Hosting from your machine. Runs `check-auth` first. |
+| `yelo-frontend` | `make eas-stage MESSAGE="..."` | Dispatches **OTA Stage**. |
+| `yelo-frontend` | `make eas-promote GROUP=<uuid> MESSAGE="..."` | Dispatches **OTA Promote** with `action=promote`. |
+| `yelo-frontend` | `make pool-status`, `pool-clean`, `pool-reset` | Inspect, reclaim, or release the shared E2E simulator pool. |
+
+<Warning>
+`make migrate` and `make migrate-down` run against whatever `DSN` your `.env` holds. Check it before you answer `y`.
+</Warning>
+
+### GitHub workflows you can dispatch
+
+| Repository | Workflow | Inputs |
+| --- | --- | --- |
+| `yelo-api` | **Release API** (`release-api.yml`) | `sha`: full Git SHA. Defaults to the selected branch. |
+| `yelo-api` | `release-e2e.yml` | None. Converges `yelo-api-e2e` with production. |
+| `yelo-api` | `sync-frontend-release.yml` | None. Refreshes the release-branch sync pull request. |
+| `yelo-api` | `propagate-openapi.yml` | None. Opens contract update pull requests in the consumers. |
+| `yelo-frontend` | **EAS Build** (`build.yml`) | `ios_staging`, `refresh_ios_staging_profile`, `ios_production`, `android_staging`, `android_production`, `submit_ios`, `submit_android`, `allow_non_main` |
+| `yelo-frontend` | **OTA Stage** (`ota-stage.yml`) | `source_ref`, `platforms` (`all`, `ios`, `android`), `message` |
+| `yelo-frontend` | **OTA Promote** (`ota-promote.yml`) | `action` (`promote`, `rollback`), `source_commit`, `group_id`, `second_group_id`, `platforms`, `message` |
+| `yelo-frontend` | **Finalize App Store release** | `tag`, `storefronts` |
+| `yelo-frontend` | `backport-supported-release.yml` | `pull_request`: merged pull request number to reconcile |
+| `yelo-frontend` | **Mobile E2E** (`e2e-agent-device.yml`) | `runner`, `app_source`, `app_url`, `flow`, `mode`, `suite`, `max_devices` |
+
+`yelo-web` has no dispatchable workflow. Its **Firebase** workflow runs on every push to `main`.
+
+## Runbooks
+
+<CardGroup cols={2}>
+  <Card title="Stuck or ghost ride" href="/runbooks/stuck-ride">Rides and users stuck in a status or in driving mode.</Card>
+  <Card title="Driver can't go online" href="/runbooks/driver-cannot-go-online">Go-online errors and drivers who get no rides.</Card>
+  <Card title="Rider can't request" href="/runbooks/rider-cannot-request">Missing ride options and request errors.</Card>
+  <Card title="Payment failures and holds" href="/runbooks/payment-issues">Authorization failures, holds, captures, and fee disputes.</Card>
+  <Card title="Payout issues" href="/runbooks/payout-issues">Restricted Stripe accounts and fleets that aren't payout-ready.</Card>
+  <Card title="Push notifications not delivered" href="/runbooks/push-notifications">Missing push, suppressed deliveries, dead tokens.</Card>
+  <Card title="SMS, OTP, and sign-in failures" href="/runbooks/sms-and-sign-in">Phone codes and provider sign-in.</Card>
+  <Card title="Deploy rollback" href="/runbooks/deploy-rollback">API, web, and mobile OTA rollback.</Card>
+  <Card title="Failed migration" href="/runbooks/failed-migration">A release that failed while migrating.</Card>
+  <Card title="River job failures" href="/runbooks/river-jobs">Failed, stuck, and missing background jobs.</Card>
+  <Card title="Redis outage" href="/runbooks/redis-outage">What degrades and what to do.</Card>
+  <Card title="E2E environment reset" href="/runbooks/e2e-environment-reset">Fixtures, simulator leases, and the E2E API.</Card>
+  <Card title="Onboard a community" href="/runbooks/onboard-community">End-to-end launch checklist.</Card>
+  <Card title="Onboard a fleet" href="/runbooks/onboard-fleet">Fleet setup checklist.</Card>
+</CardGroup>

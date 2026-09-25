@@ -1,0 +1,154 @@
+---
+title: "Mobile PaymentSheet and wallets"
+description: "How the rider app initializes Stripe, runs PaymentSheet in custom-flow mode against a SetupIntent, offers Apple Pay, turns the chosen method into a payment_method_id for ConfirmRide, and what the rider sees when any step fails."
+---
+
+The rider app never creates PaymentIntents. It uses Stripe PaymentSheet in **custom flow** to save or pick a payment method against a platform SetupIntent, then sends that method's ID to `POST /ride/i/{id}/confirm`. Authorization happens later on the server when a driver accepts. See [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
+
+## Stripe initialization
+
+`ensureStripeInitialized` in `yelo-frontend/lib/payments/ensureStripeInitialized.ts` runs once per process:
+
+1. Calls `GET /payment/publishable-key` (JWT-authenticated). The API returns `STRIPE_PUBLISHABLE_KEY`.
+2. Records whether the key starts with `pk_live_` (`rememberStripeKeyMode`).
+3. Calls `initStripe` with the key, `merchantIdentifier: merchant.com.rideyelo.yelo`, and `urlScheme: com.rideyelo`.
+
+A module-level promise deduplicates concurrent callers. On failure, the promise is cleared so the next caller retries, and `stripe.init.error` is logged.
+
+The Expo config plugin in `app.json` sets `merchantIdentifier: merchant.com.rideyelo.yelo` and `enableGooglePay: true`. The SDK version is `@stripe/stripe-react-native` 0.64.0.
+
+## Inputs from the API
+
+`POST /ride/v2/` (`useRideCreateRideV2` in `usePreRideRequest`) returns the quote plus three Stripe values from `ensureStripeCustomerSetup`:
+
+| Field | Source |
+| --- | --- |
+| `stripe_customer_id` | Platform customer, created on first request |
+| `ephemeral_key` | New ephemeral key secret for that customer |
+| `setup_intent_client_secret` | New SetupIntent with automatic payment methods, no redirects |
+
+The request always sends `X-Features: tips,driver-options`, so every ride created from the app has `tips_enabled = true`.
+
+## PaymentSheet configuration
+
+`buildPaymentSheetParams` in `lib/payments/paymentSheetConfig.ts`:
+
+```ts
+{
+  merchantDisplayName: 'Yelo',
+  customerId: customerID,
+  customerEphemeralKeySecret: ephemeralKey,
+  setupIntentClientSecret,
+  customFlow: true,
+  style: 'automatic',
+  returnURL: createDeepLink('ride/2-select-ride'),
+  applePay: {                       // omitted on simulator + live key
+    merchantCountryCode: 'US',
+    cartItems: [
+      { label: 'Ride fare', amount: fare, paymentType: Immediate },
+      { label: 'Tip authorization', amount: '5.00', paymentType: Immediate, isPending: true },
+      { label: 'Yelo', amount: fare + 5, paymentType: Immediate, isPending: true },
+    ],
+  },
+}
+```
+
+- The fare is `discounted_price` when the selected option `is_discounted`, otherwise `price`.
+- `TIP_AUTHORIZATION_BUFFER = 5` mirrors `models.TipBuffer` on the API. Change both together.
+- **Apple Pay is suppressed** only when `Device.isDevice` is false and the key is live. Stripe's SDK crashes on a simulator's dummy token under live keys. Test keys work on the simulator.
+- **Google Pay isn't configured.** The params don't include a `googlePay` block, so PaymentSheet doesn't offer Google Pay on Android despite `enableGooglePay` in the plugin config.
+
+## Component lifecycle
+
+`StripePaymentScreen` (`components/ride/StripePaymentScreen.tsx`) is headless. The request screen, `app/(app)/(tabs)/map/request.tsx`, renders it and drives it through a ref.
+
+### Serialization
+
+The native SDK owns a single sheet per process. The component serializes every native call through a module-level promise chain, `nativePaymentTail`, so a stale initialization can't replace a newer one.
+
+A **selection key** of ride ID, customer, ephemeral key, SetupIntent secret, vehicle type, fleet, direct driver, and amount is recomputed each render. When it changes, a generation counter bumps. Every async step checks the generation and discards its result if it's stale.
+
+### Initialize
+
+`initializePaymentSheet(price)`:
+
+- `price == null`: do nothing.
+- `price === 0`: mark ready with no sheet. Free rides skip Stripe entirely.
+- Otherwise: `ensureStripeInitialized`, then `initPaymentSheet`. On success it stores the initialized SetupIntent secret and the default `paymentOption`, and marks ready. On error it logs `stripe.paymentSheet.init.error` and stays not-ready.
+
+### Select
+
+`openPaymentSheet` runs `presentPaymentSheet` when ready. In custom flow this only chooses or adds a method. The selected option's label and image drive the payment row.
+
+### Confirm the ride
+
+`confirmAndCreateRide`:
+
+<Steps>
+  <Step title="Guard">
+    Rejects a second call while one is in flight. Requires ride ID, vehicle option, and ready state, and runs `ensureRideEntryVersion`.
+  </Step>
+  <Step title="Confirm the SetupIntent">
+    For paid rides only. Fails with "Payment details changed" if the initialized secret doesn't match the current one. Then `confirmPaymentSheetPayment`, which confirms the SetupIntent and may show 3D Secure on-session.
+  </Step>
+  <Step title="Read the payment method">
+    `retrieveSetupIntent(secret)` and takes `paymentMethod.id` or `paymentMethodId`. Missing returns "No payment method found."
+  </Step>
+  <Step title="Check ride state">
+    `ensureUserStatus` must show no current ride, or this ride still `requested`. Otherwise "Your ride has changed."
+  </Step>
+  <Step title="Confirm">
+    `POST /ride/i/{id}/confirm` with `vehicle_type`, `fleet_id`, `payment_method_id`, and `driver_id` for direct offers.
+  </Step>
+  <Step title="Reconcile">
+    After any attempt that reached the network, it calls `ensureUserStatus` again before releasing the lock, to recover from lost responses.
+  </Step>
+</Steps>
+
+`save_payment_method` is never sent, so the API never calls `AllowPaymentMethodRedisplay` for mobile rides. SetupIntent confirmation still attaches the method to the customer, so PaymentSheet shows it next time.
+
+## What the rider sees
+
+| Failure | Where | Rider-visible result |
+| --- | --- | --- |
+| Publishable key or `initStripe` fails | `ensureStripeInitialized` | Payment row stays in `loading`. **Find Yelo** stays disabled. No message |
+| `initPaymentSheet` fails | `initializePaymentSheet` | Same as above |
+| Rider closes the sheet | `presentPaymentSheet` or `confirmPaymentSheetPayment` returns `Canceled` | Nothing |
+| Card declined or 3DS failed during SetupIntent confirm | `confirmPaymentSheetPayment` | "Could not confirm this request. Check your ride status before trying again." |
+| Any confirm API error | `confirmRideMutateAsync` | Same message |
+| Card fails later, at driver accept | Server | Nothing immediately. The ride stays on the board until it expires. See [Payment failure modes](/engineering/payments/failure-modes-and-invariants) |
+
+`paymentRequired` on the request screen is true when the selected amount is unknown or above 0. **Find Yelo** is disabled until the sheet is ready and, for paid rides, a payment option exists.
+
+## Payment brand on receipts
+
+The API stores `Rides.payment_method_brand` at confirm through `extractPaymentBrand`: the card brand such as `visa`, or `Apple Pay` or `Google Pay` when the card has a wallet type. The rider and driver ride detail screens show that string.
+
+## Testing wallets and cards
+
+- Point the app at an API with test keys. E2E mode refuses to start unless both keys are `sk_test_` and `pk_test_`.
+- Apple Pay on the iOS simulator works only with test keys. Use a real device for live-key checks.
+- Stripe's standard test cards cover the interesting paths: `4242 4242 4242 4242` succeeds, `4000 0027 6000 3184` requires authentication on every charge, and `4000 0000 0000 9995` declines for insufficient funds.
+- A card that always requires authentication passes SetupIntent confirmation on-session, then fails at driver accept because the ride hold is off-session. Use it to exercise the accept failure path.
+- `components/ride/StripePaymentScreen.test.tsx` and `lib/payments/ensureStripeInitialized.test.ts` are the unit tests for this flow.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Stripe init | `yelo-frontend/lib/payments/ensureStripeInitialized.ts` |
+| Sheet params, Apple Pay, tip buffer | `yelo-frontend/lib/payments/paymentSheetConfig.ts` |
+| Sheet orchestration and confirm | `yelo-frontend/components/ride/StripePaymentScreen.tsx` |
+| Request screen wiring and errors | `yelo-frontend/app/(app)/(tabs)/map/request.tsx`, `yelo-frontend/components/map/request/selectionHelpers.ts` (`resolvePaymentRowState`) |
+| Feature header | `yelo-frontend/hooks/usePreRideRequest.ts` |
+| Native config | `yelo-frontend/app.json` (`@stripe/stripe-react-native` plugin) |
+| Publishable key endpoint | `yelo-api/internal/server/http/payment/payment_handler.go` (`GetPublishableKey`) |
+| Brand extraction | `yelo-api/internal/service/ride/rider.go` (`extractPaymentBrand`) |
+
+## Gotchas and edge cases
+
+- **The Apple Pay sheet overstates the charge.** It shows fare plus a pending $5.00 on every ride, because every app ride has tips enabled. Nothing is charged at this point. The sheet only saves a method.
+- **Silent loading state.** Init failures leave the payment row spinning with no retry prompt. The parent can call `reinitialize()` through the ref, but the request screen doesn't expose it.
+- **Stale SetupIntents.** Each new quote returns a new SetupIntent secret. If the quote refreshes after the sheet initialized, confirmation is blocked with "Payment details changed" until the sheet re-initializes.
+- **3D Secure only happens here.** Authentication can happen on-session during SetupIntent confirmation. The later ride hold is off-session, so a card that requires authentication for every charge fails at driver accept with no prompt to the rider.
+- **No tip confirmation sheet.** The ride-complete screen ignores `tip_status: requires_action`. See [Ride tip charging](/engineering/payments/ride-tips).

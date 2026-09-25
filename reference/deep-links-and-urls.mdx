@@ -1,0 +1,221 @@
+---
+title: "Deep links and URLs"
+description: "Every public host, short-link domain, app URL scheme, universal link, and in-app deep link path Yelo uses, and where the server generates each one."
+---
+
+This page maps every URL the system serves, generates, or handles. It covers public hosts, Dub short domains, app schemes and universal links, and the deep link paths the mobile app understands. Paths are relative to each repository root: `yelo-api`, `yelo-web`, and `yelo-frontend`.
+
+<Note>
+Which Firebase site answers on which custom domain is configured in the Firebase and Cloudflare consoles, not in code. Where this page says a site is "likely" served on a domain, the evidence is the API CORS list and cross-links in code.
+</Note>
+
+## Hosts and domains
+
+<AccordionGroup>
+  <Accordion title="API">
+    | Host | Purpose | Referenced at |
+    | --- | --- | --- |
+    | `https://api.rideyelo.com` | Production API. Mobile release builds always use it | `yelo-frontend` `lib/config.ts:1`; `yelo-web` `tools/vite/base/config.ts:18` (dev proxy default); `workers/world-cup-router/wrangler.jsonc` |
+    | `https://api.joinyelo.com` | Production API alias. Web production builds fall back to it when `VITE_API_URL` is relative | `yelo-web` `src/lib/api-client.ts:10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:3`; `yelo-frontend` `lib/config.ts:2` (treated as production) |
+    | `https://yelo-api-e2e-798668004250.us-central1.run.app` | E2E API on Cloud Run | `yelo-frontend` `lib/config.ts:6`, `eas.json` (`e2e-simulator`) |
+    | `http://localhost:8080` | Local API default (`API_URL`) | `yelo-api` `internal/utilities/config/config.go:254` |
+
+    Top-level API route groups that browsers or third parties hit directly are in `internal/server/http/router.go`: `/redirect` (`:339`), `/stripe-reauth` (`:333`), `/stripe-webhook` (`:334`), `/appstore-webhook` (`:335`), `/twilio-verify-events` (`:336`), `/twilio-webhook` (`:337`), `/link` (`:348`), `/public/events` (`:351`), `/referral` (`:355`), `/tips` (`:305`), `/world-cup` (`:299`), `/fleet-join` (`:193`), `/authv3` (`:239`), `/riverui/` (`:513`), and `/metrics` (`:207`).
+  </Accordion>
+  <Accordion title="Web sites (Firebase Hosting)">
+    The Firebase project is `yelo-dashboard-v2` (`.firebaserc`). Each site in `sites.config.json` deploys to its own Hosting site.
+
+    | Site | Firebase site | Public domain | Evidence |
+    | --- | --- | --- | --- |
+    | dashboard | `yelo-dashboard-v2` | `https://dash.rideyelo.com` | API `YELO_DASHBOARD_URL` default (`config.go:258`), CORS list (`config.go:730-731`) |
+    | signup | `yelo-signup` | `https://signup.yelo.link`, and under `joinyelo.com` via the experience router | CORS list (`config.go:732-733`), `workers/experience-router/wrangler.jsonc` |
+    | home | `yelo-home` | `https://joinyelo.com` (likely also `rideyelo.com`) | `og:url` in `src/sites/home/index.html:33`, CORS list (`config.go:728-729,740-742`) |
+    | event | `yelo-event` | `https://event.yelo.link` | CORS list (`config.go:736-737`) |
+    | invite | `yelo-invite` | `https://invite.yelo.link` | `INVITE_LANDING_BASE_URL` default (`config.go:355`), CORS list (`config.go:738-739`) |
+    | world-cup | `yelo-world-cup` | `https://world-cup.yelo.link`, and under `/world-cup` via the world-cup router | CORS list (`config.go:734-735`) |
+    | maestro | `yelo-maestro` | `https://yelo-maestro.web.app` | E2E Auth v3 origin (`cloudbuild.e2e.yaml:120`, `eas.json`) |
+
+    The API's default CORS allowlist is the union of these origins and their `*.web.app` hosts (`corsTrustedOrigins`, `internal/utilities/config/config.go:722-744`).
+  </Accordion>
+  <Accordion title="Cloudflare Worker routes">
+    | Worker | Routes | Upstream | Config |
+    | --- | --- | --- | --- |
+    | `yelo-og` | `rideyelo.com/og/*`, `www.rideyelo.com/og/*` | Renders signed OG PNGs | `workers/og/wrangler.jsonc` |
+    | `yelo-experience-router` | `joinyelo.com` and `www.joinyelo.com` on `/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/_yelo/signup/*` | `SIGNUP_ORIGIN` (`https://yelo-signup.web.app`) | `workers/experience-router/wrangler.jsonc` |
+    | `yelo-world-cup-router` | `/world-cup*` on `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com` | `WORLD_CUP_ORIGIN`. `/world-cup/api/*` goes to `WORLD_CUP_API_ORIGIN` as `/world-cup/*` | `workers/world-cup-router/wrangler.jsonc`, `src/index.ts:1-41` |
+
+    The experience router maps public paths onto signup paths (`workers/experience-router/src/index.ts:1-50`):
+
+    | Public path on joinyelo.com | Upstream path on the signup site |
+    | --- | --- |
+    | `/auth/v3` | `/auth/v3/` |
+    | `/pay/tip/<slug>` | `/tip/<slug>` |
+    | `/world-cup/claim` | `/world-cup` |
+    | `/_yelo/signup/<asset>` | `/<asset>`. HTML fallbacks become 404 so a missing asset is never cached as JS |
+  </Accordion>
+  <Accordion title="Dub short-link domains">
+    | Domain | Links created | Destination | Generated at |
+    | --- | --- | --- | --- |
+    | `join.yelo.link` | `join.yelo.link/<referral_code>?v=3` | `INVITE_LANDING_BASE_URL/<code>` (`invite.yelo.link/<code>`) with a signed OG card | `internal/service/referral/referral.go:91,133,148-168` |
+    | `yelo.link` | `yelo.link/fleet-<code>` | `INVITE_LANDING_BASE_URL/fleet/<code>` | `internal/service/fleetjoin/fleet_join.go:22-23,181-184,238` |
+    | `pay.yelo.link` | `pay.yelo.link/<slug>` | `https://joinyelo.com/pay/tip/<slug>` | `internal/service/qrpayment/qrpayment.go:18-19,80,192` |
+
+    `shareLinkVersion` (`"3"`, `referral.go:150`) is appended as `?v=` so iMessage re-scrapes previews after card changes. Dub links go into `DUB_SYSTEM_FOLDER_ID` when set (`internal/data/dub/dub.go:72`).
+  </Accordion>
+  <Accordion title="Other Yelo hosts">
+    | URL | Purpose | Referenced at |
+    | --- | --- | --- |
+    | `https://rideyelo.com` | Default `YELO_WEBSITE_URL`, `STRIPE_RETURN_URL`, and `OG_IMAGE_BASE_URL` | `config.go:257,285,359` |
+    | `http://redirect.rideyelo.com/?deepLink=com.rideyelo://<path>` | App-open wrapper built by the mobile app. Plain HTTP | `yelo-frontend` `lib/navigation/deepLink.ts:3`, `providers/SocialContext.tsx:32,63` |
+    | `https://redeem.rideyelo.com` | Coupon redemption link | `yelo-frontend` `components/modals/CouponModal.tsx:108` |
+    | `https://yelo.link/terms`, `https://yelo.link/privacy` | Legal links in the app | `app/(app)/profile/settings.tsx:294,301`, `app/(auth-v3)/phone.tsx:69,79` |
+    | `https://joinyelo.com/_yelo/signup/app-store-badge.svg`, `.../app-store-qr.svg`, `.../apple-touch-icon.png` | Signup assets proxied through the experience router | `yelo-web` `src/shared/signup/openApp.ts:11-12`, `src/shared/signup/StyledQrCode.tsx:3` |
+    | `https://u.expo.dev/174d3057-0fb3-49db-bbf5-6caa04fe0e3c` | EAS Update endpoint | `yelo-frontend` `app.config.ts:109` |
+    | `https://api.rideyelo.com/mobile-vehicle-catalog` | OIDC audience for vehicle catalog uploads | `yelo-api` `internal/server/http/vehiclecatalog/oidc.go:20` |
+  </Accordion>
+  <Accordion title="Store listings">
+    | URL | Used by |
+    | --- | --- |
+    | `https://apps.apple.com/us/app/yelo-social-ride-network/id1667384111` | API `APP_STORE_URL` default, `/redirect` fallback (`config.go:256`) |
+    | `https://apps.apple.com/app/apple-store/id1667384111?pt=125924162&mt=8` plus `&ct=<code>` | Invite landing store link with campaign token (`yelo-web` `src/sites/invite/referralHandoff.ts:1-5`) |
+    | `https://apps.apple.com/us/app/yelo-ride-find-events/id1667384111` | Event site and friends hub (`yelo-web` `src/sites/event/lib/openInApp.ts:6`, `yelo-frontend` `components/bottom-sheets/friends-hub/constants.ts:7`) |
+    | App Store Connect app `1667384111` | `ascAppId` in `eas.json` |
+  </Accordion>
+</AccordionGroup>
+
+## App URL schemes and universal links
+
+| Item | Production | E2E build | Where |
+| --- | --- | --- | --- |
+| Custom schemes | `com.rideyelo`, `yelo` | `com.rideyelo.e2e`, `yelo-e2e` | `app.json:10`, `app.config.ts:82` |
+| Extra iOS URL types | Google OAuth reverse client id, `yelo` | Same | `app.json` `ios.infoPlist.CFBundleURLTypes` |
+| Extra Android scheme | `uberauth` (Uber login callback) | Not registered | `app.config.ts:93-98` |
+| iOS associated domains | `applinks:yelo.link`, `applinks:join.yelo.link`, `applinks:invite.yelo.link` | Same | `app.json:19` |
+| Android App Links (`autoVerify`) | `https://yelo.link/` and `https://yelo.link/fleet-*`, all of `join.yelo.link`, all of `invite.yelo.link` | Same | `app.json:62-82` |
+| iOS bundle id / Android package | `io.flutterflow.ridedesi.desirider` / `com.rideyelo` | `.e2e` / `com.rideyelo.e2e` | `app.json`, `app.config.ts:32-33` |
+| Queried external schemes | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam` | Same | `app.json` `LSApplicationQueriesSchemes`, `app.config.ts:31` |
+| Auth v3 redirect URI | `com.rideyelo://auth/v3/callback` | `com.rideyelo.e2e://auth/v3/callback` | `lib/auth/security.ts:4-7`, `cloudbuild.e2e.yaml:120` |
+| API `/redirect` scheme | `com.rideyelo://` (`APP_URL_SCHEME`) | | `config.go:255` |
+
+Web association files live in `yelo-web/public/.well-known/` and ship with every site that copies `public/`:
+
+- `apple-app-site-association` lists app id `6CUL8VB632.io.flutterflow.ridedesi.desirider`. Its `applinks` components only **exclude** `/tip/*` and `/web/tip/*`. It also grants `webcredentials`.
+- `assetlinks.json` grants `handle_all_urls` to `com.rideyelo` with two signing certificate fingerprints.
+- Firebase serves both as `application/json` with `max-age=3600` on the signup and invite sites (`firebase.json`).
+
+## Deep links the app handles
+
+Expo Router maps each file under `app/` to a path. Route groups in parentheses do not appear in the URL. `app/+native-intent.tsx` rewrites incoming system URLs before routing.
+
+<AccordionGroup>
+  <Accordion title="Rewrites in +native-intent.tsx">
+    | Incoming URL | Rewritten to | Line |
+    | --- | --- | --- |
+    | `com.rideyelo://auth/v3/callback` (or `.e2e`) | `/auth-return`. Returns `null` when an Auth v3 browser session is active and the link is not the initial URL | `:10-20` |
+    | `uberauth://...` | `/connect-uber`. The WebBrowser listener consumes the credentials | `:21-25` |
+    | `https://yelo.link/fleet-<code>` | `/fleet-join/<code>` | `:27-34` |
+    | `https://invite.yelo.link/fleet/<code>` | `/fleet-join/<code>` | `:36-42` |
+    | `https://join.yelo.link/<code>`, `https://invite.yelo.link/<code>` | `/invite/<code>`, or `/` with no code | `:44-48` |
+    | `https://signup.yelo.link/.../tip/<slug>?...` | `/tip/<slug>?...` | `:50-59` |
+    | `https://joinyelo.com/*`, `https://www.joinyelo.com/*` | `/` | `:61-64` |
+    | Any other `yelo.link` or `*.yelo.link` URL | `/` | `:66-69` |
+    | Anything else, including `com.rideyelo://<path>` | Unchanged, so it matches a file route | `:71-75` |
+  </Accordion>
+  <Accordion title="Linkable routes">
+    | Path | Screen | File |
+    | --- | --- | --- |
+    | `/` | Home and status redirect | `app/(app)/index.tsx` |
+    | `/map`, `/map/request`, `/map/featured`, `/map/drops`, `/map/moves`, `/map/friends` | Map tab and sheets | `app/(app)/(tabs)/map/*` |
+    | `/map/poi/<poiId>`, `/map/poi/place` | POI and place sheet | `app/(app)/(tabs)/map/poi/*` |
+    | `/map/friend/<friendId>`, `/map/vehicle/<vehicleId>` | Friend and vehicle sheets | `app/(app)/(tabs)/map/*` |
+    | `/profile`, `/profile/settings`, `/profile/accounts`, `/profile/experiments`, `/profile/community-switch`, `/profile/ride-details` | Profile | `app/(app)/(tabs)/profile.tsx`, `app/(app)/profile/*` |
+    | `/profile/glass-lab`, `/profile/color-lab`, `/profile/design-system-lab` | Experiment-gated labs | `app/(app)/profile/*` |
+    | `/ride`, `/ride/pickup`, `/ride/dropoff`, `/ride/3-ride-matching`, `/ride/4-ride` | Rider flow | `app/(app)/ride/*` |
+    | `/ride-matching`, `/ride-matching/1-waiting`, `/ride-matching/2-queued`, `/ride-matching/leave-queue` | Matching | `app/(app)/ride-matching/*` |
+    | `/ride-complete` | Rating and tip | `app/(app)/ride-complete/index.tsx` |
+    | `/drive`, `/drive/queue`, `/drive/queue/<rideId>`, `/drive/driver-hub/1-hub` through `6-vehicle-details` | Driver flow | `app/(app)/drive/*` |
+    | `/driver-earnings/1-hub`, `/2-all-activity`, `/3-all-payouts` | Earnings | `app/(app)/driver-earnings/*` |
+    | `/driver-signup`, `/driver-signup/1-hub` through `8-submitted`, `/driver-signup/verify/*` | Driver application | `app/(app)/driver-signup/*` |
+    | `/driver-marketing` | Why-drive stories | `app/(app)/driver-marketing.tsx` |
+    | `/invite/<code>` | Referral connect | `app/(app)/invite/[code].tsx` |
+    | `/fleet-join/<code>` | Fleet driver join | `app/fleet-join/[code].tsx` |
+    | `/tip/<slug>` | Opens `https://signup.yelo.link/web/tip/<slug>` in the in-app browser | `app/(app)/tip/[slug].tsx:14` |
+    | `/events/<eventId>`, `/deals/<dealId>` | Event and deal detail | `app/(app)/events/*`, `app/(app)/deals/*` |
+    | `/link?yeloLink=<encoded>` | Decodes through `GET /link/decode`, then navigates to the stored path after 1 second | `app/(app)/link.tsx`, `providers/SocialContext.tsx:73-86` |
+    | `/connect-uber`, `/connect-lyft`, `/connect-empower` | Provider account linking | `app/(app)/connect-*.tsx` |
+    | `/scan-qr`, `/save-location`, `/referral-share`, `/verify/*`, `/post-signup/*` | Utility screens | `app/(app)/*` |
+    | `/auth-return` | Auth v3 callback landing | `app/auth-return.tsx` |
+
+    Auth v3 screens (`app/(auth-v3)/*`) render at `/`, `/method`, `/phone`, `/phone-confirm`, `/permissions`, `/finish-profile`, and `/error` before sign-in.
+  </Accordion>
+  <Accordion title="Deferred deep links (Dub SDK)">
+    `components/ReferralCaptureObserver.tsx:29-53` calls `trackOpen()` once, 750 ms after the app becomes interactive.
+
+    - A fleet link navigates to `/fleet-join/<code>` unless that code was already handled.
+    - A referral link stores the code for signup attribution. It does not navigate.
+
+    The SDK is configured with `EXPO_PUBLIC_DUB_PUBLISHABLE_KEY` and `EXPO_PUBLIC_DUB_DOMAIN`, and is disabled in E2E builds (`app/_layout.tsx:283-286`).
+  </Accordion>
+  <Accordion title="Push notification taps">
+    `lib/notifications/processNotificationTap.ts:27-60` reads `data.url`, or `data.route` as a fallback, and calls `router.push(url)` (`providers/PushNotificationProvider.tsx:278-284`). It deduplicates by `notification_delivery_id` and records the open.
+
+    The API sets `data.url` from the template's rendered `deeplink` (`internal/notify/client_data.go:24-26`). Seeded template deeplinks (`internal/notify/seed/templates.go`):
+
+    | Template code | Deeplink | Line |
+    | --- | --- | --- |
+    | `ride_confirmed`, `driver_arrived` | `ride/4-ride` | `:56,75` |
+    | `ride_completed` | `ride?rate={{ride_id}}` | `:98` |
+    | `ride_canceled_by_driver`, `ride_canceled_by_rider`, `direct_request_fallback`, `ride_requeued`, `ride_request_no_drivers`, `message_sent` | `ride` | `:112-164` |
+    | `ride_available`, `unclaimed_ride`, `unclaimed_ride_fleet`, `ride_auto_queued`, `driver_renew_online`, `dashboard_ping_driver` | `drive` | `:209-276,391` |
+    | `waitlist_cleared`, `welcome_to_yelo`, `community_broadcast`, `dashboard_ping_rider` | `ride` | `:286-311,404` |
+    | `friend_bump` | `/map` | `:329` |
+    | `dashboard_send` | none | `:417` |
+    | `driver_application_approved` | `/driver-signup/1-application-status` | `:430`, also `internal/service/dashboard/driver_application_notification.go:15` |
+    | `payout_paid`, `payout_failed`, `payout_canceled` | `yelo://drive/earnings` | `:442-466`, also `internal/service/earnings/webhook.go:78` |
+
+    Operators can override `deeplink` per template in the dashboard (`internal/notify/admin/contracts.go:10,47,62`). See [Notification templates](/dashboard/notification-templates).
+  </Accordion>
+</AccordionGroup>
+
+## Server-generated URLs
+
+| Template | Used for | Generated at |
+| --- | --- | --- |
+| `https://join.yelo.link/<referral_code>?v=3` | Referral share link | `internal/service/referral/referral.go:91,133` |
+| `<INVITE_LANDING_BASE_URL>/<code>` | Dub destination for referral links | `referral.go:156` |
+| `https://yelo.link/fleet-<code>` | Fleet driver join link | `internal/service/fleetjoin/fleet_join.go:238` |
+| `<INVITE_LANDING_BASE_URL>/fleet/<code>` | Dub destination for fleet links | `fleet_join.go:182` |
+| `pay.yelo.link/<slug>` | QR payment short link | `internal/service/qrpayment/qrpayment.go:80` |
+| `https://joinyelo.com/pay/tip/<slug>` | QR short link destination and tip checkout base | `qrpayment.go:19`, `internal/service/tipping/tipping.go:17` |
+| `.../pay/tip/<slug>?status=success&checkout=<guest or yelo>&session_id={CHECKOUT_SESSION_ID}` | Stripe Checkout success URL for tips. `checkout=yelo` when the tipper is signed in | `tipping.go:95,104` |
+| `.../pay/tip/<slug>?status=canceled` | Stripe Checkout cancel URL | `tipping.go:96` |
+| `<OG_IMAGE_BASE_URL>/og/<template>?<params>&sig=<hmac>` | Signed OG image for Dub previews | `internal/utilities/ogcard/url.go:122-140` |
+| `<API_URL>/stripe-reauth/onboarding?jwt=<user jwt>` | Stripe Connect refresh URL for driver onboarding | `internal/service/stripeaccount/stripeaccount.go:96-99` |
+| `<STRIPE_RETURN_URL>?fleet=<fleet_id>` | Stripe Connect refresh URL for fleet onboarding | `internal/service/dashboard/fleet.go:204,255,499` |
+| `STRIPE_RETURN_URL` | Stripe Connect return URL | `internal/data/stripe/account.go:175` |
+| `/redirect` HTML | Tries `APP_URL_SCHEME`, then the App Store after 1 second | `internal/server/http/router.go:449-492` |
+| `https://calendar.google.com/calendar/r` | Operating-hours calendar link | `internal/service/operatinghours/dashboard.go:90` |
+
+The mobile app builds two URLs of its own through `createDeepLink`:
+
+- `http://redirect.rideyelo.com/?deepLink=com.rideyelo://ride/2-select-ride` as the Stripe PaymentSheet `returnURL` (`lib/payments/paymentSheetConfig.ts:80`).
+- `http://redirect.rideyelo.com/?deepLink=com.rideyelo://link?yeloLink=<encoded>` for shareable in-app links (`providers/SocialContext.tsx:63`).
+
+## Web routes of note
+
+| Site | Route | Behavior | Where |
+| --- | --- | --- | --- |
+| signup | `/auth/v3`, `/auth/v3/callback` | Auth v3 web page | `src/sites/signup/App.tsx:246`, `firebase.json` rewrites |
+| signup | `/delete-account` | Account deletion page | `App.tsx:254` |
+| signup | `/tip/<slug>`, `/web/tip/<slug>` | Tip flow. `?status=success` shows completion; `?auth=complete` skips the auth redirect | `App.tsx:269-293` |
+| signup | `/world-cup`, `/world-cup/claim`, `?intent=world-cup` | World Cup claim flow after Auth v3 | `App.tsx:276-299` |
+| signup | anything else | Redirects to Auth v3 entry | `App.tsx:300` |
+| invite | `/<code>` | Referral landing. iOS devices jump to the App Store with `ct=<code>` | `src/sites/invite/App.tsx:20`, `InvitePage.tsx:21-35` |
+| invite | `/fleet/<code>` | Fleet join landing | `src/sites/invite/App.tsx:19` |
+| invite | `/` | 302 to `https://signup.yelo.link/` | `firebase.json:373-383` |
+| event | `/<slug>` | Public event page | `src/sites/event/App.tsx:18` |
+| home | `/partner`, `/drivers`, `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, `/terms` | Static pages | `firebase.json` home rewrites |
+| world-cup | `/` | 302 to `/world-cup` | `firebase.json:411-416` |
+| og worker | `/og/<template>`, `/og/_gallery`, `/og/_sign` | PNG cards. Gallery and signer only when `ENVIRONMENT` is not `production` | `workers/og/src/index.ts:12,76-128` |
+
+For site structure, see [Web sites](/engineering/web/sites).

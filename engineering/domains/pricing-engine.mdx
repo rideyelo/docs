@@ -1,0 +1,288 @@
+---
+title: "Pricing engine internals"
+description: "Exact fare math in internal/utilities/pricing: unit conversion, tiered metering, zone overrides, surge, jitter and anchor pricing, cent truncation, discounts, the Redis quote cache, and how confirm reprices a ride."
+---
+
+This page documents how the API computes a fare, down to the float operations. It goes deeper than [Pricing](/concepts/pricing), which explains the model. For how pricing configs, zone overrides, jitter settings, and previews are managed, see [Pricing configuration](/engineering/domains/pricing-configuration). For how the stored fare is charged, see [Ride payment intents](/engineering/payments/ride-payment-intents).
+
+The engine is a pure package, `internal/utilities/pricing`. It has no database access. `RideService` in `internal/service/ride/rider.go` loads inputs, calls the engine, caches the result, and persists the selected price on confirm.
+
+## Data touched
+
+| Store | Key or table | Access |
+| --- | --- | --- |
+| Postgres | `RidePriceParameters`, `RidePriceTiers` | Read live `per_ride` configs via `ListActiveRidePriceParameters` and `ListRidePriceTiersByParameterIDs` (`queries/community.sql`) |
+| Postgres | `PricingJitterSettings` (single row, `WHERE singleton`) | Read by `RepositoryLayer.GetPricingJitter` on every quote and confirm |
+| Postgres | `Communities.surge_multiplier`, `surge_expires_at` | Read via the community row |
+| Postgres | `Zones`, `ZonePricing` | Read by `buildZoningContext` |
+| Postgres | `Discounts` | `GetBestDiscount` (`queries/education_commerce.sql`) |
+| Postgres | `Rides.route`, `distance`, `duration` | Read on confirm |
+| Postgres | `Rides.price`, `discounted_price`, `is_discounted`, `discount_id`, `fleet_id`, `vehicle_type` | Written by `ConfirmRequestedRide` on confirm |
+| Redis | `price:{community_id}:{pickup_lat}:{pickup_lng}:{dropoff_lat}:{dropoff_lng}` | Quote cache, TTL 5 minutes (`internal/data/redis/price_cache.go`) |
+
+Coordinates in the cache key are formatted with `roundCoord` (`internal/data/redis/route_cache.go`), which is `strconv.FormatFloat(v, 'f', 4, 64)`. Four decimal places is roughly 11 m of latitude.
+
+## Endpoints
+
+The engine has no endpoints of its own. It runs inside these flows:
+
+| Flow | Entry point | Pricing call |
+| --- | --- | --- |
+| Quote (v1 and v2 ride create) | `CreateRide`, `CreateRideV2` in `internal/service/ride/rider.go` | `buildVehicleOptions` and its v2 twin call `resolveRidePrices` |
+| Confirm | `ConfirmRide` | `determineEffectiveRidePrice` calls `determineRidePriceAndFleet` |
+| Cancellation fee | `RideService.Cancel` and cancel-intent | `pricing.GetCancellationFee`, documented in [Cancellations](/concepts/cancellations) |
+| Dashboard preview and overview | `/dashboard/pricing/*` | See [Pricing configuration](/engineering/domains/pricing-configuration) |
+| Zone backtest | `/dashboard/communities/{id}/zone-pricing/backtest` | See [Pricing configuration](/engineering/domains/pricing-configuration) |
+
+Route and auth details for ride create and confirm live in [Rides implementation](/engineering/api/rides-implementation).
+
+## Business rules
+
+### Inputs and units
+
+`GetRidePrice(distance, duration, paramMap, discount, surgeMultiplier, zoning, global...)` takes Mapbox road distance in meters and duration in seconds.
+
+- `distance_miles = distance × 0.000621371`
+- `duration_minutes = duration ÷ 60`
+- A `surgeMultiplier` below 1.0 is raised to 1.0.
+- `global` is the platform jitter settings. When omitted, `jitterSettings` falls back to `models.DefaultPricingJitterSettings()`.
+
+The function returns one `models.RidePrices` and one `PriceBreakdown` per config, in config order.
+
+### Raw fare
+
+For each config, `meterAndTime` (`zoned.go`) returns `meter`, `timeCharge`, and `flat`. Then:
+
+```text
+rawPrice = (base_price + meter + timeCharge + flat) × surge
+```
+
+Surge multiplies every component, including zone flat fees. If `rawPrice == 0`, the option is free: `Price = 0`, `DiscountedPrice = nil`, `IsDiscounted = false`, and no adjustment or discount runs.
+
+### Tiered metering
+
+`computeMeterCharge` (`tiers.go`) slices distance across tiers like tax brackets. For each tier in `sort_order`:
+
+- Stop when `distance ≤ min_distance_miles`.
+- The ceiling is `max_distance_miles`, or the full distance if the tier is open-ended.
+- Charge `(min(distance, ceiling) − min_distance_miles) × price_per_mile` when positive.
+
+Example with illustrative tiers `0–1 @ $0.00`, `1–3 @ $2.50`, `3+ @ $1.50` and 4.5 miles: `0 + 2 × 2.50 + 1.5 × 1.50 = $7.25`.
+
+### Zone metering
+
+`meterAndTime` uses plain metering (tiers over all miles, `price_per_minute` over all minutes, no flat fee) unless all of these hold: `zoning` is non-nil, the fleet has at least one override in `RatesByFleet`, the route has at least two points, and the polyline length is positive.
+
+When zoning applies:
+
+<Steps>
+  <Step title="Measure the polyline">
+    Each segment's length is `haversineMiles` with Earth radius 3958.7613 miles. The sum is `geomMiles`.
+  </Step>
+  <Step title="Assign a zone per segment">
+    `models.ResolveZone` checks the segment midpoint against active zones only. Highest `priority` wins, then smaller area, then lower ID string.
+  </Step>
+  <Step title="Scale to road totals">
+    Each segment gets `segMiles × (distance_miles ÷ geomMiles)` miles and `segMiles × (duration_minutes ÷ geomMiles)` minutes. Time is allocated in proportion to distance, not actual speed.
+  </Step>
+  <Step title="Bill each segment">
+    With no override for the resolved zone, miles go to a `defaultMiles` pool and minutes bill at `price_per_minute`. With an override, `applyZoneSegment` bills miles at `per_mile` (or pools them if `per_mile` is null), minutes at `per_minute` (or the config rate if null), and records `flat_fee` keyed by zone ID.
+  </Step>
+  <Step title="Finish">
+    `meter += computeMeterCharge(tiers, defaultMiles)`. `flat` is the sum of recorded flat fees, one per distinct zone entered.
+  </Step>
+</Steps>
+
+### Fare adjustment
+
+`adjustFare` (`adjustment.go`) branches on `PricingAdjustment.EffectiveMode()`. An empty mode means `jitter`.
+
+| Mode | Actual fare | Anchor (display) price |
+| --- | --- | --- |
+| `jitter` | `applyConfiguredJitter(raw)` | `applyConfiguredAnchor(actual)` |
+| `rounded` | `math.Ceil(math.Round(raw × 1e9) ÷ 1e9)` | Same as actual, factor 1 |
+| `none` | `TruncCents(raw)` | Same as actual, factor 1 |
+
+`applyConfiguredJitter` with settings `S` and a random source `r()`:
+
+```text
+jitter    = S.Min + r() × (S.Max − S.Min)
+jittered  = raw + jitter
+if floor(jittered) > floor(raw) and (jittered − floor(jittered)) < S.ClampOvershootLimit:
+    jittered = floor(raw) + S.ClampRangeMin + r() × (S.ClampRangeMax − S.ClampRangeMin)   // second draw
+price     = math.Trunc(jittered × 100) / 100
+amount    = math.Trunc((price − raw) × 100) / 100
+```
+
+`applyConfiguredAnchor` draws `factor = S.AnchorInflationMin + r() × (S.AnchorInflationMax − S.AnchorInflationMin)`. Display price is `math.Trunc(actual × factor × 100) / 100`. The reported factor is truncated to four decimals.
+
+Default settings (`DefaultPricingJitterSettings`, also seeded by migration `000325_global_pricing_jitter`): `min 0.5`, `max 1`, `clamp_overshoot_limit 0.2`, `clamp_range_min 0.9`, `clamp_range_max 0.99`, `anchor_inflation_min 1.15`, `anchor_inflation_max 1.3`.
+
+### Cent handling
+
+Two truncation helpers coexist:
+
+| Helper | Formula | Used by |
+| --- | --- | --- |
+| `TruncCents` (`jitter.go`) | `math.Trunc(math.Round(v × 10000) / 100) / 100` | `none` mode, discounted fares in non-rounded modes, fallback discounts |
+| Bare truncation | `math.Trunc(v × 100) / 100` | Jitter price, jitter amount, anchor price, breakdown fields (`RawPrice`, `MeterCharge`, `TimeCharge`, `FlatFee`) |
+
+`TruncCents` snaps to 1/100 of a cent first, so float noise like `0.4499999999999999` becomes `$0.45`. Real sub-cent amounts larger than 1/100 of a cent still truncate down.
+
+### Discounts
+
+`GetBestDiscount` returns the `Discounts` row with the highest `discount_rate` where `target_address` equals the destination address exactly and `start_time ≤ t ≤ end_time`. Quotes pass `time.Now()`. Confirm passes the ride's `request_time`.
+
+When a discount applies in `GetRidePrice`:
+
+- `discountBase` is the jittered actual fare, or the **raw** fare in `rounded` mode.
+- `DiscountedPrice = FinalizeFare(max(discountBase × (1 − discount_rate), 0), adjustment)`. `FinalizeFare` rounds up in `rounded` mode and calls `TruncCents` otherwise.
+- `Price` stays the anchor price, `IsDiscounted = true`, and `DiscountId` is set.
+
+Without a discount, `Price = anchor`, `DiscountedPrice = actual`, and `IsDiscounted = anchor > actual`.
+
+### Fallback pricing
+
+`GetDefaultRidePrice` prices every available ride type with `config.DefaultBasePrice` ($4.00), `config.DefaultPricePerMile` ($2.00), and `config.DefaultPricePerMinute` ($0.50) from `internal/utilities/config/constants.go`. It uses a flat per-mile rate (no tiers), `jitter` mode, no surge, and no zones. Every option gets `PricingType = per_ride`.
+
+`resolveRidePrices` uses fallback pricing when there are no live configs, or when no computed price matches any available `(vehicle_type, fleet_id)` ride type.
+
+## Worked examples
+
+All examples use default jitter settings and assume each random draw returns 0.5, the same value `ComputeDeterministicQuote` uses.
+
+### Example 1: fallback fare, 4,828 m and 600 s
+
+<Steps>
+  <Step title="Convert">
+    `4828 × 0.000621371 = 2.999979188` miles. `600 ÷ 60 = 10` minutes.
+  </Step>
+  <Step title="Raw fare">
+    `4.00 + 2.999979188 × 2.00 + 10 × 0.50 = 14.999958376`.
+  </Step>
+  <Step title="Jitter">
+    `jitter = 0.5 + 0.5 × 0.5 = 0.75`, so `jittered = 15.749958376`. The floor moved from 14 to 15, but the overshoot `0.7499…` is not below 0.2, so there's no clamp. `price = trunc(1574.9958…) / 100 = $15.74`. `JitterAmount = $0.74`.
+  </Step>
+  <Step title="Anchor">
+    `factor = 1.15 + 0.5 × 0.15 = 1.225`. `15.74 × 1.225 = 19.2815`, so the display price is `$19.28`. The breakdown reports the factor as `1.2249` because `1.225` isn't exactly representable.
+  </Step>
+</Steps>
+
+The rider sees `price: 19.28`, `discounted_price: 15.74`, `is_discounted: true`.
+
+The same raw fare in the other modes:
+
+| Mode | Actual fare | Why |
+| --- | --- | --- |
+| `rounded` | `$15.00` | `ceil(14.999958376)` |
+| `none` | `$15.00` | `TruncCents`: `round(149999.58) = 150000`, so `$15.00`. Bare truncation would give `$14.99`. |
+| `rounded` + 20% discount | `$12.00` | `ceil(14.999958376 × 0.8) = ceil(11.99997)`. Display price stays `$15.00`. |
+| `jitter` + 20% discount | `$12.59` | `TruncCents(15.74 × 0.8 = 12.592)`. Display price stays `$19.28`. |
+
+### Example 2: dollar-boundary clamp
+
+A raw fare of `$14.40` jitters to `15.15`. The floor moved and the overshoot `0.15` is below `0.2`, so the engine redraws: `14 + 0.90 + 0.5 × 0.09 = 14.945`, truncated to `$14.94`. `JitterClamped = true`. `JitterAmount` is `trunc((14.94 − 14.40) × 100) / 100 = $0.53` because the float difference is `0.5399999…`.
+
+### Example 3: zone override with surge
+
+A config with base $4.00, one open tier at $2.00/mile, and $0.50/minute. A zone override for this fleet sets `per_mile = 3.00`, `flat_fee = 1.00`, and leaves `per_minute` null. The trip is 6,437 m (3.999765 miles) and 720 s (12 minutes). The polyline has two equal-length segments. The first midpoint is outside every zone. The second is inside the zone.
+
+| Component | Outside segment | Zone segment |
+| --- | --- | --- |
+| Miles | 1.9998826 (pooled) | 1.9998826 × $3.00 = 5.9996478 |
+| Minutes | 6 × $0.50 = 3.00 | 6 × $0.50 = 3.00 |
+| Flat fee | none | $1.00 |
+
+`meter = 5.9996478 + 1.9998826 × 2.00 = 9.999413`. `raw = 4 + 9.999413 + 6 + 1 = 20.999413`. With an active surge of 1.5, `raw = 31.499119`. In `rounded` mode the fare is `$32.00`.
+
+## Quote cache
+
+`buildVehicleOptions` (v1) and the v2 path in `CreateRideV2` share the same logic:
+
+<Steps>
+  <Step title="Load inputs">
+    `loadPricingInputs` reads live configs and global jitter settings. `getActiveSurgeMultiplier` returns the stored multiplier only if it's greater than 1.0 and `surge_expires_at` is in the future.
+  </Step>
+  <Step title="Try the cache">
+    `PriceCache.Get` reads the `price:` key. A miss, a Redis error, or a JSON decode failure counts as a miss. Decode failures also delete the key. Hits and misses are recorded as `price_cache` cache-access metrics.
+  </Step>
+  <Step title="Compute on miss">
+    `buildZoningContext` loads overrides and zones, then `resolveRidePrices` runs with a nil discount. Each result becomes a `CachedVehiclePrice` with `actual_price`, `display_price`, `discount_base` (raw fare), `adjustment_mode`, `fleet_id`, `vehicle_type`, and `pricing_type`. `PriceCache.Set` writes it for 5 minutes.
+  </Step>
+  <Step title="Apply the discount">
+    `buildPricesFromCache` applies the current discount on top of cached pre-discount prices, using `discount_base` for `rounded` mode.
+  </Step>
+  <Step title="Record and override">
+    `recordPriceCalculatedEvent` logs `cache_hit`, distance, duration, surge, params, prices, `used_default_pricing`, breakdowns (miss only), and discount ID and rate. Then test accounts are forced to $0.00.
+  </Step>
+</Steps>
+
+`PriceCache.InvalidateCommunity` scans `price:{community_id}:*` and deletes every match. These paths call it asynchronously with a detached context:
+
+| Trigger | Caller |
+| --- | --- |
+| Pricing config create, update, delete | `DashboardService.CreateRidePriceParameter`, `UpdateRidePriceParameter`, `DeleteRidePriceParameter` (`internal/service/dashboard/dashboard.go`) |
+| Zone override upsert or delete | `invalidatePriceCacheForZone` (`internal/service/dashboard/zone_pricing.go`) |
+| Surge change | `internal/service/dashboard/supply_demand.go` |
+| Community update | `internal/service/dashboard/community.go` |
+| Community cache outbox | `redis.InvalidateCommunityCaches` also deletes `price:` keys |
+
+## Repricing on confirm
+
+`ConfirmRide` never reads the cache and never trusts a client price. `determineEffectiveRidePrice` runs:
+
+<Steps>
+  <Step title="Reload inputs">
+    Live configs, the best discount at `ride.RequestTime`, the community surge, the stored ride route (parsed with `models.ParseRoute`), zoning, and global jitter.
+  </Step>
+  <Step title="Select a configured price">
+    `selectConfiguredRidePrice` reruns `GetRidePrice` with the discount. With a non-nil `request.FleetId`, it returns the price matching both vehicle type and fleet. Otherwise, or if no fleet match exists, it returns the first price matching the vehicle type.
+  </Step>
+  <Step title="Fall back">
+    With no configs or no vehicle-type match, `determineFallbackRidePrice` loads ride types (filtered with `filterRideTypesForRider`), picks a fleet with `selectFleetIdForVehicleType` (first ride type of that vehicle type, else the community's primary fleet), and prices it with `GetDefaultRidePrice`. It overwrites `request.FleetId` with that fleet.
+  </Step>
+  <Step title="Override and validate">
+    Test accounts get $0.00. `validatePaymentMethod` requires a `PaymentMethodId` when the effective price is above 0.
+  </Step>
+  <Step title="Persist">
+    `Ride.Confirm` writes `price`, `discounted_price`, `discount_id`, `is_discounted`, `fleet_id`, and `vehicle_type` through `ConfirmRequestedRide`.
+  </Step>
+</Steps>
+
+Every downstream consumer reads `RideDetails.GetEffectivePrice()`: `discounted_price` when non-nil, else `price`.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Engine entry point | `internal/utilities/pricing/pricing.go` | `GetRidePrice`, `GetDefaultRidePrice`, `PriceBreakdown` |
+| Tier metering | `internal/utilities/pricing/tiers.go` | `computeMeterCharge` |
+| Zone metering | `internal/utilities/pricing/zoned.go` | `ZoningContext`, `meterAndTime`, `applyZoneSegment`, `haversineMiles` |
+| Adjustment modes | `internal/utilities/pricing/adjustment.go` | `adjustFare`, `FinalizeFare` |
+| Jitter, anchor, cents | `internal/utilities/pricing/jitter.go` | `applyConfiguredJitter`, `applyConfiguredAnchor`, `TruncCents` |
+| Adjustment and jitter models | `internal/models/pricing_adjustment.go` | `PricingAdjustment`, `PricingJitterSettings`, `DefaultPricingJitterSettings` |
+| Config and tier models | `internal/models/community.go` | `RidePriceParameters`, `PriceTier` |
+| Price results | `internal/models/ride.go` | `RidePrices`, `GetEffectivePrice`, `NewVehicleOptionsV2` |
+| Zone overrides | `internal/models/zone_pricing.go`, `internal/models/zone.go` | `ZonePricing`, `ResolveZone` |
+| Discount | `internal/models/discount.go` | `Discount` |
+| Fallback constants | `internal/utilities/config/constants.go` | `DefaultBasePrice`, `DefaultPricePerMile`, `DefaultPricePerMinute` |
+| Quote orchestration | `internal/service/ride/rider.go` | `buildVehicleOptions`, `resolveRidePrices`, `buildZoningContext`, `buildPricesFromCache`, `getActiveSurgeMultiplier` |
+| Confirm pricing | `internal/service/ride/rider.go` | `determineEffectiveRidePrice`, `determineRidePriceAndFleet`, `selectConfiguredRidePrice`, `determineFallbackRidePrice` |
+| Quote cache | `internal/data/redis/price_cache.go` | `PriceCache`, `CachedVehiclePrice`, `priceCacheKey` |
+| Config load | `internal/data/repository/community.go` | `sqlCommunityRepository.GetRidePriceParameters` |
+
+## Gotchas and edge cases
+
+- **Cache key ignores most inputs.** The key is community plus rounded coordinates only. It doesn't include the rider, available ride types, adjustment mode, or jitter settings. Two riders requesting the same trip within 5 minutes get the same jitter draw.
+- **Jitter settings changes don't invalidate the cache.** `PUT /dashboard/pricing/jitter` writes the row but never calls `InvalidateCommunity`, so cached quotes keep old jitter for up to 5 minutes.
+- **Surge expiry doesn't invalidate the cache.** Only an explicit surge change clears `price:` keys. Quotes cached just before `surge_expires_at` keep the surged fare for up to 5 minutes. Confirm still reprices without surge.
+- **A cache hit reports `used_default_pricing: false`.** The flag is only set on a miss, so the `price_calculated` event under-reports fallback pricing.
+- **Quote and confirm can disagree.** Confirm redraws jitter and anchor, uses `request_time` instead of `now` for discounts, and picks up any config or surge change. See [Ride events](/reference/ride-events) for the recorded metadata.
+- **Pooled out-of-zone miles restart the tiers.** `defaultMiles` from separate out-of-zone stretches are summed and metered from mile 0. A cheap first tier applies to them even if the trip started inside a zone.
+- **The highest-priority zone wins even without an override.** If a segment midpoint is in a high-priority zone with no override for this fleet, the segment bills at the default rate, even when a lower-priority overlapping zone has an override.
+- **Zone `per_mile` bypasses tiers.** Zone miles bill linearly at `per_mile`. They don't count toward tier brackets.
+- **Fallback always sets `is_discounted = true`.** `GetDefaultRidePrice` sets it on every non-discount option, even when the anchor equals the fare.
+- **Confirm fallback silently changes fleets.** If the requested fleet has no matching config, `selectConfiguredRidePrice` returns another fleet's price for the same vehicle type. The stored `fleet_id` comes from that price.
+- **Jitter settings are load-bearing.** A failed read of `PricingJitterSettings` fails the quote and the confirm. It doesn't fall back to defaults. Only repositories without a database (unit tests) use defaults.
+- **`per_person` configs are invisible to riders.** `ListActiveRidePriceParameters` filters to `pricing_type = 'per_ride'`.
+- **Unused helpers.** `allTierRatesZero`, `applyJitter`, and `applyAnchorInflation` only have test callers. `VehicleOptionV2.PriceMax` is declared but never set.

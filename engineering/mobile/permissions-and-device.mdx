@@ -1,0 +1,232 @@
+---
+title: "Permissions and device integration"
+description: "Every OS permission the mobile app requests, when and how it asks, what happens on denial, background modes, entitlements, config plugins, and other device APIs."
+---
+
+This page lists every OS permission and device capability `yelo-frontend` touches. It covers the native config (`app.json`, `app.config.ts`), the runtime prompts, the fallback UI when a user says no, and the device data the app reports back to the API.
+
+For how location feeds heartbeats and the driver background task, see [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#location). For release impact, remember that every item in the native config section below is a store-build change. See [Releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
+## Permission matrix
+
+| Permission | Requested where | Copy the user sees first | Denied fallback |
+| --- | --- | --- | --- |
+| Location (when in use) | Auth v3 **permissions** screen, then `LocationGate` on the map, the **Where to?** control, save-location, event and deal detail | "Location — To show your driver where you are." | Full-screen **Turn on location** blocker on the map. The first tap re-prompts, later taps open Settings. |
+| Location (always) | Never requested in code. Checked only when a driver taps **Go online**. | "Keep your driver location updated" sheet | Driver can't go online. The sheet deep-links to Settings. |
+| Notifications | Auth v3 **permissions** screen, `post-signup/10-marketing` | "Notifications — To get friend alerts." | Nothing blocks. Push token is never registered. |
+| Contacts | Auth v3 **permissions** screen, friends hub, bump sheet, profile contacts sheet | "Contacts — To securely match phone numbers with friends on Yelo." | Friends hub and bump sheet show contact-access rows. Sync clears the server snapshot. |
+| Camera (image picker) | Driver profile photo, driver license, profile photo sheet | OS prompt only | Alert with **Open Settings** (driver photo) or a dead-end alert (profile sheet). |
+| Camera (scanner) | `scan-qr` | "Camera access is needed to scan QR codes." | In-screen **Grant access** button. |
+| Photo library | Driver profile photo, profile photo sheet, QR image upload | OS picker only | No explicit check. The system picker handles access. |
+| Microphone | Never | n/a | `microphonePermission: false` in every plugin that could add it. |
+| App Tracking Transparency | Never | n/a | No ATT prompt or `expo-tracking-transparency` dependency. |
+
+## Onboarding permissions screen
+
+`app/(auth-v3)/permissions.tsx` is the only place the app asks for several permissions together. It renders **Yelo needs some permissions** with three `PermissionsCard` rows (Location, Notifications, Contacts) and a **Finish** button.
+
+<Steps>
+  <Step title="Silent check">
+    On mount it reads all three statuses without prompting. `areOnboardingPermissionsGranted` in `lib/auth/permissions.ts` returns true only when location and contacts are `granted` and notifications count as allowed. If all three pass, the screen calls `completePermissions()` and never renders.
+  </Step>
+  <Step title="Auto-request after 2 seconds">
+    If anything is missing, the screen renders and schedules `onContinue` after 2,000 ms. The user does not have to tap **Finish**. Tapping **Finish** early cancels the timer and runs the same flow.
+  </Step>
+  <Step title="Sequential native prompts">
+    `onContinue` asks for location, then notifications, then contacts, one at a time "so iOS never has to coordinate overlapping prompts". Each step emits `auth_v3_permission_requested` and `auth_v3_permission_completed` with `outcome: granted | denied`.
+  </Step>
+  <Step title="Location is the only hard gate">
+    Notification and contact failures are non-fatal. If location is denied, the screen shows "Location access is required before you can open the map." with an inline **Open Settings** link, and stays put.
+  </Step>
+</Steps>
+
+<Note>
+On iOS, "notifications allowed" means `granted` plus `allowsAlert`, `allowsBadge`, and `allowsDisplayInNotificationCenter`. A provisional or banner-only grant counts as denied. On a simulator (`Device.isDevice` false) notifications always count as allowed.
+</Note>
+
+## Location
+
+### Foreground
+
+`providers/LocationProvider.tsx` owns foreground permission and the single `watchPositionAsync` client.
+
+- `checkPermissions(false)` runs on mount and on every return to the foreground. It never prompts.
+- `requestPermissions()` prompts only if `canAskAgain` is true. Otherwise it sets `errorMsg` to "Location permission denied. Please enable it in Settings." and returns false.
+- `permissionsChecked` stays false until the first silent check settles, so gates never flash.
+- Revoking permission calls `controller.reset()` to drop the cached fix and ignore late native callbacks.
+- On any screen where `inSensitiveFlow` is true (active ride or drive paths), the provider forces `trackLocation` on and calls `checkPermissions(true)`, which can prompt.
+
+The UI surfaces for a missing grant:
+
+| Surface | File | Behavior |
+| --- | --- | --- |
+| Map blocker | `components/map/LocationGate.tsx` | Absolute overlay at `zIndex: 1000`: **Turn on location**, "Yelo is built around where you are — rides, friends, and spots near you. Enable location to use the map." Button reads **Enable location**, then **Open Settings** after one failed request. Hidden while the request sheet is active. |
+| Onboarding | `app/(auth-v3)/permissions.tsx` | Inline "Location access is required…" with **Open Settings**. |
+| Legacy search pill | `components/home/WhereTo.tsx` | Native alert **Location Required** with **Not Now** and **Open Settings**. The component is exported but no screen renders it. |
+| Save location, events, deals | `save-location/index.tsx`, `events/[eventId]`, `deals/[dealId]` | Call `requestForegroundPermissionsAsync()` directly for a best-effort ETA and silently skip on denial. |
+
+The app never distinguishes precise from approximate location. It does not read `accuracy` authorization on iOS 14+ or `ACCESS_COARSE_LOCATION`-only grants on Android. A coarse grant counts as `granted`.
+
+### Background ("Always")
+
+<Warning>
+No code calls `requestBackgroundPermissionsAsync()`. The app only reads the background status.
+</Warning>
+
+When a driver taps **Go online**, `handlePressGoOnline` in `app/(app)/drive/index.tsx` calls `Location.getBackgroundPermissionsAsync()`:
+
+- `granted`: the go-online confirmation sheet opens.
+- Anything else, or a thrown error (older Android binaries without the manifest capability throw): `LocationRequiredSheet` opens.
+
+`components/drive/LocationRequiredSheet.tsx` shows **Keep your driver location updated**, explains that "Yelo collects your location in the background while you're online as a driver, even when the app is closed", and instructs "open Settings → Yelo → Location and choose 'Allow all the time' or 'Always'". **Open Settings** calls `Linking.openSettings()`. **Not now** dismisses.
+
+So every driver must upgrade to Always in system Settings by hand. On iOS the app never triggers the system "Change to Always Allow" upgrade prompt.
+
+### Background task and foreground service
+
+`tasks/DriverLocationTask.ts` runs only while the driver is online or has a current ride. Relevant device settings:
+
+| Setting | Value |
+| --- | --- |
+| Accuracy | `Balanced` |
+| Interval | 15 s, 25 m, deferred to the same values |
+| Activity type | `AutomotiveNavigation`, `pausesUpdatesAutomatically: false` |
+| iOS indicator | `showsBackgroundLocationIndicator: true` (blue status bar pill) |
+| Android foreground service | Title "Location sharing active", body "Updating your location for your ride", icon `assets/yelo/notification-icon.png` from the `expo-location` plugin |
+
+The task self-heals after a force-quit: iOS relaunches the app for significant location changes, and the task unregisters itself if the SecureStore flag `driver_should_share_location` is not `1`.
+
+## Notifications
+
+- **Prompt.** `PushNotificationProvider.requestPermissions()` calls `registerForPushNotificationsAsync(true)`. Only two screens call it: Auth v3 permissions and `post-signup/10-marketing` (both **Continue** and **Interested in driving**).
+- **Token registration.** Separately, once a JWT exists and the app is interactive, the provider fetches an Expo push token without prompting and posts it to `POST /notification/set-token` only if it changed. Simulators never register a token.
+- **Android channels.** `default` ("Yelo notifications") and `kaching-channel` ("Kaching", sound `kaching.wav`), both `HIGH` importance. They are created lazily inside registration, not at startup.
+- **Foreground display.** Banner, list, and sound are shown unless `data.type` is `map_content_changed`. The badge is never set.
+- **Denied.** Nothing in the app re-prompts or deep-links to notification settings. Settings exposes an in-app **Notifications** toggle (`NotificationsSheet`) that writes `PUT /user/allow-notifications`, which is a server preference, not the OS permission.
+
+## Contacts
+
+`providers/ContactPermissionProvider.tsx` wraps `expo-contacts`.
+
+- It tracks `status`, `accessPrivileges` (`all`, `limited`, `none`), and `canAskAgain`, and bumps `permissionRevision` whenever that signature changes. On iOS, a `limited` grant also bumps the revision on every foreground, because the selected people can change in Settings without a status change.
+- `requestPermissions()` prompts only when `canAskAgain` is true.
+- `manageContactAccess()` picks the right action: prompt if possible, `Contacts.presentAccessPicker()` when access is `limited`, otherwise `Linking.openSettings()`. iOS has no public URL for the Contacts subsection, so it lands on the app's Settings page.
+- Reads re-check permission after the native call. If access changed mid-read, the read throws "Contact access changed while reading" so a revoked book never repopulates.
+
+The permission string (from `app.config.ts`) is: "Yelo securely sends phone numbers from your contacts to Yelo to find people you know. Contact names and other details are not uploaded." For what is uploaded and how, see [Social and contacts](/engineering/mobile/social-and-contacts#contacts-sync).
+
+## Camera and photos
+
+| Flow | File | Permission handling |
+| --- | --- | --- |
+| Driver profile photo | `hooks/useDriverProfilePhotoPicker.ts` | Checks, then requests if `canAskAgain`. Denied and askable: "Camera access needed… or upload a photo from your library." Denied permanently: same title with **Open Settings**. Front camera, square crop, quality 1. |
+| Driver license | `app/(app)/driver-signup/5-license.tsx` | Same check-then-request. Denied copy: "Camera access is needed to capture your license." or "Camera access is disabled. Enable it for Yelo in Settings to continue." No Settings button. Back camera, quality 0.8, camera only. |
+| Profile photo sheet | `components/bottom-sheets/profile-sheets/ProfilePictureSheet.tsx` | Calls `requestCameraPermissionsAsync()` unconditionally. Denied: "You've refused to allow this app to access your camera!" No Settings path. |
+| QR scanner | `app/(app)/scan-qr.tsx` | `useCameraPermissions()` from `expo-camera`. Shows **Grant access** until granted. Simulator dev builds show "Camera preview unavailable on simulator." |
+| QR from image | `components/bottom-sheets/QRBottomSheet.tsx` | Picks from the library and decodes with `Camera.scanFromURLAsync`. |
+
+## Native configuration
+
+### Info.plist and entitlements (iOS)
+
+| Key | Value | Source |
+| --- | --- | --- |
+| `NSLocationWhenInUseUsageDescription` | "Yelo uses your location to show nearby rides, set pickup and drop-off locations, and track active trips." | `expo-location` plugin |
+| `NSLocationAlways*UsageDescription` | "Yelo uses your location in the background while you are online as a driver so riders can find you and active trips continue updating when the app is closed." | `expo-location` plugin |
+| `NSCameraUsageDescription` | Two plugins set it. `expo-image-picker`: "Yelo needs access to your camera to take profile pictures and verify driver identity for safety". `expo-camera`: "Allow $(PRODUCT_NAME) to access your camera in order to verify your identity via a selfie / license photo". | `app.json`, `app.config.ts` |
+| `NSPhotoLibraryUsageDescription` | "Yelo needs access to your photos to upload profile pictures and verify driver identity for safety" | `expo-image-picker` plugin |
+| `NSContactsUsageDescription` | See [Contacts](#contacts) | `expo-contacts` in `app.config.ts` |
+| `UIBackgroundModes` | `location`, `remote-notification`. `fetch` is stripped by `withoutBackgroundFetch`. | `app.json`, `app.config.ts` |
+| `LSApplicationQueriesSchemes` | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam`, plus the `react-native-share` list (`fb`, `instagram`, `twitter`, `tiktoksharesdk`) | `app.json` |
+| `ITSAppUsesNonExemptEncryption` | `false` | `app.json` |
+| `aps-environment` | `production`. `withProductionAps` restores it after `expo-widgets` overwrites it with `development`. | `app.config.ts` |
+| Apple Pay | `com.apple.developer.in-app-payments` = `merchant.com.rideyelo.yelo` | `app.json` |
+| Sign in with Apple | `usesAppleSignIn: true` | `app.json` |
+| Associated domains | `yelo.link`, `join.yelo.link`, `invite.yelo.link` | `app.json` |
+| App group (widgets) | `group.io.flutterflow.ridedesi.desirider` (E2E: `group.io.flutterflow.ridedesi.desirider.e2e`) | `expo-widgets` plugin |
+
+### Android manifest
+
+- Declared permissions: `ACCESS_NETWORK_STATE`, `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`. Plugins add background location, foreground service, camera, contacts, and notification permissions.
+- Blocked permissions: `READ_PHONE_STATE`, `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS`.
+- `withRideProviderQueries` adds a `<queries>` intent block for `uber`, `lyft`, `waymo`, and `rideyazam` so Android 11+ package-visibility checks can see those apps.
+- Non-E2E builds add a `uberauth` intent filter for the Uber login callback.
+
+### Config plugins
+
+| Plugin | What it configures |
+| --- | --- |
+| `expo-location` | Background location on both platforms, Android foreground service and icon, usage strings |
+| `expo-image-picker` | Camera and photo strings, `microphonePermission: false` |
+| `expo-camera` (in `app.config.ts`) | Camera string, no microphone, no Android audio recording |
+| `expo-contacts` (in `app.config.ts`) | Contacts string |
+| `expo-audio` (in `app.config.ts`) | `enableBackgroundPlayback: false`, no microphone |
+| `expo-notifications` | Icon, color `#F7F169`, default channel, bundled `kaching.wav` |
+| `@stripe/stripe-react-native` | Merchant id, `enableGooglePay: true` |
+| `@rnmapbox/maps` | Mapbox SDK `11.20.1` |
+| `expo-widgets` | Live Activity extension, app group, push-to-update |
+| `react-native-share` | iOS share-target query schemes |
+| `react-native-bootsplash` | Splash logo and background `#fdfde2` |
+| `expo-font` | Embedded Switzer and Boston Angel fonts |
+| `expo-localization`, `expo-apple-authentication`, `expo-secure-store`, `expo-web-browser`, `expo-image`, `expo-build-properties` (iOS 16.4) | Standard config |
+
+## Other device APIs
+
+| API | Module | Used for |
+| --- | --- | --- |
+| Haptics | `expo-haptics` via `lib/platform/haptics.ts` | `triggerImpactHaptic`, `triggerNotificationHaptic`, `triggerSelectionHaptic`, and the four-step `triggerGroupInviteHaptic`. Lint forbids importing `expo-haptics` anywhere else. |
+| Audio | `expo-audio` | `DriverMapOverlay` plays `assets/audio/ride_sound.mp3` for each new ride card and each new auto-queued ride. Only plays when `AppState` is `active`. Going online sets `playsInSilentMode: true`, going offline resets it. |
+| SMS composer | `expo-sms` | Friend invites, bump SMS fallback, and `openYeloSms` for **Contact Yelo** and **Report safety issue** |
+| Phone dialer | `Linking` `tel:` | Call driver, call rider, **Call 911** |
+| Share sheet | `react-native-share` | Profile share, QR image share, referral share card |
+| Clipboard | `expo-clipboard` | Copy phone or email in Settings, referral links, error details |
+| Store review | `expo-store-review` | `lib/prompts/reviewPrompt.ts`, 90-day cooldown |
+| Battery, network | `expo-battery`, `expo-network` | Heartbeat payload |
+| Carrier, install referrer | `expo-cellular`, `expo-application` | Telemetry |
+| Crypto | `expo-crypto` | PKCE, contact digest, idempotency keys, message ids |
+
+### Store review and feedback prompt
+
+`providers/FeedbackPromptProvider.tsx` runs a custom three-step funnel: **Thoughts on the app?** (Meh or Love it!), **What can we improve?** (Not Now or Give Feedback), then a free-text modal. Whatever the user picks, finishing the funnel calls `maybeRequestReview`, which calls `StoreReview.requestReview()` if the 90-day native cooldown allows.
+
+| Trigger | Caller | Custom funnel cadence |
+| --- | --- | --- |
+| `ride-positive` | `ride-complete` after a 4 or 5 star rating | 1st positive rating, then every 10th, 14-day cooldown |
+| `first-like` | Liking a spot in `SearchOverlay` | Once |
+| `driver-shift` | Going offline after 3+ positive and 0 negative rider ratings this shift | 14-day cooldown |
+| `driver-approved` | `(app)/_layout.tsx` on `driver_application_status` change | Once |
+
+Feedback text goes only to PostHog as `appFeedbackSubmitted` with the full `text`. It is not sent to the Yelo API.
+
+### Telemetry payload
+
+`lib/observability/TelemetryService.ts` posts `POST /telemetry/` at most every 5 minutes (forced on contact-permission changes). It includes platform, OS version, device model and manufacturer, native app version and build, `expo_update_id`, screen size and pixel ratio, locale and timezone, `notifications_enabled`, `location_permission` (`always`, `when_in_use`, `denied`, `undetermined`), contact status and access scope, the Expo push token, carrier, total memory, and the Android install referrer.
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Native config | `app.json`, `app.config.ts` |
+| Onboarding prompts | `app/(auth-v3)/permissions.tsx`, `lib/auth/permissions.ts` |
+| Location | `providers/LocationProvider.tsx`, `components/map/LocationGate.tsx`, `lib/map/deviceLocation.ts` |
+| Background location | `tasks/DriverLocationTask.ts`, `app/(app)/drive/index.tsx`, `components/drive/LocationRequiredSheet.tsx` |
+| Notifications | `providers/PushNotificationProvider.tsx` |
+| Contacts | `providers/ContactPermissionProvider.tsx`, `hooks/useContactsAccessAction.ts` |
+| Camera and photos | `hooks/useDriverProfilePhotoPicker.ts`, `app/(app)/driver-signup/5-license.tsx`, `app/(app)/scan-qr.tsx`, `components/bottom-sheets/profile-sheets/ProfilePictureSheet.tsx` |
+| Haptics | `lib/platform/haptics.ts` |
+| Prompts | `providers/FeedbackPromptProvider.tsx`, `lib/prompts/feedbackPrompt.ts`, `lib/prompts/reviewPrompt.ts` |
+| Telemetry | `lib/observability/TelemetryService.ts` |
+| Permission analytics | `lib/analytics/events/permissions.ts` |
+
+## Gotchas and edge cases
+
+- **Drivers must find "Always" themselves.** The app never requests background location, so every new driver hits `LocationRequiredSheet` on their first **Go online** and must change the setting in the Settings app.
+- **Waze never opens on iOS.** `openNavApp` in `components/drive/CurrentRideBottomSheet.tsx` probes `waze://` with `canOpenURL`, but `waze` is not in `LSApplicationQueriesSchemes`, so iOS returns false and the app falls back to the Google Maps web URL. Android has the same issue: the manifest `<queries>` block lists only the ride-provider schemes.
+- **Two camera strings compete.** Both `expo-image-picker` and `expo-camera` write `NSCameraUsageDescription`. The one applied last wins at prebuild. Check the generated `Info.plist` before submitting a build.
+- **`msauth://` probe is unlisted.** `lib/auth/oAuth.ts` checks for Microsoft Authenticator with `canOpenURL('msauth://')`, which isn't in `LSApplicationQueriesSchemes`, so it always returns false on iOS.
+- **Notifications have no recovery path.** A user who denies notifications during onboarding is never asked again and never sent to Settings.
+- **Notification channels exist only after registration.** They are created inside `registerForPushNotificationsAsync`. A push that arrives before that uses the OS default channel.
+- **Ride alerts are foreground-only.** `playRideAlert` returns early unless the app is active, and `expo-audio` has background playback disabled. A backgrounded driver relies on the push sound.
+- **Coarse location counts as granted.** A user who picks approximate location passes every gate, but pickup accuracy suffers.
+- **Deals and events prompt out of context.** Opening an event or deal detail calls `requestForegroundPermissionsAsync()` just to show an ETA.
+- **`userInterfaceStyle` is `automatic`** in `app.json`, but the app ships only a light theme. System dark mode affects native chrome (alerts, pickers) but not app screens.

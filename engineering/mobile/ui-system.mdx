@@ -1,0 +1,244 @@
+---
+title: "UI system"
+description: "Theme tokens, typography, the design-system component kit, bottom sheets, modals and snackbars, the map component, icons, fonts, haptics, accessibility, and localization in the mobile app."
+---
+
+This page documents the building blocks every `yelo-frontend` screen is made of. [Architecture](/engineering/mobile/architecture#theming) covers the one-light-theme decision and the `rem()` helper. This page goes into the tokens, components, and conventions underneath.
+
+## Theme tokens
+
+Everything lives in `lib/theme/index.ts`. Read it through `useTheme()` from `@/lib/theme`, which returns the MD3 theme extended with Yelo colors. Outside React, import `yeloColors` and `textColors` directly.
+
+### Color groups
+
+Colors are HSL strings. Alpha variants use a `_NN` suffix (`yellow500_25` is 25% opacity).
+
+| Group | Keys | Intended use (from the source comments) |
+| --- | --- | --- |
+| Primary yellow | `yellow50` to `yellow800`, `yellow500_75/_50/_25/_15`, `yellowShadow` | `yellow500` (`hsl(61, 99%, 51%)`) is for CTAs and primary actions only, always with black text. `yellowShadow` is the glow behind primary CTAs. |
+| Secondary blue | `blue50` to `blue800`, `blue500_75/_50/_25`, `blueOutline` | `blue500` for driver-mode screens and secondary actions, white text. `blueOutline` for option-card borders only. |
+| Semantic | `green400/500/600` (+ alphas), `red300/400/500/600` (+ alphas) | Green for success (matched, paid, online). Red for cancel, warnings, errors, destructive states only. |
+| Surface | `surface50` (white), `surface100`, `surface100Border`, `surface300`, `surface400`, `surface700`, `surface800` (black), many `surface50_NN` and `surface800_NN` | Backgrounds, inputs, scrims, hairlines. `surface700` is the near-black for driver screens. |
+| Glass fallbacks | `surfaceGlassClearFallback`, `surfaceGlassRegularFallback`, and their `Inverse` variants | Tints when Liquid Glass isn't available |
+| Disabled | `surfaceDisabled`, `surfaceDisabledBorder` | Disabled buttons, with `text_40` on top |
+| Accent | `lavender200/500/800` (+ alphas) | Sparing highlights such as a focused input or selected card border |
+| Purple | `purple500`, `purple500_15` | "Unlock Room" accent |
+| Neutral | `neutral200` to `neutral900` (hex) | Pure grays for text, icons, and dividers |
+| Text | `text`, `text_70`, `text_50`, `text_40`, `textInverse`, `textInverse_70`, `textInverse_40` | Foreground on light and dark surfaces |
+
+MD3 overrides: `primary` is `yellow500`, `roundness` is 4, `dark` is false.
+
+Other exports: `shadow` (5% black, 10 radius), `bottomSheetBackgroundStyle` (radius 30), `blurhash` (default image placeholder), `useCommonStyles()` (legacy button, shadow, and modal styles), and `cappedFontScale()` for raw text inputs.
+
+### Typography
+
+`YeloText` wraps Paper's `Text` with MD3 variants. Sizes scale with `sf()` on tablets (width over 600pt, capped at 1.5x).
+
+| Variant | Size / line height | Default family |
+| --- | --- | --- |
+| `displayLarge`, `displayMedium`, `displaySmall` | 57/64, 45/52, 36/44 | Switzer Regular |
+| `headlineLarge`, `headlineMedium`, `headlineSmall` | 32/40, 28/36, 24/32 | Switzer Regular |
+| `titleLarge` | 22/28 | Switzer Regular |
+| `titleMedium`, `titleSmall` | 16/24, 14/20 | Switzer Medium |
+| `bodyLarge` (default), `bodyMedium`, `bodySmall` | 16/24, 14/20, 12/16 | Switzer Regular |
+| `labelLarge`, `labelMedium`, `labelSmall` | 14/20, 12/16, 11/16 | Switzer Medium |
+
+`textStyle` swaps the family: `light`, `regular`, `medium`, `semibold`, `bold`, `italic` (`textStyleToFontFamily`). `matchLineHeight` sets line height equal to font size for tight single-line labels.
+
+**Font-scale cap.** `YeloText` and `YeloTextInput` pre-shrink `fontSize` and `lineHeight` by `cap / osScale` when the OS font scale exceeds `MAX_FONT_SIZE_MULTIPLIER` (1.2). They deliberately don't pass a native `maxFontSizeMultiplier`, because it is not honored in this setup and would compound if it were. Call sites can cap tighter with their own `maxFontSizeMultiplier` (for example 1.1 on CTA captions).
+
+### Color tooling
+
+- `scripts/color-inventory.mjs` (`make color-inventory`) scans for color literals and writes `lib/dev/colorInventory.generated.ts`. It skips `lib/theme`, `lib/dev`, tests, generated code, and Mapbox style objects.
+- **Color Lab** (`profile/color-lab`, experiment `color-lab`) renders that inventory as swatches next to the theme tokens.
+- `scripts/color-codemod.mjs` rewrites literals to tokens.
+- ESLint rejects `#fff`, `#ffffff`, `#000`, and `#000000` literals everywhere except `components/map/**`, `LocationMap.tsx`, `lib/theme/**`, and the generated inventory.
+
+## Design-system components
+
+`components/design-system/` is the shared kit, exported from its `index.ts`. oxlint forbids it from importing `../` paths, feature components, providers, hooks, stores, or `app/` (`.oxlintrc.json` override).
+
+### Text and inputs
+
+| Component | Purpose |
+| --- | --- |
+| `YeloText` | All app text. See [Typography](#typography). |
+| `YeloTextInput` | Labeled input with `inputType: 'text' \| 'phone'`, verification callback and message, bottom-sheet mode, and an imperative `focus`/`blur` handle |
+| `YeloRawTextInput` | Thin `TextInput` for custom layouts (comment boxes) |
+| `FlowTextInput`, `PhoneNumberPicker`, `CustomCodeField` | Onboarding inputs. `CustomCodeField` wraps `react-native-confirmation-code-field` for OTPs and PINs. |
+| `YeloSelect`, `SelectionGroup` | Picker sheet and a stacked single-select list with overridable colors |
+
+### Buttons and pressables
+
+| Component | Purpose |
+| --- | --- |
+| `HapticPressable`, `HapticTouchableOpacity` | Base pressables. Fire a Medium impact haptic before `onPress` unless `impactHaptic={false}`, or a notification haptic via `notificationHaptic`. |
+| `YeloButton` | Paper button with `size`: `large` (48pt), `medium` (44pt), `small`, `minimum`, plus `loading` and `isSelected` |
+| `BottomButton` | The pinned bottom CTA with `main`, optional `caption` and `footer`, a masked fade, and per-state color overrides |
+| `YeloGlowButton` | Pill with a colored glow, `color`: `yellow`, `red`, `green`, and `trailingIcon`: `arrow-right`, `check`, `none` |
+| `YeloRoundedButton` | Round or pill glass button (`glass: clear \| regular`, `colorScheme`) used for map chrome |
+| `YeloGlassButton`, `YeloGlassButtonGroup`, `YeloGlassIconButton`, `YeloGlassPillButton` | Liquid Glass buttons with fallbacks |
+| `YeloSliderButton` | Slide-to-confirm with green, light, and dark palettes |
+| `YeloMultiButton`, `YeloPressableButton`, `BlackWhiteButton`, `RidePillButton`, `ActionBar` | Specialized button rows |
+
+### Surfaces and layout
+
+| Component | Purpose |
+| --- | --- |
+| `YeloCard`, `IconCard`, `YeloTileRow`, `YeloSectionHeader`, `IconSectionHeader`, `SpotRow` | Cards and settings-style rows |
+| `YeloGlassView`, `YeloGlassContainer` | Native `expo-glass-effect` when `glassCapability` allows, else a blur view with the fallback tint and a hairline border |
+| `YeloGradientBackground` | Full-screen gradient used by driver-signup and driver screens |
+| `NavigationHeader`, `ThumbnailHeroSection`, `LocationMap` | Headers, hero images, a static map preview |
+| `YeloPaymentRow` | Payment method row with `loading`, `method`, `empty`, `error` states |
+| `StackedProfiles`, `TagChip`, `IconBadge`, `YeloIconCircle`, `YeloLogoTile` | Avatars, chips, badges |
+| `YeloShimmer`, `YLoader`, `YeloLoader` | Skeleton shimmer, the Y logo loader, a full-screen Lottie loader |
+| `YeloConfettiBurst`, `YeloTutorialBanner`, `CoachMarkCard` | Celebration and tutorial overlays |
+| `YeloPhotoViewer` | Full-screen photo viewer |
+
+`components/design-system/lab/` backs the **Design System Lab** screen (`profile/design-system-lab`, experiment `design-system-lab`), which renders every component and variant on device.
+
+## Bottom sheets
+
+The app uses `@gorhom/bottom-sheet` v5 through three wrappers.
+
+| Wrapper | Built on | Used for |
+| --- | --- | --- |
+| `YeloBottomSheet` (`components/design-system/YeloBottomSheet.tsx`) | `BottomSheetModal` | Most modal sheets. Owns the backdrop, handle, `enablePanDownToClose`, and `accessible={false}` so inner `testID`s stay visible to UI automation. `tone: 'light' \| 'dark'` (dark is the navy driver gradient). |
+| `DriverDarkBottomSheet` (`components/driver/`) | `YeloBottomSheet` dark | Driver sheets: go online, auto-queue, location required, cash out |
+| `GlassBottomSheet` (`components/bottom-sheets/GlassBottomSheet.tsx`) | `BottomSheet` (non-modal) | The persistent map sheet and the ride sheet. Renders glass as the `backgroundComponent`, supports `solid` with a custom color, `solidProgress` for an opaque cross-fade near the top snap, and `backgroundKey` to remount the glass when the OS drops the material. Its backdrop appears at index 2 and collapses on tap. |
+
+Sheet patterns to follow:
+
+- Screens inside the map sheet drive it through `MapSheetController` (`setSnapOverride`, `setBottomBar`, `snapToSheetIndex`, `sheetExpandProgress`), never by holding the ref.
+- The ride stack uses `BottomSheetContext` (`providers/BottomSheetContext.tsx`) to set percent snap points, top and bottom bars, and sheet color per screen.
+- A modal sheet shown from inside a React Native `Modal` needs its own `BottomSheetModalProvider`. See `DriverMapOverlay`.
+- `lib/ui/modalSnap.ts` converts content heights to percent snap points.
+
+## Modals, dialogs, and snackbars
+
+### Modal context
+
+`ModalContextProvider` (`providers/ModalProvider.tsx`) mounts one instance of each app-wide modal and exposes imperative functions through `useModalContext()`:
+
+| Function | Component |
+| --- | --- |
+| `showErrorModal(title, message)` | `ErrorModal` |
+| `showWarningModal(title, message)` | `WarningModal` |
+| `showCommunitySwitchModal(community, distance)` | `CommunitySwitchModal` |
+| `showDeleteAccountModal()` | `AccountDeletion` |
+| `showCouponModal(coupon)` | `CouponModal` |
+| `showDriverLeaderboardModal(data)` | `DriverLeaderboard` |
+| `showEventStoryModal(eventId)` | `EventStoryModal` |
+| `showSponsoredModal()` | `InfoModals` |
+| `showSnackbarMessage(text, sentiment?, duration?, darkmode?)` | `YeloSnackbar` |
+| `showUndoSnackbar(text, onUndo, onTimeout, duration?)` | `YeloSnackbar` with an **Undo** action |
+
+Snackbars default to `success` and 2,500 ms. `sentiment` is `success`, `warning`, or `error`. Only one shows at a time. A new call replaces the current one. For the undo variant, timer expiry, swipe-down, and a body tap all count as timeout.
+
+`AxiosErrorInterceptor` calls `showErrorModal` or `showWarningModal` for any request made with `showErrorModal: true` or `showWarningModal: true`. It reads the title from `title` or `error.title` (default "Request Failed") and the message from `body`, `message`, `error.body`, or `error.message` (default "An error occurred"). Only `CouponModal` opts in today.
+
+### Native alerts
+
+`lib/ui/alerts.ts` wraps `Alert.alert`:
+
+- `showGuardedAlert(title, message, buttons?)` shows at most one alert at a time. A burst of failures no longer stacks prompts.
+- `singleButtonAlert(title, text, action?)`.
+- `errorAlert(text?)` uses `text` as the **title** and the fixed body "Please try again later, or if the problem persists, please contact us".
+
+### Dialogs
+
+- `YeloModal` is a full-screen `Modal` with a `footer`, used by the rider cancel flow. `showModal(showCloseIcon?, backgroundDismissable?)`.
+- `YeloAlertDialog` is a themed Paper dialog with `variant: 'rider' | 'driver'` and `buttonLayout: 'stack' | 'row'`. `FeedbackPromptProvider` uses it.
+
+## Maps
+
+`components/map/CustomMapView.tsx` wraps `@rnmapbox/maps` and exposes an imperative ref.
+
+| Ref group | Methods |
+| --- | --- |
+| `display` | `setPickup`, `setDropoff`, `setDriver`, `setRiderDriver`, `setRoute`, `setPaddingBottom`, `showCommunityBoundingBox`, `setSmartLabelPlacement`, `setLabelExclusions` |
+| `control` | `clearMap`, `focusMap(elements, padding?)`, `flyTo`, `snapTo`, `stopCamera`, `setMapInteractionsEnabled`, `queryRenderedInLayers`, `subscribeCamera` |
+
+`focusMap` frames any of `user`, `pickup`, `dropoff`, `driver`, `route`, `hotLocations`, `communityBoundingBox`. Props include `colorTheme` (`dark` on the drive screen), `initialZoom`, `initialCenterCoordinate` (seeds the camera before tiles load), `paddingTop`, `initialPaddingBottom`, `styleEnhancementsEnabled` (labels and 3D after first paint), and callbacks for touch, pan, settle, basemap POI taps, first frame, and load errors.
+
+- **Styles and token.** `lib/map/mapbox.ts` holds the public `pk.` access token and two style URLs: `YELO_MAP_STYLE_URL` (home map and routes) and `LEGACY_MAP_STYLE_URL` (static previews, community switch, ride details).
+- **Startup staging.** `mapStartupStore.baseMapReady` gates network map content until the basemap paints. The map layout then enables details, sprites, and overlays in stages (`useMapStageProgression`).
+- **Layers.** `CommunityZonesLayer`, `CommunityHeatLayer`, `CommunityMovesLayer`, `CommunityPoisLayer`, `VehiclesLayer`, `FriendsLayer` (MarkerView), `RoutePulseLayer`, and `EdgePoiPointersLayer` (off-screen POI pointers, behind `EDGE_POINTERS_ENABLED`).
+- **Other map components.** `RouteMap` and `RideRouteMap` (static route previews), `MapTopBar` (a slot per screen through `MapTopBarProvider`), `SwipeDismissDock`, `ZoneLabel`, `OffPeakHoursOverlay`.
+- Map layer styles are exempt from the white and black literal lint rule because Mapbox's parser may not accept `hsl()`.
+
+## Icons and images
+
+- Icons come from `phosphor-react-native`, imported per icon path (`phosphor-react-native/src/icons/CaretLeft`) to keep bundles small. Common weights are `regular`, `bold`, and `fill`.
+- Custom glyphs are SVG components: `YeloBumpIcon`, `YeloTicketIcon`, and the `ShinyTag` in `RideOptionCard`.
+- Vehicle artwork resolves through `lib/ride/vehicleIcons.ts` and the generated `lib/ride/vehicleArtwork.generated.ts`.
+- Images use `expo-image` with `blurhash` placeholders and `contentFit`.
+
+## Fonts
+
+| Family name in code | File | How it loads |
+| --- | --- | --- |
+| `Switzer-Light`, `-Regular`, `-Italic`, `-Medium`, `-Semibold`, `-Bold` | `assets/fonts/switzer/*.otf` | Embedded by the `expo-font` plugin at build time |
+| `BostonAngel-Medium` | `assets/fonts/boston-angel/Boston-Angel-Medium.ttf` | Embedded |
+| Instrument Serif | loaded at runtime | Only on the auth entry screen (`app/(auth-v3)/index.tsx`) |
+| `Menlo`, `Menlo-Bold` | system | PIN and license plate displays in the rider sheet |
+
+Because fonts are embedded, the root layout hides the splash right after the first commit without waiting on `useFonts`.
+
+## Haptics and motion
+
+- Import haptics only from `lib/platform/haptics.ts`: `triggerImpactHaptic(style?)`, `triggerNotificationHaptic(type)`, `triggerSelectionHaptic()`, `triggerGroupInviteHaptic()` (Light, Medium, Heavy, then Success over 240 ms), and `withPressHaptic` for custom pressables. Call them before any `await` so presses feel instant.
+- Animation uses Reanimated 4 and Worklets. A few older components still use React Native `Animated`.
+- `useReduceMotion()` (`hooks/useReduceMotion.ts`) is true when the OS setting is on or `EXPO_PUBLIC_DISABLE_ANIMATIONS=true` (E2E). 23 components use it to stop decorative loops such as the matching pings and online sonar. `useReduceMotionState()` also reports `determined`, so heavy assets can wait for the answer.
+- `usePresentationActive()` pauses loops on screens that aren't focused or while the app is backgrounded.
+
+## Accessibility
+
+- Across `app/` and `components/` (466 non-test `.tsx` files), there are about 217 `accessibilityLabel`, 147 `accessibilityRole`, and 399 `testID` usages. Coverage is uneven. Driver sheets and map chrome are well labeled; many feed cards are not.
+- `glassTouchArea.ts` enlarges hit areas without changing layout: `GLASS_HIT_SLOP` (12), `GLASS_INLINE_HIT_SLOP` (12 vertical, 4 horizontal) for buttons in a row, and `GLASS_STACKED_HIT_SLOP` (4 vertical, 12 horizontal) for stacked buttons.
+- Ride option cards drop the vehicle image at 130% font scale so text fits.
+- Ride option cards and several confirmation errors set `accessibilityRole` and `accessibilityState={{ selected }}` or `accessibilityRole="alert"`.
+
+## Localization
+
+There is no i18n framework and no translation files. All copy is inline English.
+
+- `expo-localization` is used only for the contact-sync default region and the telemetry locale and timezone.
+- Money uses `Intl.NumberFormat('en-US', { currency: 'USD' })` in `lib/format/money.ts`. Operating hours use `Intl.DateTimeFormat('en-US')` with the community timezone in `lib/map/calendarHours.ts`.
+- Dates elsewhere use `date-fns` subpath imports with fixed patterns such as `'EEE, MMM d'`.
+
+## App-level fallbacks
+
+| Component | When it shows |
+| --- | --- |
+| `ErrorBoundaryFallback` | Root `Sentry.ErrorBoundary`. **Something went wrong** / "We hit a snag loading this…" with `hello@rideyelo.com`, version details, **Copy** for the error, and **Refresh**, which checks for an OTA update and reloads if one exists. |
+| `FeatureErrorBoundary` | Wraps the `drive` and `ride` stacks and tags Sentry with `feature`. |
+| `UpdateRequiredScreen` | Replaces the tree when `/update-required` returns 426. |
+| `StartupReadyView` | Marks a screen interactive for `StartupPhaseProvider`. |
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Tokens and typography | `lib/theme/index.ts`, `lib/theme/glassCapability.ts`, `lib/theme/navigation.ts` |
+| Component kit | `components/design-system/`, `components/design-system/lab/` |
+| Sheets | `components/design-system/YeloBottomSheet.tsx`, `components/bottom-sheets/GlassBottomSheet.tsx`, `components/driver/DriverDarkBottomSheet.tsx`, `components/map/MapSheetController.tsx`, `providers/BottomSheetContext.tsx` |
+| Modals | `providers/ModalProvider.tsx`, `providers/ModalContext.ts`, `components/modals/`, `providers/AxiosErrorInterceptor.tsx`, `lib/ui/alerts.ts` |
+| Map | `components/map/CustomMapView.tsx`, `components/map/customMapView/`, `components/map/layout/`, `lib/map/mapbox.ts`, `stores/mapStartupStore.ts` |
+| Haptics and motion | `lib/platform/haptics.ts`, `hooks/useReduceMotion.ts`, `hooks/usePresentationActive.ts` |
+| Formatting | `lib/format/` |
+| Lint rules | `.oxlintrc.json`, `eslint.config.js` |
+| Labs | `app/(app)/profile/color-lab.tsx`, `design-system-lab.tsx`, `glass-lab.tsx`, `scripts/color-inventory.mjs` |
+
+## Gotchas and edge cases
+
+- **The icon lint rule has a hole.** `.oxlintrc.json` restricts the exact path `@expo/vector-icons`, so the subpath import `@expo/vector-icons/Ionicons` passes. `app/(app)/ride/4-ride.tsx:28` and `components/bottom-sheets/friends-hub/AppsSection.tsx:4` use Ionicons.
+- **`Text.defaultProps` is a no-op.** `YeloText`'s comment notes that `Text.defaultProps.allowFontScaling = false` does nothing under React 19, so OS scaling runs uncapped on any raw `Text`. Only `YeloText`, `YeloTextInput`, and `cappedFontScale()` enforce the 1.2 cap.
+- **Dark mode is half on.** `app.json` sets `userInterfaceStyle: automatic`, so native alerts and pickers follow the system, while app screens stay light.
+- **Brand yellow differs by surface.** The theme's `yellow500` is `hsl(61, 99%, 51%)` (about `#FAFE06`), while `app.json` `primaryColor` and the notification color are `#F7F169`.
+- **`errorAlert` shows its argument as the title.** Passing a sentence produces a bold sentence with a generic body.
+- **Only one snackbar at a time.** A second `showSnackbarMessage` replaces the first immediately. An undo snackbar replaced this way never fires `onTimeout`. No screen calls `showUndoSnackbar` today.
+- **Glass can wash out.** When Liquid Glass isn't available (older iOS, Android), glass components fall back to a tinted blur. `GlassBottomSheet`'s `backgroundKey` exists because the native material sometimes fails to recomposite after the view detaches.
+- **The public Mapbox token is hard-coded** in `lib/map/mapbox.ts`. It is a publishable token, but rotating it is a code change.
+- **Placeholder copy ships.** `map/vehicle/[vehicleId].tsx` shows fleet bios that begin with "Placeholder:" because the API has no fleet `bio` or `operating_hours`.
+- **Dead UI components.** `WhereTo`, `OffPeakCard`, `MessageCarousel`, `LightRedActionButton`, `BumpFriendsButton`, and `EventStoryBar` have no screen that renders them.

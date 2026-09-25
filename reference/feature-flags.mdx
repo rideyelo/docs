@@ -1,0 +1,276 @@
+---
+title: "Feature flags and runtime gates"
+description: "Every switch that changes Yelo behavior at runtime: API environment toggles, the X-Features header, app-version gates, experiments, admin-editable settings, per-entity flag columns, and client build toggles."
+---
+
+Yelo has no feature flag service. Behavior is switched by seven kinds of gates:
+
+1. API environment variables, read once at startup.
+2. Request headers that a client sends per request.
+3. A single store-version floor.
+4. Experiment keys stored on users and communities.
+5. Admin-editable settings rows in Postgres.
+6. Boolean and enum columns on communities, users, fleets, and other rows.
+7. Build-time variables in the web and mobile clients.
+
+<Note>
+Neither client reads PostHog feature flags, and the API never evaluates them. PostHog is used for events, session replay, and metrics only.
+</Note>
+
+**Path conventions.** API paths are relative to `yelo-api/internal/`, with these abbreviations:
+
+- `config.go` is `utilities/config/config.go`.
+- `main.go` is `yelo-api/cmd/api/main.go`.
+- `queries/` is `data/repository/queries/`.
+
+Mobile paths are relative to `yelo-frontend/`, and web paths to `yelo-web/`.
+
+**Who can change it** uses these values:
+
+- **Deploy**: an environment variable on Cloud Run or the build.
+- **Admin**: the Clerk dashboard `admin` role. See [Dashboard roles](/administration/dashboard-roles).
+- **Self**: the signed-in app user.
+- **Client**: the app or site that sends the request.
+- **SQL**: no API writer exists, so it needs a migration or a manual query.
+
+## API environment toggles
+
+Values load once, and an unparseable boolean silently falls back to its default (`config.go:640-648`). For variable names and defaults in context, see [API configuration](/engineering/api/configuration). All rows are changed by **Deploy**.
+
+<AccordionGroup>
+  <Accordion title="Product behavior">
+    | Name | Where defined | Default | What it changes |
+    | --- | --- | --- | --- |
+    | `ACTIVATION_ENABLED` | `config.go:262` | `true` | `false` makes `ProcessUnmatchedRides` a no-op, so no staged driver pings (`service/activation/activation.go:96`) |
+    | `RIDE_STATE_SNAPSHOT_ENABLED` | `config.go:250` | `false` | With the client header, returns the snapshot shape from `/user/status` (`server/http/user/user_handler.go:87`). When off, `GET /user/ride-state` returns 503 (`service/user/ride_snapshot.go:12`). Emits ride state revisions (`data/repository/ride_revision.go:110,129`) |
+    | `DRIVER_VERIFIED_PHONE_REQUIRED` | `config.go:394` | `false` | Requires a verified phone to go online, activate, upload driver photos, create a vehicle, and create a Stripe Express account (`service/driver/driver.go:341,371,435,629,688,733`, `service/vehicle/vehicle.go:63`, `service/stripeaccount/stripeaccount.go:108`) |
+    | `SEARCH_PROVIDER` | `config.go:308` | `google` | `google` uses Places with Mapbox fallback. `mapbox` or any other value uses Mapbox (`service/mapping/mapping.go:100,447-456`) |
+    | `SKIP_TEST_SCHOOL_NOTIFICATIONS` | `config.go:261` | `true` | Suppresses Slack alerts (not user notifications) for test schools and `test*` emails (`service/notifications/notification.go:30,72-84`) |
+    | `COMMUNITY_TIMEZONE_RECONCILIATION_ENABLED` | `config.go:251` | `false` | Maintenance job re-derives stale community time zones (`notify/queue/community_timezone.go:33`) |
+    | `STRIPE_RECONCILIATION_ENABLED` | `config.go:281` | `true` | Enqueues the periodic Stripe reconciliation job (`main.go:328`, `notify/queue/queue.go:252`) |
+    | `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` | `config.go:286` | empty | Points all earnings calls at one Stripe account. Honored only when `ENVIRONMENT` is `dev`, `development`, `local`, or `test` (`service/service.go:405`) |
+    | `CONTACT_HASH_PEPPER` | read directly | empty | Empty makes contact matching fail as "not configured" and hides registered contacts in the dashboard (`service/user/contacts.go:176`, `data/repository/dashboard.go:2073`) |
+  </Accordion>
+  <Accordion title="Auth and messaging">
+    | Name | Where defined | Default | What it changes |
+    | --- | --- | --- | --- |
+    | `AUTH_V3_ENABLED` | `utilities/config/authv3.go:105` | `false` | Mounts `/authv3/*`. When off, `/authv3` returns 503 (`server/http/router.go:238,287-296`). Adds Auth v3 CORS origins and cleanup loops (`main.go:103,529,543`) |
+    | `AUTH_V3_STUDID_ENABLED` | `authv3.go:115` | `false` | Builds StudID verification. When off, `/authv3/student/studid/*` returns 503 (`server/http/authv3/handler.go:136`) |
+    | `AUTH_V3_CORS_ALLOW_CREDENTIALS` | `authv3.go:113` | `false` | Credentialed CORS for Auth v3 origins |
+    | `TWILIO_VERIFY_SERVICE_SID` (non-empty) | `config.go:323` | empty | Sends phone OTPs through Twilio Verify (`data/twilio/twilio.go:324`). Required when Auth v3 is on |
+    | `TWILIO_OTP_FALLBACK_ENABLED` | `config.go:324` | `false` | Re-sends unconfirmed Verify OTPs from a toll-free number (`service/authv3_composition.go:215`). Sweep runs only with Auth v3 on |
+    | `PHOTON_PROJECT_ID` and `PHOTON_PROJECT_SECRET` (both set) | `config.go:327-328` | empty | Routes friend bump texts through Photon iMessage instead of Twilio (`main.go:256`) |
+    | `CONTACT_SYNC_RESEND_ENABLED` | `utilities/config/contact_sync.go:24` | `false` | Enables Resend contact sync when its keys are also set (`main.go:222-226`) |
+    | `GOOGLE_CALENDAR_ENABLED` | `utilities/config/calendar.go:25` | `false` | Owner OAuth connection for operating hours (`service/operatinghours/owner.go:68,101,188`) |
+    | `GOOGLE_CALENDAR_SYNC_ENABLED` | `calendar.go:25` | `false` | Calendar sync and the dashboard attach and prefix controls (`service/operatinghours/dashboard.go:82-101,180`). Requires the connection flag |
+  </Accordion>
+  <Accordion title="Infrastructure">
+    | Name | Where defined | Default | What it changes |
+    | --- | --- | --- | --- |
+    | `ENVIRONMENT` | `config.go:246` | `dev` | See the **Environment branches** table in this section |
+    | `BACKGROUND_TASKS_ENABLED` | `cmd/api/background_cleanup.go:45` | unset (on) | `false` stops every in-process ticker group (`main.go:526-620`) |
+    | `REDIS_ENABLED` | `config.go:342` | `true` | `false`, or an empty `REDIS_URL`, uses in-memory caches (`data/redis/client.go:112-120`) |
+    | `OTEL_ENABLED` | `config.go:290` | `true` | OpenTelemetry. Also gates the PostHog business metrics provider (`main.go:169-180`) |
+    | `PPROF_ENABLED` | `config.go:297` | `true` | Mounts `/debug/pprof` (`server/http/router.go:203,210`) |
+    | `METRICS_AUTH_TOKEN` | `config.go:296` | empty | Empty leaves `/metrics` and pprof unauthenticated (`server/http/middleware_metrics_auth.go:12`) |
+    | `INTERNAL_API_KEY` | `config.go:372` | empty | Empty rejects all `/internal/*` requests (`server/http/middleware.go:213`) |
+    | `DISABLE_SLOW_QUERY_WARNINGS` | `config.go:278` | `false` | Silences slow query warnings |
+    | `SWAGGER_ENABLED` | `config.go:260` | `true` | Only adds the Swagger URL to the startup log in `dev` (`main.go:492`) |
+    | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` | `config.go:349` | `true` only when `ENVIRONMENT=production` | Starts the Play release monitor (`main.go:274`) |
+    | `E2E_ENABLED` | `config.go:378` | `false` | Mounts `/internal/e2e`, skips OAuth provider clients, and disables River and background tasks (`router.go:158`, `main.go:361,426`) |
+    | `E2E_BACKGROUND_JOBS_ENABLED` | `config.go:384` | `false` | Must stay `false`. Validation rejects `true` |
+  </Accordion>
+  <Accordion title="Environment branches">
+    | Check | Where | Effect |
+    | --- | --- | --- |
+    | `ENVIRONMENT == "dev"` | `main.go:108` | CORS disabled; every origin reflected |
+    | `ENVIRONMENT != "dev"` | `server/http/ride/ride_handler.go:498` | `DELETE /ride/` (drop all rides) refused outside `dev` |
+    | `ENVIRONMENT == "dev"` | `service/ride/rider.go:292` | Test-account free rides are off in `dev` |
+    | `ENVIRONMENT == "dev"` | `utilities/logger/logger.go:32` | Debug level and console output |
+    | `ENVIRONMENT == "prod"` or an OTLP auth header | `utilities/otel/otel.go:134` | OTLP over TLS |
+    | `ENVIRONMENT != "production"` | `utilities/slack/slack.go:120` | Slack posts are skipped |
+    | `ENVIRONMENT` is `e2e` with `E2E_ENABLED` | `config.go:399-630` | Strict E2E validation |
+  </Accordion>
+</AccordionGroup>
+
+## Request headers
+
+| Header | Where defined | Default | What it changes | Who can change it |
+| --- | --- | --- | --- | --- |
+| `X-Features: tips` | `utilities/features/features.go:8-28`; read at `server/http/ride/ride_handler.go:67` (`POST /ride/`) and `:104` (`POST /ride/v2/`) | absent (off) | Sets `rides.tips_enabled`, overriding the body. Pre-authorizes fare plus the $5 `TipBuffer` (`models/tip.go:13`), defers capture for the 24-hour tip window, and allows tipping on rating (`service/ride/driver.go:573,853,901`, `service/ride/ride.go:264,998`) | Client. The mobile app sends it from `hooks/usePreRideRequest.ts:61` |
+| `X-Features: driver-options` | `ride_handler.go:105` (v2 only) | absent (off) | Adds up to 3 specific-driver options to the v2 vehicle options (`service/ride/rider.go:1406,1604`, `service/ride/driver_options.go:87`) | Client, same call site |
+| `X-Ride-State-Protocol: 1` | `server/http/user/user_handler.go:87` | absent | Opts `/user/status` into the ride state snapshot. Also needs `RIDE_STATE_SNAPSHOT_ENABLED` | Client (`api/rideStatusProtocol.ts:75`) |
+| `X-Ride-State-Minimum-Revision` | `user_handler.go:88`, `service/user/ride_snapshot.go:33` | absent | Minimum acceptable session revision. Non-digits return 400 | Client (`api/rideStatusProtocol.ts:78`) |
+| `X-Api-Version: v2` | `utilities/json/json.go:107` | absent | v2 error envelope with `request_id` and latency. Required for Auth v3 web session refresh and logout (`server/http/authv3/handler.go:249,279`) | Client (`lib/auth/client.ts:193`; web `src/sites/signup/auth-v3/authV3Fetch.ts:30`) |
+| `User-Agent` | `ride_handler.go:148` | | Stored as `rider_user_agent`. Fare and tip PaymentIntents fail without it | Client |
+
+The mobile app sends `X-Features: tips,driver-options` on every ride creation. `X-Features` is not in `openapi.json`. See [State and data](/engineering/mobile/state-and-data#x-features-header).
+
+## App-version gates
+
+| Name | Where defined | Default | What it changes | Who can change it |
+| --- | --- | --- | --- | --- |
+| `minimumFrontendVersion` | `server/http/healthcheck/healthcheck_handler.go:28`, compared at `:179` with `utilities/helpers/helpers.go:144` | `5.7.3` | `GET /update-required?version=` returns 426 with the store link for older native versions | Deploy (code change) |
+| Update-required screen | `app/_layout.tsx:205-256`, `lib/platform/appUpdateGate.ts:10-21` | | Checks on launch, on foreground, and every 10 minutes. A 426 replaces the app with `UpdateRequiredScreen` | Follows the API value |
+| `ensureRideEntryVersion` | `lib/platform/appUpdateGate.ts:32-52` | | Fails closed before a ride request (`hooks/usePreRideRequest.ts:128`, `components/ride/StripePaymentScreen.tsx:223`) and before going online (`providers/DriveProvider.tsx:280`, `components/drive/DriverMapOverlay.tsx:237,261`) | Follows the API value |
+| OTA runtime | `app.config.ts:102-118` | `fingerprint` policy | OTA updates reach only binaries with the same native fingerprint. E2E builds disable updates | Native build |
+| Liquid Glass capability | `lib/theme/glassCapability.ts:22-28` | | `isLiquidGlassAvailable() && isGlassEffectAPIAvailable()` picks glass or fallback views | OS version |
+
+No API behavior branches on `PUT /user/app-version`, telemetry `app_version`, or platform headers. `Communities.minimum_version` was added in migration 105 and dropped in 106. See [Mobile releases](/engineering/mobile/releases#update-required-gate).
+
+## Experiments
+
+| Name | Where defined | Default | What it changes | Who can change it |
+| --- | --- | --- | --- | --- |
+| `glass_lab` | `lib/experiments/index.ts:13` | off | Settings row and Glass Lab screen (`app/(app)/profile/settings.tsx:61,241`, `profile/glass-lab.tsx:113`) | Admin (community list) and Self (user list) |
+| `rideshare-price-aggregator` | `lib/experiments/index.ts:15` | off | Live third-party quotes on the request sheet instead of static deep-link cards (`app/(app)/(tabs)/map/request.tsx:364,921`). Also gates the connect screens, linked accounts, and provider diagnostics. Needs a per-user disclosure (`lib/ride/aggregatorDisclosure.ts`) | Admin and Self |
+| `color-lab` | `lib/experiments/index.ts:17` | off | Color Lab screen | Admin and Self |
+| `design-system-lab` | `lib/experiments/index.ts:19` | off | Design System Lab screen | Admin and Self |
+
+- An experiment is on only when `user.active_experiments` **and** `community.active_experiments` both contain the key (`lib/experiments/index.ts:37-53`). The client evaluates this; the API only stores and returns the lists (`Users.active_experiments`, `Communities.active_experiments`, migration 000265).
+- Admins edit the community list as free text in the community editor (`src/components/CommunityEditor.tsx:66,142,160-164`, `PATCH /dashboard/manage/{id}`).
+- Users opt in on **Settings > Experiments** (`app/(app)/profile/experiments.tsx`, `PUT /user/experiments`). The row appears only when the community has at least one experiment.
+
+## Admin-editable settings
+
+<AccordionGroup>
+  <Accordion title="Pricing">
+    | Name | Where defined | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- | --- |
+    | `PricingJitterSettings.settings` (singleton JSON: `min`, `max`, `clamp_overshoot_limit`, `clamp_range_min`, `clamp_range_max`, `anchor_inflation_min`, `anchor_inflation_max`) | Migration 000325; `models/pricing_adjustment.go:34` | 0.5, 1.0, 0.2, 0.90, 0.99, 1.15, 1.30 | Fare jitter, dollar-boundary clamp, and the crossed-out anchor price (`utilities/pricing/jitter.go`, `adjustment.go`). Read on every quote and confirm (`service/ride/rider.go:1964,2060,2301`) | Admin, `PUT /dashboard/pricing/jitter` (`server/http/dashboard/pricingjitter/routes.go:28-43`); web `src/components/pricing/GlobalJitterSettings.tsx:72,94` |
+    | `RidePriceParameters` with `RidePriceTiers`, `adjustment` (`jitter`, `rounded`, `none`), `is_featured`, `is_active` | Migrations 000077, 000209, 000210, 000324 | `jitter`. No rows falls back to $4 + $2/mile + $0.50/minute (`utilities/config/constants.go:40-42`) | Fare computation | Create and delete: Admin. Update: Admin, or the fleet role for its own fleet (`server/http/community/community_handler.go:1031-1053`) |
+    | `ZonePricing` | Migration 000224 | none | Zone fare overrides | Admin, `PUT`/`DELETE /dashboard/zone-pricing` |
+    | `Communities.surge_multiplier`, `surge_expires_at` | Migration 000187 | 1.00, null | Fare multiplier while above 1 and unexpired (`rider.go:2285`) | Admin, `POST /dashboard/supply-demand/markets/{id}/surge` |
+
+    See [Ride pricing](/dashboard/ride-pricing) and [Pricing](/concepts/pricing).
+  </Accordion>
+  <Accordion title="Activation, hours, and map">
+    | Name | Where defined | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- | --- |
+    | `ActivationConfigs` (`tiers`, `cooldown_minutes`, `rescue_enabled`, `rescue_grace_minutes`) per community | Migration 000206; code tiers in `models/activation_config.go:28-40` | code tiers, 15, `false`, 5 | Staged driver ping radius, timing, and rescue (`service/activation/activation.go:322-736`). Cached 5 minutes in Redis | Admin, `PUT /dashboard/manage/{id}/activation-config` and `POST .../reset` (`community_handler.go:2095`) |
+    | `Communities.limited_hours_enabled` with `CommunityOperatingWindows` | Migrations 000234, 000185 | `false`, none | Live versus off-peak market status (`data/repository/community.go:1094-1107`). An active calendar overrides it | Admin, `PUT /dashboard/manage/{id}/operating-windows` (`community_handler.go:2034`) |
+    | `Communities.auto_queue_max_minutes`, `auto_queue_default_minutes` | Migration 000184 | 120, 60 | Driver auto-queue cap and default (`service/activation/auto_queue.go:334`) | SQL. The admin update request does not map them |
+    | `CommunityTopLocationSettings.enabled`, `automatic` | Migration 000345 | Column `true`; runtime fallback `NOT is_default` | Top locations display and daily refresh (`queries/places.sql:8`, `queries/top_location_profiles.sql:21`) | `PUT /dashboard/{id}/top-locations/settings`. No handler role check, so interns can change their own community |
+    | `VehicleTypes` including `is_active` | Migration 000200 | Seeded `x`, `xl`, `cart`, `minibus` | Valid types, seats, artwork. Registry reloads every 5 minutes (`main.go:407`) | Admin, `/dashboard/vehicle-types` |
+    | `NotificationTemplates` (`is_active`, `silent`, cooldowns, quiet hours) and variants | Migrations 000237, 000250, 000293 | Seeded insert-if-missing | Inactive templates are skipped (`notify/queue/orchestrate.go:406`). `silent` sends data-only pushes (`notify/queue/send.go:248`) | Admin, `/dashboard/notifications/templates` (`router.go:642`) |
+    | `NotificationPolicies`, `ReferralRewards`, `PromoBanners`, `PromoBars`, `RideDemandCurves` | Migrations 000250, 000142, 000085, 000144, 000129 | | Read at runtime | SQL |
+    | `GoogleCalendarOwner` | Migration 000317 | | Operating-hours calendar source | Admin, `/dashboard/calendar-owner/*` |
+
+    See [Activation](/dashboard/activation), [Operating hours](/admin/operating-hours), and [Notification templates](/dashboard/notification-templates).
+  </Accordion>
+</AccordionGroup>
+
+## Per-entity flags
+
+Column defaults come from `data/sqlc/schema.sql`.
+
+<AccordionGroup>
+  <Accordion title="Communities">
+    Unless noted, Admin changes these through `PATCH /dashboard/manage/{id}` (`community_handler.go:1845`) from the community editor (`src/components/CommunityEditor.tsx:244-261`).
+
+    | Column | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- |
+    | `rides_disabled` | `false`; `true` on create (`queries/community.sql:126`) | Ride creation returns "Rides Unavailable" (`service/ride/rider.go:795`). The app shows the inactive map state (`api/helpers/community.ts:168-171`) | Admin |
+    | `is_active` | `false` | Users can switch only to active communities (`queries/user_profile.sql:74`). Geo lookup, heatmap, and fleet service views skip inactive ones | Admin |
+    | `is_hidden` | `false` | Non-test users cannot join (`queries/user_profile.sql:77`). No heatmap. The app ignores it | Admin |
+    | `is_test` | `false` | Hidden from non-test users. Excluded from analytics, geo lookup, and default community | SQL (migration 000230 sets it for "Yelo") |
+    | `is_default` | `false` | Catch-all community: skipped in geo match, used as the repair target (`service/authv3/active_community.go:256`), top locations off by default | SQL |
+    | `active_experiments` | `{}` | See [Experiments](#experiments) | Admin |
+    | `primary_vehicle_type`, `primary_fleet_id`, `map_moves_window_hours` | `x`, null, 168 | Defaults and map-layer lookback | Admin |
+    | `show_driver_banner`, `banner_type` | `false` | Never read in Go | Admin |
+
+    Archiving sets `is_active=false`, `is_hidden=true`, and `rides_disabled=true` (`queries/community.sql:395`).
+  </Accordion>
+  <Accordion title="Users">
+    | Column | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- |
+    | `is_test` | `false` | Free $0 pricing outside `dev` (`rider.go:291,338,1291,1588`). Keeps a manually chosen community. Can join test and hidden communities. Excluded from analytics, contact sync, and session replay (`api/helpers/authUser.ts:89`) | Admin, `PUT /dashboard/users/detail/{id}/test-status` |
+    | `is_banned` | `false` | JWT middleware returns 403 "Account Suspended" (`server/http/middleware.go:278`). Auth v3 denies. Excluded from first-tier pings | SQL |
+    | `lock` | `false` | Excluded from driver pings (`queries/user_driver.sql:326`, `queries/community.sql:63`). Treated as banned in fleet join (`queries/fleet_join.sql:42`) | SQL |
+    | `is_deleted` | `false` | JWT and auth rejected | Account deletion flow |
+    | `allow_notifications` | `true` | Driver ping eligibility | Self, `PUT /user/allow-notifications` |
+    | `auto_queue`, `auto_queue_max_minutes` | `false` | Auto-queue activation (`data/repository/auto_queue_settings.go:47`) | Self (driver) |
+    | `share_location_with_friends` | `true` | Friend location visibility | Self, `PUT /user/location-sharing` |
+    | `account_type` (`student`, `community`) | `community` | Only students see student-only fleets (`rider.go:1625`) | Derived from education claims |
+    | `tags` | `{}` | A `Founding Driver`, `founding driver`, or `founding` tag is required to get first-tier pings for the fleet named "Yelo" (`queries/community.sql:60`) | Admin, `PUT /dashboard/users/detail/{id}/tags` |
+    | `active_experiments` | `{}` | See [Experiments](#experiments) | Self, `PUT /user/experiments` |
+    | `is_power_driver` | `false` | Read only by the debug `/score-driver` endpoint | None |
+  </Accordion>
+  <Accordion title="Fleets">
+    Admin creates fleets with `POST /dashboard/communities/{id}/fleets`. Admin, or the fleet role for its own fleet, updates them with `PATCH .../fleets/{fleet_id}` (`community_handler.go:1755`), from `src/components/FleetFormSheet.tsx:441-463`.
+
+    | Column | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- |
+    | `requires_confirmation_code` | `true` | `false` skips the pickup PIN (`rider.go:212`). The app shows PIN UI from `ride.requires_confirm_code` | Admin or own fleet |
+    | `is_student_only` | `false` | Hidden from non-student riders (`rider.go:1632`) | Admin or own fleet |
+    | `has_custom_payouts` with `payment_model` (`owner_operator`, `fleet_merchant`) | `false` | Routes payouts to the fleet's Stripe account (`service/ride/driver.go:23,690`, `service/tipping/tipping.go:239`) and drives join eligibility (`models/fleet.go:98-117`) | Admin or own fleet |
+    | `has_owner_operators` | `true` | Derived from `payment_model` on create. The app reads it in the go-online sheet (`components/drive/GoOnlineConfirmationSheet.tsx:58`) | Admin or own fleet |
+    | `is_active` | `false` on create | Set by Stripe onboarding completion (`service/payment/payment.go:121`). Gates `ActiveFleetCommunityServices` and tipping | System |
+  </Accordion>
+  <Accordion title="Other rows">
+    | Table and column | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- |
+    | `FleetCommunityServices.enabled` | `true` | Whether a fleet serves a community | Admin, `PUT /dashboard/fleets/services/{fleetId}/{communityId}` |
+    | `FleetDriverWhitelist.is_active` | `true` | Email-based automatic fleet assignment (`service/driver/driver.go:800`) | Admin or own fleet |
+    | `DriverApplications.is_active`, `is_action_required` | `false` | Active driver: can go online and receive pings | Dashboard review and activation flow |
+    | `Zones.is_active`, `show_on_map` | `true`, `true` | Map layer display (`queries/places.sql:110`) | Admin, `PATCH /dashboard/zones/{id}` |
+    | `Locations.show_on_map`, `is_public` | `false`, `false` | Map display, public destination, bump metadata | Admin or own community |
+    | `CommunitySpots.is_active`, `MobilityFeeds.is_active`, `QrPaymentConfigs.is_active` | `false`, `true`, `true` | Visibility, GBFS polling, QR availability | Community-scoped dashboard routes. QR: Admin or own fleet |
+    | `Schools.is_synthetic` | `false` | A DB trigger skips coordinate-based community remapping (migration 000307) | SQL |
+    | `Events.has_dynamic_pricing` | `false` | Stored and returned only | Event routes |
+    | `PromoBanners.is_new_campus` | `false` | Never read | None |
+  </Accordion>
+  <Accordion title="Hard-coded test identities">
+    These are not configurable. Values are omitted.
+
+    | Identity | Effect | Where |
+    | --- | --- | --- |
+    | `+1555` phone numbers | Fixed OTP. SMS sends are simulated as success. Auth v2 skips Twilio Verify | `data/twilio/twilio.go:270`, `data/photon/photon.go:104`, `service/authv3/phone/adapter.go:72,99`, `service/authv2/phone.go:39` |
+    | `@rideyelo.com` emails | Fixed ride confirmation code and email OTP. Excluded from analytics and replay | `service/ride/rider.go:300`, `service/authv2/authv2.go:225` |
+    | `test*.edu` and `rideyelo@*.edu` emails | Fixed email OTP | `service/authv2/authv2.go:208-218` |
+    | Reserved "Yelo" community id | Excluded from community joins and geo lookup | `service/authv3/yelo_community_repair.go:12` |
+    | Fleet named "Yelo" | Verified-student badge. Founding tag rule above | `rider.go:1817`, `queries/community.sql:60` |
+  </Accordion>
+</AccordionGroup>
+
+## Client build toggles
+
+<AccordionGroup>
+  <Accordion title="Mobile (yelo-frontend)">
+    | Name | Where defined | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- | --- |
+    | `EXPO_PUBLIC_APP_ENV=e2e` | `app.config.ts:59-75`, `lib/config.ts:21-41`, `lib/auth/entryMode.ts:9`, `app/_layout.tsx:61` | unset | E2E bundle id, schemes, and name. Disables OTA, Sentry, PostHog, and Dub. Forces the E2E API and native Auth v3 | EAS `e2e-simulator` profile |
+    | `EXPO_PUBLIC_IS_PRODUCTION` | `providers/EasUpdateObserver.tsx:9`, `lib/observability/logger.ts:73` | `false` | Foreground OTA checks and production logging | EAS environment |
+    | `EXPO_PUBLIC_API_URL` | `lib/config.ts:44-48` | production API | Honored only in dev and E2E builds | Local env, EAS |
+    | `EXPO_PUBLIC_ENABLE_MOCK_DATA` | `lib/dev/mockConfig.ts:14` | `false` | Mock vehicles, events, and ride details | Local env. Not `__DEV__`-gated |
+    | `EXPO_PUBLIC_MAP_TUTORIAL_OVERRIDE` (`always`, `never`) | `lib/map/mapTutorial.ts:32` | unset | Forces or suppresses the map tutorial | Local env. Not `__DEV__`-gated |
+    | `EXPO_PUBLIC_ALWAYS_SHOW_DRIVER_MARKETING` | `components/onboarding/why-drive/constants.ts:7` | `false` | Always routes to `/driver-marketing` | Local env. Not `__DEV__`-gated |
+    | `EXPO_PUBLIC_FEEDBACK_FORCE` | `lib/prompts/feedbackPrompt.ts:25` | `false` | Bypasses feedback cadence | Local env, dev builds only |
+    | `EXPO_PUBLIC_FAKE_FRIENDS` | `lib/dev/devFakeFriends.ts:41-50` | 0 | Adds filler friends | Local env, dev builds only |
+    | `EXPO_PUBLIC_DISABLE_ANIMATIONS` | `hooks/useReduceMotion.ts:8` | `false` | Forces reduced motion | EAS `e2e-simulator` |
+    | `EXPO_PUBLIC_LOG_REQUESTS` | `providers/AxiosProvider.tsx:74,92` | `false` | Logs requests | Local env |
+    | `__DEV__` | `app/_layout.tsx:169`, `lib/prompts/reviewPrompt.ts:65`, `app/(app)/driver-signup/5-license.tsx:76`, `lib/auth/security.ts:46` | build type | Disables Sentry and store review. Skips license photos. Allows loopback HTTP auth URLs | Build type |
+    | Version reveal | `app/(auth-v3)/index.tsx:26,159-170` | hidden | Three taps within 2.5 seconds on the auth hero shows version and OTA id | Anyone |
+  </Accordion>
+  <Accordion title="Web (yelo-web)">
+    | Name | Where defined | Default | What it changes | Who can change it |
+    | --- | --- | --- | --- | --- |
+    | `VITE_APP_ENV` | `src/sites/signup/auth-v3/analytics.ts:155,185` | falls back to Vite `MODE` | Only `production` enables Auth v3 PostHog. Excludes emulator, `is_test`, and `@rideyelo.com` users | GitHub variable |
+    | `VITE_APPLE_SERVICES_ID` | `src/shared/signup/webOAuth.ts:80-88` | unset | Shows the Apple button only when set, on HTTPS, not loopback, and on the matching origin | GitHub variable |
+    | `VITE_AUTH_V3_APP_SCHEME` | `src/shared/signup/openApp.ts:3` | `com.rideyelo` | App scheme for open-app links. `maestro` builds use `com.rideyelo.e2e` | Build command |
+    | `VITE_AUTH_V3_DEVICE_TEST` | `tools/vite/base/config.ts:37` | `false` | Signup dev server only: binds all interfaces, adds mock Auth v3 endpoints, enables `?device-test=1` | `pnpm dev:signup-device` |
+    | `VITE_USE_PROD_DOMAIN` | `tools/vite/base/config.ts:17` | `false` | Dev server on the production dashboard dev host | Local env |
+    | `VITE_CURVED_BAND_FIT` | `src/sites/home/components/bandfit.ts:28` | `false` | Curved band typography on the home site | Build env |
+    | Signup `?preview=` | `src/sites/signup/App.tsx:262` | dev only | Step gallery with a stubbed tip config | Dev builds |
+    | `yelo-og` `ENVIRONMENT` | `workers/og/wrangler.jsonc`, `src/index.ts:12,23` | `production` | Any other value enables `/og/_gallery`, `/og/_sign`, and `?svg=1` | Worker deploy |
+  </Accordion>
+</AccordionGroup>
+
+## Server fields the app ignores
+
+The API returns these, but the mobile app never branches on them:
+
+- User: `is_banned`, `is_deleted`, `is_power_driver`, `is_terms_agreed`, `is_verified`, `is_waitlisted`, `has_dub_link`.
+- Community: `is_asleep`, `is_hidden`, `limited_hours_enabled`, `low_supply`, `extensions`.
+- Fleet: `has_custom_payouts`, `is_student_only`.
+- Ride request: `tips_enabled` in the body, because the server overwrites it from `X-Features`.

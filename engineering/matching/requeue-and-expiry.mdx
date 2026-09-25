@@ -1,0 +1,167 @@
+---
+title: "Requeue and expiry"
+description: "Every way a ride returns to the unmatched pool or leaves it for good: driver-cancel requeue, offline unqueue, direct-request release, the expiry sweep, and exactly which database and Redis state each path resets or keeps."
+---
+
+A ride can return to `confirmed` after it was assigned, and a `confirmed` ride can be retired without a driver. This page covers those paths. For cancellations that end a ride, see [Cancellations](/concepts/cancellations).
+
+## Paths back to `confirmed`
+
+| Path | Trigger | Code |
+| --- | --- | --- |
+| Driver-cancel requeue | The assigned driver cancels from `queued`, `driver_en_route`, or `driver_waiting` | `RideService.requeueAfterDriverCancel` |
+| Offline unqueue | A driver with queued rides has no presence and no ping for 5 minutes | `UserService.unqueueOfflineDriverRides` |
+| Direct-request release | Selected driver declines, or the 30-second hold lapses | `DeclineRide`, `resumeExpiredDirectRide` |
+
+Direct-request release never leaves `confirmed`, so it only clears the hold. See [Direct requests](/engineering/matching/direct-requests).
+
+## Driver-cancel requeue
+
+`RideService.Cancel` checks `isReQueueEligible` before any payment handling:
+
+```go
+isDriverInitiatedCancel := cancelUser == models.UserTypeDriver &&
+	ride.DriverID != nil && *ride.DriverID == cancellerID
+eligibleStatus := ride.Status == models.RideStatusQueued ||
+	ride.Status == models.RideStatusDriverEnRoute ||
+	ride.Status == models.RideStatusDriverWaiting
+```
+
+When it's true, `requeueAfterDriverCancel` runs instead of the cancel. A driver cancel from `in_progress` isn't eligible, and goes through the normal cancel with fee logic.
+
+<Steps>
+  <Step title="Reset in one transaction">
+    `Ride.RequeueAfterCancel` locks participants and the ride, checks the expected status and driver, and runs `RequeueRideAfterDriverCancel`. In the same transaction, `PromoteNextQueuedRide` promotes the cancelling driver's next queued ride, if any. The revision finalizer runs for both rides.
+  </Step>
+  <Step title="Advance the promoted ride">
+    If a ride was promoted, `advanceQueuedRide` runs in the background. Otherwise the driver's queue summary is refreshed inline.
+  </Step>
+  <Step title="Rebuild the board entry">
+    `RemoveRide`, then a fresh `GetByID`, then `AddRide`. Errors are logged, not returned.
+  </Step>
+  <Step title="Notify drivers">
+    `notifyDriversAboutNewRide(freshRide)` attempts T0 again.
+  </Step>
+  <Step title="Notify the rider">
+    `NotifyRiderRideRequeued`, only if the rider has a push token and allows notifications. The regular driver-cancelled push isn't sent.
+  </Step>
+  <Step title="Record the event">
+    `auto_requeued` with the cancelling driver, the old status, reason, and comment.
+  </Step>
+</Steps>
+
+The reset:
+
+```sql
+UPDATE "Rides" SET
+    status = 'confirmed', driver_id = NULL, driver_vehicle_id = NULL,
+    match_time = NULL, offer_time = NULL, potential_driver = NULL,
+    payment_consent_at=COALESCE(payment_consent_at,confirm_time),
+    confirm_time = sqlc.arg(requeued_at)::timestamptz,
+    declined_drivers = array_append(declined_drivers, sqlc.arg(cancelled_driver_id)::uuid),
+    cancel_reason = sqlc.arg(cancel_reason)::text,
+    cancel_comment = sqlc.arg(cancel_comment)::text
+WHERE id = sqlc.arg(ride_id)::uuid;
+```
+
+## What each path resets
+
+| State | Driver-cancel requeue | Offline unqueue |
+| --- | --- | --- |
+| `status` | `confirmed` | `confirmed` |
+| `driver_id`, `driver_vehicle_id`, `match_time` | Cleared | Cleared |
+| `fleet_id` | Kept | **Cleared to null** |
+| `auto_queued` | Kept | Cleared |
+| `confirm_time` | **Reset to now** | Kept |
+| `payment_consent_at` | Set to the old `confirm_time` if null | Unchanged |
+| `declined_drivers` | Driver appended | Unchanged |
+| `potential_driver`, `offer_time` | Cleared | Unchanged |
+| `cancel_reason`, `cancel_comment` | Set to the driver's values | Unchanged |
+| `pickup_distance`, `pickup_duration`, `pickup_route` | Kept (stale) | Kept (stale) |
+| `payment_intent_id`, `stripe_merchant_id`, `pre_auth_amount` | Kept | Kept |
+| `price`, `discounted_price`, `confirm_code`, `payment_method_id` | Kept | Kept |
+| `lifecycle_revision` | Incremented | Incremented |
+| `assignment_generation` | Incremented | Incremented |
+| Board entry | Removed and re-added | Added |
+| T0 push | Attempted | None |
+| Rider push | `ride_requeued` | None |
+| Queue summary | Refreshed or rebuilt by the promoted ride | Deleted |
+
+Redis state is never touched by either path:
+
+| Key | Effect after requeue |
+| --- | --- |
+| `ride:notify:{rideId}` (20 min) | Tiers already fired don't fire again. With a reset `confirm_time`, the next tier waits for its full delay from the requeue |
+| `ride:notified:{rideId}` (30 min) | Drivers notified before are still excluded from tiers without `ignore_already_notified` |
+| `ride:aq_attempted:{rideId}` (1 h) | If an earlier pass gave up, the requeued ride skips auto-queue |
+| `ride:rescue:{rideId}` (30 min) | A rescue alert already sent isn't sent again |
+| `driver:activation_cd:{driverId}` | Unrelated to the ride. Previously paged drivers stay in cooldown |
+
+### Payment on the next accept
+
+The retained `payment_intent_id` still has the old driver in its metadata. When a new driver accepts, `reuseRideAuthorization` in `driver.go` handles it:
+
+- If the intent's `driver_id` and merchant match the accepting driver, it's reused.
+- Otherwise the previous driver must be in `declined_drivers`. The old intent is cancelled if it's still `requires_capture`, and a new one is created.
+- Anything else fails with "ride authorization belongs to an unknown assignment".
+
+Driver-cancel requeue appends the driver, so the next accept works. Offline unqueue doesn't, so any other driver's accept of a ride that had an authorization fails.
+
+## The expiry sweep
+
+`RideService.CancelUnmatchedRides` runs on every `Operational` tick.
+
+<Steps>
+  <Step title="Find candidates">
+    `ListExpiredRideCommandCandidates` returns every `confirmed` ride with no driver and `confirm_time` older than 10 minutes, with its rider. There's no limit.
+  </Step>
+  <Step title="Lock riders">
+    `lockRideParticipants` locks the riders' `Users` rows in UUID order. It doesn't lock the rides or check durable ride operations.
+  </Step>
+  <Step title="Conditional update">
+    `CancelUnmatchedConfirmedRides` sets `status = 'complete'`, `cancel_phase = 'confirmed'`, `cancel_reason = 'automatic'`, `cancel_user = NULL`, and `complete_time = now`. It rechecks `status`, `driver_id IS NULL`, and the cutoff, so a ride assigned while locks were taken is skipped.
+  </Step>
+  <Step title="Enqueue rider notice in the same transaction">
+    For each expired ride, `notify.Emit` enqueues `ride_request_no_drivers` with event key `ride_expired:{rideId}`. The expiry and the push commit together.
+  </Step>
+  <Step title="Finalize and commit">
+    The revision finalizer runs for every expired ride, then the transaction commits.
+  </Step>
+  <Step title="Clean up">
+    After commit, each ride is removed from the board provider and a `no_drivers_available` ride event is recorded with old status `confirmed` and new status `complete`.
+  </Step>
+</Steps>
+
+Expired rides don't use the `no_drivers_available` status value. See [Rides implementation](/engineering/api/rides-implementation#statuses).
+
+### Timing
+
+Expiry is measured from `confirm_time`, which requeue resets. A ride that's requeued at minute 9 gets another 10 minutes. The sweep runs every 30 seconds on each instance, so a ride can live up to about 10.5 minutes unassigned.
+
+Direct-request holds don't pause expiry. Queued rides never expire, however long they wait.
+
+### Payment on expiry
+
+The sweep doesn't call Stripe. A ride that expires after being requeued keeps its `payment_intent_id`, and nothing in the sweep cancels that authorization. Rides that were never accepted have no authorization, because authorization happens on accept or promotion.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Requeue decision and flow | `yelo-api/internal/service/ride/ride.go` (`Cancel`, `isReQueueEligible`, `requeueAfterDriverCancel`, `notifyRiderOfRequeue`) |
+| Requeue transaction | `yelo-api/internal/data/repository/ride_lifecycle.go` (`RequeueAfterCancel`), `queries/ride_lifecycle.sql` (`RequeueRideAfterDriverCancel`, `PromoteNextQueuedRide`) |
+| Requeue event | `yelo-api/internal/service/ride/events.go` (`recordRequeueEvent`) |
+| Offline unqueue | `yelo-api/internal/service/user/user.go`, `ride_matching.go` (`UnqueueDriverRides`), `queries/ride_matching.sql` |
+| Authorization reuse | `yelo-api/internal/service/ride/driver.go` (`processRidePayment`, `reuseRideAuthorization`) |
+| Expiry | `ride.go` (`CancelUnmatchedRides`), `ride_lifecycle.go` (`CancelUnmatchedRides`), `queries/ride_command.sql` (`ListExpiredRideCommandCandidates`), `queries/ride_lifecycle.sql` (`CancelUnmatchedConfirmedRides`) |
+| Tests | `yelo-api/internal/service/ride/requeue_test.go`, `yelo-api/internal/data/repository/ride_expiry_notification_test.go` |
+
+## Gotchas and edge cases
+
+- **T0 isn't resent on requeue.** `notifyDriversAboutNewRide` uses event key `ride_available:{rideId}:fleet-t0:{fleetId}`, the same key as the original confirm. `Notifications.event_key` is unique with `ON CONFLICT DO NOTHING` and no expiry, so the orchestrator drops the second send as a duplicate whenever the first confirm enqueued T0. `AddNotifiedDrivers` still runs and marks the fleet as notified, which also keeps them out of tiers 1 to 3.
+- **The rider may not hear about the new match.** Manual accept notifies the rider through `notifyRiderOfRideUpdate`, which checks `RideNotifications` for a `driver_matched` row on this ride. The first match wrote one, so a re-accept after requeue doesn't push the rider. Auto-queue and promotion call `NotifyRiderRideConfirmed` directly and aren't affected.
+- **Unqueued rides can vanish.** Offline unqueue nulls `fleet_id`, which hides the ride from every fleet-filtered board, and keeps the old `confirm_time`, which often expires it on the next sweep. The rider gets no push when it's unqueued, only the expiry notice.
+- **The cancelling driver's reason overwrites the ride's cancel fields.** `cancel_reason` and `cancel_comment` stay set on a ride that later completes normally.
+- **Stale pickup fields.** After requeue, `pickup_distance`, `pickup_duration`, and `pickup_route` describe the previous driver until the next accept or promotion overwrites them.
+- **Expiry doesn't consult ride operations.** Unlike other commands, the sweep doesn't call `HasConflictingRideOperation`. The durable operation journal isn't wired into production yet, so this has no effect today.
+- **Requeue skips payment handling entirely.** The requeue branch runs before `handleCancellationPayment`, so it never computes a cancellation fee or voids the intent. This is deliberate: the retained authorization is reused or replaced on the next accept.

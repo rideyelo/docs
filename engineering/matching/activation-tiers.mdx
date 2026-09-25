@@ -1,0 +1,198 @@
+---
+title: "Activation tiers"
+description: "Exact behavior of the activation loop: which tier fires on each tick, how candidates are picked and deduplicated, cooldown interactions, rescue alerts, pending-ride pushes, and the config limits that silently disable parts of it."
+---
+
+Activation pushes offline drivers about a ride that nobody has taken. It's the `ProcessUnmatchedRides` task in the `Operational` loop. For the product description and the dashboard editor, see [Matching and auto-queue](/concepts/matching-and-auto-queue#activation-tiers) and [Driver activation](/dashboard/activation).
+
+## Which rides are processed
+
+`Ride.GetUnmatchedRidesForActivation` runs `ListUnmatchedRidesForActivation` with a cutoff of `now - RideRequestExpiry`:
+
+```sql
+WHERE status = 'confirmed'
+    AND driver_id IS NULL
+    AND (potential_driver IS NULL OR offer_time <= NOW() - INTERVAL '30 seconds')
+    AND confirm_time IS NOT NULL
+    AND confirm_time > sqlc.arg(cutoff)::timestamptz
+ORDER BY confirm_time ASC;
+```
+
+Every tick loads every such ride across every community. Rides older than 10 minutes are never activated, even if the expiry sweep hasn't removed them yet. `price` in this query is `COALESCE(discounted_price, price)`.
+
+## One tick, step by step
+
+For each ride, oldest first:
+
+<Steps>
+  <Step title="Resume a lapsed direct request">
+    If `potential_driver` is set, `resumeExpiredDirectRide` runs. On error, the ride is skipped for tiers and rescue on this tick. See [Direct requests](/engineering/matching/direct-requests).
+  </Step>
+  <Step title="Load the community config">
+    `loadConfig` reads `activation_config:{communityId}` from Redis, then `ActivationConfigs` in Postgres, then falls back to `DefaultActivationConfig()`. Results are cached in Redis for 5 minutes and in a per-tick map, so one tick uses one config per community.
+  </Step>
+  <Step title="Pick the tier">
+    `determineTierIdx` reads the last fired tier from `ride:notify:{rideId}` and returns the next one whose delay has passed. See the next section.
+  </Step>
+  <Step title="Fill the quota and push">
+    `activateForConfigTier` builds the exclude set, fills the tier's `TargetDrivers`, records `activation_tier_reached`, enqueues `unclaimed_ride`, and saves the tier.
+  </Step>
+  <Step title="Check rescue">
+    `checkRescue` fires a Slack alert once per ride if the ride is past the rescue threshold.
+  </Step>
+</Steps>
+
+After every ride has been through tiers, a second loop runs `tryAutoQueueAssign` on rides aged 2 minutes or more, again oldest first. See [Auto-queue scoring](/engineering/matching/auto-queue-scoring).
+
+## Tier selection
+
+```go
+for i, tier := range ac.Tiers {
+	tierIdx := i + 1
+	if elapsed >= time.Duration(tier.DelaySeconds)*time.Second && tierIdx > currentTier {
+		return tierIdx
+	}
+}
+return -1
+```
+
+The loop returns the **lowest** tier that is due and hasn't fired, not the highest. Tiers never skip. If a ride is first seen when several tiers are due, they fire one per tick.
+
+Worked example with default tiers (45, 120, 300, 480 seconds) for a ride confirmed at `t = 0`, with ticks at 10, 40, 70, and so on:
+
+| Tick | Elapsed | `currentTier` before | Fires |
+| --- | --- | --- | --- |
+| 10 s | 10 s | 0 | Nothing |
+| 40 s | 40 s | 0 | Nothing |
+| 70 s | 70 s | 0 | Tier 1 |
+| 100 s | 100 s | 1 | Nothing |
+| 130 s | 130 s | 1 | Tier 2 |
+| 310 s | 310 s | 2 | Tier 3 |
+| 490 s | 490 s | 3 | Tier 4 |
+
+If Redis was down from 0 to 400 s and the tier key is empty, tier 1 fires at the first tick after recovery, tier 2 on the next tick 30 s later, and so on. They catch up one tier per tick.
+
+`SetRideTier` writes `ride:notify:{rideId}` with fields `tier` and `ts` and a 20-minute TTL. It's saved even when no drivers were found, so an empty tier isn't retried.
+
+A read error on the tier key returns `-1` and skips the ride's tiers and rescue on that tick.
+
+## Candidate selection
+
+### Exclude set
+
+`buildExcludeSet` starts with `declined_drivers`. Unless the tier has `ignore_already_notified`, it adds every member of `ride:notified:{rideId}`. That set is fed by T0, direct requests, pending-ride pushes, and earlier tiers. If the set can't be read, the tier proceeds without deduplication.
+
+### Quota fill
+
+`fillDriverQuota` fills `TargetDrivers` from two pools in order:
+
+1. **Warm pool**, only when `warm_age_minutes > 0`. It reads `community:warm:{communityId}` members with a score within the warm age. On `main`, nothing writes this key, so the pool is always empty.
+2. **Inactive drivers** from `ListNearbyInactiveDrivers`, capped at 50 rows. See [Driver eligibility](/engineering/matching/driver-eligibility#activation-candidates-in-detail).
+
+For each candidate in the inactive pool, the loop checks the exclude set, then the haversine distance, then takes the cooldown:
+
+```go
+acquired, cdErr := s.activationCache.TrySetActivationCooldownWithTTL(ctx, driver.ID.String(), cooldownTTL)
+```
+
+This is `SET driver:activation_cd:{driverId} 1 NX EX cooldown`. The cooldown is per driver, not per ride. A driver who was paged for any ride in any community is skipped by every tier of every ride until it expires. The cooldown is taken before the push is enqueued.
+
+### Push and bookkeeping
+
+```go
+eventKey := activationTierEventKey(ride.ID, tierIdx, driverIDs)
+// "unclaimed_ride:{rideId}:tier:{n}:recipients:{sha256 of sorted IDs}"
+```
+
+- `NotifyUnclaimedRide` enqueues one notification to all selected drivers.
+- Only after a successful enqueue are the drivers added to `ride:notified:{rideId}` (30-minute TTL, refreshed on each add).
+- Then the tier is saved. If saving fails, the next tick re-runs the same tier. The cooldowns already taken push it to different drivers, and the recipient hash gives it a new event key.
+- If the enqueue fails, the error is logged. The tier isn't saved, so it retries next tick. The cooldowns stay, so the retry can't reach the same drivers for the cooldown period.
+
+The `activation_tier_reached` ride event is recorded before the push, with `tier`, `drivers_notified`, `driver_ids`, `driver_names`, `elapsed_since_confirm_ms`, `search_radius_km`, `target_drivers`, and `ignore_already_notified`. It's recorded even when zero drivers were found.
+
+## Cooldown versus re-notify
+
+The default config has `cooldown_minutes = 15` and tier 4 has `ignore_already_notified = true`. Tier 4 fires at 480 s, which is 8 minutes. Every driver paged by tiers 1 to 3 took a cooldown at 45 to 300 s and still holds it at 8 minutes. So tier 4 can't re-notify them.
+
+In practice, tier 4 with defaults re-notifies only drivers who were in the notified set without a cooldown: T0 recipients, the direct-request driver, and pending-ride recipients. For `ignore_already_notified` to reach earlier tier recipients, the cooldown must be shorter than the gap between those tiers.
+
+## Rescue alert
+
+```go
+lastTier := ac.Tiers[len(ac.Tiers)-1]
+rescueThreshold := lastTier.DelaySeconds*time.Second + ac.RescueGraceMinutes*time.Minute
+```
+
+When `rescue_enabled` is true and `elapsed >= rescueThreshold`, `TrySetRescueSent` does `SETNX ride:rescue:{rideId}` with a 30-minute TTL. The winner posts to Slack with community, ride ID, pickup, destination, price, minutes waiting, and the notified count. A failed notified-set read reports `unknown` instead of `0`. A `rescue_alert_sent` ride event follows.
+
+<Warning>
+With the default tiers, rescue never fires. The threshold is 480 s plus 5 minutes, which is 13 minutes. `ListUnmatchedRidesForActivation` drops rides older than 10 minutes, and the expiry sweep cancels them at 10 minutes. Rescue only works when the last tier's delay plus the grace is under 600 seconds.
+</Warning>
+
+## Config validation
+
+`UpsertActivationConfigRequest.Validate` in `internal/server/http/community/requests/activation_config.go` enforces:
+
+| Field | Rule |
+| --- | --- |
+| `tiers` | 1 to 10 entries |
+| `delay_seconds` | Greater than 0 and strictly increasing |
+| `radius_km` | Greater than 0 |
+| `target_drivers` | Greater than 0 |
+| `warm_age_minutes` | 0 or more |
+| `cooldown_minutes` | Greater than 0 |
+| `rescue_grace_minutes` | Greater than 0 |
+
+Nothing caps `delay_seconds` at 600. A tier with a delay of 600 seconds or more is accepted and never fires.
+
+`DashboardService.UpsertActivationConfig` writes the row and then deletes `activation_config:{communityId}` in a detached goroutine. Other instances pick up the change on their next tick, since the cache is in shared Redis. If the delete fails, the old config lasts up to 5 minutes.
+
+## Drivers who come online
+
+The loop only targets offline drivers. `DriverService.RefreshOnlineStatus` calls `reconcilePendingRideAfterOnline` only when `RefreshDriverSession` reports a real offline-to-online transition, not on session renewals.
+
+`NotifyPendingRideForDriver`:
+
+1. Returns early if the driver has no stored location.
+2. Loads the driver's session and runs the same board query as `GET /ride/v2/board`.
+3. Returns early if the community config has no tiers.
+4. Walks the board oldest first and picks the first ride that is 0 to 10 minutes old, inside the radius for its age, and not in the driver's notified set.
+5. Sends `ride_available` with event key `ride_available:{rideId}:driver-online:{driverId}` and adds the driver to the notified set.
+
+The radius comes from `pendingRideTier`:
+
+```go
+tierIdx := 1
+radiusKM := ac.Tiers[0].RadiusKM
+for i := range ac.Tiers {
+	if elapsed >= time.Duration(ac.Tiers[i].DelaySeconds)*time.Second {
+		tierIdx = i + 1
+		radiusKM = ac.Tiers[i].RadiusKM
+	}
+}
+```
+
+Unlike `determineTierIdx`, this picks the **highest** due tier, and it uses tier 1's radius even before tier 1's delay. It doesn't take a cooldown. Only one push is sent, because the `ride_request` push type makes the app refetch the whole board.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Loop, tier selection, quota, rescue | `yelo-api/internal/service/activation/activation.go` (`ProcessUnmatchedRides`, `determineTierIdx`, `activateForConfigTier`, `fillDriverQuota`, `checkRescue`) |
+| Pending-ride push | `activation.go` (`NotifyPendingRideForDriver`, `findPendingRideCandidate`, `pendingRideTier`), `yelo-api/internal/service/driver/driver.go` (`reconcilePendingRideAfterOnline`) |
+| Config model and defaults | `yelo-api/internal/models/activation_config.go` |
+| Config storage | `yelo-api/internal/data/repository/activation_config.go`, migration `000206_activation_configs` |
+| Config API | `yelo-api/internal/server/http/community/requests/activation_config.go`, `yelo-api/internal/service/dashboard/community.go` |
+| Redis keys | `yelo-api/internal/data/redis/activation_cache.go` |
+| Candidate SQL | `queries/ride_matching.sql` (`ListUnmatchedRidesForActivation`), `queries/user_driver.sql` (`ListNearbyInactiveDrivers`) |
+
+## Gotchas and edge cases
+
+- **The concepts page says "highest tier".** The code fires the lowest unfired due tier, one per tick. Only `pendingRideTier` uses the highest.
+- **Two instances can double a tier.** Each instance reads `currentTier = 0`, picks disjoint drivers because cooldowns are `SETNX`, and enqueues under different recipient hashes. A tier can reach up to `TargetDrivers` times the number of instances.
+- **Cooldown is global.** One busy ride can starve activation for another ride nearby for the cooldown period. There's no per-ride cooldown.
+- **Warm age does nothing.** The dashboard describes warm age as a pass over recently offline drivers. The code reads a Redis sorted set of online drivers that nothing populates, so every tier is filled from the inactive pool.
+- **Drivers without Redis get nothing.** A cooldown `SETNX` error skips the candidate, so with Redis disabled or the breaker open, every tier finds zero drivers.
+- **Tier state outlives requeue.** A requeued ride gets a fresh `confirm_time`, but `ride:notify:{rideId}` keeps the old tier for up to 20 minutes. If the ride reached tier 2 before it was accepted, tiers 1 and 2 don't fire again after requeue. Tier 3 fires once 300 seconds have passed since the requeue.
+- **Push price is the effective price.** Tiers use `COALESCE(discounted_price, price)`. T0 uses `ride.Price`, which is the undiscounted price. The same driver can see two prices for one ride.

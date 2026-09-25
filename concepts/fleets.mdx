@@ -26,7 +26,7 @@ A fleet row (`Fleet` in `internal/models/fleet.go`) holds:
 
 ### Service communities
 
-A fleet can serve more than one community. Each fleet-to-community pairing is a row in `FleetCommunityServices`. A fleet's prices in a community only reach riders while that service is enabled, the fleet is active, and the community is active and not archived. The `ActiveFleetCommunityServices` view enforces this.
+A fleet can serve more than one community. Each fleet-to-community pairing is a row in `FleetCommunityServices`. The `ActiveFleetCommunityServices` view lists the pairings where the service is enabled, the fleet is active, and the community is active and not archived. The dashboard pricing and driver fleet queries use this view. The rider-facing price and ride-type queries (`ListActiveRidePriceParameters`, `ListAvailableRideTypes`) do not, so a retired service does not by itself hide a fleet's open prices from riders. See [Fleet isolation](/engineering/fleets/isolation).
 
 Admins add, retire, or restore service communities in the fleet editor. The API routes are `GET /dashboard/fleets/services/{fleet_id}` and `PUT /dashboard/fleets/services/{fleet_id}/{community_id}`, and both require the `admin` role.
 
@@ -76,7 +76,7 @@ For authorization, capture, and payout timing, see [Payments and payouts](/conce
 
 ## Fleet drivers and independent drivers
 
-A driver can belong to several fleets but has one **active fleet** (`Users.active_fleet_id`). The active fleet decides the community they drive in, the rides they can accept, and where their fares go.
+A driver can belong to several fleets but has one **active fleet**: the `FleetDrivers` row with `is_active = TRUE`. See [Membership and payout routing](/engineering/fleets/membership-and-payout-routing). The active fleet decides the community they drive in, the rides they can accept, and where their fares go.
 
 When a driver's application activates and they have no active fleet, Yelo picks one in this order (`reconcileFleetAssignmentForUser` in `internal/service/driver/driver.go`):
 

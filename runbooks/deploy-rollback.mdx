@@ -1,0 +1,108 @@
+---
+title: "Deploy rollback"
+description: "Roll back a bad API revision on Cloud Run, a web site on Firebase Hosting, or a mobile OTA update, using the tools each pipeline supports"
+---
+
+Each repository ships on its own, so roll back only the surface that broke. For how each pipeline works, see [Deployment](/engineering/deployment).
+
+## Symptoms
+
+- Error rates or latency jump right after a Slack deploy message.
+- `/healthcheck/deep` returns 503 on the serving revision.
+- A dashboard or public site breaks after a merge to `yelo-web` `main`.
+- The mobile app crashes or misbehaves after an OTA promote.
+
+## Diagnose
+
+<Steps>
+  <Step title="Find what changed">
+    - **API**: the Slack deploy message names the revision, commit, and pull request. **Release API** runs also write the currently deployed SHA to the job summary.
+    - **Web**: the **Firebase** workflow's Slack message lists the deployed sites and commit.
+    - **Mobile**: **OTA Promote** runs list the promoted group IDs. The auth entry screen shows the first 8 characters of the update ID after repeated taps.
+  </Step>
+  <Step title="List API revisions">
+    ```bash
+    gcloud run revisions list --service=yelo-api-testflight \
+      --region=us-central1 --project=prod-yelo \
+      --format="table(metadata.name, metadata.labels.commit-sha, metadata.labels.migration-version, metadata.creationTimestamp)"
+    ```
+
+    Every release revision is labeled with `commit-sha` and `migration-version`. The promote step's build log prints `Rollback revision: <previous-revision>`.
+  </Step>
+  <Step title="Check schema compatibility">
+    Compare the `migration-version` label of the revision you want to restore with the current one. Migrations run before the new revision gets traffic and are written so the older revision keeps working. That's the premise of an API rollback. Review any migration between the two versions before you roll back past it.
+  </Step>
+</Steps>
+
+## Fix
+
+<Tabs>
+  <Tab title="API">
+    <Steps>
+      <Step title="Shift traffic back">
+        Route 100% of traffic to the previous revision. This is the command the release pipeline prints:
+
+        ```bash
+        gcloud run services update-traffic yelo-api-testflight \
+          --region=us-central1 --project=prod-yelo \
+          --to-revisions=<previous-revision>=100
+        ```
+      </Step>
+      <Step title="Stop the next push from redeploying the bad code">
+        **Release API** runs on every push to `main`. Revert the bad change on `main`. The next release builds the revert and promotes it normally.
+      </Step>
+    </Steps>
+
+    <Warning>
+    Don't try to roll back by dispatching **Release API** with an older `sha`. `release-required.sh` skips any SHA that the serving revision already contains, reporting "already deployed or superseded". If migrations moved forward, `migration-required.sh` also refuses a release whose migration version is older than the deployed one.
+    </Warning>
+
+    <Warning>
+    Down migrations never run in production. If the restored revision can't work with the current schema, don't roll back. Fix forward. Don't roll back past a binary that advances ride state counters while clients hold revision-based snapshots. See [Ride state protocol](/engineering/api/rides-implementation#ride-state-protocol).
+    </Warning>
+  </Tab>
+  <Tab title="Web">
+    Firebase deploys come from `main`, and there's no rollback workflow in `yelo-web`.
+
+    1. Revert the bad change on `main`. **Firebase** computes affected sites from the last successful deploy, builds them, and deploys them in one `firebase deploy --only hosting:<site>,...`.
+    2. If you can't wait for CI, check out a known-good commit and run `make deploy-<site>`. It checks Firebase auth, validates the generated `firebase.json`, builds the site, and deploys it.
+
+    <Warning>
+    A local `make deploy-<site>` builds with your local `VITE_*` values. CI uses the repository variables such as `VITE_API_URL` and `VITE_CLERK_PUBLISHABLE_KEY`. Make sure your values match production before deploying. `make deploy-<site>` also skips the typecheck.
+    </Warning>
+
+    Cloudflare Workers under `workers/` deploy only by hand with `pnpm worker:<name>:deploy`. Roll back by deploying the previous code the same way.
+  </Tab>
+  <Tab title="Mobile OTA">
+    Run **OTA Promote** from GitHub Actions with:
+
+    - `action`: `rollback`
+    - `group_id`: the earlier **production** group to restore
+    - `second_group_id`: only when the iOS and Android runtimes differ
+    - `platforms`: `all`, `ios`, or `android`
+    - `message`: the rollback reason
+
+    Rollback takes exact production group IDs, not a source commit. The workflow needs a release admin. Devices pick up the restored update on the next cold launch, or when they return to the foreground (checked at most every 30 minutes). See [OTA updates](/engineering/mobile/releases#ota-updates).
+
+    <Note>
+    A store build can't be rolled back. `minimumFrontendVersion` in the API only forces updates forward.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Verify
+
+- **API**: `gcloud run services describe yelo-api-testflight --region=us-central1 --project=prod-yelo` shows the restored revision at 100%. `GET /healthcheck/deep` returns `status: healthy`, and error rates recover.
+- **Web**: the site loads the expected build, and the **Firebase** workflow on the revert is green.
+- **Mobile**: the **OTA Promote** run succeeded, and a test device shows the restored update ID.
+
+## Follow-ups
+
+- **E2E drift.** `release-e2e.yml` converges `yelo-api-e2e` on whatever revision serves 100% of production traffic, and migrates `yelo_e2e` to that revision's version. After a rollback across a migration, expect that run to fail until production is back on the newest migration version. It doesn't affect production.
+- **Frontend release branch.** Reverts on `yelo-frontend` `main` are considered for the supported release branch by `backport-supported-release.yml`.
+
+## Root causes seen in code
+
+- **No automatic rollback.** Cloud Build only promotes after `/healthcheck` and `/healthcheck/deep` pass on the candidate. Anything those don't cover, including Redis, reaches production.
+- **Coalesced releases.** Pushes that land during a release coalesce into the newest SHA, so one release can carry several pull requests.
+- **Stale promotion guard.** A build refuses to promote when a newer release build exists, and that older build's run fails. Watch the newest build instead.

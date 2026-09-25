@@ -1,0 +1,276 @@
+---
+title: "Environment variables"
+description: "Index of every environment variable, build variable, CI secret, CI variable, EAS profile value, and Cloudflare Worker binding that yelo-api, yelo-web, and yelo-frontend read."
+---
+
+This page is an index. It lists names, the repository that reads each one, whether it is required, and a one-line purpose. It never lists secret values.
+
+- For how `yelo-api` loads configuration, validation rules, and defaults, see [API configuration](/engineering/api/configuration).
+- For a working local setup, see [Local development](/engineering/local-development).
+- For `VITE_*` usage per site, see [Web conventions](/engineering/web/conventions#environment-variables).
+- For EAS profiles and release workflows, see [Mobile releases](/engineering/mobile/releases).
+
+"Required" means the process fails fast without it. Required values are:
+
+- **Yes**: `Validate()` in `yelo-api` `internal/utilities/config/config.go:399-454`, or a site's `metadata.requiredBuildEnv` in `yelo-web`.
+- **E2E**: `validateE2E` requires it in E2E mode.
+- **Cond.**: required only when a related flag is on.
+
+## yelo-api runtime
+
+Every variable below is read in `internal/utilities/config/*.go` unless the **Where** column says otherwise. Defaults and behavior are in [API configuration](/engineering/api/configuration#environment-variables).
+
+<AccordionGroup>
+  <Accordion title="App, server, and feature toggles">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `ENVIRONMENT` | No | `dev`, `production`, `e2e`. Switches CORS, logging, and dev-only behavior | `config.go:246` |
+    | `PORT` | No | Listen port. Read directly | `cmd/api/main.go:67` |
+    | `API_URL` | No | Public API base, used in Stripe reauth links | `config.go:254` |
+    | `API_VERSION` | No | Sentry release name | `config.go:259` |
+    | `APP_URL_SCHEME`, `APP_STORE_URL` | No | `/redirect` targets | `config.go:255-256` |
+    | `YELO_WEBSITE_URL`, `YELO_DASHBOARD_URL` | No | Links in emails and Stripe | `config.go:257-258` |
+    | `CORS_TRUSTED_ORIGINS` | No | Overrides the built-in CORS list | `config.go:723` |
+    | `SWAGGER_ENABLED` | No | Swagger in `dev` | `config.go:260` |
+    | `ACTIVATION_ENABLED` | No | Driver activation loop | `config.go:262` |
+    | `RIDE_STATE_SNAPSHOT_ENABLED` | No | Ride state protocol | `config.go:250` |
+    | `COMMUNITY_TIMEZONE_RECONCILIATION_ENABLED` | No | Time zone reconciliation job | `config.go:251` |
+    | `SKIP_TEST_SCHOOL_NOTIFICATIONS` | No | Suppresses notifications for test schools | `config.go:261` |
+    | `DRIVER_VERIFIED_PHONE_REQUIRED` | No | Requires a verified phone in driver flows | `config.go:394` |
+    | `BACKGROUND_TASKS_ENABLED` | No | `false` disables in-process tickers. Read directly | `cmd/api/background_cleanup.go:45` |
+  </Accordion>
+  <Accordion title="Database, Redis, and telemetry">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `DSN` | Yes | Postgres connection string | `config.go:276` |
+    | `POSTGRES_POOL_LOG_INTERVAL` | No | Pool monitor log interval | `config.go:277` |
+    | `DISABLE_SLOW_QUERY_WARNINGS` | No | Silences slow query warnings | `config.go:278` |
+    | `K_REVISION` | No | Set by Cloud Run. Becomes Postgres `application_name` | `internal/data/repository/storage.go:486` |
+    | `REDIS_URL`, `REDIS_ENABLED`, `REDIS_STARTUP_TIMEOUT_SECONDS` | E2E | Redis connection and fallback | `config.go:341-343` |
+    | `LOG_LEVEL`, `GOOGLE_CLOUD_PROJECT` | No | Logger level and Cloud Logging project | `internal/utilities/logger/logger.go:35,51` |
+    | `SENTRY_DSN`, `POSTHOG_API_KEY` | No | Error reporting and product analytics | `config.go:289,295` |
+    | `OTEL_ENABLED`, `OTEL_OTLP_ENDPOINT`, `OTEL_OTLP_AUTH_HEADER`, `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, `OTEL_TRACE_SAMPLING_RATIO` | No | OpenTelemetry export | `config.go:290-303` |
+    | `METRICS_AUTH_TOKEN` | No | Bearer token for `/metrics` and pprof | `config.go:296` |
+    | `PPROF_ENABLED`, `PPROF_BLOCK_RATE`, `PPROF_MUTEX_RATE` | No | pprof | `config.go:297-299` |
+    | `SLOW_REQUEST_THRESHOLD_MS`, `SLOW_QUERY_THRESHOLD_MS`, `POOL_STATS_INTERVAL_S` | No | Slow thresholds and pool gauge cadence | `config.go:300-302` |
+  </Accordion>
+  <Accordion title="Auth (JWT, Clerk, OAuth, Auth v3)">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `KEY` | Yes | App JWT signing key | `config.go:265` |
+    | `KEY_LEGACY` | No | Previous keys accepted during rotation | `config.go:266` |
+    | `CLERK_SECRET_KEY` | No | Dashboard sessions | `config.go:267` |
+    | `GOOGLE_ALLOWED_AUDIENCES` | Yes | Google ID token audiences | `config.go:269` |
+    | `APPLE_ALLOWED_AUDIENCES` | No | Apple ID token audiences | `config.go:268` |
+    | `INTERNAL_API_KEY` | No | `X-Internal-Key` for `/internal` | `config.go:372` |
+    | `AUTH_V3_ENABLED` | No | Enables `/authv3` | `authv3.go:105` |
+    | `AUTH_V3_PUBLIC_WEB_ORIGIN`, `AUTH_V3_API_CALLBACK_ORIGIN`, `AUTH_V3_CORS_ORIGINS`, `AUTH_V3_CORS_ALLOW_CREDENTIALS` | Cond. | Web and callback origins, CORS | `authv3.go:106-113` |
+    | `AUTH_V3_TERMS_VERSION`, `AUTH_V3_PRIVACY_VERSION` | Cond. | Accepted legal versions | `authv3.go:108-109` |
+    | `AUTH_V3_TRUSTED_PROXY_CIDRS`, `AUTH_V3_TRUSTED_GEO_HEADER` | No | Client IP and coarse geo | `authv3.go:111-112` |
+    | `AUTH_V3_STUDID_ENABLED`, `AUTH_V3_STUDID_BASE_URL`, `AUTH_V3_STUDID_REDIRECT_URL`, `AUTH_V3_STUDID_SERVICE_NAME` | No | StudID student verification | `authv3.go:115-118` |
+    | `AUTH_V3_GOOGLE_ISSUER`, `AUTH_V3_GOOGLE_CLIENT_ID`, `AUTH_V3_GOOGLE_CLIENT_SECRET`, `AUTH_V3_GOOGLE_CALLBACK_URL` | Cond. | Google provider | `authv3.go:121-124` |
+    | `AUTH_V3_APPLE_ISSUER`, `AUTH_V3_APPLE_SERVICES_ID`, `AUTH_V3_APPLE_NATIVE_CLIENT_ID`, `AUTH_V3_APPLE_TEAM_ID`, `AUTH_V3_APPLE_KEY_ID`, `AUTH_V3_APPLE_PRIVATE_KEY`, `AUTH_V3_APPLE_CALLBACK_URL` | Cond. | Apple provider | `authv3.go:127-133` |
+    | `AUTH_V3_CLIENT_REDIRECT_ALLOWLIST` | Cond. | JSON map of client IDs to redirect URIs | `authv3.go:144` |
+    | `AUTH_V3_STATE_HMAC_KEYS`, `AUTH_V3_SUBJECT_HMAC_KEY`, `AUTH_V3_RATE_LIMIT_HMAC_KEY`, `AUTH_V3_ONBOARDING_JWT_KEY`, `AUTH_V3_REFRESH_TOKEN_KEYS` | Cond. | Auth v3 signing and encryption keys | `authv3.go:145-151` |
+    | `AUTH_V3_TRANSACTION_TTL`, `AUTH_V3_PROVIDER_START_TTL`, `AUTH_V3_HANDOFF_CODE_TTL`, `AUTH_V3_ONBOARDING_TOKEN_TTL`, `AUTH_V3_WEB_ACCESS_TOKEN_TTL`, `AUTH_V3_WEB_SESSION_IDLE_TTL`, `AUTH_V3_WEB_SESSION_ABSOLUTE_TTL` | No | Auth v3 lifetimes. See [Timing and limits](/reference/timing-and-limits) | `authv3.go` |
+  </Accordion>
+  <Accordion title="Payments, maps, messaging">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `STRIPE_API_KEY` | Yes | Stripe secret key. Also read by `scripts/create_payment_link/main.go:23` | `config.go:282` |
+    | `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_RETURN_URL`, `STRIPE_RECONCILIATION_ENABLED` | No | Stripe client key, webhooks, Connect return, reconciliation job | `config.go:281-285` |
+    | `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` | No | Non-production earnings override | `config.go:286` |
+    | `MAPBOX_API_KEY` | Yes | Mapbox. Also read by `cmd/sync-school-catalog/coordinates.go:112` | `config.go:306` |
+    | `GOOGLE_MAPS_API_KEY` | Yes | Google Routes, Places, Geocoding | `config.go:307` |
+    | `SEARCH_PROVIDER`, `GOOGLE_PLACES_BIAS_RADIUS_METERS` | No | Place search provider and bias radius | `config.go:308-309` |
+    | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` | Yes | Twilio SMS | `config.go:320-322` |
+    | `TWILIO_VERIFY_SERVICE_SID`, `TWILIO_OTP_FALLBACK_ENABLED`, `TWILIO_OTP_FALLBACK_DELAY`, `TWILIO_OTP_SWEEP_INTERVAL` | No | Twilio Verify and OTP fallback | `config.go:323-324,674,678` |
+    | `TWILIO_EVENTS_WEBHOOK_USER`, `TWILIO_EVENTS_WEBHOOK_PASSWORD` | No | Basic auth on `/twilio-verify-events` | `config.go:337-338` |
+    | `PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET`, `PHOTON_CLOUD_URL`, `PHOTON_IMESSAGE_ADDRESS` | No | Photon iMessage bump texts | `config.go:327-330` |
+    | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | No | Transactional email | `config.go:318-319` |
+    | `SLACK_WEBHOOK_URL`, `SLACK_USER_UPDATES_WEBHOOK_URL`, `SLACK_DRIVER_UPDATES_WEBHOOK_URL` | No | Slack channels | `config.go:333-335` |
+    | `APP_STORE_WEBHOOK_SECRET` | No | App Store webhook HMAC | `config.go:336` |
+  </Accordion>
+  <Accordion title="Contact sync, links, storage, calendar, Play">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `QUO_API_KEY`, `QUO_DASHBOARD_API_KEY`, `QUO_BASE_URL`, `QUO_CONTACT_BASE_URL` | No | Quo (OpenPhone) | `config.go:364-369` |
+    | `QUO_REQUEST_INTERVAL_MS`, `QUO_REQUEST_INTERVAL_SECONDS` (legacy), `QUO_DASHBOARD_REQUEST_INTERVAL_MS` | No | Quo pacing | `quo.go:7-12`, `config.go:365` |
+    | `QUO_ACCOUNT_KEY`, `RESEND_ACCOUNT_KEY`, `RESEND_CONTACTS_API_KEY` | No | Contact sync accounts | `contact_sync.go:18-20` |
+    | `RESEND_REQUEST_INTERVAL`, `RESEND_CONTACT_REQUEST_INTERVAL`, `CONTACT_SYNC_RECONCILE_INTERVAL`, `CONTACT_SYNC_RESEND_ENABLED` | No | Contact sync pacing and toggle | `contact_sync.go:21-24` |
+    | `CONTACT_HASH_PEPPER` | No | Contact hash pepper. Read on each use | `config.go:375`, `internal/service/user/contacts.go:176`, `internal/data/repository/dashboard.go:2073` |
+    | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID` | No | Dub short links | `config.go:352-354` |
+    | `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL` | No | Invite landing and OG worker bases | `config.go:355,359` |
+    | `OG_SIGNING_SECRET` | Yes | Signs OG card URLs. Must match the `og` Worker secret | `config.go:361` |
+    | `STORAGE_URL`, `STORAGE_TOKEN`, `STORAGE_PUBLIC_BUCKET_ID`, `STORAGE_PRIVATE_BUCKET_ID` | No | Supabase Storage | `config.go:312-315` |
+    | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_SYNC_ENABLED`, `GOOGLE_CALENDAR_OWNER_EMAIL`, `GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET`, `GOOGLE_CALENDAR_CALLBACK_URL`, `GOOGLE_CALENDAR_DASHBOARD_URL`, `GOOGLE_CALENDAR_TOKEN_KEYS` | Cond. | Operating-hours calendar | `calendar.go:25-26` |
+    | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED`, `GOOGLE_PLAY_PACKAGE_NAME`, `GOOGLE_PLAY_TRACKS`, `GOOGLE_PLAY_CONSOLE_URL` | Cond. | Play release monitor. Package and tracks required when enabled | `config.go:346-349,714` |
+  </Accordion>
+  <Accordion title="E2E mode">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `E2E_ENABLED` | E2E | Enables E2E mode | `config.go:378` |
+    | `E2E_CONTROL_API_KEY` | E2E | `X-E2e-Key` secret, at least 32 bytes | `config.go:379` |
+    | `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` | E2E | Database isolation checks | `config.go:380-382` |
+    | `E2E_FIXTURE_TTL`, `E2E_BACKGROUND_JOBS_ENABLED` | No | Fixture lifetime. Jobs must stay off | `config.go:383-384` |
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+These variables are read in code but missing from `.env.example`: `APP_STORE_WEBHOOK_SECRET`, `CONTACT_HASH_PEPPER`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID`, `GOOGLE_PLACES_BIAS_RADIUS_METERS`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET`, `PHOTON_*`, `QUO_REQUEST_INTERVAL_SECONDS`, `RIDE_STATE_SNAPSHOT_ENABLED`, and `TWILIO_EVENTS_WEBHOOK_*`. `OG_SIGNING_SECRET` is required, so a fresh `.env` copied from the example fails `Validate()`.
+</Note>
+
+## yelo-api deploy and CI
+
+<AccordionGroup>
+  <Accordion title="Cloud Build and migration job">
+    | Name | Surface | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `_RUNTIME_ENV_VARS`, `_RUNTIME_SECRET_REFS` | Cloud Build substitution | Production runtime env and Secret Manager refs. Set on the manual release trigger. The build fails if either is empty | `cloudbuild.yaml:15-21,40-41` |
+    | `_AR_HOSTNAME`, `_AR_PROJECT_ID`, `_AR_REPOSITORY`, `_DEPLOY_REGION`, `_SERVICE_NAME`, `_MAX_INSTANCES`, `_GITHUB_REPOSITORY` | Cloud Build substitution | Image registry and Cloud Run target | `cloudbuild.yaml:22-30` |
+    | `_GIT_SHA`, `_API_IMAGE`, `_SERVICE_ACCOUNT`, `_DATABASE_PROJECT_REF`, `_PRODUCTION_DATABASE_PROJECT_REF`, `_DATABASE_NAME`, `_REGION`, `_SERVICE_NAME`, `_API_ORIGIN` | Cloud Build substitution (E2E) | E2E convergence deploy | `cloudbuild.e2e.yaml:24-120` |
+    | `MIGRATION_DSN` | Cloud Run Job secret | Migration DSN, bound from Secret Manager | `cloudbuild.yaml`, `cloudbuild.e2e.yaml:88` |
+    | `EXPECTED_MIGRATION_VERSION` | Cloud Run Job env | Latest migration the job must reach | `scripts/release/run-migrations.sh` |
+    | `E2E_BOOTSTRAP_SUPABASE_SECONDARY_DATABASE`, `E2E_EXPECTED_DATABASE_NAME`, `E2E_EXPECTED_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `E2E_BOOTSTRAP_SQL_PATH`, `E2E_SEED_SQL_PATH` | Cloud Run Job env (E2E) | E2E database bootstrap and seed | `cloudbuild.e2e.yaml:89`, `scripts/release/run-migrations.sh` |
+    | `SMOKE_ATTEMPTS`, `SMOKE_DEEP_ATTEMPTS`, `SMOKE_DELAY_SECONDS`, `SMOKE_CONNECT_TIMEOUT_SECONDS`, `SMOKE_REQUEST_TIMEOUT_SECONDS`, `SMOKE_ALLOW_HTTP` | Release script | Candidate smoke test tuning | `scripts/release/smoke-candidate.sh:11-20` |
+    | `RELEASE_BUILD_POLL_SECONDS`, `RELEASE_MANUAL_TRIGGER` | Release script | Build polling and trigger name | `scripts/release/wait-release-build.sh:7`, `resolve-release-build.sh:8` |
+
+    The E2E service binds these Secret Manager secrets by name: `DSN`, `KEY`, `REDIS_URL`, `E2E_CONTROL_API_KEY`, `STRIPE_API_KEY`, `STRIPE_PUBLISHABLE_KEY`, `GOOGLE_MAPS_API_KEY`, `MAPBOX_API_KEY`, and the five `AUTH_V3_*` key variables (`cloudbuild.e2e.yaml:119`). Release failure alerts read the `yelo-api-deploy-slack-webhook` secret (`.github/workflows/release-api.yml:257`).
+  </Accordion>
+  <Accordion title="GitHub Actions">
+    | Name | Kind | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_RELEASE_SERVICE_ACCOUNT` | Variable | Workload identity for release and E2E | `release-api.yml:96-97`, `release-e2e.yml:39-40` |
+    | `E2E_RELEASE_ENABLED` | Variable | Gates the E2E convergence workflow | `release-e2e.yml:30` |
+    | `E2E_DATABASE_PROJECT_REF`, `E2E_SERVICE_ACCOUNT`, `PRODUCTION_DATABASE_PROJECT_REF` | Variable | E2E deploy inputs | `release-e2e.yml:200-202` |
+    | `OPENAPI_BOT_CLIENT_ID` | Variable | GitHub App that opens OpenAPI and release sync PRs | `propagate-openapi.yml:49`, `sync-frontend-release.yml:36` |
+    | `OPENAPI_BOT_PRIVATE_KEY` | Secret | GitHub App key | `propagate-openapi.yml:50`, `sync-frontend-release.yml:37` |
+    | `PREVIOUS_RELEASE_BRANCH` | Variable | Mobile release branch to sync the contract into | `sync-frontend-release.yml:23` |
+  </Accordion>
+</AccordionGroup>
+
+## yelo-web
+
+Vite inlines `VITE_*` values at build time. CI takes them from GitHub repository variables in the `env` block of `ci.yml:16-27` and `firebase.yml:14-25`.
+
+<AccordionGroup>
+  <Accordion title="Build-time VITE variables">
+    | Name | Required by | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `VITE_API_URL` | dashboard, event, invite, signup | API base. Relative values fall back to `https://api.joinyelo.com` in production builds | `src/lib/api-client.ts:6-10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:2-3` |
+    | `VITE_CLERK_PUBLISHABLE_KEY` | dashboard | Clerk | `src/shared/bootstrap/ClerkAuth.tsx:4` |
+    | `VITE_MAPBOX_API_KEY` | dashboard, event | Mapbox GL and static maps | `src/components/CommunityMap.tsx:10`, `src/sites/event/lib/staticMap.ts:1` |
+    | `VITE_SENTRY_DSN` | Optional | Dashboard Sentry | `src/sites/dashboard/main.tsx:60` |
+    | `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID` | signup | Web OAuth | `src/shared/signup/webOAuth.ts:50,84` |
+    | `VITE_APPLE_REDIRECT_URI` | Optional | Apple return URL. Default `https://signup.yelo.link` | `src/shared/signup/webOAuth.ts:74-77` |
+    | `VITE_AUTH_V3_APP_SCHEME` | maestro (set by build command) | App scheme for "open app". Default `com.rideyelo` | `src/shared/signup/openApp.ts:3`, `src/sites/maestro/project.json:14` |
+    | `VITE_APP_ENV` | Optional | Only `production` enables Auth v3 analytics | `src/sites/signup/auth-v3/analytics.ts:155` |
+    | `VITE_POSTHOG_KEY`, `VITE_POSTHOG_HOST` | Optional | Auth v3 PostHog. Host defaults to `https://us.i.posthog.com` | `src/sites/signup/auth-v3/analytics.ts:156-160` |
+    | `VITE_SUPABASE_URL`, `VITE_E2E_API_URL` | maestro | E2E artifact bucket and E2E API | `src/sites/maestro/types.ts:146`, `src/sites/maestro/project.json:7` |
+    | `VITE_E2E_ARTIFACT_BASE_URL` | Optional | Overrides the artifact base | `src/sites/maestro/types.ts:145` |
+    | `VITE_SIGNUP_URL` | Optional | World Cup claim link. Default `https://joinyelo.com/world-cup/claim` | `src/sites/world-cup/lib/brand.ts:19` |
+    | `VITE_CURVED_BAND_FIT` | Optional | Landing animation dev toggle | `src/sites/home/components/bandfit.ts:28` |
+  </Accordion>
+  <Accordion title="Dev server and tooling">
+    | Name | Purpose | Where |
+    | --- | --- | --- |
+    | `SITE` | Which site to serve or build. Default `dashboard` | `tools/vite/base/config.ts:23` |
+    | `VITE_API_PROXY_TARGET` | Dev proxy target. Default `https://api.rideyelo.com` | `tools/vite/base/config.ts:18` |
+    | `VITE_USE_PROD_DOMAIN` | Serves on the production dashboard dev host over HTTPS | `tools/vite/base/config.ts:17` |
+    | `VITE_ALLOWED_HOST` | Extra dev hosts | `tools/vite/base/config.ts:32` |
+    | `VITE_AUTH_V3_DEVICE_TEST` | Mock Auth v3 server for device testing (signup, `serve` only) | `tools/vite/base/config.ts:37` |
+    | `GOOGLE_APPLICATION_CREDENTIALS` | Manual `firebase deploy` from the Makefile | `Makefile` |
+  </Accordion>
+  <Accordion title="GitHub Actions and Firebase">
+    | Name | Kind | Purpose | Where |
+    | --- | --- | --- | --- |
+    | All `VITE_*` above except `VITE_POSTHOG_HOST` | Variable | Build env | `ci.yml:16-27`, `firebase.yml:14-25` |
+    | `SLACK_WEBHOOK_URL` | Secret | Deploy notifications | `firebase.yml:165` |
+    | `GITHUB_TOKEN` | Secret | Built-in token | `ci.yml:187` |
+    | `FIREBASE_PROJECT` | Workflow env | `yelo-dashboard-v2`. Deploys authenticate with workload identity, not a key | `firebase.yml:13,140-144` |
+  </Accordion>
+  <Accordion title="Cloudflare Workers">
+    | Worker | Name | Kind | Purpose | Where |
+    | --- | --- | --- | --- | --- |
+    | `yelo-og` | `ENVIRONMENT` | Var (`production`) | `development` enables `/og/_gallery`, `/og/_sign`, and `?svg=1` | `workers/og/wrangler.jsonc`, `src/index.ts:12,23` |
+    | `yelo-og` | `OG_SIGNING_SECRET` | Secret | Verifies signed OG URLs. Must equal the API value | `workers/og/src/index.ts:86` |
+    | `yelo-experience-router` | `SIGNUP_ORIGIN` | Var | Upstream signup site (`https://yelo-signup.web.app`) | `workers/experience-router/wrangler.jsonc`, `src/index.ts:80` |
+    | `yelo-world-cup-router` | `WORLD_CUP_ORIGIN`, `WORLD_CUP_API_ORIGIN` | Var | Upstream site and API | `workers/world-cup-router/wrangler.jsonc`, `src/index.ts:41` |
+
+    No worker declares KV, R2, or D1 bindings. Local secrets go in `workers/<name>/.dev.vars`.
+  </Accordion>
+</AccordionGroup>
+
+## yelo-frontend
+
+`EXPO_PUBLIC_*` values are inlined into the JavaScript bundle. They can change over the air, unlike values read by `app.config.ts`, which are native.
+
+<AccordionGroup>
+  <Accordion title="App runtime (EXPO_PUBLIC)">
+    | Name | Required | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `EXPO_PUBLIC_API_URL` | No | API override for dev and E2E builds. Release builds ignore it | `lib/config.ts:52` |
+    | `EXPO_PUBLIC_APP_ENV` | No | `e2e` switches bundle ids, schemes, API, and disables telemetry | `app.config.ts:59`, `lib/config.ts:54`, `lib/auth/security.ts:4` |
+    | `EXPO_PUBLIC_E2E_AUTH_ORIGIN` | E2E | Extra Auth v3 web origin trusted in E2E | `lib/auth/security.ts:6` |
+    | `EXPO_PUBLIC_IS_PRODUCTION` | No | Enables foreground OTA checks and production logging | `providers/EasUpdateObserver.tsx:9`, `lib/observability/logger.ts:73` |
+    | `EXPO_PUBLIC_POSTHOG_API_KEY` | No | PostHog. Unset disables it | `app/_layout.tsx:290` |
+    | `EXPO_PUBLIC_SENTRY_DSN` | No | Sentry | `app/_layout.tsx:166` |
+    | `EXPO_PUBLIC_DUB_PUBLISHABLE_KEY`, `EXPO_PUBLIC_DUB_DOMAIN` | No | Dub SDK for deferred deep links | `app/_layout.tsx:284-285` |
+    | `EXPO_PUBLIC_PROJECT_ID` | No | Expo push token project | `providers/PushNotificationProvider.tsx:211` |
+    | `EXPO_PUBLIC_SOURCE_COMMIT` | No | Commit shown in settings. Set by OTA Stage | `app/(app)/profile/settings.tsx:97`, `.github/workflows/ota-stage.yml:190` |
+    | `EXPO_PUBLIC_ENABLE_MOCK_DATA` | No | Dev mock data | `lib/dev/mockConfig.ts:14` |
+    | `EXPO_PUBLIC_FAKE_FRIENDS` | No | Dev fake friends | `lib/dev/devFakeFriends.ts:45` |
+    | `EXPO_PUBLIC_DISABLE_ANIMATIONS` | No | Forces reduced motion (E2E) | `hooks/useReduceMotion.ts:8` |
+    | `EXPO_PUBLIC_LOG_REQUESTS` | No | Logs axios requests | `providers/AxiosProvider.tsx:74,92` |
+    | `EXPO_PUBLIC_MAP_TUTORIAL_OVERRIDE` | No | Forces map tutorial state | `lib/map/mapTutorial.ts:32` |
+    | `EXPO_PUBLIC_FEEDBACK_FORCE` | No | Forces the feedback prompt | `lib/prompts/feedbackPrompt.ts:25` |
+    | `EXPO_PUBLIC_ALWAYS_SHOW_DRIVER_MARKETING` | No | Forces the driver marketing screen | `components/onboarding/why-drive/constants.ts:7` |
+  </Accordion>
+  <Accordion title="Native build (app.config.ts)">
+    | Name | Purpose | Where |
+    | --- | --- | --- |
+    | `GOOGLE_SERVICES_JSON` | Android FCM config file path. Default `./google-services.json`. EAS sensitive file variable | `app.config.ts:62` |
+    | `GOOGLE_SERVICES_JSON_E2E` | E2E variant. Default `./google-services.e2e.json` | `app.config.ts:61` |
+  </Accordion>
+  <Accordion title="EAS build profiles">
+    Every profile except `e2e-simulator` uses the `production` EAS environment and sets no inline `env` (`eas.json`).
+
+    | Profile | EAS environment | Inline env |
+    | --- | --- | --- |
+    | `production`, `staging`, `preview`, `development`, `simulator` | `production` | none |
+    | `e2e-simulator` | `preview` | `EXPO_PUBLIC_API_URL` (E2E Cloud Run origin), `EXPO_PUBLIC_APP_ENV=e2e`, `EXPO_PUBLIC_E2E_AUTH_ORIGIN`, `EXPO_PUBLIC_DISABLE_ANIMATIONS=true` |
+
+    The EAS workflow `.eas/workflows/build-and-submit.yml:70` reads `GITHUB_RELEASE_TOKEN` from EAS to dispatch `ios-staging-built` back to GitHub.
+  </Accordion>
+  <Accordion title="GitHub Actions">
+    | Name | Kind | Purpose | Where |
+    | --- | --- | --- | --- |
+    | `EXPO_TOKEN` | Secret | EAS CLI auth | `build.yml:50`, `ota-stage.yml:36`, `ota-promote.yml:47`, `fingerprint.yml:51`, `finalize-app-store-release.yml:173`, `e2e-agent-device.yml:93` |
+    | `SLACK_WEBHOOK_URL` | Secret | Build and OTA notifications | `build.yml:132`, `ota-stage.yml:222`, `ota-promote.yml:186`, `staging-build-slack.yml:21` |
+    | `RELEASE_ADMINS` | Variable | Actors allowed to run production builds, promotes, and finalize | `build.yml:70`, `ota-promote.yml:69`, `finalize-app-store-release.yml:34` |
+    | `YELO_BOT_CLIENT_ID`, `YELO_BOT_PRIVATE_KEY` | Variable, secret | GitHub App for backports and release branches | `backport-supported-release.yml:54-55`, `finalize-app-store-release.yml:64-65` |
+    | `E2E_API_URL`, `E2E_VIEWER_URL`, `E2E_ARTIFACT_SUPABASE_URL` | Variable | E2E target, viewer, artifact store | `e2e-agent-device.yml:216,298,300` |
+    | `E2E_CONTROL_API_KEY`, `E2E_ARTIFACT_SUPABASE_SECRET_KEY` | Secret | E2E control plane and artifact upload | `e2e-agent-device.yml:296-297` |
+  </Accordion>
+  <Accordion title="Local scripts and E2E runner">
+    | Name | Purpose | Where |
+    | --- | --- | --- |
+    | `YELO_API_DIR` | Path to the paired `yelo-api` checkout | `scripts/dev.sh:26` |
+    | `SIM_API_ENV` | `prod` or local API for simulators. Default `prod` | `scripts/dev.sh:129,159` |
+    | `DEV_*`, `SIM_COUNT`, `SIM_1_UDID`, `ANDROID_MODE`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` | Dev session ports, names, and devices | `scripts/dev.sh`, `Makefile` |
+    | `E2E_*` (suite, rig, pairs, devices, timeouts, run id, artifacts, publish) | Agent-device E2E scheduler | `scripts/e2e-scheduler.mjs`, `scripts/e2e-artifacts.mjs`, `scripts/e2e-app-target.mjs` |
+    | `AGENT_DEVICE_IOS_*` | iOS runner bundle ids | `scripts/e2e-scheduler.mjs:38-42` |
+    | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | E2E artifact upload | `scripts/e2e-artifacts.mjs:174-175` |
+    | `ACTIONS_ID_TOKEN_REQUEST_URL`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, `TARGET_PLATFORMS` | Vehicle catalog upload with GitHub OIDC | `scripts/vehicle-catalog.mjs:112-131` |
+  </Accordion>
+</AccordionGroup>
+
+## Values shared across repositories
+
+| Value | Must match |
+| --- | --- |
+| OG signing secret | API `OG_SIGNING_SECRET` and the `yelo-og` Worker secret `OG_SIGNING_SECRET` |
+| Clerk instance | Web `VITE_CLERK_PUBLISHABLE_KEY` and API `CLERK_SECRET_KEY` |
+| Apple Services ID | Web `VITE_APPLE_SERVICES_ID` must appear in API `APPLE_ALLOWED_AUDIENCES` |
+| E2E control key | API `E2E_CONTROL_API_KEY` and mobile CI secret `E2E_CONTROL_API_KEY` |
+| E2E API origin | Mobile `EXPO_PUBLIC_API_URL` (`e2e-simulator`), web `VITE_E2E_API_URL`, and API `AUTH_V3_API_CALLBACK_ORIGIN` in E2E |

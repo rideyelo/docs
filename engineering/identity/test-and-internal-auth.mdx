@@ -1,0 +1,131 @@
+---
+title: "Test, E2E, and internal auth paths"
+description: "Every hardcoded test behavior in Yelo auth: reserved 555 phone numbers, the fixed 12345 code, test and admin email patterns, is_test accounts, E2E mode, the device-test page, and shared-key internal routes."
+---
+
+Yelo auth has several built-in shortcuts for testing. Most of them are **not** limited to non-production environments. This page lists each one, what it bypasses, and where it lives, so you can use them deliberately and spot them in incident reviews.
+
+## Reserved phone numbers
+
+A number is a test number when it normalizes to `+1555` followed by exactly seven digits (`IsTestPhone` in `internal/utilities/phone/phone.go`). The area code must be 555. A real number with a 555 exchange, such as `+12025551234`, is not a test number.
+
+`Normalize` accepts these even though libphonenumber considers area code 555 invalid: 10 digits starting with `555`, or 11 digits starting with `1555`, become `+1555...` before any validation.
+
+| Path | Behavior for a test number |
+| --- | --- |
+| Auth v3 send | No Twilio call. Returns `sent` with no verification SID, so the fallback sweep never touches it. |
+| Auth v3 verify | Only `12345` verifies. Any other code is `invalid`. Twilio is never called. |
+| Auth v3 rate limits | Counted normally: per-attempt, per-number, and per-requester limits all apply. |
+| Auth v2 send | Code is `12345`, stored in Redis. No SMS, and Twilio Verify is never used. |
+| Auth v2 verify | Local compare against `12345` |
+| Legacy SMS (`SendText`) | Returns success without contacting Twilio (`internal/data/twilio/twilio.go`) |
+| Photon iMessage | Skipped (`internal/data/photon/photon.go`) |
+
+<Warning>
+None of these checks look at the environment. Anyone can sign up on production with any `+1555` number and the code `12345`. Accounts created this way through Auth v3 are **not** marked `is_test`, because `resolveInTransaction` never sets `IsTest` when it creates a user.
+</Warning>
+
+Auth v2 matches test numbers with a plain `strings.HasPrefix(phone, "+1555")` (`isTestPhone` in `internal/service/authv2/authv2.go`), without the length check.
+
+## Fixed email codes
+
+Auth v2 school email verification uses fixed codes for some addresses (`isTest`, `isAdmin`, and `buildEmailOtp` in `internal/service/authv2/authv2.go`). Matching is case-insensitive.
+
+| Address pattern | Code | Email sent | New user `is_test` |
+| --- | --- | --- | --- |
+| Starts with `rider`, `driver`, or `test_runner` and ends with `@rideyelo.com` | `12345` | No | Yes |
+| Starts with `test` and ends with `.edu` | `12345` | No | Yes |
+| Starts with `rideyelo@` and ends with `.edu` | `12345` | No | No |
+| Any other `@rideyelo.com` address | `12345` | Yes | No |
+| Everything else | Random 5 digits | Yes | No |
+
+A fixed code still requires the domain to match a school, a subdomain of one, or a fleet whitelist entry.
+
+<Warning>
+The `test*.edu` rule applies at every real school. Anyone can request a code for an address like `test.someone@<any school domain>`, enter `12345` without owning the mailbox, and get `account_type = 'student'` for that school. The same is true for `rideyelo@<school domain>`.
+</Warning>
+
+## Recipes
+
+<Steps>
+  <Step title="Sign in with a reserved number">
+    On the phone step, enter a number such as `(555) 010-0001`. The API normalizes it to `+15550100001`. Enter `12345` as the code. A new number creates a new account and asks for a name. Reuse the same number to return to that account.
+  </Step>
+  <Step title="Mark the account as a test user">
+    Auth v3 doesn't do this for you. An admin sets it from the user detail sheet on the **Users** page (`UserDetailSheet.tsx`), which calls `PUT /dashboard/users/detail/{id}/test-status`. After that, the account can join test or hidden communities and skips location-based community switching.
+  </Step>
+  <Step title="Make the account a student">
+    From **Are you a student?**, choose the email code method and use an address like `test.qa@<school domain>` for a school that exists in `Schools`. Enter `12345`. No email is sent.
+  </Step>
+</Steps>
+
+## What `is_test` changes
+
+| Behavior | Where |
+| --- | --- |
+| Skips location-based community resolution after sign-in | `ActiveCommunityService.Resolve` in `internal/service/authv3/active_community.go` |
+| Allows switching into test and hidden communities | `SetUserActiveCommunityValidated` in `internal/data/repository/queries/user_profile.sql` |
+| Set or cleared by admins | `PUT /dashboard/users/detail/{id}/test-status` |
+
+Signup Slack alerts are skipped separately, by school and email rather than `is_test`, when `SKIP_TEST_SCHOOL_NOTIFICATIONS` is true (the default). The rule skips the school named "Yelo University", the school ID `c9817564-6850-4497-a248-67ea43e32d78`, and any email starting with `test` (`shouldSkipSlackForUser` in `internal/service/notifications/notification.go`).
+
+## E2E mode
+
+The E2E API runs the production image with `E2E_ENABLED=true` and `ENVIRONMENT=e2e`. Setting one without the other fails startup (`Config.validateE2E` in `internal/utilities/config/config.go`).
+
+| Aspect | E2E behavior |
+| --- | --- |
+| Providers | No Google or Apple clients. `GET /authv3/config` reports only phone. |
+| Phone | Reported available even without Twilio Verify. Real numbers still need Verify, which the E2E deployment doesn't configure, so in practice only `+1555` numbers work. |
+| HTTP rate limits | Every per-requester max multiplied by 100 |
+| Phone limits | Per-number and per-requester maxima multiplied by 100. Per-transaction limits unchanged. |
+| Redirect allowlist | Only `yelo-ios` and `yelo-android`, each allowed only `com.rideyelo.e2e://auth/v3/callback` (`AuthV3.validateE2E`) |
+| CORS | Exactly one origin, the public web origin |
+| Keys | All Auth v3 keys required and separated, as in production |
+| Background jobs | `E2E_BACKGROUND_JOBS_ENABLED` must stay false |
+| Fixture control | `/internal/e2e/*` with `X-E2e-Key`, which must be at least 32 bytes |
+
+Fixture actors get deterministic numbers from an FNV hash of the run ID and role (`testPhoneForRole` in `internal/server/http/e2econtrol/routes.go`): `+1555` plus seven digits. Deleting a run also deletes its actors' `AuthTransactions`, found through their `AuthPhoneAttempts`.
+
+On the client side:
+
+- E2E builds (`EXPO_PUBLIC_APP_ENV=e2e`) use the native Auth v3 screens, not the hosted page (`authV3EntryMode`).
+- They use the `com.rideyelo.e2e` scheme for callbacks.
+- `isSafeAuthV3WebURL` also trusts `EXPO_PUBLIC_E2E_AUTH_ORIGIN` in E2E builds.
+- The `maestro` web site ships a second Auth v3 entry that points at the E2E API with the `com.rideyelo.e2e` scheme. See [Sites](/engineering/web/sites#maestro).
+
+## Hosted page device-test mode
+
+The signup site has a device keyboard test mode for Auth v3. It only exists when the Vite dev server runs the signup site with `VITE_AUTH_V3_DEVICE_TEST=true` (`tools/vite/base/config.ts` sets `__AUTH_V3_DEVICE_TEST__` only for `command === 'serve'`). With `?device-test=1`, `captureAuthV3RequestSecret` accepts the fake secret `device-test` and the page renders a keyboard trace. Production builds compile the flag to `false`.
+
+## Shared-key routes
+
+| Route group | Header | Secret | Behavior when unset |
+| --- | --- | --- | --- |
+| `/internal/*` | `X-Internal-Key` | `INTERNAL_API_KEY` | Rejects every request |
+| `/internal/e2e/*` | `X-E2e-Key` | `E2E_CONTROL_API_KEY` | Group not mounted unless E2E is enabled |
+| `/metrics`, `/debug/pprof/` | `Authorization: Bearer` | `METRICS_AUTH_TOKEN` | Open |
+
+Both key middlewares compare in constant time. `GET /internal/context/user` looks a user up by `phone` (normalized, then matched like Auth v2) or `user_id`, and returns profile, test flag, ban flag, and driver progress for automation.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Test phone rule | `yelo-api/internal/utilities/phone/phone.go`, `yelo-api/internal/service/authv3/phone/policy.go` |
+| Auth v3 fixed code | `testVerificationCode` in `yelo-api/internal/service/authv3/phone/adapter.go` |
+| Auth v2 fixed codes | `yelo-api/internal/service/authv2/authv2.go`, `phone.go`, `email.go` |
+| E2E config validation | `yelo-api/internal/utilities/config/config.go`, `AuthV3.validateE2E` in `authv3.go` |
+| E2E multipliers | `e2eAuthV3RateLimitMultiplier` in `yelo-api/internal/service/authv3_composition.go` |
+| E2E fixtures | `yelo-api/internal/server/http/e2econtrol/` |
+| Key middleware | `yelo-api/internal/server/http/middleware.go` |
+| Mobile E2E switches | `yelo-frontend/lib/auth/entryMode.ts`, `yelo-frontend/lib/auth/security.ts` |
+| Device-test mode | `yelo-web/src/sites/signup/auth-v3/requestSecret.ts`, `yelo-web/tools/vite/base/config.ts` |
+
+## Gotchas and edge cases
+
+- **Test numbers can collide with real test accounts.** Phone numbers aren't unique. Two people using `+15551234567` on production share candidate matching. The second sign-in usually lands in the first person's account.
+- **Test numbers skip fallback, not limits.** A load test with one `+1555` number hits the 10-sends-per-hour cap like a real number.
+- **E2E-only Auth v3 users look real.** Users created through the E2E sign-in flow are not `is_test`, and E2E doesn't need them to be, because the E2E database is separate.
+- **Legacy test emails create test users only on first signup.** `isTest` sets `is_test` only when Auth v2 creates a user. Verifying a test email on an existing account doesn't mark it.
+- **`Schools.admin_otp` is unused.** Despite the name, no code path accepts a school's `admin_otp`. The fixed codes above are the only overrides.

@@ -1,0 +1,103 @@
+---
+title: "Onboard a fleet"
+description: "Checklist for setting up a new fleet: payment model, creation, Stripe onboarding, service communities, pricing, vehicles, manager access, drivers, and readiness checks"
+---
+
+A fleet is ready when it's active, serves its communities, has prices riders can see, has drivers online under it, and, for fleet-managed payouts, has a complete Stripe account. This checklist gets a fleet to that state. All steps need the `admin` role unless noted.
+
+Read [Fleets](/concepts/fleets) first, especially [Payment models](/concepts/fleets#payment-models).
+
+## Before you start
+
+Decide the **Payment Model**. You can't change it after you create the fleet.
+
+| Payment model | Who gets paid | Fleet state at creation | Payout-ready when |
+| --- | --- | --- | --- |
+| **Owner Operator** | Each driver, through their own Stripe account | Active, Stripe status `not_required` | Not applicable. Each driver completes their own Stripe onboarding |
+| **Fleet Merchant** | The fleet's Stripe account | **Inactive** until Stripe onboarding completes | Active, **Custom Payouts** on, and Stripe status `complete` |
+
+<Warning>
+A **Fleet Merchant** fleet needs **Custom Payouts** on to be payout-ready. An **Owner Operator** fleet with **Custom Payouts** on can't accept driver joins at all.
+</Warning>
+
+## Checklist
+
+<Steps>
+  <Step title="Create the fleet">
+    In **Fleets** (Configuration group), select **Create Fleet**. Pick the home **Community**, then fill in **Name**, **Payment Model**, **Supported Vehicle Types**, **Primary Vehicle Type**, **Custom Payouts**, and **Require rider confirmation code**. Select **Create Fleet**. See [Create a fleet](/dashboard/fleets#create-a-fleet).
+
+    Creating a fleet also:
+
+    - Creates the fleet's service row for its home community.
+    - Copies pricing. By default, for each supported vehicle type it copies one active price row from another fleet in the community. With **Import from Existing Fleet**, it shares the source fleet's Stripe account and, with **Copy Pricing from Source**, copies the source fleet's prices.
+  </Step>
+  <Step title="Finish Stripe onboarding (Fleet Merchant only)">
+    Copy or open the **Stripe Onboarding Link** from the banner and send it to the fleet's owner. The link expires in about 24 hours. Generate a new one with **Refresh Link** on the **Operations** tab.
+
+    When Stripe reports the account complete, Yelo sets the fleet's Stripe status to `complete` and activates the fleet. If the **Stripe Account** card shows everything enabled but the stored status hasn't changed, see [Payout issues](/runbooks/payout-issues#fix).
+  </Step>
+  <Step title="Set service communities">
+    On the **Operations** tab, open **Service communities** and add any other community the fleet serves. See [Manage service communities](/dashboard/fleets#manage-service-communities). A fleet's prices only reach riders in a community while the service is current, the fleet is active, and the community is active.
+  </Step>
+  <Step title="Review pricing">
+    On **Pricing Management**, check the copied configs for each service community. Copies don't carry **Always shown**, so turn it on where riders should see the fleet's option before any driver is online. Add configs for communities that have none. See [Ride pricing](/dashboard/ride-pricing).
+  </Step>
+  <Step title="Add vehicles">
+    Add fleet-owned vehicles on the fleet editor's **Vehicles** tab, or let owner-operators add their own. See [Fleet vehicles](/dashboard/fleet-vehicles). A driver can only go online with a vehicle from their active fleet or a personal vehicle.
+  </Step>
+  <Step title="Give the fleet manager access">
+    On **Access**, invite the manager as a fleet manager and assign the fleet and community. See [Invite a user](/dashboard/access-and-settings#invite-a-user) and [Fleet managers](/dashboard/access-and-settings#fleet-managers).
+  </Step>
+  <Step title="Bring in drivers">
+    - **Invitation link.** On **Invite drivers**, create the fleet's reusable link and share it. It's only available when the fleet can accept joins. See [Fleet driver invitations](/fleets/driver-invitations).
+    - **Existing driver.** On the driver's user detail sheet, use **Assign active payout fleet**. It only lists payout-ready fleets.
+    - **Community default.** Set the fleet as the community's **Primary Fleet** so new drivers without a fleet join it.
+
+    Drivers still need an activated application. See [Driver can't go online](/runbooks/driver-cannot-go-online).
+  </Step>
+  <Step title="Optional: hours, QR payments, and the PIN">
+    - Attach the fleet's Google Calendar for operating hours. See [Fleet operating hours](/admin/operating-hours).
+    - Create QR payment links for street pickups and tips. See [QR payments](/dashboard/qr-payments).
+    - **Require rider confirmation code** is on by default. Turn it off if drivers should start rides with a single tap.
+  </Step>
+</Steps>
+
+## Verify
+
+**Read-only:**
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+
+SELECT name, is_active, deleted_at, payment_model, has_custom_payouts,
+       stripe_status, supported_vehicle_types, requires_confirmation_code
+FROM "Fleets" WHERE id = '<fleet-id>';
+
+SELECT community_id, enabled, origin, retired_at
+FROM "FleetCommunityServices" WHERE fleet_id = '<fleet-id>';
+
+SELECT community_id, vehicle_type, pricing_type, is_featured
+FROM "RidePriceParameters" WHERE fleet_id = '<fleet-id>' AND end_time IS NULL;
+
+SELECT fd.driver_id, fd.is_active
+FROM "FleetDrivers" fd WHERE fd.fleet_id = '<fleet-id>';
+
+ROLLBACK;
+```
+
+- The fleet is active and not deleted. For **Fleet Merchant**, `has_custom_payouts` is true and `stripe_status` is `complete`.
+- Each service community has `enabled = true`.
+- Each service community has open price rows for the fleet's vehicle types.
+- The fleet appears under **Select a payout-ready fleet** on a user detail sheet (**Fleet Merchant** only).
+- The invitation card can create a link.
+- A test driver joins, goes online under the fleet, and sees board rides priced for this fleet.
+
+## Common gaps
+
+| Missed step | Symptom |
+| --- | --- |
+| Stripe onboarding not finished | Fleet stays inactive, prices don't reach riders, and **Invitations unavailable**. |
+| **Custom Payouts** off on a **Fleet Merchant** fleet | Not payout-ready. Drivers see **Fleet Payouts Unavailable** when selecting it. |
+| **Custom Payouts** on for **Owner Operator** | Joins are refused. |
+| No **Always shown** pricing | The fleet's option only appears while one of its drivers is online with auto-queue on. |
+| Service community retired | The fleet's prices disappear in that community. |

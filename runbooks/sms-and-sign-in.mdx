@@ -1,0 +1,102 @@
+---
+title: "SMS, OTP, and sign-in failures"
+description: "Diagnose phone codes that don't arrive, rate limits, OTP fallback, account conflicts, provider sign-in failures, and friend bump texts"
+---
+
+Phone sign-in uses Auth v3: `POST /authv3/providers/phone/send`, then `/verify`. Codes go through Twilio Verify. Twilio reports delivery to `POST /twilio-verify-events`, and the `AuthV3OtpFallback` loop re-sends codes that were never confirmed. Read [How sign-in works](/concepts/accounts-and-sign-in#how-sign-in-works) and [Rate limiting and OTP delivery](/engineering/api/authentication#rate-limiting-and-otp-delivery) first.
+
+## Symptoms
+
+| What the user sees | Cause in code |
+| --- | --- |
+| No code arrives | Twilio accepted the send but didn't confirm delivery, or the send failed |
+| **Try Again Later** ("Too many phone verification attempts") | A cooldown, per-attempt limit, or cross-transaction limit was hit, or Twilio rate-limited the send |
+| **Can't Text That Number** | Twilio rejected the number on send |
+| **Wrong Code** | The code didn't match |
+| **Code Expired** | Twilio says the verification expired |
+| Provider unavailable error | The phone provider or its `twilio-verify` circuit breaker is failing |
+| Sign-in fails right away with a 503 | Auth v3 is off. `/authv3/*` returns `AuthV3UnavailableError` |
+| Sign-in stops with an account-merge or identity-conflict error | The verified phone or identity belongs to another established account |
+| "account is unavailable" | The identity is on the denied list for a banned or disabled user |
+
+## Diagnose
+
+<Steps>
+  <Step title="Check platform-wide delivery">
+    In metrics, compare `otp_delivery_status_total` by status with `otp_fallback_sent_total`. A jump in fallbacks or a drop in `delivered` points at Twilio. Slack gets an alert when the `twilio` or `twilio-verify` breaker opens.
+
+    In Cloud Logging, look for `[twilio-verify-events] failed to record delivery status`. If only one of `TWILIO_EVENTS_WEBHOOK_USER` and `TWILIO_EVENTS_WEBHOOK_PASSWORD` is set, the webhook rejects every event, so nothing is ever confirmed.
+  </Step>
+  <Step title="Check one user's account">
+    Call `GET /internal/context/user?phone=<number>` with the `X-Internal-Key` header. The phone can be in any format. It returns `found`, `is_banned`, `is_deleted`, `is_test`, `profile_completed`, and `phone_verified` without exposing contact data.
+  </Step>
+  <Step title="Check the user's recent attempts">
+    **Read-only.** This filters by phone number, so treat the query and its results as sensitive. Never select `otp_code`.
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT created_at, expires_at, last_sent_at, send_count, verify_count,
+           verified_at, delivery_status, delivered_at, fallback_sent_at
+    FROM "AuthPhoneAttempts"
+    WHERE phone_number = '<e164-phone>'
+    ORDER BY created_at DESC
+    LIMIT 10;
+
+    ROLLBACK;
+    ```
+
+    | Pattern | Meaning |
+    | --- | --- |
+    | `send_count` at 5, or sends 30 seconds apart | Per-attempt limits. The user starts a new sign-in after the cooldown. |
+    | Many attempts in the last hour | Per-phone or per-requester hourly limits. See [Phone code limits](/concepts/accounts-and-sign-in#phone-code-limits). |
+    | `delivery_status` null and `fallback_sent_at` null after a minute | No delivery event and no fallback. Check that `TWILIO_OTP_FALLBACK_ENABLED` is true. |
+    | `fallback_sent_at` set | The fallback SMS went out through the Twilio messaging API. |
+    | `verified_at` set | Verification succeeded. The problem is later in the flow. |
+
+    Expired attempts are deleted every 5 minutes, so an empty result can mean the attempt is old.
+  </Step>
+  <Step title="Check for duplicate accounts">
+    Run `yelo-api/scripts/auth-v3-user-preflight.sql` (read-only). It counts duplicate phone groups among undeleted users and prints sample user IDs, never phone numbers.
+  </Step>
+</Steps>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Rate limits and cooldowns">
+    Limits reset on their own. The user waits out the 30-second cooldown, or the hour for hourly limits, then starts a fresh sign-in. There's no tool to reset `AuthRateLimitCounters`. Its dimensions are HMAC-hashed, so you can't find a user's row anyway.
+  </Accordion>
+  <Accordion title="Option 2: Code not delivered">
+    - Confirm `TWILIO_OTP_FALLBACK_ENABLED=true` on the running revision. Fallback re-sends after `TWILIO_OTP_FALLBACK_DELAY` (60 seconds by default), every `TWILIO_OTP_SWEEP_INTERVAL` (15 seconds by default).
+    - If the Verify events webhook is misconfigured, fix the credentials so both user and password are set, or neither.
+    - Suggest **Continue with Apple** or **Continue with Google**. The user still verifies a phone if the account doesn't have one.
+  </Accordion>
+  <Accordion title="Option 3: Wrong or shared phone number">
+    If a number is on the wrong account, an admin can correct it on the other account with **Edit profile**. Saving fails with "This phone number is already assigned to an account or lead." if the number is still on another account or lead.
+
+    <Warning>
+    There's no tool to merge two accounts. Account-merge and identity-conflict errors need engineering review.
+    </Warning>
+  </Accordion>
+  <Accordion title="Option 4: SMS opt-out and friend bumps">
+    Friend bump texts only go to users with a phone and no `sms_opted_out_at`. A user who replied `STOP` texts `START`, `UNSTOP`, or `YES` to opt back in. The `/twilio-webhook` route records both. Bump texts are dropped after 15 minutes and limited to one per recipient every 5 minutes. Recipients who can't get SMS get a push instead. See [Friend bumps](/concepts/notifications#friend-bumps).
+  </Accordion>
+  <Accordion title="Option 5: Dashboard sign-in">
+    Dashboard access uses Clerk, not Auth v3. A user who signs in but sees no pages usually has a missing or malformed role assignment. See [Missing or malformed assignments](/administration/dashboard-roles#missing-or-malformed-assignments).
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- The user's latest `AuthPhoneAttempts` row has `verified_at` set.
+- `/internal/context/user` returns `phone_verified: true` and `profile_completed: true`.
+- `otp_delivery_status_total` for `delivered` returns to its usual rate.
+
+## Root causes seen in code
+
+- **Unconfirmed Verify sends.** The `otp_delivery_status_total` metric exists because about 3% of Verify sends never confirm. Fallback only covers them when it's enabled.
+- **Webhook credentials set halfway** reject every delivery event.
+- **Deleting an account doesn't block its phone.** Deletion removes identities without a denied-subject record, so the number can sign up again. Bans and disabled users are recorded in `AuthDeniedSubjects`.
+- **Duplicate phone numbers** across undeleted users cause account-merge errors, and make dashboard test sends fail.
+- **Auth v3 off.** Without `AUTH_V3_ENABLED=true`, the router mounts only the 503 handler for `/authv3`.

@@ -1,0 +1,183 @@
+---
+title: "Concurrency and races"
+description: "How ride commands serialize: participant lock discovery and retry, row locks, the advisory lock, revision compare-and-set, the revision finalizer, and walked-through race scenarios with who wins and what the loser sees."
+---
+
+Matching is contended by design. Drivers accept from the board, auto-queue assigns in the background on every instance, riders cancel, and sweeps expire. None of this is coordinated in Go. Every decision that matters is rechecked in a Postgres transaction under row locks.
+
+This page goes deeper than [Rides implementation](/engineering/api/rides-implementation#locking-and-command-transactions).
+
+## The lock hierarchy
+
+| Level | Mechanism | Scope | Used by |
+| --- | --- | --- | --- |
+| 1 | `SELECT ... FOR UPDATE` on `Users` rows, sorted by UUID string | Every participant of the command | Every ride command, offline purge, expiry sweep |
+| 2 | `SELECT ... FOR UPDATE` on the `Rides` row | The target ride | Every ride command with a ride ID |
+| 3 | `pg_advisory_lock(key)` on a dedicated connection | Queue head preparation | `prepareAndPromoteQueuedRide` only |
+| 4 | Redis `SET NX` | Activation cooldowns, rescue alerts | Activation loop |
+
+Levels 1 and 2 are always taken in that order. The advisory lock is taken before any row locks, outside the transaction.
+
+## Participant discovery
+
+`beginOwnedRideCommand` in `internal/data/repository/ride_command.go`:
+
+```go
+for range 4 {
+	tx := BeginTx()
+	state, retry, lockErr := lockRideCommand(ctx, tx, rideID, driverID)
+	if lockErr == nil && !retry {
+		// reject if another durable ride operation owns the ride
+		return tx, state, nil
+	}
+	rollback(tx)
+}
+return rideCommandConflict()
+```
+
+`lockRideCommand` does this inside the transaction:
+
+1. `ListRideCommandParticipants(rideID, driverID)` finds everyone the command could affect: the ride's rider and driver, the explicit driver argument, and the riders and drivers of every ride in those drivers' `queued`, `driver_en_route`, `driver_waiting`, or `in_progress` states.
+2. `lockRideParticipants` sorts the IDs as strings, deduplicates them, and locks each `Users` row.
+3. It runs the discovery query again. If a new participant appeared, it signals a retry.
+4. `LockRideCommandState` locks the ride row and reads `rider_id`, `driver_id`, `status`, `lifecycle_revision`, and `assignment_generation`. If the ride's rider or driver isn't in the locked set, it signals a retry.
+
+Locks are never appended out of order. A participant set that changed means rollback and start over. After 4 attempts, the command fails with a conflict.
+
+The error every lock and state check returns:
+
+```go
+errors.NewError("ride state changed", errors.ErrorTypeInput, "Ride Unavailable",
+	"This ride has changed. Refresh and try again.")
+```
+
+That's a 400.
+
+### Why queue riders are locked
+
+Promoting a queued ride changes another rider's ride. The revision finalizer also bumps `ride_state_revision` on every rider in the affected drivers' queues. Locking them up front means the finalizer's `UPDATE "Users"` never waits on a lock outside the sorted order.
+
+## Compare-and-set on revisions
+
+`Rides.lifecycle_revision` increments on every committed lifecycle command. Two places use it as an optimistic check across work done outside a transaction:
+
+| Caller | Reads revision | External work | Checks revision |
+| --- | --- | --- | --- |
+| `persistPaymentIntent` | `ride.LifecycleRevision` from the service's `GetByID` | Stripe clone and intent creation | `AddPaymentIntent` rejects a mismatch with a conflict and cancels the new intent |
+| `prepareRidePickup` | Same | Mapbox route, Stripe authorization | `PromoteQueuedRide` rejects a mismatch with a conflict |
+
+`AddPaymentIntent` doesn't increment the revision itself. Two writers that read the same revision can both pass.
+
+## The revision finalizer
+
+`finalizeOwnedRideCommand` in `ride_revision.go` runs last in every lifecycle transaction. For each changed ride:
+
+```sql
+UPDATE "Rides" SET lifecycle_revision=lifecycle_revision+1,
+ assignment_generation=assignment_generation+CASE WHEN
+ (CASE WHEN status IN ('queued','driver_en_route','driver_waiting','in_progress') THEN driver_id ELSE NULL END)
+ IS DISTINCT FROM sqlc.narg(previous_assignment)::uuid THEN 1 ELSE 0 END
+WHERE id=sqlc.arg(ride_id)::uuid RETURNING rider_id,driver_id;
+```
+
+`assignment_generation` counts changes of the effective assignee:
+
+| Command | Previous assignee | New assignee | Generation |
+| --- | --- | --- | --- |
+| Confirm | None | None | Unchanged |
+| Accept or auto-queue | None | Driver | +1 |
+| Promotion | Driver | Same driver | Unchanged |
+| Requeue or unqueue | Driver | None | +1 |
+| Complete | Driver | None, because `pending_rider_rating` isn't an assigned status | +1 |
+| Expiry | None | None | Unchanged |
+
+Then it collects the rider, the current driver, the previous assignee, and every rider queued behind any of those drivers. It increments each one's `Users.ride_state_revision` in sorted order. When `RIDE_STATE_SNAPSHOT_ENABLED` is true, it enqueues a `ride_state_changed` push per user with event key `ride_state:{userId}:{revision}`, in the same transaction.
+
+The finalizer also re-runs `HasConflictingRideOperation` over every changed ride. Nothing in production writes `RideOperations` yet, because `RideOperationJournal` isn't wired into service construction.
+
+## The advisory lock
+
+`sqlRideRepository.AcquireLock` in `ride.go`:
+
+```go
+lockKey := int64(binary.BigEndian.Uint64(b[:8]))
+conn, err := r.postgresDb.Acquire(ctx)
+queries.AcquireRideAdvisoryLock(ctx, lockKey)           // SELECT pg_advisory_lock($1)
+unlockCtx := context.WithoutCancel(ctx)
+release := func() {
+	defer conn.Release()
+	queries.ReleaseRideAdvisoryLock(unlockCtx, lockKey) // SELECT pg_advisory_unlock($1)
+}
+```
+
+It exists so two preparers don't both call Mapbox and Stripe for the same queue head. It isn't a correctness lock. The guarded promotion rechecks everything under row locks, so a missing advisory lock would cost a duplicate authorization, not a double promotion.
+
+It holds a pool connection for the whole preparation, including network calls to Mapbox and Stripe. `RefreshQueueSummaries` runs up to 10 recoveries at once per instance, so it can hold up to 10 connections.
+
+## Race scenarios
+
+<AccordionGroup>
+  <Accordion title="Two drivers tap accept on the same ride">
+    Both pass the service checks, which read without locks. For a paid ride, both run `processRidePayment`:
+
+    1. Both see `payment_intent_id` null and create separate Stripe intents on their own merchants.
+    2. Both call `AddPaymentIntent` with the same expected revision. They serialize on the ride lock, both pass the revision check, and the second write overwrites the first.
+    3. Both call `Ride.Accept`. The first commits the assignment. The second sees `status = 'queued'` or `driver_en_route` and fails with "Ride request no longer valid".
+
+    The loser gets a 400. Their Stripe intent stays authorized and isn't cancelled by `AcceptRide`. If the loser wrote the intent last, the ride now references the loser's intent and merchant while the winner is assigned. `Complete` captures through the winner's merchant. Treat this as a suspected bug: the revision check in `AddPaymentIntent` doesn't catch it, because `AddPaymentIntent` doesn't bump the revision.
+  </Accordion>
+  <Accordion title="Manual accept races auto-queue">
+    Both reach `acceptRide`. The ride row lock serializes them. The first to commit wins. If auto-queue loses, `assignWinner` logs "may have been claimed" and doesn't set the attempted flag. The ride is no longer unmatched, so it isn't retried. If the driver loses, they see "Ride request no longer valid".
+  </Accordion>
+  <Accordion title="Rider cancels while a driver accepts">
+    `RideService.Cancel` passes a `RideStateExpectation` with the status and driver it read. `validateRideExpectation` compares them under lock.
+
+    - Accept commits after the cancel read the ride but before it took the lock: the cancel sees a driver it didn't expect and gets "This ride has changed". The app must refetch and cancel again, this time against the assigned ride.
+    - Cancel commits first: the accept sees `status = 'complete'` and fails with "Ride request no longer valid". If the driver already authorized payment, that intent is left behind.
+  </Accordion>
+  <Accordion title="Accept races the expiry sweep">
+    The sweep locks riders only, then runs a conditional update that rechecks `status = 'confirmed' AND driver_id IS NULL`. Accept locks the same rider as a participant. Whichever holds the rider lock first wins. If accept wins, the sweep's update skips the ride. If the sweep wins, accept sees `complete`.
+  </Accordion>
+  <Accordion title="Completion races idle recovery">
+    Driver completes ride A with ride B queued. At the same moment, the 3-minute loop runs `RecoverIdleQueue` for the same driver.
+
+    - Recovery reads "no active ride" only if A is already past `in_progress`. If it is, it takes the advisory lock and preflights `PromoteAutoQueuedRide`.
+    - `Complete` runs `PromoteNextQueuedRide` in its own transaction. Both need the driver's `Users` lock.
+    - Whichever commits first moves B to `driver_en_route`. The other's `NOT EXISTS (active ride)` or `status = 'queued'` guard fails. Recovery treats that input error as success and returns quietly.
+  </Accordion>
+  <Accordion title="Two instances recover the same driver">
+    Both reach `prepareAndPromoteQueuedRide` for the same queue head. The advisory lock admits one. The second waits, then preflights against a ride that is no longer `queued`, gets an input error, and returns `nil`.
+  </Accordion>
+  <Accordion title="Driver switches vehicle during an accept">
+    The service reads the session's vehicle and fleet before locking. `validateRideAssignmentDriver` rereads under the driver's `Users` lock and requires exactly one open session matching those IDs. Session rotation takes the same driver lock, so either the rotation or the accept sees the other's result.
+  </Accordion>
+  <Accordion title="Two instances fire the same activation tier">
+    Both read `ride:notify:{rideId}` as tier 0 and pick tier 1. Cooldown `SETNX` gives each instance a disjoint set of drivers. Their event keys differ because they hash different recipients, so both pushes go out. Tier 1 reaches up to twice its target. Both then write tier 1.
+  </Accordion>
+  <Accordion title="Decline retried after the ride was matched">
+    `DeclineRide` returns success if the driver is already in `declined_drivers`, before checking status. A retry after a lost response succeeds even if another driver has since accepted.
+  </Accordion>
+</AccordionGroup>
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Participant discovery and locking | `yelo-api/internal/data/repository/ride_command.go` (`beginOwnedRideCommand`, `lockRideCommand`, `lockRideParticipants`) |
+| Lock and discovery SQL | `yelo-api/internal/data/repository/queries/ride_command.sql` (`ListRideCommandParticipants`, `LockRideCommandParticipant`, `LockRideCommandState`) |
+| State validation | `ride_command.go` (`validateRideExpectation`, `validateRideDriverCommand`, `validateRideAssignmentDriver`, `validateRideAssignmentAdmission`) |
+| Revision finalizer | `yelo-api/internal/data/repository/ride_revision.go` |
+| Advisory lock | `yelo-api/internal/data/repository/ride.go` (`AcquireLock`), `queries/ride_driver.sql` |
+| Revision compare-and-set | `yelo-api/internal/data/repository/ride_lifecycle.go` (`AddPaymentIntent`), `ride_matching.go` (`PromoteQueuedRide`) |
+| Operation journal | `yelo-api/internal/data/repository/ride_operation.go` |
+| Regression tests | `yelo-api/internal/data/repository/ride_command_regression_test.go`, `ride_assignment_admission_test.go`, `ride_transition_matrix_test.go`, `idle_auto_queue_test.go` |
+
+## Gotchas and edge cases
+
+- **Admission failures surface as 500s.** `acceptRide` wraps `validateRideAssignmentAdmission` errors with `NewServerErrorFromError`. A fleet mismatch or a full queue detected under lock returns "Something Went Wrong" instead of a 400 conflict.
+- **Service-level reads are advisory.** `AcceptRide` reads the driver, session, and ride without locks. Every check is repeated in the transaction except payment, which runs between the reads and the transaction.
+- **External calls happen outside transactions.** Mapbox and Stripe calls never run while row locks are held. They do run while the advisory lock is held.
+- **Four retries isn't much under churn.** A driver whose queue changes on every attempt, for example during a burst of auto-queue assignments, can see "This ride has changed" without any real conflict on the ride itself.
+- **Payment failure on a manual accept doesn't cancel the ride.** `clonePaymentMethodToMerchant` and `createPaymentIntent` call `RideService.Cancel` with the accepting driver as the request user. The driver isn't assigned yet, so `Cancel` returns "User is not authorized to cancel this ride" and the error is only logged. The ride stays `confirmed` on the board, despite the "ride canceled" wording in the cancel reason.
+- **Unlock failures leak the advisory lock.** The connection returns to the pool still holding it. See [Queue promotion and recovery](/engineering/matching/queue-promotion#idle-recovery).
+- **Redis isn't transactional with Postgres.** Board updates, notified sets, tiers, and flags are written after commit. A crash between commit and those writes leaves Redis behind. Every Redis-derived decision is revalidated in Postgres before it assigns anything.

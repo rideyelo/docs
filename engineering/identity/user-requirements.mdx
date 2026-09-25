@@ -1,0 +1,136 @@
+---
+title: "Account states and requirements"
+description: "Every account state that changes what a Yelo user can do, and every gate that enforces it on the API and in the mobile app: provisional, incomplete, phoneless, banned, deleted, and test accounts."
+---
+
+A `Users` row can be in several partial states. Each state is enforced in a different place, and some are enforced only on the client. This page lists every state, where it's checked, and what the user sees.
+
+## State flags
+
+| State | Stored as | Set by | Cleared by |
+| --- | --- | --- | --- |
+| Provisional | `auth_v3_provisional = true` | App-channel Google or Apple sign-up that created a user | Phone verification (`ResolveProvisionalUser`) or profile completion |
+| Profile incomplete | `profile_completed = false`, or a blank first or last name | Every new Auth v3 and Auth v2 user | `POST /authv3/profile` or Auth v2 profile setup |
+| No verified phone | `phone_number = ''` | Web-channel OAuth sign-ups, legacy rows | Any successful phone OTP that fills the blank column |
+| Verified | `is_verified = true` | Auth v3 user creation, school verification, provisional recovery | Nothing clears it |
+| Student | `account_type = 'student'`, `school_id` set | School verification | Removing the last school proof |
+| SMS opted out | `sms_opted_out_at` set | Carrier `STOP` through the Twilio webhook | Carrier `START` |
+| Banned | `is_banned = true` | Direct database edit | Direct database edit |
+| Deleted | `is_deleted = true`, `deleted_at` set | Account deletion | Never |
+| Test | `is_test = true` | Auth v2 test email patterns, dashboard toggle | Dashboard toggle |
+
+A non-empty `phone_number` is treated as verified everywhere. Auth v3 only ever writes a phone after an OTP check. Legacy phones are grandfathered as verified (`RequireVerifiedPhone` in `internal/service/userrequirements/user.go`).
+
+## API gates
+
+### Request-level
+
+| Gate | Where | Response |
+| --- | --- | --- |
+| Deleted | `getValidateJWTMiddleware` via `AuthCache` | 401 `AccountDeletedError` |
+| Banned | Same | 401 `AccountBannedError` |
+| Presignup token on a user route | `ValidateJwt` rejects `sub: pending`. Presignup tokens with a user ID fail the `user` role check. | 401 |
+| Onboarding token on a user route | Different signing key, so the general middleware can't parse it | 401 |
+| Deleted or banned on optional-auth routes | `getOptionalAuthMiddleware` | Request continues as anonymous |
+
+### Sign-in
+
+| Gate | Where | Result |
+| --- | --- | --- |
+| App-channel OAuth without a phone | `requiresSupplementalPhone` in `internal/service/authv3/resolver.go` | No token until a phone is verified |
+| Profile incomplete | `ExchangeToken` | `needs_profile` with an onboarding token |
+| Deleted or banned at exchange | `ExchangeToken` | 401 `account is unavailable` |
+| Deleted or banned at resolution | `resolveInTransaction` | 401, plus a permanent denied subject |
+
+### Feature-level
+
+| Requirement | Check | Applied to | Error |
+| --- | --- | --- | --- |
+| Verified phone | `RequireVerifiedPhone` | Going online (`RefreshOnlineStatus`), driver profile photo, license photos, activation, activation reconcile, vehicle registration, Stripe Express account creation | 409 `PhoneRequired`, "Phone Number Required" |
+| Completed profile | `RequireCompletedProfile` | Stripe Express account creation, so Stripe receives a legal name | 409 `ProfileRequired`, "Finish Your Profile" |
+| SMS consent | `CanReceiveSMS` | Friend bump texts (`internal/service/notifications/bump.go`) | Text skipped |
+| Student | `filterRideTypesForRider` | Vehicle options | Student-only ride types hidden |
+
+<Warning>
+Every verified-phone check is behind `DRIVER_VERIFIED_PHONE_REQUIRED`, which defaults to `false`. With the flag off, only the profile check on Stripe account creation is enforced. The profile check only runs when the user has no `stripe_merchant_id` yet.
+</Warning>
+
+`GET /driver/signup-status` reports `phone_verified` from `HasVerifiedPhone` regardless of the flag, so the app can prompt early (`DriverService.GetSignupStatus`).
+
+### Community changes
+
+| Path | Extra conditions |
+| --- | --- |
+| Auth v3 resolve after sign-in (`UpdateAuthV3ActiveCommunity`) | Transaction must be a completed `signin` owned by the user. User not deleted or banned. No ride in `confirmed`, `driver_en_route`, `driver_waiting`, or `in_progress` as rider or driver. |
+| Auth v3 authenticated resolve with coordinates (`UpdateAuthenticatedActiveCommunity`) | Not deleted or banned, and the same active-ride block |
+| Manual switch (`PUT /user/community`, `SetUserActiveCommunityValidated`) | Community active, not the admin-only community `87794dc9-7ef8-438c-b2e8-ba6fd77e66aa`, not test or hidden unless the user is a test user, user not deleted or banned. No active-ride check. |
+
+Test users skip location-based community resolution entirely (`ActiveCommunityService.Resolve` returns `already_active` for `IsTest`).
+
+## Mobile gates
+
+<Steps>
+  <Step title="Session present">
+    `app/(app)/_layout.tsx` requires a JWT in SecureStore. Without one, the app shows `/(auth-v3)`.
+  </Step>
+  <Step title="Profile initialized">
+    `resolveOnboardingRoute` in `lib/navigation/onboardingRoute.ts` sends any session whose `/authv2/status` has `profile_initialized: false` back to Auth v3, and the layout signs the user out once so a clean transaction starts. `profile_initialized` is `Users.profile_completed`.
+  </Step>
+  <Step title="Account not deleted">
+    `AxiosProvider` signs out on the first 401 with `AccountDeletedError`. `useCurrentUser` also signs out on `status: "deleted"`.
+  </Step>
+  <Step title="Mode">
+    `StatusGuard` sends `driving` users to `/drive`. See [Accounts and sign-in](/concepts/accounts-and-sign-in#riding-or-driving-server-driven-status).
+  </Step>
+</Steps>
+
+The mobile client doesn't handle `PhoneRequired` or `ProfileRequired` specially. They surface as ordinary API errors with the server's title and body.
+
+## Web gates
+
+The signup site sends its token only to `/authv2/`, `/user/`, `/world-cup/`, and `/tips/` (`installSignupAuthInterceptor`). On 401 with `AccountDeletedError`, it clears the token and returns to `/`. The `/delete-account` page only proceeds when Auth v2 phone verification returns `authenticated`. See [Account deletion and retention](/engineering/identity/account-deletion#web-deletion-page).
+
+## Error reference
+
+Identity errors carry a machine-readable `error.code` in the v2 envelope. HTTP status comes from `MapErrorToStatusCode` in `internal/server/http/httperrors/errors.go`. Provider callbacks can't return JSON to the app, so they redirect with a stable `error` value instead (`stableCallbackError`). The hosted page maps both into its own error kinds (`authV3ErrorKind` in `yelo-web/src/sites/signup/auth-v3/authV3Errors.ts`).
+
+| `error.code` | HTTP | Callback `error` | Hosted page kind | Meaning |
+| --- | --- | --- | --- | --- |
+| `IdentityConflictError` | 409 | `identity_conflict` | `conflict` (terminal) | Identity belongs to another account, or the account already has this provider |
+| `AccountMergeRequiredError` | 409 | `account_merge_required` | `account_merge_required` (terminal) | Verified phone belongs to an established account |
+| `ExistingAccountVerificationRequiredError` | 409 | `verify_existing_account` | `verify_existing_account` (terminal) | An unverified legacy account holds this email |
+| `AuthTransactionExpiredError` | 410 | `transaction_expired` | `expired` (terminal) | Transaction, attempt, or StudID attempt expired or already finished |
+| `HandoffCodeInvalidError` | 400 | Not used | `invalid` | Code unknown, used, expired, or PKCE, client, or redirect mismatch |
+| `AuthV3UnavailableError` | 503 | `temporarily_unavailable` | `provider_unavailable` | Auth v3 disabled or a dependency is missing |
+| `ProviderUnavailableError` | 503 | `temporarily_unavailable` | `provider_unavailable` | Google, Apple, Twilio, StudID, or the requester resolver failed |
+| `RateLimitError` | 429 | Not used. Callback limits reject before the transaction is known, so they return JSON. | `rate_limit` | Any HTTP or phone limit. `Retry-After` is set. |
+| `PhoneRequiredError` | 409 | Not used | Not used | Feature needs a verified phone |
+| `ProfileRequiredError` | 409 | Not used | Not used | Feature needs first and last name |
+| `AccountDeletedError` | 401 | Not used | `invalid` | Token belongs to a deleted account |
+| `AccountBannedError` | 401 | Not used | Not used | Token belongs to a banned account |
+| `DuplicateError` ("Sign in already started") | 409 | Not used | `conflict` | Attempt ID bound to a transaction that progressed |
+
+The hosted page shows terminal errors without a retry button. It maps **any** 409 without a more specific code to `conflict`, so every 409 it receives ends the flow on a terminal screen.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Requirement helpers | `yelo-api/internal/service/userrequirements/user.go` |
+| Driver enforcement | `getDriverForPhoneEnforcement`, `getDriverForOnline` in `yelo-api/internal/service/driver/driver.go` |
+| Vehicle enforcement | `yelo-api/internal/service/vehicle/vehicle.go` |
+| Stripe enforcement | `validateExpressAccountUser` in `yelo-api/internal/service/stripeaccount/stripeaccount.go` |
+| Error constructors | `NewPhoneRequiredError`, `NewProfileRequiredError` in `yelo-api/internal/utilities/errors/error.go` |
+| Status mapping | `MapErrorToStatusCode` in `yelo-api/internal/server/http/httperrors/errors.go` |
+| Community SQL | `yelo-api/internal/data/repository/queries/authv3.sql`, `yelo-api/internal/data/repository/queries/user_profile.sql` |
+| Mobile guards | `yelo-frontend/app/(app)/_layout.tsx`, `yelo-frontend/lib/navigation/onboardingRoute.ts`, `yelo-frontend/providers/AxiosProvider.tsx` |
+
+## Gotchas and edge cases
+
+- **Two meanings of "complete".** Auth v3 treats a profile as complete when `profile_completed` is true and both names are non-blank. Auth v2's `IsV2SignupComplete` also requires a non-empty phone **and** email. An Auth v3 phone sign-up has no email, so Auth v2 sees it as incomplete forever, and `/authv2/status` returns `needs_email` for it even though the app treats it as finished.
+- **Auth v2 phone login refuses Auth v3 phone users.** Because of the rule above, `POST /authv2/phone/verify-otp` returns a presignup token, not a full token, for an Auth v3 phone-only account.
+- **Web OAuth users can't use phone-gated features.** A web-channel Google or Apple account has no phone. With `DRIVER_VERIFIED_PHONE_REQUIRED=true`, it can't upload driver photos or go online until it adds one. There is no dedicated "add phone" endpoint outside a sign-in transaction.
+- **Bans are soft for up to 15 minutes.** The auth cache holds `is_banned` for 15 minutes and nothing invalidates it on a ban.
+- **Banned users see their profile.** `/authv2/status` uses the presignup middleware, which doesn't check bans. The mobile app keeps its session and shows errors on every other call.
+- **`is_verified` is sticky.** Nothing resets it. Disconnecting every school proof leaves the account `is_verified` and still an Auth v3 matching candidate.
+- **Manual community switches ignore active rides.** Only the Auth v3 resolve paths block a switch during an active ride.

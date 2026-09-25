@@ -24,7 +24,7 @@ At accept and at complete, `selectStripeMerchantID` in `internal/service/ride/dr
 - The **fleet's** account, when the driver's current session fleet has `has_custom_payouts = true` and a `stripe_merchant_id`.
 - Otherwise, the **driver's own** account.
 
-The chosen account is saved as `Rides.stripe_merchant_id` and recorded in a `merchant_selected` ride event with `merchant_type` of `fleet` or `driver`. Every later capture, cancel, and tip for that ride uses the saved account.
+At accept, the chosen account is saved as `Rides.stripe_merchant_id`. Both selections are recorded in a `merchant_selected` ride event with `merchant_type` of `fleet` or `driver`. Cancels, tip captures, and deferred fare captures use the saved account. The immediate capture at complete does not: `Complete` recomputes the account from the driver's current session fleet and captures on that, without updating the ride row. See [Ride payment intents](/engineering/payments/ride-payment-intents).
 
 A fleet is fully payout-ready (`Fleet.IsDriverPayoutReady`) when it's active, uses the `fleet_merchant` payment model, has custom payouts on, and its Stripe status is `complete`. Drivers only receive immediate ride pushes if they're payout-ready themselves or through such a fleet. See [Fleets](/concepts/fleets#payment-models) for payment models and [Fleet driver invitations](/fleets/driver-invitations) for how fleets and owner-operators enroll drivers.
 

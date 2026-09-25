@@ -1,0 +1,155 @@
+---
+title: "Tokens, sessions, and keys"
+description: "Every app credential Yelo issues, how each is validated, every expiry, refresh, and revocation path, the auth cache, and how to rotate each signing and encryption key."
+---
+
+This page lists every token the Yelo API mints for app users, what accepts it, and every way it stops working. For the Clerk side, see [Dashboard identity with Clerk](/engineering/identity/dashboard-clerk).
+
+## Issuance paths
+
+Every place in `yelo-api` that signs an app token:
+
+| Call site | Token | Lifetime | Community claim |
+| --- | --- | --- | --- |
+| `ExchangeToken` (`internal/service/authv3/token.go`), app channel, profile complete | Native user | 6,360 hours | User's `community_id` |
+| `ExchangeToken`, web channel, profile complete | Web user | `AUTH_V3_WEB_ACCESS_TOKEN_TTL` (at most 1 hour) | User's `community_id` |
+| `ExchangeToken`, profile incomplete | Onboarding | 15 minutes (app), web access TTL (web) | User's `community_id` |
+| `FinishProfile` (`onboarding.go`) | Native user | 6,360 hours, for both channels | User's `community_id` |
+| `RefreshWebSession` (`web_session.go`) | Web user | Web access TTL | User's `community_id` |
+| `ActiveCommunityService.resultWithToken` (`active_community.go`) | Native user or onboarding, matching the caller's scope | 6,360 hours or onboarding TTL | Resolved community |
+| `UserHandler.UpdateActiveCommunity` (`internal/server/http/user/user_handler.go`) | Native user | 6,360 hours | Requested community |
+| Auth v2 phone verify, email verify, profile setup (`internal/service/authv2/`) | Native user or presignup | 6,360 hours or 1 hour | User's community or `*` |
+| `StripeAccountService.GetOnboardingLink` (`internal/service/stripeaccount/stripeaccount.go`) | Native user shape | 24 hours | User's `community_id` |
+
+All user and presignup tokens are HS256 with `iss` and `aud` set to `api.rideyelo.com`, `sub` set to the user UUID (or `pending` for a presignup token with no user), and `app_metadata.authorization.roles` plus `app_metadata.community` (a UUID or `*`). Presignup tokens add `app_metadata.phone`. Onboarding tokens add a top-level `auth_transaction_id`.
+
+## Validation paths
+
+| Middleware | Accepts | Key | Checks account state |
+| --- | --- | --- | --- |
+| `getValidateJWTMiddleware` | Roles in token, then `getRequireRoleMiddleware` requires `user` | `KEY`, then `KEY_LEGACY` | Yes, via `AuthCache` |
+| `getOptionalAuthMiddleware` | Same, never rejects | Same | Yes. Deleted or banned callers continue anonymously. |
+| `getValidatePresignupTokenMiddleware` | `presignup` or `user` | Same | No |
+| `ValidateOnboardingTokenMiddleware` | Only `authv3_onboarding` | `AUTH_V3_ONBOARDING_JWT_KEY` only | Service checks deleted and banned per call |
+| `ReauthOnboardingLink` (`/stripe-reauth/onboarding?jwt=`) | Any token that parses, via `GetUserIDFromToken` | `KEY`, then `KEY_LEGACY` | No |
+
+`parseToken` in `internal/utilities/jwt/jwt.go`:
+
+- Accepts any HMAC algorithm (`HS256`, `HS384`, `HS512`). RSA and `none` fail.
+- Tries `KEY` first. It falls through to each `KEY_LEGACY` entry **only** when the error is a signature failure. An expired token signed with an old key fails immediately.
+- Does not verify `iss` or `aud`.
+- Uses `golang-jwt/v5` defaults, so `exp` is checked if present but not required.
+
+`ValidateJwt` strips the first 7 characters of the header without checking that they are `Bearer `, rejects a `sub` of `pending`, and rejects a community claim that is neither `*` nor a UUID.
+
+`ValidateOnboardingToken` in `internal/service/authv3/jwt.go` is strict: `HS256` only, exact issuer and audience, `exp` and `iat` required, `sub` and `auth_transaction_id` must be non-nil UUIDs, and roles must be exactly `["authv3_onboarding"]`.
+
+## The auth cache
+
+`AuthCache.Check` in `internal/data/redis/auth_cache.go` runs on every JWT-protected request.
+
+- Key `auth:user:<uuid>`, value `<deleted>:<banned>:<community uuid>`, TTL 15 minutes.
+- On a miss or when Redis is disabled, it reads Postgres and repopulates the cache.
+- A corrupt value is deleted and treated as a miss.
+- A non-nil community from the cache **replaces** the token's community claim. Community switches take effect without a new token once the cache is invalidated.
+
+`Invalidate` is called by account deletion, community switches (`UserService.UpdateActiveCommunity`, `ActiveCommunityService`), `DriverService` at `driver.go:606`, and fleet joins (`fleet_join.go:97`).
+
+<Warning>
+There is no API or dashboard action that bans a user. Bans are set directly in the database, and nothing invalidates the cache. A newly banned user keeps working for up to 15 minutes, until their cache entry expires.
+</Warning>
+
+## Lifecycles
+
+<Tabs>
+  <Tab title="Native user token">
+    - Stored in SecureStore under `session`. There is no refresh token.
+    - Expires 6,360 hours (about 265 days) after issue. Any re-issue resets the clock: a community switch, a community resolve that returns a token, or a new sign-in.
+    - Can't be revoked individually. It stops working when the account is deleted (`AccountDeletedError`, 401), banned (`AccountBannedError`, 401), or when its signing key is removed from both `KEY` and `KEY_LEGACY`.
+    - Mobile swaps tokens through `SessionProvider.signIn`, which gates outgoing requests for up to 15 seconds until `GET /authv2/status` succeeds with the new token. See [Auth and onboarding](/engineering/mobile/auth-and-onboarding#swapping-tokens).
+  </Tab>
+  <Tab title="Web session">
+    - The access token lives in `sessionStorage` (`yelo_signup_jwt`) and is sent only on signup-site calls to `/authv2/`, `/user/`, `/world-cup/`, and `/tips/` (`installSignupAuthInterceptor`).
+    - The refresh token is a 32-byte random value in the `__Host-yelo_refresh` cookie: `Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`, `Expires` set to the idle expiry.
+    - `POST /authv3/session/refresh` requires the header `X-Api-Version: v2`. A custom header forces a CORS preflight, which blocks cross-site form posts.
+    - Each refresh creates a new session row in the same `family_id`, marks the old row `rotated_at`, and returns a new access token. The idle expiry slides to `min(now + idle TTL, absolute expiry)`. The absolute expiry never moves.
+    - On a 401 from a signup call, the web client refreshes once, deduplicated per tab, and retries. If the body is `AccountDeletedError`, it clears the token and goes to `/` without refreshing.
+  </Tab>
+  <Tab title="Onboarding token">
+    - Returned by `POST /token` with status `needs_profile`.
+    - Valid only on `GET /authv3/status`, `POST /authv3/profile`, and `POST /authv3/community/resolve`.
+    - Tied to one transaction. `onboardingState` requires that transaction to be `completed`, `signin`, and owned by the token's user.
+    - Expires after 15 minutes on app, or the web access TTL on web. Mobile checks `exp` before saving it to the draft and fails with `transaction_expired` if it's already past.
+  </Tab>
+  <Tab title="Presignup token">
+    - Issued by Auth v2 phone verification for users without a finished v2 signup, and by email verification during a v2 signup.
+    - 1 hour. `sub` is the user UUID or `pending`.
+    - Accepted on `/authv2/*` phases 2 and 3, `/world-cup/*` authenticated routes, and `/tips/*` authenticated routes.
+    - The presignup middleware never checks whether the user exists, is deleted, or is banned. Handlers must check.
+  </Tab>
+</Tabs>
+
+## Web session revocation
+
+`RefreshWebSession` treats refresh tokens as single use:
+
+| Situation | Effect |
+| --- | --- |
+| Token not found | 401 `web session is invalid`. Cookie cleared. |
+| Token already rotated or revoked (replay) | Revoke the **entire family**, 401 |
+| Idle or absolute expiry passed | Revoke the family, 401 `web session has expired` |
+| User deleted or banned | Revoke the family, 401 `account is unavailable` |
+| Rotation update affects zero rows | Revoke the family, 401 |
+| `POST /session/logout` | Revoke the family of the presented cookie and clear it. Always succeeds, even with no cookie. |
+| Account deletion | `RevokeAllWebSessionsForUser`, best effort |
+
+## Key rotation
+
+<AccordionGroup>
+  <Accordion title="KEY (app JWT signing key)">
+    1. Deploy with the new value in `KEY` and the old value appended to `KEY_LEGACY`.
+    2. New tokens use the new key. Old tokens validate through the legacy fallback.
+    3. Remove the old key from `KEY_LEGACY` only after 6,360 hours, or accept that remaining mobile sessions sign out.
+
+    `KEY` must never equal any Auth v3 HMAC or encryption key. Startup validation rejects that.
+  </Accordion>
+  <Accordion title="AUTH_V3_ONBOARDING_JWT_KEY">
+    There's no legacy list. Rotating it invalidates onboarding tokens issued in the last 15 minutes (or 1 hour for web). Affected users see an error on **Finish profile** and restart sign-in.
+  </Accordion>
+  <Accordion title="AUTH_V3_STATE_HMAC_KEYS">
+    Comma-separated base64 keys, newest first. The first key seals new secrets and provider state. Every key verifies. Keep the old key for at least the transaction TTL. Changing the first key also changes nonces derived for attempt IDs, so an in-progress attempt's retry is rejected.
+  </Accordion>
+  <Accordion title="AUTH_V3_REFRESH_TOKEN_KEYS">
+    Comma-separated base64 keys of exactly 32 bytes, newest first. Ciphertexts start with `YRT1` and an 8-byte key ID derived from the key. Decryption picks the matching key. Apple refresh tokens and StudID verification secrets share this keyring. Never remove a key while any `AuthIdentities.apple_refresh_token_ciphertext` uses it, or deletion for those users fails with `ProviderUnavailable`.
+  </Accordion>
+  <Accordion title="AUTH_V3_RATE_LIMIT_HMAC_KEY">
+    Rotation resets every counter, because the new key computes different hashes. It also breaks the phone binding of any live attempt, so a user mid-OTP gets `phone verification transaction is invalid`. Rotate during low traffic.
+  </Accordion>
+  <Accordion title="AUTH_V3_SUBJECT_HMAC_KEY">
+    Don't rotate without a data migration. Every `AuthDeniedSubjects` row becomes unreachable, which un-bans every banned provider subject.
+  </Accordion>
+</AccordionGroup>
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| App JWT sign and parse | `yelo-api/internal/utilities/jwt/jwt.go` |
+| Auth v3 issuer and onboarding validation | `yelo-api/internal/service/authv3/jwt.go` |
+| Web sessions | `yelo-api/internal/service/authv3/web_session.go`, `RefreshSession` and `LogoutSession` in `yelo-api/internal/server/http/authv3/handler.go` |
+| Middleware | `yelo-api/internal/server/http/middleware.go` |
+| Auth cache | `yelo-api/internal/data/redis/auth_cache.go` |
+| Refresh token cipher | `yelo-api/internal/service/authv3/refresh_token_cipher.go` |
+| Key validation | `hmacKeySeparationProblems` in `yelo-api/internal/utilities/config/authv3.go` |
+| Web client token handling | `yelo-web/src/shared/signup/signupSession.ts`, `signupTokenStore.ts` |
+| Mobile session | `yelo-frontend/providers/SessionProvider.tsx`, `yelo-frontend/providers/AxiosProvider.tsx` |
+
+## Gotchas and edge cases
+
+- **Two tabs, one family.** The web client deduplicates refresh within a tab only. Two tabs that refresh at the same moment race on the same refresh token. The loser sees `rotated_at` set, treats it as replay, and revokes the family, which signs out both tabs.
+- **Web refresh has no serialization retry.** Unlike exchange and resolution, `RefreshWebSession` runs its transaction once. A serialization failure surfaces as a 500 and clears the cookie.
+- **Web onboarding becomes a full token on refresh.** A web user with an incomplete profile gets a web session at exchange. The first refresh returns a full `user` token. See [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions#gotchas-and-edge-cases).
+- **Finishing a profile on web yields a long-lived token.** `FinishProfile` always calls `IssueUserToken`, so a web client that calls it gets a 6,360-hour token in `sessionStorage`. The current web page never calls it.
+- **The Stripe reauth link carries a bearer token in a URL.** `GetOnboardingLink` embeds a 24-hour user token in the Stripe return URL query string. `ReauthOnboardingLink` accepts any parseable token there, including one with a `presignup` role, and doesn't check deleted or banned state.
+- **Presignup routes ignore bans.** A banned user's full token still passes `/authv2/status`. On mobile that is the `currentUser` query, so a banned user's profile loads while every other call returns 401. The app only signs out on `AccountDeletedError`, not `AccountBannedError`.
+- **Tokens without `exp` never expire.** `parseToken` doesn't require `exp`. Every Yelo issuer sets it, but a hand-signed token with the production key and no `exp` would be accepted forever.

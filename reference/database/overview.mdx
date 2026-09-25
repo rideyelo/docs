@@ -1,0 +1,357 @@
+---
+title: "Database overview"
+description: "How to read the yelo-api database reference, the schema conventions for naming, keys, timestamps, soft deletes, enums, and migrations, and an index of every table with its purpose and reference page."
+---
+
+These pages describe the Postgres schema that yelo-api runs on, as produced by applying every file in `migrations/`. They document what the code does with each table, not what the product intends. For how the API talks to Postgres (pools, sqlc, transactions, Redis), see [Data layer](/engineering/api/data-layer).
+
+## How to read these pages
+
+Each reference page groups related tables. For each table you'll find:
+
+- **Purpose** and the migration that created it.
+- **Columns** as `name | type | null | default | meaning`. Types use Postgres names: `timestamptz` is `timestamp with time zone`, and `timestamp` means without time zone. "Meaning" is based on the queries and services that use the column. "No foreign key" is called out wherever a column looks like a reference but isn't constrained.
+- **Keys, indexes, constraints, and triggers.**
+- **Writers and readers**, as query files in `internal/data/repository/queries/`, repository files in `internal/data/repository/`, and service packages in `internal/service/`.
+- **Gotchas** for behavior that's easy to get wrong.
+
+Every page has a Mermaid diagram of its tables. Tables owned by another page appear in the diagram when they're referenced, and are linked through the [table index](#table-index).
+
+### Reproducing the schema
+
+`internal/data/sqlc/schema.sql` is generated from every `*.up.sql` file by `scripts/sqlc/generate-schema.sh`, with the same Supabase rewrites the integration tests use. To inspect the real current schema, apply it to a scratch Postgres 15 and dump it:
+
+```bash
+docker run -d --name yelo-schema -e POSTGRES_PASSWORD=pw postgres:15-alpine
+docker exec yelo-schema psql -U postgres -c "create role anon; create role authenticated; create role service_role;"
+docker cp internal/data/sqlc/schema.sql yelo-schema:/schema.sql
+docker exec yelo-schema psql -U postgres -q -f /schema.sql
+docker exec yelo-schema pg_dump -U postgres -s --no-owner --no-privileges -n public > schema-dump.sql
+docker rm -f yelo-schema
+```
+
+One statement fails outside a transaction (`LOCK TABLE ... IN SHARE ROW EXCLUSIVE MODE` from `000318_calendar_snapshots`). The error is harmless for a schema dump.
+
+## Conventions
+
+### Naming
+
+- Tables are PascalCase, plural, quoted identifiers: `"Rides"`, `"RideEvents"`, `"AuthTransactions"`. Always quote them in SQL. Of 155 relations, 148 follow this pattern.
+- Exceptions are snake_case: `referral_sources`, `surge_history`, and River's `river_job`, `river_leader`, `river_migration`, `river_notification`, and `river_queue`.
+- Columns are snake_case. A few columns are named after SQL keywords, such as `"timestamp"` on `Issues`, `Messages`, `ReferralPayouts`, and others, and `lock` on `Users`. Quote them when needed.
+- Constraint and index names are inconsistent: Postgres defaults (`"Rides_pkey"`), `idx_<table>_<cols>`, and `<table>_<purpose>` all appear. `EnterpriseAccounts` still has the primary key name `Merchants_pkey` from a rename.
+- Two views exist: `ActiveFleetCommunityServices` and `AvailableDriverVehicles`.
+
+### Primary keys and IDs
+
+- 86 tables use `id uuid DEFAULT gen_random_uuid()`.
+- Append-only logs use `bigint` identity or sequence IDs: `RideEvents`, `ContactSyncRequests`, `QuoSyncRequests`, `CommunityTimezoneHistory`, `FleetCommunityServiceHistory`, `GoogleCalendarOwnerHistory`, and River's tables.
+- Some tables take a caller-supplied `uuid` with no default so retries are idempotent, for example `RideOperations`, `RideCancellationQuotes`, and `MarketingSegments`.
+- One-to-one extension tables use the parent key as their primary key, such as `DriverApplications.user_id`, `DeviceTelemetry.user_id`, and `UserAttribution.user_id`.
+- Singleton tables enforce one row with a boolean key and `CHECK`: `StripeReconciliationControl.id`, `GoogleCalendarOwner.singleton`, and `PricingJitterSettings.singleton`.
+- Four tables have no primary key: `Issues`, `RideIssues`, `PaymentIntents`, and `Referrals`.
+
+### Sentinels and foreign keys
+
+The schema has 156 foreign keys, but many core references are unconstrained. `Rides.rider_id`, `Rides.driver_id`, `Rides.community_id`, `Users.community_id`, `Users.school_id`, and `DriverApplications.user_id` are examples. Each page lists them.
+
+Older columns use sentinels instead of `NULL`:
+
+- The zero UUID `00000000-0000-0000-0000-000000000000` is the default for `Users.home_community_id` and `Rides.community_id`, and auth v2 stores it in `Users.school_id`.
+- Empty string `''` means "none" for many `text` columns, such as `Users.email`, `Users.phone_number`, `Users.stripe_customer_id`, and `Users.stripe_merchant_id`. Unique indexes on these columns are partial (`WHERE email <> ''`).
+- `Discounts.community_id` defaults to one specific community UUID.
+
+Treat both `NULL` and the sentinel as "absent" when you query these columns.
+
+### Timestamps
+
+- Almost all time columns are `timestamptz`. Community-local times, such as operating windows, are interpreted in the community's time zone.
+- Five columns are `timestamp` without time zone: `Rides.at_pickup_time`, `PhoneOTPs.created_at`, `Waitlist.created_at`, `Messages.timestamp`, and `EventStoryViews.viewed_at`. `MarkRideAtPickup` casts its argument to `::timestamp`.
+- Creation time is usually `created_at DEFAULT now()`. Older tables use `created_timestamp` (`Users`, `DriverAutoQueueLog`, `KpiManualLog`, `ScheduledCommunityNotifications`) or `"timestamp"`.
+- No trigger maintains `updated_at`. Queries set `updated_at = NOW()` explicitly, so a new `UPDATE` must do the same.
+- The ride operation tables default to `clock_timestamp()`, the wall-clock time of the insert, instead of `now()`, the transaction start time.
+
+### Soft deletes and retirement
+
+There's no single soft-delete pattern:
+
+| Table | Mechanism | Meaning |
+| --- | --- | --- |
+| `Users` | `is_deleted`, `deleted_at` | Personal fields scrubbed, row kept. See [Users](/reference/database/users-and-identity#soft-delete). |
+| `Fleets` | `deleted_at` | Deleted fleets also get `is_active = false`. Queries filter `deleted_at IS NULL`. |
+| `Communities` | `archived_at` | Archived communities. |
+| `Vehicles` | `archived_at` | Archived vehicles. |
+| `FleetCommunityServices` | `retired_at` | Retired fleet service in a community. |
+| Many others | `is_active` | Disabled but kept, for example `QrPaymentConfigs`, `Zones`, `NotificationTemplates`. |
+
+Hard deletes are used for runtime state such as expired auth rows. Hard-deleting a user is blocked by several foreign keys without `ON DELETE` actions.
+
+### Enums
+
+Five Postgres `ENUM` types exist, and only `kpi_manual_metric` and River's `river_job_state` are attached to columns. The codebase instead uses `text` columns, either with a `CHECK (col = ANY (ARRAY[...]))` constraint or constrained only by Go constants. A `CHECK` can be changed with a normal migration, while enum labels can't be removed. See [Enums and value sets](/reference/database/enums).
+
+### Money
+
+Money types vary by era: `real` dollars on `Rides`, `numeric(10,2)` dollars for tips and pre-authorization, `double precision` dollars on referral and ticket tables, and `bigint` cents on QR payment tables and `Rides.stripe_fee_cents`. See [Payments](/reference/database/payments#gotchas).
+
+### Triggers and database functions
+
+59 triggers do real work in the database. The main families are:
+
+- **Outbox triggers** that queue sync work: `enqueue_contact_sync`, `enqueue_contact_activity`, `enqueue_quo_user_sync`, and `enqueue_community_cache_invalidation`.
+- **Place resolution**: `attach_yelo_place` on `Rides`, `Bumps`, and location tables assigns `PlaceIdentities`.
+- **Integrity guards** that raise errors: `guard_fleet_vehicle_session`, `protect_ride_operation_identity`, `protect_ride_cancellation_quote`, and the calendar guards.
+- **Counters**: `assign_ride_message_index` and `remove_ride_message_counts`.
+- **Legacy compatibility**: `retire_user_waitlisting` and `sync_legacy_telemetry_push_token`.
+
+When a write seems to have side effects you can't find in Go, check the table's triggers.
+
+### Row level security
+
+Row level security is enabled on 17 tables, including `Users`, `Rides`, `Communities`, `Schools`, and `EmailOTPs`, with no policies. This blocks Supabase's `anon` and `authenticated` roles. The API connects as the table owner and isn't affected.
+
+### Migrations
+
+- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 345 versions, each with both files.
+- `000001_init_db` is a `pg_dump` of the original Supabase schema, including Supabase extensions. Integration tests and the sqlc schema generator rewrite the Supabase-only statements.
+- `000242_river_v1` through `000248_river_v7` vendor River's own migrations.
+- Some migrations change data as well as schema, for example `000254_normalize_user_shape`, which backfilled missing `DriverApplications` rows.
+- Migrations `000082` and `000083` repeat the same rename on `Rides`. The release script and test tooling work around it. See [Platform and admin](/reference/database/platform-and-admin).
+- Applied migrations are immutable. See [Data layer](/engineering/api/data-layer#migrations) for the workflow and checks.
+
+## Table index
+
+Every table and view in the `public` schema, grouped by reference page, plus golang-migrate's `schema_migrations`.
+
+### Users and identity
+
+[Users and identity](/reference/database/users-and-identity)
+
+| Table | Purpose |
+| --- | --- |
+| `Users` | Account row for every rider and driver. |
+| `AuthTransactions` | One auth v3 sign-in or link attempt. |
+| `AuthIdentities` | Verified Google, Apple, or phone identity per user. |
+| `AuthHandoffCodes` | Single-use code exchanged for a token. |
+| `AuthPhoneAttempts` | Phone OTP step for an auth transaction. |
+| `AuthWebSessions` | Rotating web refresh tokens. |
+| `AuthDeniedSubjects` | Provider subjects blocked from signing in. |
+| `AuthRateLimitCounters` | Fixed-window auth rate limit counters. |
+| `UserLegalAcceptances` | Terms and Privacy versions each user accepted. |
+| `EducationVerifications` | Verified school affiliation per provider. |
+| `StudIDVerificationAttempts` | Pending StudID verifications. |
+| `UserEducationClaims` | World Cup `.edu` email claims. |
+| `DriverApplications` | Driver onboarding status per user. |
+| `DeviceTelemetry` | Latest device and permission snapshot per user. |
+| `EmailOTPs` | Retired email OTP table. |
+| `PhoneOTPs` | Retired phone OTP table. |
+| `Waitlist` | Retired pre-launch waitlist. |
+
+### Rides
+
+[Rides](/reference/database/rides)
+
+| Table | Purpose |
+| --- | --- |
+| `Rides` | One row per ride request through completion or cancellation. |
+| `RideEvents` | Best-effort timeline of ride events. |
+| `RideOperations` | Idempotent journal of money-affecting ride commands (not yet wired). |
+| `RideOperationSteps` | Provider calls inside a ride operation. |
+| `RideCancellationQuotes` | Immutable short-lived cancellation fee quotes. |
+| `RideMessages` | Rider and driver chat messages. |
+| `RideMessageStreams` | Per-ride message counter and latest index. |
+| `RideMessageSenderCounts` | Per-ride, per-sender message counts. |
+| `RideMessageReads` | Per-participant read cursors. |
+| `Messages` | Retired chat table. |
+| `RideDeclineReasons` | Why a driver declined a ride. |
+| `Issues` | User problem reports. |
+| `RideIssues` | Retired ride issue table. |
+| `DriverSessions` | Driver online sessions with fleet and vehicle. |
+| `DriverAutoQueueLog` | Intervals with auto-queue enabled. |
+| `RideNotifications` | Dedupe log of ride push notifications. |
+| `DriverNotifications` | Log of community-wide driver broadcasts. |
+| `Bumps` | Short-lived "heading to" intents sent to friends. |
+
+### Payments
+
+[Payments](/reference/database/payments)
+
+| Table | Purpose |
+| --- | --- |
+| `StripeReconciliation` | Per connected account reconciliation schedule and outcome. |
+| `StripeReconciliationControl` | Singleton global Stripe cooldown. |
+| `QrPaymentConfigs` | Fleet QR payment pages backed by Stripe payment links. |
+| `QrPayments` | Completed QR and tip checkout sessions. |
+| `QrTipVisits` | Tip page visit and checkout funnel. |
+| `PaymentIntents` | Legacy PaymentIntent log with no current writer. |
+| `ReferralPayouts` | Manual ledger of referral reward payouts. |
+
+### Markets, communities, and zones
+
+[Markets, communities, and zones](/reference/database/markets-communities-and-zones)
+
+| Table | Purpose |
+| --- | --- |
+| `Communities` | Markets with bounds, time zone, and settings. |
+| `CommunityOperatingWindows` | Weekly open hours per community. |
+| `CommunityCacheInvalidations` | Outbox that versions community cache invalidations. |
+| `CommunityTimezoneHistory` | History of community time zone changes. |
+| `Schools` | Schools, email domains, and their community. |
+| `SchoolAcademicEntities` | External academic entity IDs mapped to schools. |
+| `SchoolCatalogMetadata` | Imported school catalog details. |
+| `SchoolCoordinateProvenance` | Source of each school's coordinates. |
+| `Zones` | Geographic zones inside a community. |
+| `ZonePricing` | Per-zone, per-fleet price overrides. |
+| `VehicleTypes` | Configurable vehicle type catalog. |
+| `RidePriceParameters` | Base and per-minute pricing per community, fleet, and vehicle type. |
+| `RidePriceTiers` | Distance tiers for a price parameter. |
+| `PricingJitterSettings` | Singleton price jitter configuration. |
+| `surge_history` | Surge multipliers set and ended by operators. |
+| `RideDemandCurves` | Demand curves per community, weekday, and time window. |
+| `Discounts` | Address-targeted ride discounts. |
+| `ActivationConfigs` | Driver activation tiers and rescue settings per community. |
+| `MobilityFeeds` | GBFS and GTFS feeds shown on the map. |
+| `EnterpriseAccounts` | Business partners that own venues, events, and ads. |
+
+### Locations and places
+
+[Locations and places](/reference/database/markets-locations-and-places)
+
+| Table | Purpose |
+| --- | --- |
+| `PlaceIdentities` | Canonical place records. |
+| `PlaceIdentityKeys` | Snapshot keys mapped to canonical places. |
+| `PlaceProviderAliases` | Provider place IDs mapped to canonical places. |
+| `PlaceProfiles` | Provider details for a canonical place. |
+| `PlaceIdentityBackfills` | Progress of place identity backfills. |
+| `Locations` | Shared location cache and curated points of interest. |
+| `CommunityTopLocations` | Canonical top locations per community. |
+| `CommunityTopLocationSettings` | Top location settings per community. |
+| `TopLocations` | Legacy top locations. |
+| `FeaturedLocations` | Featured destinations per community. |
+| `LikedLocations` | Places a user liked. |
+| `RecentLocations` | Places a user recently selected. |
+| `SavedLocations` | Places a user saved, such as home or work. |
+| `LocationFollows` | Location follow subscriptions. |
+| `LocationBrowses` | Location search result interactions. |
+| `LocationSearches` | Location search analytics. |
+| `LocationShares` | Location share analytics. |
+| `Venues` | Partner venues. |
+
+### Fleets, vehicles, and drivers
+
+[Fleets, vehicles, and driver supply](/reference/database/fleets-and-vehicles). `DriverApplications`, `DriverSessions`, and `DriverAutoQueueLog` are also described there, from the fleet side.
+
+| Table | Purpose |
+| --- | --- |
+| `Fleets` | Fleets with payout model and Stripe account. |
+| `FleetDrivers` | Driver membership in fleets. |
+| `FleetVehicles` | Vehicles assigned to fleets. |
+| `FleetDriverWhitelist` | Emails pre-approved to join a fleet. |
+| `FleetCommunityServices` | Which fleets serve which communities. |
+| `FleetCommunityServiceHistory` | Audit history of fleet community services. |
+| `ActiveFleetCommunityServices` | View of enabled services for active, non-deleted fleets in active, unarchived communities. |
+| `AvailableDriverVehicles` | View of vehicles a driver can use: personal vehicles outside any fleet, plus vehicles of active fleets the driver belongs to. |
+| `Vehicles` | Driver vehicles and their review status. |
+| `MobileVehicleCatalogs` | Published mobile vehicle catalog assets per platform. |
+| `DriverLeads` | Driver recruiting CRM leads. |
+| `DriverLeadNotes` | Notes on driver leads. |
+
+### Fleet calendars
+
+[Fleet calendars](/reference/database/fleets-calendars)
+
+| Table | Purpose |
+| --- | --- |
+| `CalendarConnections` | Google Calendar sources for fleet operating hours. |
+| `CalendarSnapshots` | Published calendar snapshot revisions. |
+| `CalendarOccurrences` | Calendar events in a snapshot. |
+| `CalendarOccurrenceZones` | Zones attached to calendar events. |
+| `CalendarScopeAliases` | Calendar keys mapped to communities and zones. |
+| `GoogleCalendarOwner` | Singleton Google account used for calendar access. |
+| `GoogleCalendarOwnerHistory` | History of the calendar owner account. |
+| `GoogleCalendarOAuthFlows` | In-progress Google Calendar OAuth flows. |
+
+### Growth and monetization
+
+[Growth and monetization](/reference/database/growth-and-engagement). QR payment tables and `ReferralPayouts` are also described there; the [Payments](/reference/database/payments) page covers their Stripe side.
+
+| Table | Purpose |
+| --- | --- |
+| `Referrals` | Referrer and referee pairs. |
+| `ReferralRewards` | Referral reward values per community and period. |
+| `ReferralLookup` | Referral codes by phone number. |
+| `referral_sources` | Self-reported referral sources. |
+| `AttributionTouches` | Marketing attribution touches. |
+| `UserAttribution` | First and last touch and conversion times per user. |
+| `Coupons` | Partner coupons. |
+| `CouponClaims` | Coupons claimed by users. |
+| `Ads` | Ads shown in the app. |
+| `AdImpressions` | Ad impressions and clicks. |
+| `PromoBars` | Community promo bars. |
+| `PromoBanners` | Community promo banners. |
+| `WorldCupWinners` | Schools that reached the World Cup threshold. |
+| `ShortenedLinks` | Short link path mappings. |
+
+### Events, spots, and social graph
+
+[Events, spots, and social graph](/reference/database/growth-events-and-social)
+
+| Table | Purpose |
+| --- | --- |
+| `Events` | Community events in the feed. |
+| `EventAttendees` | Users attending an event. |
+| `EventShares` | Event share analytics. |
+| `EventStoryViews` | Event story views. |
+| `EventFollows` | Event follow subscriptions. |
+| `TicketPurchases` | Event ticket purchases. |
+| `PollQuestions` | Community polls. |
+| `PollAnswers` | Poll answers. |
+| `CommunitySpots` | Spotlighted events and locations. |
+| `Friendships` | Friend pairs. |
+| `UserContacts` | Hashed phone contacts uploaded by users. |
+| `ContactSyncRequests` | Outbox of CRM contact sync requests. |
+| `ContactSyncProviders` | CRM provider configuration and mode. |
+| `ContactSyncState` | Per provider and user contact sync state. |
+| `ContactSyncIdentities` | Remote CRM identities per user. |
+| `ContactSyncScanProgress` | Contact sync scan cursors. |
+
+### Notifications and messaging
+
+[Notifications and messaging](/reference/database/growth-notifications-and-messaging). `DriverNotifications` is also described there.
+
+| Table | Purpose |
+| --- | --- |
+| `NotificationTemplates` | Notification templates by code and locale. |
+| `NotificationTemplateVariants` | A/B variants of a template. |
+| `NotificationTemplateVersions` | Snapshots of template and variant versions. |
+| `NotificationPolicies` | Quiet hours and cooldowns per community and template. |
+| `Notifications` | One push notification send. |
+| `NotificationCohorts` | Template variant cohorts within a send. |
+| `NotificationDeliveries` | Per-recipient delivery of a notification. |
+| `ScheduledCommunityNotifications` | Community notifications scheduled from the dashboard. |
+| `TextMessages` | SMS messages sent to users. |
+| `QuoSyncRequests` | Outbox of OpenPhone (Quo) user sync requests. |
+| `QuoSyncOutbox` | Legacy Quo sync outbox. |
+| `QuoScanProgress` | Quo scan cursor. |
+| `QuoRequestControl` | Quo request pacing and cooldown. |
+| `MarketingSegments` | CRM marketing segments. |
+| `MarketingSegmentMembers` | Contacts in a marketing segment. |
+
+### Platform and admin
+
+[Platform and admin](/reference/database/platform-and-admin). `DeviceTelemetry`, `AuthRateLimitCounters`, `Issues`, and `Messages` are also described there.
+
+| Table | Purpose |
+| --- | --- |
+| `ProviderRequestControl` | Per provider request pacing and cooldown. |
+| `KpiManualLog` | Manually entered KPI values. |
+| `GooglePlayReleaseStates` | Observed Google Play release states. |
+| `E2ERuns` | End-to-end test fixture runs. |
+| `DashboardUsers` | Legacy dashboard login accounts. No current code references it. |
+| `river_job` | River job queue. |
+| `river_queue` | River queue settings. |
+| `river_leader` | River leader election. |
+| `river_migration` | River migration ledger. |
+| `river_notification` | River notifications. |
+| `schema_migrations` | golang-migrate version table, created at runtime rather than by a migration file. |

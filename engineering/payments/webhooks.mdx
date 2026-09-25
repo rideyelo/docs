@@ -1,0 +1,173 @@
+---
+title: "Stripe webhooks"
+description: "How POST /stripe-webhook verifies, routes, and applies every Stripe event Yelo handles, what each handler writes, how replays and out-of-order delivery behave, and which failures make Stripe retry."
+---
+
+Stripe calls one endpoint, `POST /stripe-webhook`, for every event Yelo cares about. The handler is synchronous: it verifies the event, runs the service method inline, and only then returns. Any error returns a non-2xx status, so Stripe retries the delivery.
+
+For the product summary, see [Payments and payouts](/concepts/payments-and-payouts#webhooks). This page covers the mechanics.
+
+## Request pipeline
+
+<Steps>
+  <Step title="Route">
+    `payment.RegisterUnauthenticatedRoutes` mounts `HandleStripeEvent` on the `/stripe-webhook` group in `internal/server/http/router.go`. There's no JWT middleware. The signature is the only authentication.
+  </Step>
+  <Step title="Read the body">
+    The body is wrapped in `http.MaxBytesReader` with a **64 KiB** limit (`MaxBodyBytes = 65536`). A larger body fails `io.ReadAll` and returns a server error.
+  </Step>
+  <Step title="Load the secret">
+    `config.Load().Stripe.WebhookSecret`. If `STRIPE_WEBHOOK_SECRET` is empty, the handler logs `STRIPE_WEBHOOK_SECRET is empty` and returns a server error for every delivery.
+  </Step>
+  <Step title="Verify">
+    `webhook.ConstructEvent(payload, Stripe-Signature, secret)` from `stripe-go/v79`. It rejects the event on a bad signature, on a signature timestamp older than **300 seconds**, and when the event's `api_version` differs from the SDK's `2024-06-20`.
+  </Step>
+  <Step title="Dispatch">
+    A `switch` on `event.Type` calls one handler. Unknown types are logged at debug level and acknowledged.
+  </Step>
+  <Step title="Respond">
+    On success, the handler returns `200` with the parsed event echoed back in a standard envelope.
+  </Step>
+</Steps>
+
+Verification failures return a **server error**, not a 400. The log line is `[stripe-webhook] signature verification failed — check STRIPE_WEBHOOK_SECRET matches your webhook endpoint signing secret`.
+
+<Warning>
+`ConstructEvent` enforces the API version match. If the webhook endpoint in the Stripe Dashboard is pinned to a different API version than `2024-06-20`, every event fails verification and Stripe keeps retrying. Upgrading `stripe-go` changes the expected version, so the endpoint version and the SDK must move together. See [Integrations](/engineering/api/integrations).
+</Warning>
+
+### Which Stripe endpoint
+
+The handler accepts one signing secret. Ride PaymentIntents, Express accounts, payouts, and QR Checkout Sessions all live on connected accounts, and their events carry `event.account`. The handler logs `is_connect_event` and passes `event.Account` to the checkout and payout handlers. A Connect endpoint that listens to events on connected accounts is therefore the one that matters. Platform-account events would need a second endpoint with its own secret, which the code doesn't support.
+
+## Event handlers
+
+| Event | Handler | Writes | Error surface |
+| --- | --- | --- | --- |
+| `payment_intent.succeeded` | `PaymentService.PaymentSucceeded` | `Rides.driver_payout` for rides whose `payment_intent_id` matches. `PaymentIntents.status`, zero rows in practice | DB errors |
+| `payment_intent.payment_failed` | `PaymentService.PaymentFailed` | `PaymentIntents.status` only, zero rows in practice | DB errors |
+| `payment_intent.attached` | none | Nothing | Never |
+| `checkout.session.completed` | `PaymentService.CheckoutSessionCompleted` | One `QrPayments` row | Insert errors |
+| `account.updated` | `PaymentService.AccountUpdated` | `Fleets.stripe_status`, `Fleets.is_active`, driver application Stripe step | Missing owner, DB errors |
+| `payout.paid`, `payout.failed`, `payout.canceled` | `earnings.Service.HandlePayoutEvent` | Push notification | Missing owner |
+| Anything else | none | Nothing | Never |
+
+### payment_intent.succeeded
+
+`Ride.PaymentSucceeded` in `internal/data/repository/ride_lifecycle.go` runs in one transaction:
+
+```sql
+-- LockRidePaymentWebhookTargets
+SELECT id FROM "Rides" WHERE payment_intent_id = $pi ORDER BY id FOR UPDATE;
+
+-- MarkRidePaymentSucceeded
+UPDATE "Rides" ride SET driver_payout = $amount_received_dollars
+WHERE ride.id = ANY($ids)
+  AND NOT EXISTS (SELECT 1 FROM "RideOperations" operation WHERE operation.ride_id = ride.id);
+```
+
+- `driver_payout` becomes `amount_received / 100`, the amount Stripe actually captured.
+- Tip PaymentIntents, QR Checkout PaymentIntents, and Payment Link charges don't match any `payment_intent_id`, so they're no-ops.
+- The `RideOperations` guard is for a durable command journal that isn't wired into production (`RideOperationJournal`, migration `000339`). No rows exist, so the guard never blocks.
+
+The write is unconditional. It doesn't compare with the current value or with event order.
+
+<Warning>
+When a tip exceeds the buffer, the fare is captured first and the tip is charged on a second PaymentIntent. `RecordTip` sets `driver_payout = fare + tip`. The fare's `payment_intent.succeeded` usually arrives after that and sets `driver_payout` back to the fare. The tip stays in `tip_amount`, but the earnings week total and the activity feed's gross drop it.
+</Warning>
+
+For cancellations with a fee, this webhook is the only writer of `driver_payout`. `Ride.Cancel` doesn't set it.
+
+### checkout.session.completed
+
+`CheckoutSessionCompleted` builds a `QrPayment` from the session:
+
+| Column | Source |
+| --- | --- |
+| `stripe_session_id` | `session.id`. Unique, and the insert uses `ON CONFLICT (stripe_session_id) DO NOTHING` |
+| `stripe_payment_intent_id` | `session.payment_intent.id`, if present |
+| `stripe_account_id` | `event.account` |
+| `amount_total`, `currency`, `payment_status` | Session fields, as sent |
+| `customer_name`, `customer_email`, `customer_phone` | `customer_details`, falling back to metadata `customer_name` and `customer_phone` |
+| `payment_method_type` | First entry of `payment_method_types` |
+| `fleet_id`, `recipient_driver_id` | Metadata. If `fleet_id` is missing, the first fleet with `stripe_merchant_id = event.account` |
+| `metadata` | Full session metadata as JSON |
+
+`card_brand`, `card_last4`, `wallet_type`, and `stripe_created_at` exist in the table but are never populated. The row is inserted even when `payment_status` isn't `paid`, and there's no `checkout.session.async_payment_succeeded` handler. See [QR payments and tip links](/engineering/payments/qr-and-tip-links).
+
+### account.updated
+
+`AccountUpdated` first looks for fleets with that `stripe_merchant_id` and `deleted_at IS NULL`. Any match takes the fleet path, and the driver path is skipped even if a user shares the account ID.
+
+| Condition, in order | Status |
+| --- | --- |
+| `requirements.past_due` or `requirements.currently_due` non-empty | `restricted` |
+| `payouts_enabled` false | `pending` |
+| Otherwise | `complete` |
+
+**Fleet path.** Every matching fleet gets `stripe_status` set and `stripe_onboarding_url` cleared. On `complete`, `ActivateDashboardFleet` sets `is_active = true`, and each driver from `ListEligibleMarkedDrivers` runs through `ReconcileDriverActivation`. The first activation error aborts the loop and fails the webhook.
+
+**Driver path.** `GetByStripeMerchantId`, then `GetDriverApplication`. If the status is `complete` and this isn't a reconciliation run, `NotifyDriverStripeSignupCompleted` posts a Slack alert to the driver-updates channel. The Stripe step is written only if it changed. Active drivers with `complete` status re-run `ReconcileDriverActivation`.
+
+See [Connect accounts](/engineering/payments/connect-accounts) for the full status model.
+
+### payout.*
+
+`HandlePayoutEvent` skips platform payouts (empty `event.account`). Otherwise it loads the user by `stripe_merchant_id` and emits `CodePayoutPaid`, `CodePayoutFailed`, or `CodePayoutCanceled`. The event key is `{eventType}:{eventID}`, and the data includes `payout_id`, `amount`, `currency`, `arrival`, and `deeplink: yelo://drive/earnings`. Notification failures are logged and don't fail the webhook.
+
+## Replays, duplicates, and ordering
+
+Yelo doesn't store processed event IDs, so every delivery runs its handler again.
+
+| Event | Duplicate delivery | Out-of-order delivery |
+| --- | --- | --- |
+| `payment_intent.succeeded` | Same value written again | Can overwrite a newer `driver_payout`, as in the tip case above |
+| `checkout.session.completed` | Ignored by the unique session ID | n/a |
+| `account.updated` | Status rewritten. Slack alert sent again for complete drivers. Fleet activation re-runs | An older event can regress `stripe_status`, for example from `complete` to `restricted`. Reconciliation corrects it within about 24 hours |
+| `payout.*` | Deduplicated by the notification event key | Pushes can arrive in any order |
+
+## Failure responses
+
+| Condition | Response | Stripe behavior |
+| --- | --- | --- |
+| Body over 64 KiB | 500 | Retries |
+| Secret not configured | 500 | Retries |
+| Bad signature, stale timestamp, API version mismatch | 500 | Retries |
+| JSON unmarshal of the data object fails | 500 | Retries |
+| `account.updated` or `payout.*` for an account with no fleet and no user | 500. `GetUserProfileByStripeMerchantID` returns no rows, wrapped as a server error | Retries, then gives up |
+| DB error in any handler | 500 | Retries |
+| Unhandled type | 200 | Done |
+
+<Note>
+`HandlePayoutEvent` has a `user == nil` branch meant to ignore unknown accounts, but the repository returns an error instead of nil. Payouts on **fleet** accounts therefore fail the webhook on every delivery. The same applies to `account.updated` for accounts that were unlinked from a fleet or belong to a deleted fleet.
+</Note>
+
+## Testing locally
+
+Use the Stripe CLI to forward events to your local API and read the `whsec_` secret it prints into `STRIPE_WEBHOOK_SECRET`:
+
+```bash
+stripe listen --forward-connect-to localhost:8080/stripe-webhook \
+  --events payment_intent.succeeded,account.updated,checkout.session.completed,payout.paid
+```
+
+`--forward-connect-to` delivers connected-account events. Handler tests live in `internal/server/http/payment/payment_handler_test.go`, and service tests in `internal/service/payment/payment_test.go`.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Route registration | `yelo-api/internal/server/http/router.go`, `yelo-api/internal/server/http/payment/payment_routes.go` |
+| Verification and dispatch | `yelo-api/internal/server/http/payment/payment_handler.go` (`HandleStripeEvent`) |
+| Ride payout and QR recording, account status | `yelo-api/internal/service/payment/payment.go` |
+| Payout pushes | `yelo-api/internal/service/earnings/webhook.go` (`HandlePayoutEvent`) |
+| Webhook SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`LockRidePaymentWebhookTargets`, `MarkRidePaymentSucceeded`), `education_commerce.sql` (`InsertQrPayment`, `UpdatePaymentIntentStatus`) |
+| Unused journal guard | `yelo-api/internal/data/repository/ride_operation.go`, `yelo-api/migrations/000339_ride_operation_journal.up.sql` |
+
+## Gotchas and edge cases
+
+- **No failed-payment handling.** `payment_intent.payment_failed` only touches the unused `PaymentIntents` table. Ride state never changes from a webhook. Failures surface only through the synchronous Stripe call that caused them.
+- **No refund or dispute handling.** `charge.refunded`, `charge.dispute.*`, and `payment_intent.canceled` are ignored. A refund issued in the Stripe Dashboard leaves `driver_payout` and `tip_amount` unchanged.
+- **Synchronous side effects.** Fleet activation and driver reconciliation run inside the webhook request. A slow reconciliation can push the response past Stripe's timeout, which triggers a retry that runs everything again.
+- **Signature errors look like outages.** Because verification failures return 500, a rotated secret shows up as a spike of 500s on `/stripe-webhook`, not 400s.
+- **Slack noise.** Any `account.updated` for a complete driver account re-sends the "Stripe signup completed" Slack alert, including events caused by `PUT /earnings/payout-schedule`.

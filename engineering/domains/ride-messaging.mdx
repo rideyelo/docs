@@ -1,0 +1,220 @@
+---
+title: "Ride messaging"
+description: "How rider and driver chat works: the durable per-ride message stream, immutable indices, idempotent sends, read cursors, the bounded inbox, legacy endpoints, and the push that fires on every message."
+---
+
+Ride chat is a Postgres-only feature. Each ride owns one message stream between its current rider and its current driver. There is no third-party chat provider, no Twilio Conversations, and no proxy phone numbers. Twilio in this codebase only sends SMS and receives STOP/START keywords (see [SMS and friend bumps](/engineering/notifications/sms-and-friend-bumps)).
+
+The API exposes two generations of endpoints:
+
+- **Legacy (v1):** unbounded reads and a non-idempotent send. Old mobile builds still use them.
+- **Durable (v2):** idempotent sends, cursor-paged deltas and history, server-side read cursors, and a batched inbox. Current mobile builds use these and fall back to v1 when the server returns 404.
+
+Both write to the same table through the same repository function, so they interoperate.
+
+## Data touched
+
+| Store | Purpose |
+| --- | --- |
+| `RideMessages` | One row per message: `id`, `ride_id`, `sender_id`, `content`, `created_at`, `message_index`, `client_message_id`. Created in migration `000180`, extended in `000300`. |
+| `RideMessageStreams` | One row per ride: `latest_index` and `message_count`. Allocates the next index. |
+| `RideMessageSenderCounts` | Per ride and sender: `message_count`. Used for unread math. |
+| `RideMessageReads` | Per ride and user: read cursor `message_index` and `received_read_count`. |
+| `RideEvents` | A `message_sent` row per message, including full `content` in metadata. |
+| `Rides` | Row lock, participation check (`rider_id`, `driver_id`), inbox display fields. |
+| Notification outbox | A durable `message_sent` push to the other participant, enqueued in the same transaction. |
+
+There is no Redis state for chat. For column definitions, see [Rides tables](/reference/database/rides).
+
+## Endpoints
+
+All routes live under the `/ride` group. The authenticated subgroup applies `getValidateJWTMiddleware` and `getRequireRoleMiddleware(["user"])` in `internal/server/http/router.go`. Participation is checked per request, not by middleware.
+
+| Method | Path | Auth | Handler / purpose |
+| --- | --- | --- | --- |
+| `POST` | `/ride/i/{id}/messages` | JWT, role `user`, ride participant | `SendMessage` (v1). Appends without idempotency. Returns 201. |
+| `GET` | `/ride/i/{id}/messages` | JWT, participant | `GetMessages` (v1). Returns every message, ascending. |
+| `GET` | `/ride/i/{id}/messages/new?last_index=` | JWT, participant | `GetNewMessages` (v1). Every message with index greater than `last_index`. |
+| `POST` | `/ride/i/{id}/messages/v2` | JWT, participant | `SendMessageV2`. Idempotent append keyed on `client_message_id`. |
+| `GET` | `/ride/i/{id}/messages/delta?after_index=` | JWT, participant | `GetMessageDelta`. Up to 100 messages after a cursor. |
+| `GET` | `/ride/i/{id}/messages/history?before_index=` | JWT, participant | `GetMessageHistory`. Latest 100, or 100 older than a cursor. |
+| `POST` | `/ride/i/{id}/messages/read` | JWT, participant | `MarkMessagesRead`. Advances the caller's read cursor. |
+| `POST` | `/ride/messages/inbox` | JWT | `GetMessageInbox`. Imports read cursors, then returns thread summaries for up to 50 rides. |
+| `POST` | `/ride/feed-summaries` | JWT | `GetFeedSummaries`. Up to 50 public feed summaries in the caller's community. Lives in the messaging file but is not chat. |
+
+v2 routes are registered in `registerMessagingRoutes` (`internal/server/http/ride/messaging.go`). v1 routes are in `RegisterAuthenticatedRoutes` (`internal/server/http/ride/ride_routes.go`).
+
+## Channel lifecycle
+
+A chat "channel" is not an object. It is the set of `RideMessages` rows for a ride, gated by the ride's current `rider_id` and `driver_id`.
+
+<Steps>
+  <Step title="Opens on driver assignment">
+    Any request passes the participation check once the caller is the rider or the assigned driver. Before a driver is assigned, only the rider passes. A rider can send while `driver_id` is null. The message is stored but no push fires, because `lockMessageRecipient` returns `uuid.Nil`.
+  </Step>
+  <Step title="Stays open in every status">
+    No code checks `Rides.status` for chat. You can send and read on `pending_rider_rating`, `complete`, and canceled rides.
+  </Step>
+  <Step title="Moves with reassignment">
+    Participation is evaluated against the current `driver_id`. When a ride is requeued and reassigned, the old driver gets 403 and the new driver sees the full history, including the previous driver's messages.
+  </Step>
+  <Step title="Never closes">
+    There is no retention job, TTL, or archival. Rows persist until the ride row's dependents are deleted explicitly.
+  </Step>
+</Steps>
+
+The driver inbox surfaces a completed ride as "recent" for 24 hours after `request_time` (see business rules). That is a display window, not an access window.
+
+## Sending a message
+
+`sqlMessageRepository.AppendMessage` (`internal/data/repository/messaging.go`) runs the whole send in one transaction:
+
+<Steps>
+  <Step title="Lock the ride">
+    `LockMessageRide` runs `SELECT rider_id, driver_id FROM "Rides" WHERE id=$1 FOR UPDATE`. A missing ride returns 404 **ride not found**. A non-participant returns 403 **user is not part of the ride**.
+  </Step>
+  <Step title="Pick the recipient">
+    If the sender isn't the rider, the recipient is the rider. Otherwise, the recipient is the driver, or nobody when `driver_id` is null.
+  </Step>
+  <Step title="Check idempotency (v2 only)">
+    `FindMessageAttempt` looks up `(ride_id, sender_id, client_message_id)`. A hit with identical content returns the existing message without writing. A hit with different content returns 400 **client_message_id was already used for different content**.
+  </Step>
+  <Step title="Insert and index">
+    `AppendRideMessage` inserts the row. The `ride_message_index` BEFORE INSERT trigger (`assign_ride_message_index`) locks the ride again, re-checks participation (SQLSTATE `42501`), upserts `RideMessageStreams` to get the next `latest_index`, and increments `RideMessageSenderCounts`.
+  </Step>
+  <Step title="Write the timeline event">
+    `InsertMessageTimeline` inserts a `RideEvents` row with `event_type = 'message_sent'`, `actor_type` of `rider` or `driver`, and metadata `content`, `message_length` (`octet_length`, in bytes), and `sender_type`.
+  </Step>
+  <Step title="Enqueue the push">
+    `enqueueMessage` in `internal/service/ride/messaging.go` calls `notify.Emit` with `CodeMessageSent` inside the same transaction. If the enqueue fails, the message rolls back.
+  </Step>
+  <Step title="Commit">
+    The committed message is returned. v1 discards it and returns `success: true`.
+  </Step>
+</Steps>
+
+The push payload data is:
+
+```json
+{
+  "type": "message_received",
+  "ride_id": "<ride uuid>",
+  "message_id": "<message uuid>",
+  "message_index": "<decimal index>"
+}
+```
+
+The event key is `message_sent:` plus the message ID, so retries of the same message dedupe but distinct messages never merge. For the template, channels, and push handling, see [Notification catalog](/engineering/notifications/catalog) and [Mobile push handling](/engineering/notifications/mobile-push-handling).
+
+## Business rules
+
+### Validation
+
+| Rule | v1 `SendMessage` | v2 `SendMessageV2` |
+| --- | --- | --- |
+| Empty content | Rejected when `content == ""` (`SendMessageRequest.Validate`) | Rejected when `strings.TrimSpace(content) == ""` |
+| Whitespace-only content | Accepted | Rejected |
+| Maximum length | None | 4000 runes (`utf8.RuneCountInString`) |
+| `client_message_id` | Not accepted | Required, nonzero UUID |
+| Stored content | As sent | As sent (not trimmed) |
+
+The v2 validation error is one message for all cases: **content must contain 1-4000 characters and client_message_id must be a nonzero UUID**.
+
+### Indices and cursors
+
+- `message_index` is a per-ride integer starting at 1. It is allocated from `RideMessageStreams.latest_index` under the ride row lock, so it is gap-free at insert time and strictly increasing.
+- Deleting a message never reuses its index. `remove_ride_message_counts` decrements `message_count` but leaves `latest_index` alone.
+- Migration `000300` backfilled indices for existing rows with `row_number() OVER (PARTITION BY ride_id ORDER BY created_at, content DESC, id)`.
+- Every cursor parameter must be at most `maxMessageCursor = 9007199254740991` (2^53 minus 1, the JavaScript safe integer limit). The repository also rejects values above `math.MaxInt64`.
+- Unique indexes: `ride_messages_cursor` on `(ride_id, message_index)` and `ride_messages_idempotency` on `(ride_id, sender_id, client_message_id)` where `client_message_id` is not null.
+
+### Paging
+
+| Endpoint | Page size | Cursor semantics | Returned cursor |
+| --- | --- | --- | --- |
+| Delta | 100, hard-coded in `GetMessageDelta` | Exclusive lower bound `after_index`. Fetches 101 rows to detect `has_more`. | `next_index` is the last returned index, or `after_index` when empty |
+| History | 100, fetches 101 (`LIMIT 101`) | Exclusive upper bound `before_index`. `0` means latest page. | `next_before_index` is the oldest returned index, or 0 when empty |
+| v1 new | Unbounded | Exclusive lower bound `last_index` | None |
+| v1 all | Unbounded | None | None |
+
+History rows are read newest first and reversed with `slices.Backward`, so every endpoint returns messages in ascending index order.
+
+Worked example: a ride has 250 messages. `history?before_index=0` returns indices 151 to 250 with `has_more: true` and `next_before_index: 151`. `history?before_index=151` returns 51 to 150. `history?before_index=51` returns 1 to 50 with `has_more: false`.
+
+### Read cursors
+
+`advance_ride_message_read(ride, participant, through_index)` is a plpgsql function from migration `000300`:
+
+1. Locks the ride row and re-checks participation. Non-participants raise `42501`, which `MarkMessagesRead` maps to 403.
+2. Clamps the target to `LEAST(through_index, latest_index)`. You can't acknowledge a message that doesn't exist yet.
+3. Returns the old cursor unchanged if the target isn't greater. Cursors only move forward.
+4. Counts messages in `(old_index, target]` not sent by the participant and adds that to `received_read_count`.
+
+The endpoint returns `read_index`, which is the clamped value.
+
+### Inbox
+
+`POST /ride/messages/inbox` accepts `ride_ids` (up to 50), `read_cursors` (up to 50), and `include_recent`.
+
+- `validateMessageBatch` rejects more than 50 IDs, the nil UUID, and duplicates. It runs separately on `ride_ids` and on the ride IDs in `read_cursors`.
+- Read cursors are imported first through `ImportMessageReadCursors`, which silently skips rides the caller isn't on.
+- `include_recent` adds up to 20 rides where the caller is the **driver**, status is `complete` or `pending_rider_rating`, and `request_time` is within the last 24 hours. Riders get nothing extra.
+- Threads are ordered by `request_time DESC, id DESC`.
+- `inaccessible_ride_ids` lists every requested ID that wasn't returned. That covers both nonexistent rides and rides the caller isn't on.
+
+Each thread returns the rider's name and phone number, pickup and destination names, `COALESCE(discounted_price, price)`, `latest_message`, `latest_index`, `read_index`, and `unread_count`.
+
+The unread count uses constant-size counters, not a range scan:
+
+```text
+unread_count = GREATEST(0, stream.message_count - my_sent.message_count - my_reads.received_read_count)
+```
+
+Worked example: a ride has 7 messages. You sent 3 and received 4. Your read cursor is at index 5, and 2 of the messages at indices 1 to 5 came from the other participant. Your `unread_count` is `7 - 3 - 2 = 2`.
+
+## Mobile client behavior
+
+The mobile app (`yelo-frontend`) implements two sync loops. For screen-level behavior, see [Driver experience](/engineering/mobile/driver-experience) and [Rider experience](/engineering/mobile/rider-experience).
+
+| Concern | File | Behavior |
+| --- | --- | --- |
+| Open chat | `hooks/drive/useRideMessages.ts` | Uses `history` then `delta`. Falls back to v1 `messages/new` on a 404. Polls every `MESSAGE_FALLBACK_MS = 30_000` while focused and active. |
+| Send | `hooks/drive/useRideMessages.ts` | Sends v2 with a persisted pending attempt ID as `client_message_id`. Uses v1 only when the inbox is unsupported. |
+| Inbox | `providers/MessagingProvider.tsx` | Calls `messages/inbox` in batches of 50. Polls every `INBOX_FALLBACK_MS = 60_000`. Caches state in AsyncStorage under `@yelo/driver-messaging-v1:` plus the user ID. |
+| Read state | `lib/messaging/inboxBatches.ts` | Sends reads as `read_cursors` on the next inbox call. The app never calls `POST .../messages/read`. |
+| Access loss | `hooks/drive/messageErrors.ts` | Stops syncing on 403, 404, 410, or a 400 with **user is not part of the ride**. |
+
+A push with `data.type == "message_received"` triggers an immediate refresh.
+
+## Where this lives in code
+
+| Concern | File | Function / type |
+| --- | --- | --- |
+| v2 routes and handlers | `internal/server/http/ride/messaging.go` | `registerMessagingRoutes`, `GetMessageInbox`, `GetMessageDelta`, `SendMessageV2`, `MarkMessagesRead`, `GetMessageHistory`, `GetFeedSummaries` |
+| v1 routes and handlers | `internal/server/http/ride/ride_routes.go`, `ride_handler.go` | `SendMessage`, `GetMessages`, `GetNewMessages` |
+| v1 service and push enqueue | `internal/service/ride/messaging.go` | `SendMessage`, `GetMessages`, `GetNewMessages`, `requireRideParticipant`, `enqueueMessage` |
+| v2 service validation | `internal/service/ride/messaging_sync.go` | `validateMessageBatch`, `GetMessageInbox`, `GetMessageDelta`, `SendMessageV2`, `MarkMessagesRead`, `GetMessageHistory`, `maxMessageCursor` |
+| Request and response models | `internal/models/messaging.go`, `internal/models/ride.go` | `MessageInboxRequest`, `MessageThread`, `MessageDelta`, `MessageHistory`, `Message`, `SendMessageRequest` |
+| Repository | `internal/data/repository/messaging.go` | `AppendMessage`, `MessageInbox`, `MessageDelta`, `MarkMessagesRead`, `ImportMessageReads`, `ParticipantMessages`, `MessageHistory`, `lockMessageRecipient` |
+| SQL | `internal/data/repository/queries/messaging.sql` | `GetMessageInbox`, `GetRideMessageDelta`, `GetRideMessageHistory`, `InsertMessageTimeline` |
+| Triggers and functions | `migrations/000300_durable_ride_messaging.up.sql` | `assign_ride_message_index`, `remove_ride_message_counts`, `advance_ride_message_read` |
+| Template code | `internal/notify/codes.go` | `CodeMessageSent`, `MessageSentVars` |
+
+## Gotchas and edge cases
+
+<Warning>
+Chat access follows the ride's current participants. A reassigned driver immediately sees all prior messages, including those exchanged with the previous driver. The previous driver loses access to their own messages.
+</Warning>
+
+- **No status gate.** Participants can message on completed and canceled rides indefinitely. Every such message sends a push.
+- **Messages before a driver exists.** A rider message sent before assignment is stored with no push. The driver sees it once assigned, but is never notified about it.
+- **v2 service skips the upfront participant check.** `SendMessageV2`, `GetMessageDelta`, `GetMessageHistory`, and `MarkMessagesRead` rely on the repository and SQL checks. The v1 path checks in the service with `requireRideParticipant` and again in the repository.
+- **Status codes differ by path.** A missing ride returns 404 on v1 and v2 send (from `Ride.GetByID` or `LockMessageRide`). It returns 403 on delta and history (`GetMessageParticipation` returns false) and on mark-read (the `42501` from `advance_ride_message_read`).
+- **Different content, same ID.** Reusing a `client_message_id` for different content returns 400. That can happen if a client retries after the user edits a failed draft without generating a new ID.
+- **Chat writes lock the ride row.** `LockMessageRide` takes `FOR UPDATE` on `Rides`. A send waits behind any in-flight lifecycle command on the same ride, and vice versa.
+- **Message content is duplicated.** `InsertMessageTimeline` copies the full text into `RideEvents.metadata`. Deleting a `RideMessages` row doesn't remove that copy.
+- **No cascade from `Rides`.** `RideMessages.ride_id` references `Rides(id)` without `ON DELETE CASCADE`. The streams, sender counts, and reads tables do cascade. The e2e fixture deletes `RideMessages` explicitly before deleting rides (`internal/server/http/e2econtrol/ride_fixture.go`).
+- **Rider phone numbers in the inbox.** Every thread includes `rider_phone_number` regardless of whether the caller is the rider or the driver.
+- **`message_length` is bytes.** `octet_length` counts UTF-8 bytes. The 4000 limit on v2 counts runes.
+- **Dead code.** `NotificationService.NotifyNewMessage` (`internal/service/notifications/notification.go`) has no callers. Chat pushes go through `enqueueMessage`. The repository methods `AddMessage`, `GetMessages`, and `GetNewMessages` in `internal/data/repository/message.go` are also unused. The service reads through `ParticipantMessages`.
+- **Feed summaries share the file only.** `GetFeedSummaries` returns public fields for rides in the caller's community with a non-null `confirm_time`. It masks pickup and destination fields unless `is_public_pickup` or `is_public_destination` is set. It has nothing to do with chat.

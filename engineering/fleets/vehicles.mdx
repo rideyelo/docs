@@ -1,0 +1,166 @@
+---
+title: "Fleet vehicles and vehicle resolution"
+description: "How shared fleet inventory is stored, which vehicles a driver can see and use, how triggers pick defaults, how going online resolves the vehicle, and how admin inventory writes cascade."
+---
+
+A fleet can own shared vehicles that every member drives. This page covers the storage rules, visibility, automatic selection, the go-online resolver, and the admin inventory write path. For the dashboard workflow, see [Fleet vehicles](/dashboard/fleet-vehicles). For migration history, see `yelo-api/docs/fleet-owned-vehicles.md`.
+
+## Ownership rules
+
+Migration `000333_fleet_owned_vehicles` defines ownership:
+
+| Rule | Enforcement |
+| --- | --- |
+| A shared vehicle has `Vehicles.driver_id = NULL` and one `FleetVehicles` row. | Convention. The dashboard handler requires exactly one of `fleet_id` or `driver_id`. |
+| A vehicle belongs to at most one fleet. | Unique index `fleet_vehicle_owner` on `FleetVehicles(vehicle_id)`. |
+| A fleet has at most one default. | Partial unique index `fleet_default_vehicle` on `FleetVehicles(fleet_id) WHERE is_default`. |
+| A default must be approved. | Handler validation: `is_default` requires `fleet_id` and `application_status = complete`. |
+| Removal is archival. | `Vehicles.archived_at`. The `FleetVehicles` row stays. |
+
+Legacy fleet vehicles may still have a `driver_id`. The inventory list (`FleetVehicleStore.List`) reports `driver_id` only when there is no fleet link, so the dashboard never shows two owners.
+
+## Visibility: `AvailableDriverVehicles`
+
+The view is the single definition of "vehicles this driver may see":
+
+```sql
+-- Personal: owned by the driver, not archived, not linked to any fleet
+SELECT v.id, v.driver_id, NULL::uuid AS fleet_id FROM "Vehicles" v
+WHERE v.driver_id IS NOT NULL AND v.archived_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM "FleetVehicles" fv WHERE fv.vehicle_id = v.id)
+UNION
+-- Shared: owned by an active, non-deleted fleet the driver is a member of
+SELECT v.id, fd.driver_id, fv.fleet_id FROM "Vehicles" v
+JOIN "FleetVehicles" fv ON fv.vehicle_id = v.id
+JOIN "Fleets" f ON f.id = fv.fleet_id AND f.deleted_at IS NULL AND f.is_active
+JOIN "FleetDrivers" fd ON fd.fleet_id = f.id
+WHERE v.archived_at IS NULL;
+```
+
+The shared branch joins every membership, active or not. An inactive membership means "selected another fleet", not "removed". Visibility and usability are separate: the other queries add approval and active-membership checks on top of this view.
+
+The view and the two trigger functions are revoked from `PUBLIC`, `anon`, and `authenticated`, so only the API's database role reads them.
+
+## Automatic selection triggers
+
+### `select_fleet_default_vehicle`
+
+Runs `AFTER INSERT OR UPDATE OF is_active ON "FleetDrivers"`, only when `NEW.is_active` is true:
+
+1. Picks the fleet's vehicle ordered by `is_default DESC, v.id`, restricted to non-archived vehicles with `application_status = 'complete'`.
+2. If one exists, sets `Users.vehicle_id` to it, replacing any personal selection.
+3. If none exists and the user's current `vehicle_id` is a shared vehicle of any fleet, clears it to `NULL`.
+
+This trigger fires on enrollment (`UpsertDriverFleetMembership`, even when the row was already active), on switching (`SetDriverActiveFleet`), and on `AddDriverToFleet`. It doesn't check whether the driver is online. The callers that check offline state are the join and switch paths only.
+
+### `guard_fleet_vehicle_session`
+
+Runs `BEFORE INSERT OR UPDATE OF driver_id, fleet_id, vehicle_id, end_time ON "DriverSessions"`. For open sessions it locks the user and vehicle rows, then applies the rule only if the session's fleet owns inventory or the vehicle is fleet-owned. In that case the vehicle must be:
+
+- In `AvailableDriverVehicles` for this driver, and approved.
+- Used by a driver whose active membership is the session fleet.
+- Either owned by the session fleet, or personal while the session fleet owns no inventory at all.
+
+Otherwise the insert fails with **vehicle is not approved for this fleet and driver** (SQLSTATE `23514`). Occupancy isn't checked, so shared vehicles can have concurrent sessions.
+
+## Go-online resolution
+
+`DriverService.resolveOnlineVehicle` in `internal/service/driver/driver.go`:
+
+1. If the client sends a nil vehicle, `resolveVehicleForDriver` uses `Users.vehicle_id`, else the first of `GetByDriverId`, else fails with **No Vehicle**.
+2. `sqlVehicleRepository.ResolveForDriver` in `repository/fleet_vehicle.go` picks the vehicle actually used:
+
+```sql
+WITH active_fleet AS (   -- active membership in an active, non-deleted fleet
+  ...),
+inventory AS (SELECT fv.* FROM "FleetVehicles" fv JOIN active_fleet f ON f.id = fv.fleet_id),
+candidates AS (
+  SELECT v.id, fv.is_default FROM "Vehicles" v JOIN inventory fv ON fv.vehicle_id = v.id
+  WHERE v.archived_at IS NULL AND v.application_status = 'complete'
+  UNION ALL
+  SELECT v.id, false FROM "Vehicles" v WHERE v.driver_id = $1 AND v.archived_at IS NULL
+    AND v.application_status = 'complete'
+    AND NOT EXISTS (SELECT 1 FROM inventory)
+    AND NOT EXISTS (SELECT 1 FROM "FleetVehicles" fv WHERE fv.vehicle_id = v.id))
+SELECT id FROM candidates ORDER BY (id = $2) DESC, is_default DESC, id LIMIT 1
+```
+
+   - If the active fleet has any inventory rows, only its approved, non-archived vehicles are candidates, and personal vehicles are excluded.
+   - If it has none, the driver's approved personal vehicles are candidates.
+   - Tie-break: the requested vehicle, then the fleet default, then the lowest UUID.
+   - No candidate fails with **no approved vehicle is available for your active fleet**.
+3. If the driver is already online and the resolved vehicle differs from `Users.vehicle_id`, the call fails with **go offline before changing vehicles**.
+4. `ensureVehicleFleetMatch` rejects a vehicle owned by a different fleet (**Fleet Mismatch**).
+5. `RefreshDriverSession` locks the vehicle row (`LockDriverSessionVehicle`), rechecks with `ValidateDriverSessionVehicle`, then writes `Users.vehicle_id` and the session.
+
+The resolver silently replaces a stale requested vehicle. A client asking for its personal car while its active fleet owns inventory goes online in the fleet default.
+
+### Occupancy warnings
+
+`ListDriverVehicles` returns `in_use_by_other_driver` for shared vehicles with another driver's open session. `IsFleetVehicleActive` answers the same question for one vehicle. Both are advisory. Updated mobile clients show **Vehicle already in use** and let the driver continue.
+
+## Driver-side vehicle edits
+
+`VehicleService` in `internal/service/vehicle/vehicle.go`:
+
+- Rejects any change while the driver is online (**go offline before changing vehicles**).
+- For a fleet vehicle, it calls `ResolveForDriver` with that ID. If the resolver picks it and the request marks it active, only `Users.vehicle_id` is updated. Any other edit fails with **fleet vehicles are managed by an administrator**.
+- For a personal vehicle, it requires `driver_id` to match. `UpdateVehicle` SQL also refuses rows linked in `FleetVehicles` and archived rows.
+
+## Application approval inheritance
+
+`GetDriverApplicationState` (`queries/user_driver.sql`) chooses the vehicle that backs the application's vehicle step with a lateral query. An approved shared vehicle of the driver's active, non-deleted fleet ranks first (default first), then the driver's selected personal vehicle. `vehicle_managed_by_fleet` is true when a shared vehicle was chosen.
+
+`ActivateEligibleDriver` requires at least one approved vehicle in `AvailableDriverVehicles` that is personal or belongs to the active membership. A fleet with an approved default therefore completes the vehicle step for every member.
+
+The dashboard application list (`ListDashboardDriverApplications`) excludes a pending personal vehicle from the **pending** stage when the driver's selected vehicle is an approved shared vehicle.
+
+## Admin inventory writes
+
+`/dashboard/vehicles` routes are admin-only (`Handler.authorize` in `internal/server/http/dashboard/vehicles/routes.go`). `FleetVehicleStore.Save` runs one transaction:
+
+<Steps>
+  <Step title="Lock affected users">
+    `lockFleetVehicleUsers` locks, ordered by ID, every user who has this vehicle selected, the target driver, and every member of the target fleet.
+  </Step>
+  <Step title="Lock the fleet and vehicle">
+    The fleet must not be deleted. For an update, the vehicle must not be archived and must have no open session (**take the vehicle offline before editing it**).
+  </Step>
+  <Step title="Upsert the vehicle">
+    `INSERT ... ON CONFLICT (id) DO UPDATE`. Every save sets `application_review_time = NOW()` and clears the rejection reason.
+  </Step>
+  <Step title="Rewrite ownership">
+    Deletes the `FleetVehicles` row for this vehicle, then re-inserts it with the submitted `is_default`. Setting a new default first clears the fleet's old default.
+  </Step>
+  <Step title="Propagate to members">
+    For an approved fleet vehicle, every active, offline member without a session whose current selection isn't already an approved vehicle of this fleet gets `Users.vehicle_id` set to it.
+  </Step>
+  <Step title="Clear invalid selections">
+    Any user whose `vehicle_id` is this vehicle but who can no longer use it has `vehicle_id` cleared.
+  </Step>
+</Steps>
+
+For personal vehicles, `savePersonalVehicleDefault` sets `Users.vehicle_id` only when `is_active` is set. It requires an approved vehicle and an offline driver without a session.
+
+`FleetVehicleStore.Archive` refuses vehicles with open sessions, sets `archived_at`, clears `is_default`, and clears `Users.vehicle_id` for everyone who selected it.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Schema, view, triggers | `yelo-api/migrations/000333_fleet_owned_vehicles.up.sql` |
+| Go-online resolver | `ResolveForDriver` in `yelo-api/internal/data/repository/fleet_vehicle.go` |
+| Session commit and recheck | `RefreshDriverSession` in `yelo-api/internal/data/repository/driver_availability.go`; `ValidateDriverSessionVehicle`, `SetIdleUserVehicle`, `ListDriverVehicles` in `queries/user_driver.sql` |
+| Driver service | `resolveOnlineVehicle`, `ensureVehicleFleetMatch` in `yelo-api/internal/service/driver/driver.go`; `yelo-api/internal/service/vehicle/vehicle.go` |
+| Admin inventory | `FleetVehicleStore` in `yelo-api/internal/data/repository/fleet_vehicle.go`; routes in `internal/server/http/dashboard/vehicles/routes.go` |
+| Seed data | `yelo-api/migrations/000334_breeze_shared_cart.up.sql` |
+
+## Gotchas and edge cases
+
+- **Archived inventory still counts as inventory.** `ResolveForDriver`, `ValidateDriverSessionVehicle`, and the session guard ask whether the fleet has any `FleetVehicles` rows, and archival doesn't delete them. After an admin archives a fleet's only shared vehicle, members can't fall back to personal vehicles and can't go online.
+- **Unapproved inventory also blocks personal vehicles.** A fleet whose only vehicle is `pending` has inventory but no candidates.
+- **Editing can silently drop the default.** `Save` deletes and re-inserts the `FleetVehicles` row with the submitted `is_default`. A client that omits `is_default: true` when editing the default vehicle leaves the fleet without one.
+- **Moving a vehicle between owners is one save.** Changing `fleet_id` or switching to a `driver_id` rewrites ownership in place. The member-propagation and selection-clearing steps keep users consistent.
+- **Triggers ignore online state.** An admin `AddDriverToFleet` on an online driver fires `select_fleet_default_vehicle` and can change `Users.vehicle_id` mid-session. `RefreshDriverSession` then refuses to continue with a different vehicle until the driver goes offline.
+- **Shared vehicles have no occupancy lock.** Two drivers can be online in one cart. Only the warning is new.
+- **Deleted or inactive fleets hide their inventory.** The view requires an active, non-deleted fleet, so members of a fleet whose Stripe account was just unlinked lose shared vehicles until the fleet is reactivated.

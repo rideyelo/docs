@@ -1,0 +1,207 @@
+---
+title: "Ratings and issue reports"
+description: "How riders and drivers rate each other after a ride, how pending reviews are derived, how rating averages are computed and defaulted, and how in-app issue reports are stored and alerted to Slack."
+---
+
+After a ride, each side can leave one rating and a free-text comment for the other. The rider's review also finishes the ride. It moves `pending_rider_rating` to `complete` and triggers tip capture. Separately, any user can file an issue report from the app. Issue reports go into the `Issues` table and trigger a Slack alert.
+
+Tip capture, the tip window sweeper, and Stripe behavior are documented in [Ride tips](/engineering/payments/ride-tips). This page covers ratings, feedback, and issue reports.
+
+## Data touched
+
+| Store | Columns / keys | Written by |
+| --- | --- | --- |
+| `Rides` | `driver_rating`, `rider_feedback` (the rider's review of the driver) | `RateRideDriver` |
+| `Rides` | `rider_rating`, `driver_feedback`, `num_riders` (the driver's review of the rider) | `RateRideRider` |
+| `Rides` | `status`, `complete_time` | `RateRideDriver` sets `status = 'complete'` and `complete_time = COALESCE(complete_time, NOW())` |
+| `RideEvents` | `ride_rated` event with rating metadata | `recordRateEvent` |
+| `Issues` | `id`, `ride_id` (nullable), `user_id`, `issue_description`, `issue_comment`, `timestamp` | `CreateIssue` |
+| Slack | Alerts channel webhook | `NotifyIssueCreated` |
+
+<Note>
+Column names describe **who is rated**, not who rated. `driver_rating` is the score the rider gave the driver. `rider_feedback` is the comment the rider wrote. The driver's review lands in `rider_rating` and `driver_feedback`.
+</Note>
+
+There is no ratings table and no stored per-user average. Every average is computed on read with `AVG()` over `Rides`.
+
+## Endpoints
+
+| Method | Path | Auth | Handler / purpose |
+| --- | --- | --- | --- |
+| `POST` | `/ride/i/{id}/rate` | JWT, role `user`, rider or driver of the ride | `RideHandler.Rate`. Submits a rating, feedback, rider count, and (rider only) tip. Returns `TipResult`. |
+| `GET` | `/ride/i/{id}/tip-options` | JWT, rider only | Tip presets. See [Ride tips](/engineering/payments/ride-tips). |
+| `POST` | `/ride/i/{id}/confirm-tip` | JWT, rider | Finalizes an authenticated tip charge. See [Ride tips](/engineering/payments/ride-tips). |
+| `POST` | `/issue/` | JWT, role `user` | `IssueHandler.CreateIssue`. Stores an issue and fires a Slack alert. Returns 201. |
+
+Both groups sit behind `getValidateJWTMiddleware` and `getRequireRoleMiddleware(["user"])` in `internal/server/http/router.go`. The issue group is mounted as `issue.RegisterRoutes(fuego.Group(authenticatedGroup, "/issue", ...))`.
+
+## Rating a ride
+
+### Request
+
+`models.RatingRequest` (`internal/models/ride.go`):
+
+| Field | Type | Validation (`RatingRequest.Validate`) |
+| --- | --- | --- |
+| `rating` | integer, optional | 1 to 5 inclusive when present |
+| `num_riders` | integer, optional | At least 1 when present |
+| `tip_amount` | number, optional | 0 to `MaxTip = 100.0` when present |
+| `feedback` | string | None. Empty string is allowed. |
+| `ride_id`, `user_id` | UUID | Ignored. The path ID and the JWT user are used instead. |
+
+### Flow
+
+`RideService.Rate` in `internal/service/ride/ride.go`:
+
+<Steps>
+  <Step title="Authorize">
+    Loads the ride. If the caller is neither `rider_id` nor `driver_id`, it returns an input error, **User is not authorized to rate this ride** (HTTP 400, not 403).
+  </Step>
+  <Step title="Check status">
+    Status must be `pending_rider_rating` or `complete`. Otherwise it returns **Ride is not reviewable** (400).
+  </Step>
+  <Step title="Capture the tip (rider, tips enabled)">
+    If the caller is the rider and `tips_enabled` is true, `captureTip` runs with `tip_amount`, or 0 when absent. A zero tip on a pending paid ride settles the fare immediately. This runs **before** the rating is written.
+  </Step>
+  <Step title="Submit the rating">
+    `submitRating` routes the rider to `Ride.RateDriver` and the driver to `Ride.RateRider`. Each is skipped silently if that side's rating column is already non-null.
+  </Step>
+  <Step title="Record the event">
+    `recordRateEvent` (`internal/service/ride/events.go`) writes `ride_rated` with `rating`, `feedback`, `rated_by`, `pickup_name`, `dest_name`, `distance`, `price`. It adds `elapsed_since_complete_ms` when `complete_time` is set, plus `tips_enabled` and `tip_amount` when tips are on.
+  </Step>
+</Steps>
+
+Both repository methods (`internal/data/repository/ride_lifecycle.go`) open a ride command with `beginRideCommand`, which locks the ride. They re-check status under the lock. If it isn't `complete` or `pending_rider_rating`, they return `rideCommandConflict()`, **This ride has changed. Refresh and try again.** (400). They then call `finalizeRideCommand` so ride-state snapshots and revisions update.
+
+### Status transitions
+
+| Actor | SQL | Status effect |
+| --- | --- | --- |
+| Rider | `RateRideDriver` | Sets `status = 'complete'` unconditionally, from either allowed state |
+| Driver | `RateRideRider` | None. The ride stays `pending_rider_rating` until the rider acts or the tip window sweeper settles it. |
+
+For the full ride state machine, see [Ride lifecycle](/concepts/ride-lifecycle) and [Rides implementation](/engineering/api/rides-implementation).
+
+## Pending reviews
+
+No status represents "driver still owes a review." Instead, `GetRideSnapshotRows` (`internal/data/repository/queries/ride_snapshot.sql`) derives two flags per ride:
+
+```sql
+rider_review_pending  = status IN ('complete','pending_rider_rating') AND pickup_time IS NOT NULL
+                        AND cancel_phase IS NULL AND driver_rating IS NULL AND rider_feedback IS NULL
+driver_review_pending = status IN ('complete','pending_rider_rating') AND pickup_time IS NOT NULL
+                        AND cancel_phase IS NULL AND rider_rating IS NULL AND driver_feedback IS NULL
+```
+
+The same predicate keeps a `complete` ride in the caller's ride snapshot until that caller has reviewed it. Canceled rides and rides without a pickup are never pending.
+
+**Skipping** works because feedback is written as a non-null string. Both mobile clients call `/rate` with no rating to skip. `RateRideDriver` and `RateRideRider` bind `feedback` as `text`, so an omitted feedback is stored as `''`, not `NULL`. That clears the pending flag.
+
+Worked example: the rider taps **Skip**. The app sends `{"rating": null, "tip_amount": null}` (`app/(app)/ride-complete/index.tsx`). `captureTip` runs with a tip of 0 and settles the fare. `RateRideDriver` writes `driver_rating = NULL`, `rider_feedback = ''`, and `status = 'complete'`. `rider_review_pending` is now false.
+
+## Rating averages
+
+Every surface recomputes the average, and they disagree on the default for "no ratings yet."
+
+| Surface | Query | Rated party | Default when none |
+| --- | --- | --- | --- |
+| User profile (`rider_rating`, `driver_rating`) | `GetUserProfileByID`, `GetUserProfileByEmail` (`queries/user_profile.sql`) | Self | `NULL` |
+| Public ride projection (rider and driver cards) | `GetPublicRideProjection` (`queries/ride_matching.sql`) | Rider and driver | 5 |
+| Driver ride board | `GetEligibleEnrichedRideBoard` (`queries/ride_driver.sql`) | Rider | 5 |
+| Driver's queued rides | `ListDriverQueuedRides` (`queries/ride_matching.sql`) | Rider | 0 |
+| Dashboard driver lists | `ListCommunityDrivers`, `ListGlobalActiveDrivers` (`queries/user_driver.sql`) | Driver | 0 |
+| Dashboard user detail | `GetDashboardUserDetail` (`queries/user_profile.sql`) | Driver | 0 |
+| Dashboard fleet drivers | `ListDashboardFleetDrivers` (`queries/driver_fleet_primitives.sql`) | Driver | `AVG` result, can be null |
+| Dashboard rides list | `ListDashboardRides` (`queries/analytics.sql`) | Per ride | Raw `driver_rating` and `rider_rating` |
+
+`AVG` ignores null ratings, so skipped reviews don't lower the average. Worked example: a driver has four rides rated 5, 4, null, and 3. The average is `(5 + 4 + 3) / 3 = 4.0`, not 3.0.
+
+Ratings aren't used by matching or auto-queue scoring. They're display-only. The driver app also keeps a local shift average (`incrementDriverShiftRating` in `components/drive/RideCompleteScreen.tsx`) that never reaches the server.
+
+## Issue reports
+
+### Request
+
+`requests.CreateIssueRequest` (`internal/server/http/issue/requests/request.go`):
+
+| Field | Validation |
+| --- | --- |
+| `issue` | Required, non-empty |
+| `comment` | Optional |
+| `ride_id` | Optional UUID. Not checked for existence or for the caller's participation. |
+
+### Flow
+
+<Steps>
+  <Step title="Store">
+    `IssueHandler.CreateIssue` reads the user from context and validates. `IssueService.CreateIssue` calls `sqlIssueRepository.CreateIssue`, which inserts into `Issues` with `timestamp = time.Now()` from the API process. `issue_comment` is always a non-null pointer, so an omitted comment is stored as `''`.
+  </Step>
+  <Step title="Load the reporter">
+    The service loads the user with `User.GetByID`. On failure it logs and skips the alert. The request still succeeds.
+  </Step>
+  <Step title="Alert">
+    `async.Go` runs `NotifyIssueCreated` in a detached background context named `issue-created-alert`. Failures are logged as warnings.
+  </Step>
+</Steps>
+
+`NotifyIssueCreated` (`internal/service/notifications/notification.go`) posts plain text to the default Slack alerts webhook through `sendSlackMessage`:
+
+```text
+[New Issue Reported]
+*User:* First Last (School Name)
+*Category:* <issue>
+*Comment:* <comment>
+*Ride ID:* <ride_id>        (only when ride_id is set)
+```
+
+If `issue` or `comment` contains `safety` (case-insensitive), the header becomes `@here [SAFETY ISSUE REPORTED]`. `sendSlackMessage` drops the alert for test accounts when `SKIP_TEST_SCHOOL_NOTIFICATIONS` is true (default `true`). Test accounts are school name `Yelo University`, a fixed test school ID, or an email starting with `test`. For the full alert catalog, see [Slack alerts](/engineering/notifications/slack-alerts).
+
+### Mobile callers
+
+| Screen | File | Payload |
+| --- | --- | --- |
+| Contact Yelo | `components/bottom-sheets/profile-sheets/ContactYeloSheet.tsx`, `lib/contacts/contactYeloFeedback.ts` | `issue` is one of `Safety`, `Payment`, `Issue`, `Feedback`. `comment` is the trimmed text, with `Ride ID: <id>` appended when a ride is in context. |
+| Feedback sheet | `components/bottom-sheets/profile-sheets/FeedbackSheet.tsx` | `issue` and `comment` both set to the typed text |
+| Ride provider | `providers/RideProvider.tsx` (`submitIssue`) | `issue` is the text, `ride_id` is the current ride. No screen calls it. |
+
+Picking the **Safety** category always produces the `@here` header, because the category string contains `safety`.
+
+### Dashboard
+
+No dashboard view reads the `Issues` table. The **Issues** tab on the dashboard rides page (`src/sites/dashboard/pages/RidesShellPage.tsx` in `yelo-web`) shows cancellations and uncompleted rides, not issue reports. You review issue reports in Slack or by querying `Issues` directly.
+
+## Where this lives in code
+
+| Concern | File | Function / type |
+| --- | --- | --- |
+| Rate route | `internal/server/http/ride/ride_routes.go` | `RegisterAuthenticatedRoutes` (`/i/{id}/rate`) |
+| Rate handler | `internal/server/http/ride/ride_handler.go` | `RideHandler.Rate` |
+| Rate request model | `internal/models/ride.go` | `RatingRequest`, `RatingRequest.Validate` |
+| Rate orchestration | `internal/service/ride/ride.go` | `RideService.Rate`, `submitRating` |
+| Rating event | `internal/service/ride/events.go` | `recordRateEvent` |
+| Rating writes | `internal/data/repository/ride_lifecycle.go` | `RateDriver`, `RateRider` |
+| Rating SQL | `internal/data/repository/queries/ride_lifecycle.sql` | `RateRideDriver`, `RateRideRider` |
+| Pending review flags | `internal/data/repository/queries/ride_snapshot.sql` | `GetRideSnapshotRows` |
+| Tip capture | `internal/service/ride/tip_charge.go` | `captureTip` |
+| Issue route and handler | `internal/server/http/issue/issue_routes.go`, `issue_handler.go` | `RegisterRoutes`, `IssueHandler.CreateIssue` |
+| Issue service | `internal/service/issue/issue.go` | `IssueService.CreateIssue` |
+| Issue repository | `internal/data/repository/issue.go` | `sqlIssueRepository.CreateIssue` |
+| Issue SQL | `internal/data/repository/queries/engagement.sql` | `CreateIssue` |
+| Issue model | `internal/models/issue.go` | `Issue` |
+| Slack alert | `internal/service/notifications/notification.go` | `NotifyIssueCreated`, `sendSlackMessage`, `shouldSkipSlackForUser` |
+| Schema | `migrations/000075_issue-table.up.sql`, `000110`, `000111`, `000078_ride-feedback.up.sql` | `Issues`, `rider_feedback`, `driver_feedback` |
+
+## Gotchas and edge cases
+
+- **Tip before rating.** `captureTip` runs before `submitRating`. If the rating write then fails (for example, a lock conflict), the tip or fare capture has already happened and the client sees an error.
+- **Ratings aren't truly write-once.** `submitRating` only skips when the rating column is non-null. After a skip (null rating, `''` feedback), a second `/rate` call overwrites both columns. `RateRideDriver` also sets `status = 'complete'` again.
+- **Canceled rides are rateable.** `Rate` checks only the status. Canceled rides end in `complete` with a non-null `cancel_phase`, so a participant can rate them through the API even though the app never prompts.
+- **Wrong-user errors are 400.** A non-participant gets `ErrorTypeInput`, which `MapErrorToStatusCode` maps to 400, not 403.
+- **`num_riders` only comes from the driver's review.** `CreateRequestedRide` doesn't set it, so it's `NULL` until the driver rates. `ListRideT0NotificationTargets` (`queries/community.sql`) still filters on `v.num_seats >= r.num_riders`. For a new confirmed ride, that comparison is `NULL`, which excludes every candidate. The test in `internal/data/repository/t0_notification_test.go` sets `num_riders = 2` explicitly, so it doesn't catch this.
+- **Feedback text is barely surfaced.** `rider_feedback` and `driver_feedback` are only selected by the pending-review predicate. The text is visible in the `ride_rated` event metadata (see [Ride events](/reference/ride-events)).
+- **Inconsistent defaults.** The same new rider shows 5 stars on the ride board and in the public ride projection, but 0 in the driver's queued-rides list. A new driver shows `NULL` on their own profile and 0 in dashboard lists.
+- **`Issues` has no keys.** Migration `000075` creates `Issues` with no primary key constraint, no foreign keys, and no indexes. `ride_id` can reference a nonexistent ride.
+- **Unused `RideIssues` table.** Migration `000071_ride-issues` created `RideIssues`. No code reads or writes it.
+- **Ride ID usually lives in the comment.** The main Contact Yelo flow puts the ride ID in `comment` text rather than `ride_id`, so `Issues.ride_id` is null for most reports.
+- **Alert loss is silent.** The Slack post runs in a goroutine after the response. If the process exits or the webhook fails, the issue row exists but no one is alerted.
+- **No issue read API.** No endpoint lists, resolves, or assigns issues.

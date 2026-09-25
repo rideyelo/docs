@@ -1,0 +1,171 @@
+---
+title: "Enums and value sets"
+description: "Every Postgres enum type in the yelo-api schema, which ones are still used, the CHECK-constrained text columns that act as enums, and the Go constants that mirror them, including where Go and the database disagree."
+---
+
+The schema has five Postgres `ENUM` types, and only two are attached to columns. Most enumerated values are `text` columns, either guarded by a `CHECK (col = ANY (ARRAY[...]))` constraint or not constrained at all, with the value set defined by Go constants. See [Database overview](/reference/database/overview#enums) for why.
+
+When you add a value:
+
+- For a Postgres enum, `ALTER TYPE ... ADD VALUE` in a migration. It can't run inside a transaction block on older Postgres versions and can't be removed later.
+- For a `CHECK` column, drop and re-create the constraint in a migration. Deploy the migration before code that writes the new value, because migrations run before traffic shifts.
+- For an unconstrained column, update the Go constants and every SQL literal that filters on the old set.
+
+## Postgres enum types
+
+| Type | Values | Used by | Status |
+| --- | --- | --- | --- |
+| `RidesStatus` | `requested`, `confirmed`, `matched`, `in_progress`, `complete` | Nothing | Orphaned |
+| `CancelType` | `rider_pre_match`, `rider_post_match`, `driver_post_match` | Nothing | Orphaned |
+| `DriverApplicationStatus` | `NotApplied`, `Requested`, `Approved`, `Denied` | Nothing | Orphaned |
+| `kpi_manual_metric` | `revenue`, `spotlights`, `impressions` | `KpiManualLog.metric` | Live |
+| `river_job_state` | `available`, `cancelled`, `completed`, `discarded`, `pending`, `retryable`, `running`, `scheduled` | `river_job.state` | Live, owned by River |
+
+### RidesStatus
+
+Created in `000001_init_db` as the type of `Rides.status`. Migration `000033_change-ride-status-col-type` converted the column to `text` with `ALTER COLUMN status TYPE text USING status::text`. The type was never dropped.
+
+The Go type `models.RideStatus` (`internal/models/ride.go`) has diverged completely:
+
+| Go constant | Value | In `RidesStatus`? |
+| --- | --- | --- |
+| `RideStatusRequested` | `requested` | Yes |
+| `RideStatusConfirmed` | `confirmed` | Yes |
+| `RideStatusQueued` | `queued` | No |
+| `RideStatusDriverEnRoute` | `driver_en_route` | No |
+| `RideStatusDriverWaiting` | `driver_waiting` | No |
+| `RideStatusInProgress` | `in_progress` | Yes |
+| `RideStatusPendingRiderRating` | `pending_rider_rating` | No |
+| `RideStatusCompleted` | `complete` | Yes |
+| `RideStatusNoDriversAvailable` | `no_drivers_available` | No |
+
+`matched` exists only in the enum. No Go code writes it. Cancellation isn't a status; see [Rides](/reference/database/rides#ride-status-model).
+
+### CancelType
+
+Created in `000001_init_db` as the type of `Rides.cancel_type`. Migration `000108_cancel-comment` dropped that column. Cancellation is now described by three text columns on `Rides`:
+
+- `cancel_user`: `rider` or `driver` from `models.UserType` (`UserTypeRider`, `UserTypeDriver`), or `NULL` for system cancellations.
+- `cancel_phase`: the `RideStatus` the ride was in when cancelled.
+- `cancel_reason`: free text, with the system values `automatic` and `superseded`.
+
+The Go `Ride` struct still tags `CancelUser` with `db:"cancel_type"` and `json:"cancel_type"` (`internal/models/ride.go:176`). The JSON field name leaks the old column name into the API.
+
+### DriverApplicationStatus
+
+Created in `000001_init_db` as the type of `Users.driver_registration_status`. Migration `000030_split-driver-signup-fields` dropped that column. Driver application state now lives in `DriverApplications` as unconstrained text, using `models.ApplicationStatus` (`internal/models/driver.go`):
+
+| Go constant | Value |
+| --- | --- |
+| `ApplicationStatusNotApplied` | `not_applied` |
+| `ApplicationStatusPending` | `pending` |
+| `ApplicationStatusComplete` | `complete` |
+| `ApplicationStatusFailed` | `failed` |
+| `ApplicationStatusRestricted` | `restricted` |
+| `ApplicationStatusUnknown` | `unknown` |
+
+None of these match the enum's PascalCase labels.
+
+### kpi_manual_metric
+
+Created in `000221_kpi_manual_log` for `KpiManualLog.metric`, which records manually entered KPI values on the dashboard. Go mirrors it exactly with `models.KpiManualMetric` in `internal/models/kpi.go`: `KpiManualMetricRevenue`, `KpiManualMetricSpotlights`, `KpiManualMetricImpressions`.
+
+### river_job_state
+
+Created by the vendored River migrations `000242_river_v1` through `000248_river_v7`. River's Go library owns the values through `rivertype.JobState`. Yelo SQL references the state in a few places, for example `ClaimRideOperationsWithoutLiveJob` and the Stripe reconciliation dispatcher treat `available`, `pending`, `running`, `retryable`, and `scheduled` as live. Don't alter this type by hand.
+
+## CHECK-constrained text columns
+
+These columns are `text` with a `CHECK` constraint listing the allowed values. The Go column lists the named constants when they exist.
+
+### Users and identity
+
+| Column | Allowed values | Go mirror |
+| --- | --- | --- |
+| `Users.account_type` | `student`, `community` | `models.AccountType` (`AccountTypeStudent`, `AccountTypeCommunity`), `internal/models/user.go` |
+| `Users.acquisition_source` | `NULL`, `app_organic`, `app_referral`, `qr_payment`, `event_link`, `csv_import`, `guest`, `driver_guest`, `other` | `models.AcquisitionSource`, `internal/models/user.go`. Exact match. |
+| `AuthTransactions.purpose` | `signin`, `link` | `models.AuthV3Purpose` |
+| `AuthTransactions.channel` | `app`, `web` | `models.AuthV3Channel` |
+| `AuthTransactions.provider`, `AuthIdentities.provider`, `AuthDeniedSubjects.provider` | `google`, `apple`, `phone` | `models.AuthV3Provider` |
+| `AuthTransactions.status` | `pending`, `provider_pending`, `verified`, `completed`, `conflict`, `expired`, `cancelled` | `models.AuthV3TransactionStatus`. Note the British spelling `cancelled`. |
+| `AuthTransactions.code_challenge_method` | `S256` | None; the only PKCE method accepted. |
+| `AuthTransactions.location_source` | `NULL`, `ip` | None |
+| `AuthDeniedSubjects.reason` | `NULL`, `disabled_user`, `deleted_user`, `banned_user`, `ambiguous_match`, `provider_slot_occupied` | `models.AuthV3DeniedReason` |
+| `UserLegalAcceptances.document` | `terms`, `privacy` | `models.AuthV3LegalDocument` |
+| `EducationVerifications.provider` | `studid`, `google`, `microsoft`, `email_otp` | No named type. `education_verification.go` compares literals. |
+| `UserEducationClaims.status` | `pending`, `verified`, `superseded` | `models.EducationClaimStatus`, `internal/models/world_cup.go` |
+| `UserEducationClaims.campaign_key` | `world_cup` | None |
+
+All `models.AuthV3*` types are in `internal/models/authv3.go` and match the constraints exactly.
+
+### Rides and payments
+
+| Column | Allowed values | Go mirror |
+| --- | --- | --- |
+| `RideOperations.actor_type` | `rider`, `driver`, `system` | Same strings as `models.RideEventActorType` |
+| `RideOperations.kind` | `accept`, `cancel`, `complete`, `promotion`, `settle_tip`, `tip` | None |
+| `RideOperations.state` | `pending`, `succeeded`, `failed`, `quarantined` | Unexported constants in `internal/data/repository/ride_operation.go` |
+| `StripeReconciliation.status` | `due`, `pending`, `succeeded`, `failed`, `ineligible` | Literals in `stripe_reconciliation.sql` and `reconciliation_jobs.go` |
+| `QrPaymentConfigs.pricing_mode` | `fixed`, `custom` | Literals in `internal/service/qrpayment` and `internal/service/tipping` |
+
+### Markets, fleets, and places
+
+Semantics for these are on the owning pages in the [table index](/reference/database/overview#table-index).
+
+| Column | Allowed values | Go mirror |
+| --- | --- | --- |
+| `Communities.timezone_status` | `pending`, `resolved`, `unresolved`, `non_geographic` | Literals in `internal/data/timezone` |
+| `RidePriceParameters.pricing_type` | `per_ride`, `per_person` | `models.PricingType`, `internal/models/community.go` |
+| `RidePriceParameters.adjustment` | JSON object whose `mode` is `jitter`, `rounded`, or `none` | `models.PricingAdjustment` |
+| `CommunitySpots.spot_type` | `event`, `location` | `SpotTypeEvent`, `SpotTypeLocation`, `internal/models/spot.go` |
+| `FleetCommunityServices.origin` | `admin`, `current_price`, `primary_fleet`, `fleet_creation` | None |
+| `MobilityFeeds.source` | `gbfs`, `gtfs`, `gtfs_rt` | `MobilityFeedSource*`, `internal/models/mobility_feed.go` |
+| `MobileVehicleCatalogs.platform` | `ios`, `android` | None |
+| `PlaceProfiles.provider`, `PlaceProviderAliases.provider` | `google`, `mapbox`, `legacy` | None |
+| `PlaceIdentityBackfills.source` | `Locations`, `LikedLocations`, `RecentLocations`, `TopLocations`, `Venues`, `Bumps`, `Rides` | None. Values are table names. |
+| `CalendarConnections.sync_state` | `awaiting_calendar`, `pending`, `ready`, `validation_error`, `needs_auth`, `error`, `disabled` | Literals in `internal/service/operatinghours` |
+| `GoogleCalendarOAuthFlows.status` | `pending`, `exchanging`, `authorized`, `completed`, `failed` | None |
+
+### Notifications, growth, and platform
+
+| Column | Allowed values | Go mirror |
+| --- | --- | --- |
+| `Notifications.status` | `pending`, `deferred`, `sent`, `partial_failure`, `failed`, `suppressed` | `models.NotificationLogStatus` covers only `pending`, `sent`, `partial_failure`, `failed` |
+| `NotificationDeliveries.status` | `queued`, `deferred`, `sending`, `sent`, `delivered`, `failed`, `suppressed` | `models.NotificationLogRecipientStatus` covers only `sent`, `delivered`, `failed`, `deferred`, `suppressed` |
+| `NotificationTemplates.category` | `transactional`, `marketing`, `safety` | Literals in `internal/notify` |
+| `NotificationTemplates.quiet_hours_behavior` | `bypass`, `defer` | Literals in `internal/notify` |
+| `NotificationTemplateVersions.source_table` | `template`, `variant` | None |
+| `TextMessages.status` | `sending`, `sent`, `failed` | None |
+| `MarketingSegments.match_mode` | `all`, `any` | `models.SegmentMatchMode` |
+| `ContactSyncRequests.entity_kind` | `user`, `community`, `school` | Set by the `enqueue_contact_sync` trigger |
+| `ContactSyncProviders.mode` | `legacy`, `paused`, `generic` | None |
+| `ContactSyncState.outcome` | `pending`, `synced`, `ineligible`, `removed`, `blocked` | None |
+| `ContactSyncIdentities.stage` | `prepared`, `active`, `retiring`, `retired` | Literals in `internal/service/contactsync` |
+| `ContactSyncScanProgress.mode` | `bootstrap`, `reconcile`, `orphans`, `legacy_bindings` | Literals in `internal/data/repository/contact_sync.go` |
+| `QuoScanProgress.mode` | `backfill`, `reconcile` | None |
+| `E2ERuns.scenario` | `auth_existing_rider`, `auth_rider_driver_pair`, `ride_confirmed_rider`, `ride_queued_pair`, `ride_notification_rider` | `scenario*` constants in `internal/server/http/e2econtrol/routes.go` |
+| `E2ERuns.status` | `active`, `cleaned`, `expired` | Literals in `internal/server/http/e2econtrol` |
+
+"Covers only" means Go has no named constant for the other values. The database still accepts them, and SQL in the notification pipeline writes some of them directly.
+
+## Unconstrained text value sets
+
+These columns have no database constraint. Go constants are the only definition, so a typo in SQL or a new value in Go is accepted silently.
+
+| Column | Values | Go definition |
+| --- | --- | --- |
+| `Rides.status` | See [RidesStatus](#ridesstatus) | `models.RideStatus` |
+| `Rides.vehicle_type` | `x`, `xl`, `cart`, `minibus`. Only `CHECK (vehicle_type <> '')` applies. | `models.VehicleType`. Vehicle types are also configured in `VehicleTypes`. |
+| `Rides.cancel_user` | `rider`, `driver`, `NULL` | `models.UserType` |
+| `Rides.cancel_phase` | Any `RideStatus` value | `models.RideStatus` |
+| `RideEvents.event_type` | 33 values such as `ride_requested`, `ride_accepted`, `payment_confirmed`, `tip_captured`, `rescue_alert_sent` | `models.RideEventType`, `internal/models/ride_event.go` |
+| `RideEvents.actor_type` | `rider`, `driver`, `system` | `models.RideEventActorType` |
+| `RideNotifications.type` | `no_drivers_available`, `driver_matched`, `driver_arrived`, `completed`, `rider_canceled`, `driver_canceled`, `ride_offered` | `models.RideNotificationType`. Note the American spelling `canceled`. |
+| `DriverNotifications.type` | `fare_increase`, `unclaimed_ride`, `unclaimed_ride_recent_only`, `renew_online` | `models.DriverNotificationType`, `internal/models/community.go` |
+| `DriverApplications.profile_picture_status`, `license_status`, `stripe_status` | `not_applied` (default), `pending`, `complete`, `failed`, `restricted`, `unknown` | `models.ApplicationStatus` |
+| `Fleets.stripe_status` | `not_required` (default), `pending`, `restricted`, `complete` | Literals in `internal/service/payment/payment.go` |
+| `Users.gender` | `male`, `female`, `other`, `prefernottosay` | `models.GenderOption` |
+
+<Warning>
+Spelling differs across value sets: `AuthTransactions.status` uses `cancelled`, while `RideNotifications.type` uses `rider_canceled` and `driver_canceled`, and `river_job_state` uses `cancelled`. Copy values from the Go constants rather than typing them.
+</Warning>

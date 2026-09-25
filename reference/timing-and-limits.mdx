@@ -1,0 +1,494 @@
+---
+title: "Timing and limits"
+description: "Every timeout, interval, TTL, expiry, retry policy, batch size, rate limit, cooldown, geo threshold, and money threshold in yelo-api, yelo-web, and yelo-frontend, grouped by domain."
+---
+
+This page lists the numbers that shape Yelo's runtime behavior, with the code location of each. Values come from `main`. Change the code, not this page, when you need a different value.
+
+**Path conventions.** API paths are relative to `yelo-api/internal/`, with these abbreviations:
+
+- `constants.go` is `utilities/config/constants.go`.
+- `config.go` is `utilities/config/config.go`.
+- `main.go` is `yelo-api/cmd/api/main.go`.
+- `queue.go` is `notify/queue/queue.go`.
+- `queries/` is `data/repository/queries/`.
+
+Mobile paths are relative to `yelo-frontend/`, and web paths to `yelo-web/`.
+
+For environment variables that override some of these values, see [Environment variables](/reference/environment-variables). For flags that switch behavior on or off, see [Feature flags](/reference/feature-flags).
+
+<Warning>
+`RideAcceptTimeout` (25s), `NoDriversAvailableDelay` (45s), `CommunityWaitBuffer` (5 min), and `RecentlyOnlineDriverNotificationWindow` (30 min) in `constants.go:7-16` are never referenced. The effective values are the hard-coded 30-second offer window and the 60-minute recently-online window listed below.
+</Warning>
+
+## Rides and matching
+
+<AccordionGroup>
+  <Accordion title="Request lifecycle (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `RideRequestExpiry` | 10 min | `constants.go:22` | Unmatched confirmed rides are cancelled (`data/repository/ride_lifecycle.go:793`). Also the activation look-back (`ride_matching.go:442`) |
+    | Selected-driver offer window | 30 s | `service/ride/driver.go:301`, `queries/ride_driver.sql:54`, `queries/ride_lifecycle.sql:233`, `queries/ride_matching.sql:114` | Other drivers cannot accept, and activation skips the ride, until `offer_time` is 30 s old |
+    | `MaxQueueLength` | 100 | `utilities/matching/matching.go:11` | Drivers at this queue length cannot accept and are excluded from first-tier pings |
+    | Default pickup estimate | 240 s | `queries/ride_matching.sql:61-67` | Used when there were no pickups in the last hour |
+    | Community wait window | 1 h | `queries/community.sql:212` | Average pickup wait window |
+    | Recent requests window | 20 min | `queries/community.sql:334` | Community request count |
+    | Recent active drivers | 15 min | `queries/community.sql:194` | Sessions ended within this still count |
+    | `activeRideBufferSeconds` | 120 s | `service/ride/ride.go:625` | Buffer added to remaining active-ride time |
+    | Ride board refresh key | 10 s | `service/ride/ride_board_redis.go:91,116` | Redis refresh marker |
+    | Command rollback context | 3 s | `data/repository/ride_lifecycle.go:29` and others | Detached rollback timeout |
+    | Queued authorization cleanup | 10 s | `service/ride/driver.go:258,1131` | Releases the PaymentIntent after cancel or requeue |
+  </Accordion>
+  <Accordion title="Driver options and ETAs (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `maxDriverOptions` | 3 | `service/ride/driver_options.go:24` | Specific-driver options shown to a rider |
+    | `maxDriverCandidates` | 5 | `driver_options.go:27` | Candidates sent to Mapbox for exact ETAs |
+    | `maxDriverRoughMinutes` | 60 | `driver_options.go:30` | Rough ETA cutoff |
+    | ETA hard cutoff | 3600 s | `driver_options.go:136`, `service/ride/rider.go:550` | Drivers an hour or more away are dropped or flagged `eta_too_long` |
+    | `avgSpeedKmPerMin` | 0.5 (about 30 km/h) | `driver_options.go:21` | Haversine ETA speed |
+    | `etaBufferMinutes` | ±2 min, floor 1 | `driver_options.go:33,402` | Pickup time range width |
+    | `maxBadgesPerOption` | 2 | `service/ride/rider.go:1680` | Badges per ride option |
+  </Accordion>
+  <Accordion title="Cancellation (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `WaitTimeCancellationCutoff` | 420 s | `constants.go:34` | A driver can cancel with a no-show fee after waiting this long (`utilities/pricing/pricing.go:204`) |
+    | `TimeAwayCancellationCutoff` | 300 s | `constants.go:37` | While the driver is en route, the rider pays a fee only when the driver's ETA is 5 min or less (`pricing.go:246`) |
+    | Fee, driver waiting | max(75% of fare, $1) | `pricing.go:225` | Rider cancellation |
+    | Fee, in progress | max(100% of fare, $1) | `pricing.go:227` | Rider cancellation |
+    | Fee, en route within 5 min | max(40% of fare, $1) | `pricing.go:250` | Rider cancellation |
+    | Fee, driver no-show cancel | max(40% of fare, $1) | `pricing.go:205` | Driver cancellation after 7 min |
+    | Cancellation quote | 60 s (DB check allows up to 2 min) | `queries/ride_operation.sql:103`, `migrations/000340` | Server-priced cancel consent expires |
+
+    See [Cancellations](/concepts/cancellations).
+  </Accordion>
+  <Accordion title="Ride chat">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Message page size | 1 to 100 | `data/repository/messaging.go:125`, `queries/messaging.sql:64` | Chat delta limit |
+    | Driver chat window | 24 h | `queries/messaging.sql:12` | Completed rides still open for chat |
+    | `MESSAGE_FALLBACK_MS` (mobile) | 30 s | `hooks/drive/useRideMessages.ts:25` | Fallback chat sync while a ride chat is open |
+    | `INBOX_FALLBACK_MS` (mobile) | 60 s | `providers/MessagingProvider.tsx:22` | Inbox fallback sync |
+  </Accordion>
+</AccordionGroup>
+
+## Drivers, presence, and activation
+
+<AccordionGroup>
+  <Accordion title="Presence (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `DriverExpiryInterval` | 30 min | `constants.go:25` | Online drivers with no ping for this long go offline |
+    | Renew reminder window | Last ping 29m15s to 29m45s ago | `queries/user_driver.sql:99-100` | "Renew online" push 15 to 45 s before expiry |
+    | `DriverReminderInterval` | 30 s | `constants.go:28` | Minimum gap between community renew reminders |
+    | Renew reminder bucket | 300 s | `service/user/user.go` (`Unix()/300`) | Deduplicates reminders |
+    | `OfflineGraceInterval`, `offlineGraceTTL` | 5 min | `constants.go:31`, `data/redis/queue_cache.go:21` | Grace before an offline driver's queue is released |
+    | `driverPingFreshness` | 5 s | `data/repository/user_driver.go:23` | Skips rewriting `last_pinged_driver` when fresher |
+    | `presenceTTL` | 120 s | `data/redis/presence_cache.go:18` | Presence key lifetime |
+    | `driverLocTTL` | 2 h | `data/redis/activation_cache.go:18` | Cached driver location |
+    | `warmPoolMaxAge` | 60 min | `data/redis/activation_cache.go:19`, `service/dashboard/presence.go:15` | Warm pool membership. Defined twice |
+    | `maxPauseMinutes` | 60 | `service/driver/driver.go:28` | Longest auto-queue pause |
+    | Recently-online push window | 60 min | `queries/community.sql:87,97`, `notify/repository/recipients.go:118` | Drivers picked for unclaimed-ride pushes |
+    | Demand day offset | −6 h | `server/http/driver/driver_handler.go:302` | The driver "day" rolls over at 6 AM local |
+    | Earnings cache | 60 s | `data/redis/driver_status_cache.go:20` | All-time earnings lag |
+    | Pending location syncs | 100 | `service/heartbeat/heartbeat.go:19`, `service/user/user.go:32` | Async write queue depth |
+  </Accordion>
+  <Accordion title="Heartbeat and location (mobile)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Heartbeat, background | 45 s | `lib/platform/heartbeatUtils.ts:5` | App not active |
+    | Heartbeat, `/drive` | 10 s | `heartbeatUtils.ts:8` | Driver screens |
+    | Heartbeat, `/ride` | 15 s | `heartbeatUtils.ts:11` | Rider flow |
+    | Heartbeat, elsewhere | 30 s | `heartbeatUtils.ts:13` | Default |
+    | Heartbeat interval debounce | 500 ms | `providers/HeartbeatProvider.tsx:104-118` | Avoids timer churn on fast navigation |
+    | Foreground location watch | 10 s; 0 m (high accuracy) or 50 m | `providers/LocationProvider.tsx:161-163` | `Accuracy.High` or `Balanced` |
+    | Background driver location | 15 s, 25 m, deferred to the same | `tasks/DriverLocationTask.ts:90-105` | `Balanced`, automotive, never auto-paused |
+    | Background task request | 15 s timeout | `tasks/DriverLocationTask.ts:43` | Location upload |
+    | Device location max age | 60 s | `lib/map/deviceLocation.ts:3` | Cached fix reuse |
+    | Device location timeout, refresh, retry | 12 s, 45 s, 30 s | `lib/map/deviceLocation.ts:5-9` | Map location |
+    | Community resolution | At most every 15 min, fixes up to 30 min old | `lib/map/communityResolution.ts:1-3` | Re-resolves the user's community |
+  </Accordion>
+  <Accordion title="Activation and auto-queue (API)">
+    Default tiers are in `models/activation_config.go:28-40`. Admins can override them per community. See [Activation](/dashboard/activation).
+
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Tier 1 | 45 s, 8 km, 5 drivers, warm 15 min | `activation_config.go:31` | First staged ping |
+    | Tier 2 | 120 s, 13 km, 10 drivers, warm 60 min | `activation_config.go:32` | |
+    | Tier 3 | 300 s, 16 km, 15 drivers | `activation_config.go:33` | |
+    | Tier 4 | 480 s, 16 km, 20 drivers, ignores already notified | `activation_config.go:34` | |
+    | `CooldownMinutes` | 15 | `activation_config.go:36`, `migrations/000206` | Per-driver activation cooldown |
+    | `RescueGraceMinutes`, `RescueEnabled` | 5, `false` | `activation_config.go:37-38` | Rescue fires at last tier delay plus grace (`service/activation/activation.go:736`) |
+    | Tier validation | 1 to 10 tiers, strictly increasing delays | `server/http/community/requests/activation_config.go:18-33` | Dashboard input limits |
+    | `autoQueueMinAge` | 2 min | `service/activation/activation.go:33` | Minimum ride age before auto-queue |
+    | Ride tier hash | 20 min | `data/redis/activation_cache.go:223` | Tier reached per ride |
+    | `rideNotifiedTTL`, `rideRescueTTL` | 30 min each | `activation_cache.go:23,25` | Notified set and rescue dedup |
+    | `activationConfigTTL` | 5 min | `activation_cache.go:21` | Config cache |
+    | `aqAttemptedTTL`, `queueSummaryTTL` | 1 h, 30 min | `data/redis/queue_cache.go:18,20` | Auto-queue markers and summaries |
+    | Queue refresh loop | 3 min | `main.go:589` | Rebuilds queue summaries |
+    | Auto-queue weights | efficiency 0.5, equity 0.5, rides 0.6, fare 0.4, tie 0.05 | `service/activation/auto_queue.go:14-18` | Ranking |
+    | `bufferMinutes` | 2 per ride | `auto_queue.go:19` | Queue minutes per ride |
+    | `auto_queue_max_minutes`, `auto_queue_default_minutes` | 120, 60 | `migrations/000184`, `auto_queue.go:335` | Community queue capacity. Users can override |
+    | `AutoQueueMaxSessionCap` | 12 h | `models/driver_auto_queue_log.go:13` | Caps unclosed sessions |
+    | Default auto-queue hours | 19:00 to 03:00 | `data/repository/driver_auto_queue_log_overlap.go:10-11` | Used without operating windows |
+    | Market grace period | 1 h | `data/repository/community.go:1072` | Market stays live after a window closes |
+
+    <Warning>
+    With defaults, rescue would fire at 13 minutes, but unmatched rides are cancelled at 10 minutes and activation only looks back 10 minutes. Rescue is also off by default.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Payments, tips, and pricing
+
+<AccordionGroup>
+  <Accordion title="Tips">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `TipBuffer` | $5.00 | `models/tip.go:13` | Extra pre-authorization on tip-enabled rides |
+    | `MaxTip` | $100 | `models/tip.go:16`, validated in `service/ride/ride.go:851` | In-app tip ceiling |
+    | Tip presets | $2, $5, $10 | `models/tip.go:22` | Returned by tip options. Mobile falls back to the same (`app/(app)/ride-complete/index.tsx:34`) |
+    | Tip window | 24 h | `service/ride/driver.go:575` | Capture is deferred after completion |
+    | Tip capture loop | Every 5 min, batch 50 | `main.go:598`, `service/ride/tip_capture.go:13` | Captures when the window expires |
+    | Stuck tip alert | 1 h past window | `tip_capture.go:32` | Error log |
+    | QR tip min, max, preset | $1, $500, $5 | `service/tipping/tipping.go:17-21` | Guest tipping through `pay.yelo.link` |
+    | Web tip fallback min, max | 100 or 50 cents, 10000 cents | `src/shared/signup/steps/TipStep.tsx:78-79,194` | Used only when the config omits them |
+    | Web tip preset chips | $5, $10, $15, and the config preset | `TipStep.tsx:80` | Filtered to the allowed range |
+  </Accordion>
+  <Accordion title="Payments and payouts (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Stripe HTTP client | 10 s | `main.go:194` | |
+    | Partial confirm retry | 3 attempts, 100 ms to 5 s full jitter | `data/stripe/intent.go:130-133` | Capture retries |
+    | Critical retrier | 3 attempts, 100 ms to 5 s | `utilities/retry/retry.go:61-63` | Other intent calls |
+    | `payoutIdempotencyWindow` | 1 min | `data/stripe/payout.go:20` | Collapses double-tapped payouts |
+    | Instant payout fee | 1%, minimum 50 cents | `service/earnings/earnings.go:24-25` | Shown to drivers |
+    | Earnings list | Default 25, max 100 | `earnings.go:480-481` | |
+    | Reconciliation dispatch | Every 1 min, unique 50 s | `queue.go:251-255` | |
+    | Reconcile account job | 12 attempts, 1 min timeout, retry min(6 h, 15 s × 2^attempt) | `service/payment/reconciliation_jobs.go:36,146,149` | |
+    | Stripe 429 and 401/403 cooldown | 1 min and 15 min minimum, or `Retry-After` | `reconciliation_jobs.go:227-234` | |
+    | Reconcile schedule | 24 h after success, 7 days for invalid accounts, overdue after 25 h, batch 100 | `queries/stripe_reconciliation.sql:19-50` | |
+    | Drive fee scan | Every 10 min | `queue.go:293-297` | |
+    | Drive fee repair | Page 100, 10 pages, retry 24 h, 8-day capture cushion, 25 attempts, 2 min timeout | `service/user/drive_fee_jobs.go:17-22,81,123` | |
+    | QR payments list | 1 to 100, default 25 (service) or 20 (repository) | `service/qrpayment/qrpayment.go:292-293`, `data/repository/qr_payment.go:68` | |
+    | Stripe webhook body | 64 KiB | `server/http/payment/payment_handler.go:43` | |
+  </Accordion>
+  <Accordion title="Pricing (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Default price | $4 base, $2 per mile, $0.50 per minute | `constants.go:40-42` | Only when a community has no price parameters |
+    | Minimum fare | none | | Only cancellation fees have a $1 floor |
+    | Surge | 1 to 9.99×, 1 to 168 h | `models/supply_demand.go:127-128` | Dashboard surge limits |
+    | Jitter defaults | +$0.50 to $1.00; clamp to .90 to .99 when overshoot is below 0.2; anchor ×1.15 to 1.30 | `models/pricing_adjustment.go:35` | Editable. See [Feature flags](/reference/feature-flags#admin-editable-settings) |
+    | Preview jitter | Midpoint 0.5 | `utilities/pricing/preview.go:27` | |
+    | Quote presets | 1 mi / 3 min, 3 / 9, 6 / 18 | `utilities/pricing/presets.go:21-23` | Dashboard previews |
+    | Stereotypical ride | 3 mi, 8 min | `service/community/community.go:20-21` | Community price display |
+    | Price cache | 5 min | `data/redis/price_cache.go:14` | Not invalidated when jitter settings change |
+    | Zone backtest | Default 100, max 500 | `server/http/community/zone_pricing_handler.go:22-23` | |
+  </Accordion>
+</AccordionGroup>
+
+## Notifications and messaging
+
+<AccordionGroup>
+  <Accordion title="Push pipeline (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Default queue workers | 10 | `queue.go:39` | River notify queue |
+    | Expo batch size | 100 | `queue.go:42`, `utilities/notification/expo.go:23` | |
+    | Expo HTTP timeout | 30 s | `expo.go:25` | |
+    | Receipt polling | 15 min to 24 h after send, batch 1000, every 5 min | `queue.go:46-49` | |
+    | Sending lease, recovery | 10 min, every 5 min | `queue.go:53-54` | Requeues stuck deliveries |
+    | `orchestrateFreshness` | 15 min | `queue.go:75`, `notify/queue/orchestrate.go:40-61` | Time-sensitive jobs past this are cancelled |
+    | Event key bucket | 300 s | `notify/emit.go:197` | Dedups emits within 5 min |
+    | Stale orchestration batch | 1000 | `notify/queue/stale.go:15` | |
+    | Ride-available and unclaimed cooldown | 900 s per user | `notify/seed/templates.go:221,238,254` | |
+    | Signup alert | 90 s delay, 3 attempts, 30 s timeout | `notify/signup_alert.go:25-26` | |
+    | Scheduled notifications loop | 1 min | `main.go:580` | |
+    | Dashboard notification history | Max 100 | `server/http/dashboard/notifications/handler.go:225,281` | |
+  </Accordion>
+  <Accordion title="Friend bumps">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `bumpsPerHour` | 20 per sender | `service/notifications/bump.go:20-22` | |
+    | Recipients | Max 10 | `server/http/notification/requests/bump.go:10` | |
+    | Recipient cooldown | 300 s | `notify/seed/templates.go:344` | |
+    | `bumpExpiry` | 3 h | `bump.go:27` | Also the SQL matching window |
+    | `bumpRetention` | 7 days | `service/maplayer/bump_retention.go:14` | |
+    | Bump SMS lease, cooldown, freshness | 10 min, 5 min, 15 min | `queue.go:58,62,70` | |
+    | `BumpSMSMaxAttempts` | 3 | `notify/bump_sms.go:14` | |
+    | Bump request timeout (mobile) | 15 s | `api/helpers/bump.ts:10` | |
+    | Bump preview cache (mobile) | 24 h, 20 entries persisted | `lib/query/persistence.ts:5-6` | |
+  </Accordion>
+  <Accordion title="Providers">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Twilio request | 10 s, network retrier | `data/twilio/twilio.go:29,278,332` | |
+    | Photon | 10 s timeout, token refresh 1 min early, fallback token 5 min | `data/photon/photon.go:41,45,51` | |
+    | Resend mail | 10 s context, client without timeout | `utilities/mail/mail.go:23,75` | |
+    | Twilio Verify events | 1 MiB body, 200 events | `server/http/verifyevents/verifyevents.go:36,41` | |
+  </Accordion>
+</AccordionGroup>
+
+## Auth
+
+<AccordionGroup>
+  <Accordion title="Tokens and OTPs (API)">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `DefaultJwtDuration` | 6360 h (about 265 days) | `constants.go:45`, `service/authv3/jwt.go:54` | App JWT lifetime for v2 and v3. No refresh |
+    | Presignup JWT | 1 h | `utilities/jwt/jwt.go:21` | |
+    | Auth v2 OTP | 15 min TTL, 60 s cooldown, 5 attempts | `service/authv2/authv2.go:28-31`, `constants.go:19` | |
+    | Auth v3 phone attempt | 10 min TTL, 30 s cooldown, 5 sends, 5 verifies | `service/authv3/phone_orchestration.go:72-75` | |
+    | Auth v3 phone limits | Send 10/h per phone and 20/h per requester; verify 20/h and 40/h | `phone_orchestration.go:76-79` | |
+    | Auth v3 phone code | 5 digits | `service/authv3/phone/code.go:12` | |
+    | OTP fallback | After 60 s, sweep every 15 s, batch 100 | `config.go:178,184`, `phone_fallback.go:50,100` | Off by default |
+    | Auth v3 lifetimes | Transaction 10 min, provider start 5 min, handoff 2 min, onboarding 15 min, web access 1 h, web session idle 90 days and absolute 365 days | `utilities/config/authv3.go:18-24` | Env-overridable within bounds at `authv3.go:462-468` |
+    | Runtime cleanup | Every 5 min; handoffs kept 24 h, transactions 30 days; batch 500 | `main.go:534`, `runtime_cleanup.go:12,37-39` | |
+    | Serializable retry | 5 attempts, 10 ms × 2^n with jitter | `service/authv3/resolver.go:24-25` | |
+    | OIDC JWKS cache | From `Cache-Control`, default 5 min, max 1 h | `service/authv3/providers/oidc.go:20-22` | |
+    | Provider HTTP | 10 s, cache 5 min | `providers/types.go:70,72` | |
+    | Apple client secret | 5 min | `providers/apple.go:23` | |
+    | StudID | Verification 60 min, HTTP 10 s | `service/authv3/student/studid.go:25-26` | |
+  </Accordion>
+  <Accordion title="Auth rate limits (API)">
+    Durable limits in `server/http/authv3/durable_rate_limiter.go:183-201`, keyed by requester prefix (/24 for IPv4, /56 for IPv6, `service/authv3/service.go:284-287`). E2E multiplies limits by 100.
+
+    | Scope | Limit |
+    | --- | --- |
+    | Configuration | 120 per 10 min |
+    | Authorize | 30 per 10 min |
+    | Accept, start, token | 60 per 10 min each |
+    | Callback | 120 per 10 min |
+    | Phone send, phone verify | 120/h, 240/h |
+    | Legacy v2 phone send, per requester | 20/h |
+    | Legacy v2 phone send, global | 60/h across all users (one fixed subject, `server/http/authv2/handler.go:95-98`) |
+
+    Body caps: authorize 4 KiB, accept 8 KiB, token 4 KiB, phone send 256 B, verify 384 B, Apple 16 KiB (`server/http/authv3/handler.go:31-41`).
+  </Accordion>
+  <Accordion title="Auth in the clients">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | `AUTH_V3_REQUEST_TIMEOUT_MS` | 15 s | `yelo-frontend` `lib/auth/client.ts:3` | Auth v3 fetches |
+    | `HOSTED_WEB_PROBE_TIMEOUT_MS` | 4 s | `lib/auth/client.ts:231` | Hosted web availability probe |
+    | Attempt and transaction TTL | 15 min each | `providers/AuthV3Provider.tsx:58-59` | Local attempt state |
+    | Location for Auth v3 | 3 s timeout, fixes up to 5 min old | `providers/AuthV3Provider.tsx:60-61` | |
+    | `RESEND_COOLDOWN_MS` | 30 s | `app/(auth-v3)/phone-confirm.tsx:7` | Resend button |
+    | Version reveal | 3 taps within 2.5 s | `app/(auth-v3)/index.tsx:26` | |
+    | Web Auth v3 fetch | 12 s abort | `yelo-web` `src/sites/signup/auth-v3/authV3Fetch.ts:27` | |
+    | Web resend cooldown | Server `retryAfterSeconds` | `src/sites/signup/auth-v3/AuthV3Page.tsx:884,935` | |
+    | Legacy web OTP resend | 60 s | `src/shared/signup/steps/OtpStep.tsx:19` | |
+    | Attribution cookie | 90 days | `src/sites/signup/auth-v3/attribution.ts:17` | |
+    | Dub analytics cookie | 90 days on `.joinyelo.com` | `src/shared/bootstrap/renderSite.tsx:42` | |
+  </Accordion>
+</AccordionGroup>
+
+## Maps, search, and geo
+
+<AccordionGroup>
+  <Accordion title="API">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Places bias radius | 10 km (env), max 50 km | `config.go:309`, `data/googleplaces/googleplaces.go:34-35` | |
+    | Place resolve bias | 150 m | `data/googleplaces/poi_details.go:30` | |
+    | POI distance limits | 5000 m (authority, details), 250 m (lookup) | `service/mapping/poi_google_authority.go:46`, `data/poilookup/poilookup.go:23` | |
+    | Minimum POI evidence | 0.65 | `poi_google_authority.go:25` | |
+    | Google autocomplete, API context | 1.5 s, 3 s, 10 s | `googleplaces.go:36,101,309` | |
+    | Google Routes | 2 s | `data/googlemaps/googlemaps.go:32` | |
+    | Mapbox suggest | 2 s; 1.5 s per attempt, 2 tries | `data/mapbox/mapbox.go:33,1016-1017` | |
+    | Mapbox matrix | 25 coordinates | `mapbox.go:145-148` | |
+    | Haversine fallback | ×1.4 detour, 8.33 m/s | `mapbox.go:415,418` | |
+    | Search limit | 1 to 10 | `server/http/mapping/requests/search.go:32-33` | |
+    | Place caches | Details 7 days, resolve 30 days, reverse 10 min, session 10 min | `data/redis/place_cache.go:22-29` | |
+    | Route and ride ETA cache | 5 min, 15 s | `data/redis/route_cache.go:16,21` | |
+    | Community bounds cache | 15 min | `service/mapping/mapping.go:25` | |
+    | Auth v3 community exit buffer | 20 mi | `service/authv3/active_community.go:85` | |
+    | Heatmap | 0.0005° cells, at least 3 users, 60 days, 500 cells, key 15 min | `service/maplayer/heatmap.go:17-21` | |
+    | Friends layer | Positions 7 days, 500 rows, 100 spots, moves 24 h | `service/maplayer/friends_layer.go:17-23` | |
+    | Map layer TTLs | Vehicles 60 s, community 300 s; 20 top locations, 25 events, 2000 routes | `service/maplayer/maplayer.go:20-24` | |
+    | Community moves window | 168 h default, 1 to 720 h | `migrations/000276`, `server/http/community/requests/community.go:74` | |
+    | Mobility feeds | Poll every 1 min; backoff 2^n min to 1 h; 10 MiB live, 20 MiB GTFS | `main.go:613`, `service/maplayer/mobility.go:19-23`, `data/mobility/client.go:15-18` | |
+    | Map heat loop | 5 min | `main.go:607` | |
+    | `HotIndexWindow` | 6 h | `service/location/location.go:22` | |
+  </Accordion>
+  <Accordion title="Mobile map and search">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Vehicles and friends layer poll | 60 s | `lib/map/mapLayers.ts:26-27` | Only while focused |
+    | Community layer | 5 min stale and poll | `lib/map/mapLayers.ts:28`, `providers/MapFeedProvider.tsx:71-72` | |
+    | POI stale, refresh | 30 min, 5 min | `components/map/poi/queryConfig.ts:5-6` | |
+    | POI details stale | 1 h when a place id exists | `components/map/poi/usePlacePoiDetails.ts:14` | |
+    | Basemap tilequery timeout | 2.5 s | `components/map/customMapView/basemapPoi.ts:9` | |
+    | Search suggestions throttle | 300 ms map, 200 ms save-location | `hooks/useSearchSuggestions.ts:14`, `components/save-location/SearchOverlay.tsx:19` | |
+    | Recent locations fresh | 60 s | `lib/search/recentLocations.ts:21` | |
+    | Featured spot lock | 24 h | `lib/map/featuredSpot.ts:60` | |
+    | Map cache warm, error recovery | 8 s, 5 s | `components/map/layout/constants.ts:13-14` | |
+    | Spot write debounce | 150 ms | `hooks/usePinnedSpots.ts:6` | |
+  </Accordion>
+</AccordionGroup>
+
+## Contact sync and CRM (API)
+
+| Name | Value | Where | Effect |
+| --- | --- | --- | --- |
+| Quo request interval | 200 ms, minimum 125 ms | `utilities/config/quo.go:8-15` | Main and dashboard keys |
+| Quo gate | Fails fast over 15 s wait; 429 cooldown 1 min; one retry when `Retry-After` is 2 s or less | `data/quo/gate.go:25-28,57` | |
+| Quo caches | Fields 1 h, phone numbers 5 min | `data/quo/quo.go:254,369` | |
+| Quo jobs | Batch 500, timeout 90 s, 10 attempts, snooze up to 24 h | `service/quo/jobs.go:21,58,84,151` | |
+| Quo outbox | Every 5 s | `queue.go:258-262` | |
+| Resend intervals | 125 ms, 200 ms for contacts | `utilities/config/contact_sync.go:21-22` | |
+| Contact sync reconcile | 24 h | `contact_sync.go:23` | |
+| Contact sync lease | 120 s, renewed every 30 s | `service/contactsync/service.go:15,122` | |
+| Contact sync jobs | Dispatch 5 s, scan 1 min, 90 s timeout, 10 attempts | `service/contactsync/jobs.go` | |
+| Marketing segments | 20 per account | `data/repository/marketing_segments.go:178-184` | |
+| Contact uploads | 30 per hour per user, 5000 numbers each | `service/user/contacts.go:23,41` | |
+| Contact match debounce (mobile) | 800 ms; refresh after 15 min in foreground | `yelo-frontend` `components/ContactMatchSync.tsx:28-29` | |
+
+See [Contact sync](/administration/contact-sync).
+
+## Jobs and background loops (API)
+
+| Name | Value | Where | Effect |
+| --- | --- | --- | --- |
+| Operational loop | 30 s | `main.go:560` | Purges offline drivers, cancels unmatched rides, runs activation |
+| Feed refresh loop | 2 min | `main.go:571` | |
+| Vehicle type registry | 5 min | `main.go:411` | |
+| Loop task timeout, stale | 2 min, 5 min | `cmd/api/background_cleanup.go:17-18` | |
+| Calendar dispatch | Every 15 s | `queue.go:227-231` | |
+| Calendar sync | Lease 4 min, next sync 270 to 330 s, stale 7 min | `queries/calendar_sync.sql:40,76` | |
+| Community maintenance | Every 15 s, 1 min timeout | `queue.go:233` | |
+| Top locations | Dispatch 5 min, verify 1 h, batch timeout 5m20s, auto refresh 24 h | `notify/queue/top_locations.go:97,106`, `service/toplocations/toplocations.go:26-29` | |
+| GTM refresh | Every 5 min, caches 24 h | `queue.go:245` | |
+| Play release check | Every 5 min, request 30 s | `queue.go:236-242`, `service/playrelease/monitor.go:14` | |
+| River default attempts | 25 | `migrations/000248_river_v7.up.sql:38` | |
+
+See [Background jobs](/engineering/api/background-jobs).
+
+## HTTP, database, and infrastructure (API)
+
+| Name | Value | Where | Effect |
+| --- | --- | --- | --- |
+| HTTP server | Read 30 s, write 30 s, idle 60 s | `server/http/server.go:82-84` | |
+| Per-IP limiter | 50 rps, burst 100, idle eviction 3 min | `main.go:76-83`, `server/http/middleware.go:137-148` | Flags override. In memory per instance |
+| CORS max age | 3600 s | `middleware.go:121` | |
+| Graceful shutdown | 8 s drain, then OTel 5 s and Sentry 2 s | `main.go:503,158,141` | |
+| DB pools | API 10, River 12, CLI 2; lifetime 1 h, idle 30 min | `data/repository/storage.go:337-349,432-435` | |
+| DB timeouts | Queries 5 s, dial 5 s, ping 30 s, dashboard 15 s | `storage.go:30,402,449`, `data/repository/dashboard.go:1840` | |
+| Pool monitoring | Log 30 s, warn at 80%, leak after 5 min, stats 15 s | `config.go:277,302`, `storage.go:509-510` | |
+| Slow thresholds | Request 150 ms, query 50 ms | `config.go:300-301` | |
+| Redis client | Pool 50, 10 idle, 3 retries; dial 5 s, read and write 3 s; startup 180 s | `data/redis/client.go:36-57,127-133` | |
+| Redis circuit breaker | Trips at 50 or more requests with 80% failures in 120 s; open 60 s; 10 probes | `data/redis/client.go:161-172` | |
+| Default circuit breaker | Trips at 5 consecutive failures; open 60 s; 3 probes | `utilities/circuitbreaker/circuitbreaker.go:22,58-64` | Stripe, Twilio, Photon, Resend, Google, Mapbox |
+| Network retrier | 5 attempts, 200 ms to 10 s | `utilities/retry/retry.go:66-73` | |
+| OTel | Sampling 0.1, batch 5 s or 512 | `config.go:291`, `utilities/otel/otel.go:89,166-167` | |
+| Healthcheck | 5 s; 1 GiB free disk, 90% used max | `server/http/healthcheck/healthcheck_handler.go:31-32,54` | |
+| Body limits | Multipart 100 MiB, App Store 64 KiB, vehicle catalog 20 MiB | `utilities/helpers/helpers.go:17` and handlers | |
+| Detached background context | 30 s | `utilities/context/context.go:15` | |
+| Image thumbnails | 512 px, JPEG 80 | `utilities/image/processor.go:19-20` | |
+
+## Caches (API)
+
+| Name | Value | Where |
+| --- | --- | --- |
+| Auth cache | 15 min | `data/redis/auth_cache.go:17` |
+| User profile | 5 min | `data/redis/user_profile_cache.go:15` |
+| Community, community detail | 60 s | `data/redis/community_cache.go:14`, `community_detail_cache.go:15` |
+| Community invalidation epoch | 24 h | `data/redis/community_invalidation.go:58` |
+| School signup stats | 60 s | `data/redis/school_signup_stats_cache.go:15` |
+| Feed | 2 min, lock 30 s; 10 per page, 3 pages | `service/community/feed_cache_redis.go:21-22`, `community.go:22-23` |
+
+## Mobile data freshness
+
+<AccordionGroup>
+  <Accordion title="Query defaults and persistence">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Default `staleTime`, `gcTime` | 30 s, 1 h | `app/_layout.tsx:120-123` | See [State and data](/engineering/mobile/state-and-data#client-defaults) |
+    | Persist throttle | 10 s | `app/_layout.tsx:144` | AsyncStorage writes |
+    | `/user/status` poll | 10 s in an active ride, 15 s elsewhere in `/ride`, 30 s otherwise | `providers/QueryPollers.tsx:46-56` | Stops after a 401 |
+    | Current community poll | 60 s | `QueryPollers.tsx:96` | |
+    | Community zones | 5 min stale and poll | `QueryPollers.tsx:115-116` | Only with a live map |
+    | Ride matching poll | 5 s | `providers/RideMatchingProvider.tsx:62` | |
+    | Ride poll, active ride | 5 s; 3 s for the active ride query | `providers/RideProvider.tsx:133,147` | |
+    | Driver polls | 10 s; queued rides 10 s; 15 s request timeout | `providers/DriveProvider.tsx:107,133,236-240` | |
+    | Friends convergence | 5 min, stale 60 s | `providers/FriendsProvider.tsx:20,223-224` | |
+    | Friend locations stale | 15 s | `hooks/useFriendLocations.ts:71` | |
+    | Vehicle locations stale | 30 s | `hooks/useVehicleLocations.ts:61` | |
+    | Feed polls | Coupons 30 s; ads, deals, events 5 min; stories, referrals 10 min; community 5 min and 60 min | `components/feed/*`, `components/modals/EventStoryModal.tsx:113`, `api/helpers/community.ts:61,191` | |
+    | Vehicle types stale | 5 min | `hooks/useVehicleSeatLimits.ts:27` | |
+  </Accordion>
+  <Accordion title="Updates, telemetry, prompts">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Update-required check | Every 10 min in foreground, 10 s timeout | `app/_layout.tsx:222`, `lib/platform/appUpdateGate.ts:17` | |
+    | EAS update check | Every 30 min on foreground | `providers/EasUpdateObserver.tsx:8` | Production builds only |
+    | Native update fallback | 3 s | `app.config.ts:113` | |
+    | Startup fallback | 10 s | `providers/StartupPhaseProvider.tsx:12` | Forces interactive phase |
+    | Telemetry throttle | 5 min | `lib/observability/TelemetryService.ts:15` | |
+    | Sentry traces | 0.2 | `app/_layout.tsx:171` | Disabled in dev and E2E |
+    | Review prompt cooldown | 90 days | `lib/prompts/reviewPrompt.ts:22` | |
+    | Feedback prompt cooldown | 14 days | `lib/prompts/feedbackPrompt.ts:19` | |
+  </Accordion>
+  <Accordion title="Rides UI and third-party providers">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Ride request card timer | Counts up from `request_time` every 1 s | `components/drive/RideRequestCard.tsx:270-285` | Elapsed, not a countdown |
+    | Countdown warning, critical | 30 s, 120 s elapsed | `components/drive/CountdownTimer.tsx:20-21` | Color changes |
+    | Waiting messages | Rotate every 10 s | `app/(app)/ride-matching/1-waiting.tsx:114-122` | |
+    | "Too slow" popup | 5 s | `components/drive/TooSlowPopup.tsx:14` | Auto-dismiss |
+    | Third-party quote cooldown | 20 s per route | `lib/ride/quoteRateLimiter.ts:10` | Uber and Lyft quote cache |
+    | Provider request timeouts | 8 to 20 s | `lib/ride/uberProvider.ts`, `lyftProvider.ts`, `empowerProvider.ts` | |
+    | Provider token skew | 60 s | `lib/ride/tokenStore.ts:11` | |
+    | Invite preview timeout | 10 s | `app/(app)/invite/[code].tsx:39` | |
+    | Dub `trackOpen` delay | 750 ms after interactive | `components/ReferralCaptureObserver.tsx:29-53` | |
+  </Accordion>
+</AccordionGroup>
+
+## Web
+
+<AccordionGroup>
+  <Accordion title="Dashboard data">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | Query defaults | `staleTime` 5 min, 1 retry | `src/sites/dashboard/main.tsx:89-90`, `src/shared/bootstrap/renderSite.tsx:19` | |
+    | Presence | 10 s | `src/sites/dashboard/pages/PresencePage.tsx:77-99` | |
+    | Rides tab | 10 s with active rides, else 60 s; page 50 | `src/sites/dashboard/components/RidesTab.tsx:359,445` | |
+    | Driver ops | 20 s | `src/hooks/useDriverOps.ts:4` | |
+    | Supply and demand | 15 s and 60 s | `src/hooks/useSupplyDemand.ts:208,219` | |
+    | Contact sync, marketing segments | 15 s | `src/sites/dashboard/pages/ContactSyncPage.tsx:111`, `components/MarketingSegments.tsx:155` | |
+    | Fleet calendar | 15 s | `src/components/FleetCalendar.tsx:75` | |
+    | Notification logs | 30 s, page 25 | `src/components/notifications/NotificationLogsTable.tsx:60,112` | |
+    | Driver leads | 30 s; message fetch 25 s timeout | `src/hooks/useDriverLeads.ts:27,42` | |
+    | Community map mobility | 60 s; 500 items | `src/sites/dashboard/pages/CommunityMapPage.tsx:180,267` | |
+    | Feed preview | 60 s | `src/components/feed/FeedPreview.tsx:230` | |
+    | Global search | 15 results, query up to 256 chars | `src/sites/dashboard/search/GlobalSearch.tsx:46-47` | |
+    | Jobs page River UI session | Re-minted every 45 s | `src/sites/dashboard/pages/JobsPage.tsx:47` | |
+    | Avatar cache | 30 days, 6 concurrent fetches | `src/utils/avatarCache.ts:3,6` | |
+    | Route error recovery | 3 attempts | `src/components/RouteBoundary.tsx:8` | |
+    | Sentry | Traces 1.0, replays 0.1, error replays 1.0 | `src/sites/dashboard/main.tsx:67-72` | |
+  </Accordion>
+  <Accordion title="Hosting and Workers caching">
+    | Name | Value | Where | Effect |
+    | --- | --- | --- | --- |
+    | HTML | `no-cache, no-store, must-revalidate` | `firebase.json` | Dashboard, signup root, tip routes |
+    | Hashed assets | `max-age=31536000, immutable` | `firebase.json` | `/assets/**` |
+    | Auth v3 and delete-account pages | `no-store, max-age=0` | `firebase.json` | Plus strict security headers |
+    | Association files | `max-age=3600` | `firebase.json` | `.well-known` on signup and invite |
+    | Signup fonts | `max-age=604800` | `firebase.json` | |
+    | Home media | `max-age=2592000` | `firebase.json:221` | Images, fonts, video |
+    | OG images | `max-age=31536000, immutable` in production | `workers/og/src/index.ts:20,128` | `no-store` in development |
+    | OG worker CPU | 30000 ms | `workers/og/wrangler.jsonc` | |
+    | World Cup live state | Polled every 15 s | `src/sites/world-cup/hooks/useWorldCupStandings.ts:221` | |
+  </Accordion>
+</AccordionGroup>
+
+## E2E
+
+| Name | Value | Where | Effect |
+| --- | --- | --- | --- |
+| `E2E_FIXTURE_TTL` | 30 min, must be above 0 and at most 24 h | `config.go:383,494` | |
+| Control API key | At least 32 bytes | `config.go:486` | |
+| Auth rate multiplier | ×100 | `service/authv3_composition.go:24` | |
+| Expired run sweep | 100 | `server/http/e2econtrol/routes.go:147` | |
+| Smoke test | 18 attempts, 6 deep, 5 s delay, 5 s connect, 10 s request | `yelo-api` `scripts/release/smoke-candidate.sh:16-20` | Release candidate checks |
