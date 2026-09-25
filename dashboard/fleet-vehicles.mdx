@@ -1,0 +1,174 @@
+---
+title: "Fleet vehicles"
+description: "Manage fleet settings, shared and personal vehicle inventory, vehicle approval, and vehicle artwork in the Yelo dashboard."
+---
+
+Fleets can own shared vehicles that every fleet member drives, and drivers can keep their own personal vehicles. You manage both from the dashboard. Use this page when you set up a fleet, add or approve vehicles, choose which vehicle drivers get by default, or pick the artwork riders see for a vehicle type.
+
+## Prerequisites
+
+- A dashboard account with the admin role. Fleet editors, vehicle inventory, and the artwork catalog are admin-only.
+- At least one active vehicle type. You can't add or edit vehicles until a vehicle type is active.
+
+## Where to find fleets and vehicles
+
+Open **Configuration** > **Fleets** in the sidebar. The page has two tabs:
+
+| Tab | Path | What it shows |
+| --- | --- | --- |
+| **Fleets** | `/manage` | Table of fleets across all communities. Select a row to open that fleet's editor. |
+| **Vehicles** | `/manage?tab=vehicles` | Vehicle types plus the full vehicle inventory across all fleets. |
+
+The old **Vehicles** sidebar item is gone. Links to `/vehicles` now redirect to `/manage?tab=vehicles`. **Pricing** moved to the **Configuration** group, and **Telemetry** moved to **Administration**.
+
+## Edit a fleet
+
+Selecting a fleet opens a full-page editor at `/manage/{fleet_id}`. Select **← Fleets** to return to the list, or **Delete fleet** to remove it. The editor has three tabs:
+
+<Tabs>
+  <Tab title="Settings">
+    Edit the fleet name, logo, primary and supported vehicle types, custom payouts, and confirmation PIN.
+
+    Two toggles are available when you edit an existing fleet:
+
+    - **Student riders only**: restricts the fleet to student riders.
+    - **Owner operators**: marks the fleet as having drivers who operate their own vehicles.
+
+    Select **Save Changes** to apply your edits. Select **Discard changes** to reset the form to the saved values.
+  </Tab>
+  <Tab title="Operations">
+    Manage pricing, service communities, operating hours, join links, and Stripe onboarding for the fleet.
+
+    Per-fleet operating hours live here. The Google Calendar connection is on the **Access** page.
+  </Tab>
+  <Tab title="Vehicles">
+    Shows the vehicle inventory filtered to this fleet. The list includes the fleet's shared vehicles and its members' personal vehicles.
+  </Tab>
+</Tabs>
+
+You can link directly to a tab with the `tab` query parameter, for example `/manage/{fleet_id}?tab=vehicles`.
+
+## Vehicle ownership
+
+Every vehicle has exactly one owner:
+
+- **Fleet (shared)**: owned by a fleet and shared with all of its members. A shared vehicle has no personal driver owner. Drivers see it in the app labeled **Shared fleet vehicle · managed by your fleet** and can't edit its details.
+- **Driver (personal)**: owned by a single driver. Only that driver can use and edit it.
+
+Fleet membership grants visibility into the fleet's shared vehicles. Selecting a different active fleet doesn't remove a driver's membership in other fleets.
+
+## Manage vehicle inventory
+
+The **Vehicle inventory** list is searchable, sortable, and filterable. You can:
+
+- Search by driver, plate, make, or model.
+- Filter by fleet with **All fleets** or a specific fleet.
+- Filter by approval status: **Approved**, **Pending**, **Rejected**, or **Not submitted**.
+
+### Add or edit a vehicle
+
+<Steps>
+  <Step title="Open the vehicle form">
+    Select **Add vehicle**, or select **Edit** on an existing vehicle.
+  </Step>
+  <Step title="Choose an owner">
+    Set **Owner** to **Fleet (shared)** and choose a fleet, or to **Driver (personal)** and enter the driver ID.
+  </Step>
+  <Step title="Enter vehicle details">
+    Fill in year, make, model, color, license plate, license plate state, and seats. Vehicles need at least four passenger seats.
+  </Step>
+  <Step title="Choose a type">
+    Pick an active vehicle type. If the saved type is no longer active, choose an active type before saving.
+  </Step>
+  <Step title="Set approval and default">
+    Set **Approval** to **Approved**, **Pending review**, or **Rejected**. Only approved vehicles can be defaults:
+
+    - For shared vehicles, check **Default vehicle for this fleet**.
+    - For personal vehicles, check **Make this driver's default vehicle**.
+  </Step>
+  <Step title="Save">
+    Select **Save vehicle**.
+  </Step>
+</Steps>
+
+<Note>
+  If vehicle types fail to load, select **Retry vehicle types**. You can still save edits to an existing vehicle whose type hasn't changed.
+</Note>
+
+### Remove a vehicle
+
+Select **Remove** on a vehicle and confirm with **Remove vehicle**. Removal archives the vehicle. Historical rides keep the vehicle's details.
+
+The dashboard rejects edits and removal for a vehicle that is currently in use.
+
+## Default vehicles and approval
+
+Each fleet has at most one default shared vehicle, and it must be approved.
+
+- **Inherited approval**: an approved fleet default completes the vehicle step of a fleet member's driver application. Members don't need to submit their own vehicle.
+- **Default selection**: when a driver joins or selects a fleet, Yelo selects that fleet's approved default vehicle.
+- **Going online**: the Yelo API resolves the driver's vehicle again when they go online. Stale personal selections are replaced with an eligible fleet vehicle. If every fleet vehicle is unavailable or unapproved, going online fails.
+- **Personal defaults**: setting a driver's personal default requires an approved vehicle and an offline driver. Drivers must also be offline to change vehicles themselves.
+
+Driver detail and application review sheets show vehicle context with badges for **Shared fleet vehicle** or **Personal vehicle**, **Selected**, **Fleet default**, and approval status. Shared vehicles include a **View fleet vehicles** link to the fleet's **Vehicles** tab.
+
+## Shared vehicle occupancy
+
+Multiple drivers can go online with the same shared vehicle at the same time. Occupancy is advisory, not a lock.
+
+- In the dashboard, driver vehicle context shows "Another driver has an open session with this vehicle. Concurrent sessions are allowed."
+- In the driver app, tapping **Go Online** refreshes the vehicle first. If another driver has an open session, the app shows a **Vehicle already in use** alert. The driver can select **Cancel** or **Go online anyway**.
+
+Older app versions still go online without the warning.
+
+## Vehicle artwork
+
+Vehicle types and pricing configurations can use artwork that riders see in the mobile app. Choose it with the **Vehicle artwork** selector in the vehicle type form and the pricing configuration sheet.
+
+Artwork options come from the catalogs published with Yelo's mobile releases. The dashboard only offers artwork that appears in both the published iOS and Android catalogs, so every rider on a current release can display it.
+
+- **Use vehicle type default**: clears the selection. A pricing configuration then falls back to its vehicle type's artwork. Pricing artwork overrides the vehicle type default.
+- **Current: {key} (not currently offered)**: appears when a saved key is no longer published, for example after a rollback. You can keep it while editing other fields, but you can't select it again once you change it.
+
+The status line under the selector explains what you're seeing:
+
+| Message | Meaning |
+| --- | --- |
+| Available in the published iOS and Android catalogs. | The list is current. |
+| No artwork is available across both published mobile platforms yet. | No mobile release has published a matching catalog for both platforms. Existing settings keep working. |
+| Artwork could not be refreshed. Your current selection is preserved. | The catalog request failed. Your saved value isn't changed. |
+
+New artwork becomes available after a mobile release publishes it for both platforms. Older app versions that don't recognize a key fall back to the vehicle type's icon.
+
+The vehicle type **Icon** field is now a dropdown with **Car**, **Big car**, **Cart**, and **Minibus**. Golf carts are labeled **Cart** throughout the dashboard and app.
+
+## API reference
+
+Admins can manage the same inventory through the dashboard API.
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/dashboard/vehicles` | List inventory. The optional `fleet_id` query parameter returns the fleet's shared vehicles and its members' personal vehicles. |
+| `POST` | `/dashboard/vehicles` | Create a shared or personal vehicle. |
+| `PUT` | `/dashboard/vehicles/{id}` | Update a vehicle. |
+| `DELETE` | `/dashboard/vehicles/{id}` | Archive a vehicle. Ride history is retained. |
+| `GET` | `/dashboard/vehicle-artwork` | List artwork available in both the iOS and Android catalogs. |
+
+Set exactly one of `fleet_id` or `driver_id`. Use `is_default` for a fleet default and `is_active` to select a driver's personal default.
+
+```json Create a shared fleet default
+{
+  "fleet_id": "YOUR_FLEET_ID",
+  "driver_id": null,
+  "year": 2016,
+  "make": "GEM",
+  "model": "E6",
+  "color": "White",
+  "license_plate": "RHST20",
+  "license_plate_state": "FL",
+  "num_seats": 5,
+  "type": "cart",
+  "application_status": "complete",
+  "is_default": true
+}
+```
