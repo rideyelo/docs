@@ -1,0 +1,167 @@
+---
+title: "Ride pricing"
+description: "Configure community pricing, pricing zones, fare adjustments, and rider-facing ride options in the Yelo dashboard"
+---
+
+The **Pricing Management** page in the dashboard controls how Yelo quotes rides in each community. Use it to review a community's service area and pricing zones, create pricing configs for each fleet and vehicle type, choose how fares are adjusted, and set what riders see for each ride option.
+
+## Prerequisites
+
+- A dashboard account with access to the communities you want to price.
+- A platform admin account to edit pricing zones or change global jitter settings.
+- A bounding box on the community to use the pricing geography map.
+
+## Select a community
+
+The page opens on a map of active community service areas.
+
+1. Click a community boundary on the **Community service areas** map.
+2. Alternatively, select a row in the **Communities** table below the map. Use the filter box to search by community, fleet, or vehicle.
+
+The selected community opens in the pricing workspace. The workspace shows the community's pricing configs, the pricing geography map, and recent pricing activity.
+
+## Work with pricing geography
+
+The **Pricing geography** map compares the community's service boundary and pricing zones with the paths riders actually requested. Use it to check whether zones cover real demand before you change pricing.
+
+Open the layer panel on the map to toggle these layers:
+
+| Layer | What it shows |
+| --- | --- |
+| **Zones** | The community's pricing zones. |
+| **Bounding box** | The community's service boundary. |
+| **Ride routes** | Quoted routes from recent ride requests in the community. |
+
+When **Ride routes** is on, pick a time window of **7d**, **14d**, **30d**, or **60d**. Routes appear in two colors:
+
+- **Requested route** (blue): a route a rider requested.
+- **Pricing decline** (red): a request where a driver declined because of the fare or payout.
+
+The panel shows how many routes are on the map. When a window has more than 2,000 routes, the map shows only the newest 2,000.
+
+### Edit zones inline
+
+Platform admins can manage zones next to the map in the **Zone editor** panel. Other users see the map but can't edit zones.
+
+- **Add a zone**: Draw a shape with the polygon control on the map. Then enter the zone details in the **New zone** dialog.
+- **Edit a zone**: Select the zone in the **Zone editor** panel to open the **Edit zone** dialog.
+- **Delete a zone**: Remove the zone from the **Zone editor** panel.
+
+Each zone has a name, description, color, priority, an active toggle, and a toggle to show the zone on the rider map.
+
+## Create or edit a pricing config
+
+A pricing config sets the fare for one fleet and vehicle type in a community.
+
+1. Click **Add pricing config**. To change an existing config, open it from the community's pricing table.
+2. Select the **Community**, **Fleet**, and **Vehicle type**. You can't change these after you create the config.
+3. Choose a **Pricing type**. See [Pricing types](#pricing-types).
+4. Choose a **Fare adjustment**. See [Fare adjustment modes](#fare-adjustment-modes).
+5. Enter the **Base price ($)** and **Price per minute ($)**, and add any distance tiers.
+6. Optionally set the rider-facing **Rider title** and **Vehicle artwork**. See [Rider-facing ride options](#rider-facing-ride-options).
+7. Turn on **Always shown** to show this ride option even when no matching driver is online.
+8. Save the config.
+
+When you edit a config, turn off **Enabled** to retire it. Yelo keeps the config's history.
+
+### Pricing types
+
+| Pricing type | Description | Default fare adjustment |
+| --- | --- | --- |
+| **Per ride** | One fare for the whole ride. | Jitter |
+| **Per person** | A fare for each rider. | Round up |
+
+When you change the pricing type, the dashboard resets **Fare adjustment** to that type's default. You can then pick a different mode.
+
+## Fare adjustment modes
+
+The fare adjustment controls how Yelo turns the calculated fare into the price the rider sees.
+
+| Mode | Dashboard label | Behavior |
+| --- | --- | --- |
+| `jitter` | **Jitter** | Adds a small random amount to the fare and shows a higher "was" price next to it. Uses the [global jitter settings](#global-jitter-settings). |
+| `rounded` | **Round up** | Rounds the fare up to the next whole dollar. For example, $12.10 becomes $13.00. |
+| `none` | **None** | Charges the calculated fare, truncated to whole cents, with no adjustment. |
+
+With **Round up** and **None**, Yelo doesn't show an inflated "was" price.
+
+With **Round up**, Yelo applies discounts to the calculated fare first and then rounds the discounted fare up to a whole dollar. Riders always see a whole-dollar price.
+
+Configs saved without a mode use `jitter`. Fallback fares for communities with no pricing config also use jitter.
+
+If you manage pricing through the dashboard API, set the mode in the `adjustment` object on a price parameter:
+
+```json
+{
+  "pricing_type": "per_person",
+  "base_price": 4,
+  "price_per_minute": 0.25,
+  "adjustment": {
+    "mode": "rounded"
+  }
+}
+```
+
+The API returns `400` if `mode` isn't `jitter`, `rounded`, or `none`.
+
+## Global jitter settings
+
+Jitter settings are shared by every pricing config that uses the **Jitter** mode, across all communities. Only platform admins can view or change them.
+
+To change them, click **Global jitter settings** at the top of the **Pricing Management** page, update the values, and click **Save global settings**.
+
+| Setting | API field | Default | Description |
+| --- | --- | --- | --- |
+| **Minimum added ($)** | `min` | `0.50` | Smallest random amount added to the fare. |
+| **Maximum added ($)** | `max` | `1.00` | Largest random amount added to the fare. |
+| **Dollar crossing threshold ($)** | `clamp_overshoot_limit` | `0.20` | If jitter pushes the fare into the next dollar by less than this amount, Yelo keeps the fare in the original dollar instead. |
+| **Clamp range minimum ($)** | `clamp_range_min` | `0.90` | Lowest cents value used when Yelo keeps the fare in the original dollar. |
+| **Clamp range maximum ($)** | `clamp_range_max` | `0.99` | Highest cents value used when Yelo keeps the fare in the original dollar. |
+| **Minimum "was" price multiplier** | `anchor_inflation_min` | `1.15` | Smallest multiplier for the "was" price shown next to the fare. |
+| **Maximum "was" price multiplier** | `anchor_inflation_max` | `1.30` | Largest multiplier for the "was" price shown next to the fare. |
+
+For example, with the defaults, a calculated fare of $11.60 might get $0.50 added, which gives $12.10. That crosses into the next dollar by only $0.10, so Yelo keeps the fare between $11.90 and $11.99.
+
+Values must meet these rules, or Yelo rejects the save with a `400`:
+
+- All values are zero or greater.
+- Each minimum is less than or equal to its maximum.
+- **Clamp range maximum** is less than `1`.
+- **Dollar crossing threshold** is at most `1`.
+- **Minimum "was" price multiplier** is at least `1`.
+
+Platform admins can also read and replace these settings with `GET` and `PUT` requests to `/dashboard/pricing/jitter`. A `PUT` replaces all values, so send every field:
+
+```json
+{
+  "min": 0.5,
+  "max": 1,
+  "clamp_overshoot_limit": 0.2,
+  "clamp_range_min": 0.9,
+  "clamp_range_max": 0.99,
+  "anchor_inflation_min": 1.15,
+  "anchor_inflation_max": 1.3
+}
+```
+
+Other users get a `403`.
+
+## Rider-facing ride options
+
+Each pricing config can control how its ride option looks in the rider app.
+
+| Field | API field | Limit | Behavior when blank |
+| --- | --- | --- | --- |
+| **Rider title** | `display_name` | 80 characters | Uses the fleet and vehicle name. |
+| **Vehicle artwork** | `image_asset` | 96 characters | Uses the vehicle type's default artwork. |
+
+**Vehicle artwork** lists the image files bundled with the published iOS and Android rider apps, such as `cart.png`. Pick a file to preview it. If a config uses a file that the current apps no longer include, the dashboard shows it as not currently offered.
+
+For example, to show a "Downtown Shuttle" option with shuttle artwork:
+
+```json
+{
+  "display_name": "Downtown Shuttle",
+  "image_asset": "shuttle.png"
+}
+```
