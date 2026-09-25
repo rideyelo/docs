@@ -1,0 +1,180 @@
+---
+title: "Fleets"
+description: "Track fleet performance on the Fleet page, and create, configure, and remove fleets from Fleet Management in the Yelo dashboard."
+---
+
+The dashboard has two fleet pages. The **Fleet** page shows how one fleet is performing, and fleet managers use it every day. The **Fleets** page, titled **Fleet Management**, is where admins create fleets, connect Stripe, choose service communities, and remove fleets.
+
+For background on how fleets, operators, and payouts fit together, see [Fleets](/concepts/fleets).
+
+## Prerequisites
+
+- An `admin` or `fleet` dashboard role to open the **Fleet** page. Fleet managers only see their assigned fleets.
+- An `admin` role to open **Fleet Management**. See [Dashboard roles and access](/administration/dashboard-roles).
+
+## Monitor a fleet
+
+Open **Fleet** in the **Community** group of the sidebar. The page shows the fleet for the community selected in the top bar.
+
+- Use the fleet dropdown to switch fleets. It's disabled when only one fleet is available.
+- Use the time range menu to pick **Last 7 Days**, **Last 14 Days**, or **Last 30 Days**.
+
+If a fleet manager account has no fleet assignments, the page shows "You are not assigned to a fleet."
+
+The page has three tabs.
+
+### Overview
+
+The **Overview** tab shows fleet KPIs for the selected time range, each compared with the previous period:
+
+- **Ride Requests**, **Confirmed Requests**, **Completed Rides**, **Cancelled Rides**, and **Rides Uncomplete**
+- **Completion Rate**
+- **Total Earnings**
+- **Market Users**
+- **QR Payments**
+
+For definitions of the ride metrics, see [Ride metrics](/dashboard/ride-metrics).
+
+Below the KPIs you'll find:
+
+- **Ride Requests Over Time**: an hourly chart in the community's timezone.
+- Driver metrics: **Total Drivers**, **Approved Drivers**, **Avg. Rating**, and **Total Drives**.
+- **Fleet Driver Directory**: the fleet's drivers, sorted by **Total Earnings (GMV)**. Other columns are **Name**, **Drives**, **Cancels (Driver+Rider)**, **Rating**, **Last Active**, and **Status**. Admins can select a row to review the driver's application. See [Review a driver application](/dashboard/drivers#review-a-driver-application).
+- **Invite drivers**: opens the fleet's driver invitation link. See [Fleet driver invitations](/fleets/driver-invitations).
+- **Fleet Pricing Management**: the fleet's active pricing configs in this community. See [Ride pricing](/dashboard/ride-pricing).
+
+Admins also see the community map below the tabs. See [Community map](/dashboard/community-map).
+
+### Payments
+
+The **Payments** tab manages the fleet's QR payment links and shows payment history. See [QR payments](/dashboard/qr-payments).
+
+### Operating hours
+
+The **Operating hours** tab shows the fleet's schedule imported from Google Calendar. See [Fleet operating hours](/admin/operating-hours).
+
+## Find a fleet in Fleet Management
+
+Open **Fleets** in the **Configuration** group of the sidebar. The **Fleets** tab lists fleets across all communities. Use the **All communities** filter to show only fleets that serve one community.
+
+| Column | Description |
+| --- | --- |
+| **Fleet Name** | The fleet's name and logo. |
+| **Service communities** | The first active service community, with a **+N more** tooltip for the rest. **Home** shows the fleet's home community. |
+| **Payment Model** | **Owner Operator** or **Fleet Merchant**. |
+| **Vehicle Types** | The supported vehicle types. The primary type is marked **(primary)**. |
+| **Status** | **Deleted**, **Restricted**, **Pending Stripe**, **Active**, or **Inactive**. |
+| **Drivers** | The number of active drivers. |
+| **Created** | The date the fleet was created. |
+
+Select **View** or **Edit** on a row to open the fleet editor. The **Vehicles** tab next to **Fleets** manages vehicle types and inventory. See [Vehicle types](/dashboard/vehicles) and [Fleet vehicles](/dashboard/fleet-vehicles).
+
+## Create a fleet
+
+<Steps>
+  <Step title="Open the form">
+    Select **Create Fleet** at the top of **Fleet Management**.
+  </Step>
+  <Step title="Choose a community">
+    Pick the **Community** the fleet belongs to. This becomes the fleet's home community.
+  </Step>
+  <Step title="Optionally copy an existing fleet">
+    Pick a fleet in **Import from Existing Fleet** to pre-fill its settings. The new fleet shares the source fleet's Stripe account. Turn on **Copy Pricing from Source** to copy the source fleet's pricing instead of the community defaults.
+  </Step>
+  <Step title="Enter fleet details">
+    Fill in the fields described in [Fleet settings](#fleet-settings).
+  </Step>
+  <Step title="Save">
+    Select **Create Fleet**.
+  </Step>
+</Steps>
+
+For a **Fleet Merchant** fleet, a **Stripe Onboarding Link** banner appears after you create the fleet. Select **Copy** or **Open** and share the link with the fleet manager. The link expires in about 24 hours. You can generate a new one later from the fleet's **Operations** tab.
+
+### Fleet settings
+
+| Field | Required | Description |
+| --- | --- | --- |
+| **Name** | Yes | The fleet's display name. |
+| **Logo URL** | No | A link to the fleet's logo image. |
+| **Payment Model** | Yes | How drivers are paid. You can't change it after you create the fleet. |
+| **Supported Vehicle Types** | Yes | The vehicle types the fleet operates. Pick at least one. |
+| **Primary Vehicle Type** | Yes | The fleet's main vehicle type. It must be one of the supported types. |
+| **Custom Payouts** | No | Turns on custom payout configurations for the fleet. |
+| **Require rider confirmation code** | No | When off, riders skip the 4-digit PIN and drivers start the ride with a single tap. |
+
+The two payment models work like this:
+
+| Payment model | Description |
+| --- | --- |
+| **Owner Operator** | Drivers are paid directly. The fleet doesn't need Stripe setup. |
+| **Fleet Merchant** | The fleet is the merchant of record. The fleet must finish Stripe onboarding. |
+
+For more on how each model affects driver enrollment, see [Fleet-managed payouts and owner-operator enrollment](/fleets/driver-invitations#fleet-managed-payouts-and-owner-operator-enrollment).
+
+## Edit a fleet
+
+The fleet editor opens at `/manage/{fleet_id}` and has three tabs.
+
+### Settings
+
+Edit the [fleet settings](#fleet-settings), except **Payment Model**. Existing fleets also have two extra toggles:
+
+- **Student riders only**
+- **Owner operators**
+
+Select **Save Changes** to apply your edits, or **Discard changes** to reset the form.
+
+### Operations
+
+The **Operations** tab shows the fleet's payment model, Stripe status, and active status at the top.
+
+For **Fleet Merchant** fleets, the tab also shows Stripe details:
+
+- A **Stripe Onboarding Required** or **Stripe Account Restricted** banner when Stripe needs attention. Select **Open Stripe Onboarding** to continue onboarding, or **Refresh Link** to generate a new onboarding link.
+- A **Stripe Account** card with the **Account ID**, **Payouts** and **Charges** status, any disabled reason, and **Outstanding requirements**. Select **Open Stripe dashboard** to manage the account in Stripe.
+- **Unlink Stripe Account**, which disconnects the current Stripe account and creates a new one.
+
+<Warning>
+  Unlinking a Stripe account deactivates the fleet until the new Stripe onboarding is complete. You can't undo it.
+</Warning>
+
+The **Fleet Details** card summarizes **Vehicle Types**, **Custom Payouts**, **PIN required**, **Active Drivers**, **Vehicles**, and **Created**.
+
+Below the card are four tabs:
+
+| Tab | What you can do |
+| --- | --- |
+| **Pricing** | Pick a **Service community** to see the fleet's active pricing there. |
+| **Service communities** | Add, retire, or restore the communities this fleet serves. Admin only. |
+| **Hours** | Pick a **Service community** to see the fleet's operating calendar there. |
+| **Invite drivers** | Manage the fleet's driver invitation link. See [Fleet driver invitations](/fleets/driver-invitations). |
+
+### Vehicles
+
+The **Vehicles** tab shows the vehicle inventory for this fleet. See [Fleet vehicles](/dashboard/fleet-vehicles).
+
+## Manage service communities
+
+A fleet's service communities decide where its pricing and operating calendars apply. They don't control whether riders can request rides. Community settings handle that. See [Communities](/dashboard/communities).
+
+To add a community, pick it in **Add service community** on the **Service communities** tab and select **Add**.
+
+Each service community shows its timezone and one of these statuses:
+
+| Status | Meaning |
+| --- | --- |
+| **Current service** | The fleet actively serves this community. |
+| **Retired** | You retired the community. Its configuration is kept. |
+| **Community inactive** | The community is turned off. |
+| **Fleet inactive** | The fleet is inactive. |
+| **Community archived** | The community was removed. You can't restore it. |
+
+Select **Retire** to stop serving a community, or **Restore** to bring it back with its previous configuration. Select **Stored pricing** to view the pricing history kept for that community.
+
+## Delete a fleet
+
+1. Select the delete icon on the fleet's row, or **Delete fleet** in the fleet editor.
+2. Confirm with **Delete Fleet**.
+
+Yelo soft-deletes the fleet and deactivates it. Rides already in progress complete normally. Deleted fleets show a **Deleted** status in the fleet list.

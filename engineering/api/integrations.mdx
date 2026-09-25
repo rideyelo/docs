@@ -1,0 +1,207 @@
+---
+title: "Integrations"
+description: "The third-party services yelo-api calls or receives webhooks from, where each client lives, what it is used for, how it is configured, and how failures are contained."
+---
+
+Third-party clients live in `internal/data/<provider>` (plus a few in `internal/utilities`). Services depend on small interfaces, so you can mock every provider in unit tests. This page lists each integration, its package, and its configuration. Environment variable details are in [Configuration](/engineering/api/configuration). How webhooks authenticate is in [Authentication](/engineering/api/authentication#webhooks).
+
+## Resilience
+
+Most outbound clients share two helpers.
+
+### Circuit breakers
+
+`circuitbreaker.NewSettings(name, logger)` in `internal/utilities/circuitbreaker` returns `sony/gobreaker` settings:
+
+| Setting | Value |
+| --- | --- |
+| Trip condition | 5 consecutive failures |
+| Window (`Interval`) | 1 minute |
+| Open duration (`Timeout`) | 60 seconds |
+| Half-open probes | 3 |
+
+- Client errors such as `ValidationError`, `NotFoundError`, `UnauthorizedError`, and `InputError` count as successes, so bad input cannot trip a breaker. `circuitbreaker.Exclude(err)` marks other errors the same way.
+- Opening a breaker posts a Slack alert. Closing it after an outage posts a recovery alert.
+
+Named breakers: `stripe`, `mapbox`, `google-maps`, `google-places`, `google-geocoding`, `resend`, plus the Twilio and Photon breakers. Redis uses its own breaker profile, described in [Data layer](/engineering/api/data-layer#circuit-breaker).
+
+### Retries
+
+`retry.NewNetworkRetrier` wraps `retry-go` with 5 attempts, a 200 ms base delay, a 10-second maximum, and full-jitter backoff. `NewNetworkRetrierWithRetryIf` accepts a provider-specific retry predicate.
+
+## Payments
+
+### Stripe
+
+| | |
+| --- | --- |
+| Package | `internal/data/stripe` (`stripe-go/v79`) |
+| Config | `STRIPE_API_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_RETURN_URL`, `STRIPE_RECONCILIATION_ENABLED`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` |
+| Used for | Rider customers and payment methods, payment intents on connected accounts, Stripe Connect Express onboarding and payouts, checkout sessions and payment links (QR payments, tips) |
+
+- The Stripe API client uses an `http.Client` with a 10-second timeout. The key can be overridden with the `--stripe-key` flag.
+- `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` points every earnings endpoint at one connected account, and only in `dev`, `development`, `local`, or `test`.
+- River jobs reconcile connected accounts every minute and repair drive-fee history every 10 minutes. See [Background jobs](/engineering/api/background-jobs).
+
+**Webhook:** `POST /stripe-webhook` verifies the signature, then handles `payment_intent.succeeded`, `payment_intent.payment_failed`, `checkout.session.completed`, `account.updated`, and `payout.paid`, `payout.failed`, and `payout.canceled`. Other event types are ignored.
+
+<Warning>
+A signature failure returns a `ServerError` (500), not a 400, so Stripe keeps retrying the delivery. If deliveries fail after a secret rotation, check that `STRIPE_WEBHOOK_SECRET` matches the endpoint's signing secret.
+</Warning>
+
+For the money flow itself, see [Payments and payouts](/concepts/payments-and-payouts).
+
+## Maps and places
+
+### Mapbox
+
+| | |
+| --- | --- |
+| Package | `internal/data/mapbox` |
+| Config | `MAPBOX_API_KEY` (required) |
+| Used for | Driving directions, distance matrices, forward and reverse geocoding (v6), Search Box suggestions and retrieve |
+
+Distance lookups fall back in order: Mapbox, then Google Maps, then a haversine estimate at 30 km/h. `mapbox.NewCached` puts the shared `RouteCache` in front of the client so services share one provider call per origin and destination pair.
+
+### Google Maps
+
+| | |
+| --- | --- |
+| Package | `internal/data/googlemaps` |
+| Config | `GOOGLE_MAPS_API_KEY` (required) |
+| Used for | Routes API `ComputeRoutes` over gRPC for polylines and distances, and as the Mapbox distance fallback |
+
+Only `UNAVAILABLE` gRPC errors are retried. `googlemaps.NewCached` shares the same route cache.
+
+### Google Places
+
+| | |
+| --- | --- |
+| Package | `internal/data/googleplaces` |
+| Config | `GOOGLE_MAPS_API_KEY`, `SEARCH_PROVIDER` (default `google`), `GOOGLE_PLACES_BIAS_RADIUS_METERS` (default 10000) |
+| Used for | Places API (New) autocomplete and details, Geocoding API, point-of-interest lookup for top locations |
+
+When `SEARCH_PROVIDER` is `google`, `MappingService` uses Google Places for suggestions and falls back to Mapbox on error. Any other value uses Mapbox directly. `PlaceCache` caches suggestions, details, and resolved place IDs.
+
+### Mobility feeds
+
+`internal/data/mobility` fetches GBFS, GTFS, and GTFS-RT feeds configured on the dashboard. It includes SSRF protection (`ssrf.go`) because operators supply the feed URLs. The `Mobility` ticker polls active feeds every minute.
+
+## Messaging
+
+### Twilio
+
+| | |
+| --- | --- |
+| Package | `internal/data/twilio` |
+| Config | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` (all required outside E2E), `TWILIO_VERIFY_SERVICE_SID`, `TWILIO_OTP_FALLBACK_ENABLED`, `TWILIO_OTP_FALLBACK_DELAY`, `TWILIO_OTP_SWEEP_INTERVAL`, `TWILIO_EVENTS_WEBHOOK_USER`, `TWILIO_EVENTS_WEBHOOK_PASSWORD` |
+| Used for | SMS (`SendText`), phone OTPs through Twilio Verify (`StartVerification`, `CheckVerification`) |
+
+- When `TWILIO_VERIFY_SERVICE_SID` is set, phone OTPs go through Verify with a custom code. Unset it to fall back to raw SMS.
+- Twilio 4xx responses become input errors so they don't trip the breaker. Verify rate-limit codes surface as `RateLimitError`.
+- Integration tests in this package hit the live API and skip unless `TWILIO_TEST_ACCOUNT_SID` and `TWILIO_TEST_AUTH_TOKEN` are set. The package is deliberately excluded from `make test-integration`.
+
+**Webhooks:**
+
+- `POST /twilio-webhook` handles inbound SMS. It applies carrier `STOP` and `START` keywords to the sender's SMS consent and returns empty TwiML.
+- `POST /twilio-verify-events` receives Verify message-status events from Twilio Event Streams and records delivery status. The `AuthV3OtpFallback` loop uses that status to re-send codes that were never delivered.
+
+### Photon
+
+`internal/data/photon` is an iMessage provider (Spectrum) with SMS and RCS fallback, reached over gRPC. When both `PHOTON_PROJECT_ID` and `PHOTON_PROJECT_SECRET` are set, friend-bump texts go through Photon instead of Twilio. OTP and Verify traffic always stays on Twilio. Each call has a 10-second timeout. Regenerate the gRPC client with `make proto-photon`.
+
+### Resend
+
+Resend has two separate uses with separate keys:
+
+| Use | Package | Config |
+| --- | --- | --- |
+| Transactional email, including email verification codes | `internal/utilities/mail` | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` (default `Yelo <admin@rideyelo.com>`) |
+| Contact sync (contacts, properties, segments) | `internal/data/resend` | `RESEND_CONTACTS_API_KEY`, `RESEND_ACCOUNT_KEY`, `CONTACT_SYNC_RESEND_ENABLED`, `RESEND_REQUEST_INTERVAL`, `RESEND_CONTACT_REQUEST_INTERVAL` |
+
+Both paths share a `PostgresGate` that paces requests and honors `Retry-After` cooldowns across every replica. See [Contact sync](/administration/contact-sync) for the operator view.
+
+<Note>
+The API does not use SendGrid. Transactional email goes through Resend.
+</Note>
+
+### Quo
+
+| | |
+| --- | --- |
+| Packages | `internal/data/quo`, `internal/service/quo` |
+| Config | `QUO_API_KEY`, `QUO_DASHBOARD_API_KEY`, `QUO_BASE_URL` (default `https://api.openphone.com`), `QUO_CONTACT_BASE_URL`, `QUO_ACCOUNT_KEY`, `QUO_REQUEST_INTERVAL_MS`, `QUO_DASHBOARD_REQUEST_INTERVAL_MS` |
+| Used for | CRM contact sync for riders and drivers, custom fields, and reading recent messages for driver leads on the dashboard |
+
+A `PostgresGate` per credential paces calls (at least 125 ms apart) across replicas. When the dashboard key differs from the main key, a second client with its own gate serves dashboard reads. River owns retries, and uncertain creates are looked up again before another write.
+
+### Expo push
+
+`internal/utilities/notification/expo.go` calls the Expo push API at `https://exp.host`. The River `notify_send` worker sends up to 100 messages per call, and `notify_receipt_check` fetches receipts between 15 minutes and 24 hours after sending. `DeviceNotRegistered` receipts clear the user's push token.
+
+### Slack
+
+`internal/utilities/slack` posts to incoming webhooks: `SLACK_WEBHOOK_URL` (alerts, the default), `SLACK_USER_UPDATES_WEBHOOK_URL`, and `SLACK_DRIVER_UPDATES_WEBHOOK_URL`. An unset channel webhook falls back to the default. Breaker alerts, signup alerts, App Store updates, and Google Play releases post here.
+
+## Links and media
+
+### Dub
+
+| | |
+| --- | --- |
+| Package | `internal/data/dub` (Dub Go SDK) |
+| Config | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET` |
+| Used for | Referral, invite, fleet-join, and QR payment short links (`CreateLink`, `UpsertLink`, `UpdateLinkDestination`), lead tracking (`TrackLead`) |
+
+Share cards are rendered by a Cloudflare Worker in `yelo-web` (`workers/og`). The API signs card URLs with `OG_SIGNING_SECRET`, which is required at startup because the worker rejects unsigned URLs.
+
+### Supabase Storage
+
+| | |
+| --- | --- |
+| Package | `internal/data/supabasestorage` |
+| Config | `STORAGE_URL`, `STORAGE_TOKEN`, `STORAGE_PUBLIC_BUCKET_ID`, `STORAGE_PRIVATE_BUCKET_ID` |
+| Used for | Profile pictures and thumbnails, license images, event photos, spot photos, vehicle catalog artwork |
+
+Profile photos live in the public bucket. `DownloadProfilePicture` uses a direct HTTP GET on the public URL because the SDK ignores the host in the URL.
+
+## Identity and platform
+
+| Integration | Package | Config | Used for |
+| --- | --- | --- | --- |
+| Clerk | `clerk-sdk-go/v2` in `internal/server/http` | `CLERK_SECRET_KEY` | Dashboard session verification |
+| Google and Apple OAuth | `internal/service/authv3/providers`, `internal/data/repository/oauth.go` | `AUTH_V3_GOOGLE_*`, `AUTH_V3_APPLE_*`, `GOOGLE_ALLOWED_AUDIENCES`, `APPLE_ALLOWED_AUDIENCES` | Auth v3 sign-in and Auth v2 OAuth email verification |
+| StudID | `internal/service/authv3/student` | `AUTH_V3_STUDID_*` | Student verification |
+| Google Calendar | `internal/data/googlecalendar` | `GOOGLE_CALENDAR_*` | Operating-hours calendar sync |
+| Google Play | `internal/service/playrelease` | `GOOGLE_PLAY_*` | Release monitoring to Slack |
+
+### App Store webhook
+
+`POST /appstore-webhook` receives App Store Connect events. It verifies the `X-Apple-Signature` HMAC and posts review state, build upload, and TestFlight build state changes to Slack. It does not change application data.
+
+## Telemetry
+
+| Integration | Where | Used for |
+| --- | --- | --- |
+| PostHog | `internal/utilities/logger/posthog.go`, `internal/utilities/metrics/posthog.go`, `internal/service/authv2` | Error and metric events from the server, sign-up funnel events. Configured by `POSTHOG_API_KEY` |
+| Sentry | `main.go`, `sentryhttp` middleware | Error capture for 5xx errors when `SENTRY_DSN` is set. Tracing uses OTel, so the Sentry trace sample rate is 0 |
+| OpenTelemetry | `internal/utilities/otel` | Traces and metrics over OTLP |
+
+See [Observability](/engineering/observability) for dashboards and alerting.
+
+## Adding an integration
+
+<Steps>
+  <Step title="Create a client package">
+    Add `internal/data/<provider>` with a small interface (`provider.go`) and an implementation that reads its settings from `config.Load()`.
+  </Step>
+  <Step title="Contain failures">
+    Wrap calls in a breaker from `circuitbreaker.NewSettings` and a `retry.NewNetworkRetrier`. Classify 4xx responses as input errors so they don't trip the breaker.
+  </Step>
+  <Step title="Add configuration">
+    Add fields to `internal/utilities/config`. If the integration can contact people or mutate external systems, add its secret to `validateE2EIntegrations` so E2E refuses to start with it set.
+  </Step>
+  <Step title="Wire and mock">
+    Construct the client in `service.NewService`, add the package to `.mockery.yaml`, and run `make mocks`.
+  </Step>
+</Steps>

@@ -1,0 +1,241 @@
+---
+title: "Adding an endpoint"
+description: "A step-by-step recipe for adding a route to yelo-api that follows repo conventions: models, repository and sqlc query, service, handler, route registration, mocks, tests, and OpenAPI regeneration."
+---
+
+This recipe walks through adding an authenticated endpoint to an existing domain. The running example adds `GET /ride/i/{id}/summary`, which returns a short summary of a ride the caller took part in. The example is illustrative: swap in your own domain, types, and names.
+
+Read [API structure](/engineering/api/structure) and [Request lifecycle](/engineering/api/request-lifecycle) first if you haven't.
+
+## Before you start
+
+- Decide which **auth group** the route belongs to. The group sets the credential, not the handler. See [Route groups and auth](/engineering/api/request-lifecycle#route-groups-and-auth).
+- Decide whether you need a **schema change**. If you do, add the migration first. See [Migrations](/engineering/api/data-layer#migrations).
+- Check whether an existing service method already returns what you need. Reusing it keeps the interface small.
+
+## Recipe
+
+<Steps>
+  <Step title="Define the response model">
+    Put shared domain types in `internal/models`. Put response wrappers that only one HTTP package uses next to the handler.
+
+    ```go
+    // internal/models/ride.go
+    type RideSummary struct {
+    	ID          uuid.UUID  `json:"id"`
+    	Status      RideStatus `json:"status"`
+    	PickupName  string     `json:"pickup_name"`
+    	DropoffName string     `json:"dropoff_name"`
+    	Stops       []string   `json:"stops"`
+    }
+    ```
+
+    Every type becomes an OpenAPI component. Give response DTOs distinct Go type names, because `TestOpenAPIResponseDTOsHaveDistinctComponents` fails on collisions.
+
+    For request bodies, add a `Validate(v *validator.Validator)` method with `v.Check(ok, "field", "message")` calls.
+  </Step>
+  <Step title="Add the query">
+    Add a named query to the right file in `internal/data/repository/queries`:
+
+    ```sql
+    -- name: GetRideSummary :one
+    SELECT id, status, pickup_name, destination_name
+    FROM "Rides"
+    WHERE id = sqlc.arg(ride_id)::uuid
+      AND (rider_id = sqlc.arg(user_id)::uuid OR driver_id = sqlc.arg(user_id)::uuid);
+    ```
+
+    Then regenerate:
+
+    ```bash
+    make sqlc-generate
+    ```
+  </Step>
+  <Step title="Add the repository method">
+    Add the method to the interface in `internal/data/repository/interfaces.go` and implement it on the repository struct. Map `pgx.ErrNoRows` to `NotFoundError` and coerce nil slices.
+
+    ```go
+    func (r *sqlRideRepository) GetSummary(ctx context.Context, rideID, userID uuid.UUID) (models.RideSummary, errors.Error) {
+    	row, err := datasqlc.New(r.postgresDb).GetRideSummary(ctx, datasqlc.GetRideSummaryParams{RideID: rideID, UserID: userID})
+    	if err != nil {
+    		if errors.Is(err, pgx.ErrNoRows) {
+    			return models.RideSummary{}, errors.NewNotFoundError("ride not found")
+    		}
+
+    		return models.RideSummary{}, errors.NewServerErrorFromError(err)
+    	}
+
+    	return models.RideSummary{
+    		ID:          row.ID,
+    		Status:      models.RideStatus(row.Status),
+    		PickupName:  row.PickupName,
+    		DropoffName: row.DestinationName,
+    		Stops:       []string{},
+    	}, nil
+    }
+    ```
+  </Step>
+  <Step title="Add the service method">
+    Implement business rules in `internal/service/<domain>`. Return `errors.Error`, never a plain `error`. Wrap with context using `errors.Wrap`.
+
+    ```go
+    func (s *RideService) GetSummary(ctx context.Context, rideID uuid.UUID) (models.RideSummary, errors.Error) {
+    	userID, err := customContext.GetRequestUserID(ctx)
+    	if err != nil {
+    		return models.RideSummary{}, err
+    	}
+
+    	return s.repository.Ride.GetSummary(ctx, rideID, userID)
+    }
+    ```
+
+    If the service needs a new dependency, add it to the constructor and wire it in `service.NewService` in `internal/service/service.go`.
+  </Step>
+  <Step title="Extend the HTTP service interface">
+    Add the method to the interface the handler depends on, in `internal/server/http/<domain>/service.go`:
+
+    ```go
+    type RideService interface {
+    	// ...
+    	GetSummary(ctx context.Context, rideID uuid.UUID) (models.RideSummary, errors.Error)
+    }
+    ```
+
+    For a brand-new domain, create the package with `service.go`, add a field to `app.Container` in `internal/app/container.go`, and set it in `service.NewService`.
+  </Step>
+  <Step title="Write the handler">
+    Handlers read input, call the service, and wrap the result. They never run SQL.
+
+    ```go
+    func (h *RideHandler) GetSummary(c fuego.ContextNoBody) (json.StandardResponse[models.RideSummary], error) {
+    	ctx := c.Context()
+
+    	rideID, err := helpers.ParseUuid(c.PathParam("id"))
+    	if err != nil {
+    		return json.StandardResponse[models.RideSummary]{}, err
+    	}
+
+    	summary, err := h.rideService.GetSummary(ctx, rideID)
+    	if err != nil {
+    		return json.StandardResponse[models.RideSummary]{}, err
+    	}
+
+    	return json.NewStandardResponse(ctx, summary), nil
+    }
+    ```
+
+    To set a non-200 status, call `c.Response().WriteHeader(http.StatusCreated)` before returning.
+  </Step>
+  <Step title="Register the route">
+    Add the route in the domain's routes file, inside the registrar for the right auth group. Use a unique `<domain>.<Handler>` operation ID and document errors with `routeopt`.
+
+    ```go
+    fuego.Get(s, "/i/{id}/summary", handler.GetSummary,
+    	option.Summary("Get ride summary"),
+    	option.Description("Returns a short summary of a ride the caller took part in"),
+    	option.OperationID("ride.GetSummary"),
+    	option.AddResponse(200, "Ride summary", fuego.Response{Type: json.StandardResponse[models.RideSummary]{}}),
+    	routeopt.Errors(401, 500),
+    	routeopt.Error(404, "Ride not found"),
+    )
+    ```
+
+    For a new domain, call your `RegisterRoutes` from `router()` in `internal/server/http/router.go` inside the matching group, for example `fuego.Group(authenticatedGroup, "/summary", option.Tags("Summary"))`.
+  </Step>
+  <Step title="Regenerate mocks">
+    Mockery discovers every interface under `internal/server/http` recursively and every interface in `internal/data/repository`. For a new package outside those trees, add it to `.mockery.yaml`.
+
+    ```bash
+    make mocks
+    ```
+
+    Commit the generated files in `mocks/`. `make mocks-check` fails on stale or orphaned mocks.
+  </Step>
+  <Step title="Write tests">
+    See [Tests](#tests) below.
+  </Step>
+  <Step title="Regenerate OpenAPI">
+    ```bash
+    make openapi
+    ```
+
+    This writes `openapi.json` from route registrations with stubbed services, without starting the app. Commit it. The client propagation workflow updates the web and mobile clients from it. See [OpenAPI and clients](/engineering/openapi-and-clients).
+  </Step>
+  <Step title="Run the gates">
+    ```bash
+    make lint
+    make check
+    ```
+
+    `make check` runs the same gates as CI: migration policy, generated code (sqlc, mocks, OpenAPI), lint, unit and integration tests, and the merged coverage floor.
+  </Step>
+</Steps>
+
+## Tests
+
+Most endpoint changes need three kinds of test.
+
+<Tabs>
+  <Tab title="Handler unit test">
+    Build the handler with a generated mock service and a Fuego mock context. Handler tests use the `//go:build !integration` tag.
+
+    ```go
+    func TestRideHandler_GetSummary(t *testing.T) {
+    	mockService := mocks.NewMockRideService(t)
+    	h := ride.NewHTTPHandler(mockService, testutils.NewTestLogger())
+    	rideID := testutils.RandomUUID()
+
+    	mockService.On("GetSummary", mock.Anything, rideID).
+    		Return(models.RideSummary{ID: rideID, Stops: []string{}}, nil).Once()
+
+    	ctx := testutils.NewMockContextWithUserAndCommunity[any, any](nil, nil, testutils.RandomUUID(), testutils.RandomUUID())
+    	testutils.SetMockContextPathParam(ctx, "id", rideID.String())
+
+    	resp, err := h.GetSummary(ctx)
+
+    	require.NoError(t, err)
+    	assert.Equal(t, rideID, resp.Data.ID)
+    }
+    ```
+
+    Also add a nil-slice test if the response contains arrays, following `nil_slice_json_test.go`: a nil slice from the service must serialize as `[]`.
+  </Tab>
+  <Tab title="Service unit test">
+    Construct the service with repository and provider mocks from `internal/data/repository/mocks` and the provider `mocks/` packages. Put the caller in context with `testutils.SetRequestUserID`.
+  </Tab>
+  <Tab title="Repository integration test">
+    Repository tests use `//go:build integration` and run against a real Postgres started by testcontainers, with every migration applied. Use the shared `testDB` from the package `TestMain`, and add a `*_sqlc_contract_test.go` for new query files.
+
+    ```bash
+    make test-integration
+    ```
+
+    If you add the first integration-tagged test to a package, add that package to `INTEGRATION_PKGS` in the `Makefile`. `go list` will not find it otherwise.
+  </Tab>
+</Tabs>
+
+See [Testing](/engineering/testing) for the full test strategy and coverage rules.
+
+## Checklist
+
+<AccordionGroup>
+  <Accordion title="Correctness">
+    - The route is in the right auth group, and dashboard routes pass the scope gate and any role gate they need.
+    - Errors use typed constructors so they map to the right status code.
+    - New error types are added to `MapErrorToStatusCode` and, if they are client errors, to the circuit breaker's `IsSuccessful` list.
+    - Slices in responses are never nil.
+    - Anything that sends a notification uses `notify.Emit` inside the same transaction as the state change.
+  </Accordion>
+  <Accordion title="Contract">
+    - The operation ID is unique and follows `<domain>.<Handler>`.
+    - Response DTO names don't collide with existing components.
+    - `openapi.json` is regenerated and committed.
+    - Multipart upload routes are added to the operation list in `finalizeOperation` so the spec uses `multipart/form-data`.
+    - Renaming a field, type, or operation ID is a breaking change for generated clients. Coordinate with the web and mobile apps.
+  </Accordion>
+  <Accordion title="Generated code and lint">
+    - `make sqlc-generate`, `make mocks`, and `make openapi` output is committed, including new files.
+    - Functions stay within the lint limits: cyclomatic 15, cognitive 30, 200 lines or 100 statements, nesting 5.
+    - Every `//nolint` names the linter and explains why.
+  </Accordion>
+</AccordionGroup>

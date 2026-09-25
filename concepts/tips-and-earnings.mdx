@@ -1,0 +1,149 @@
+---
+title: "Tips and earnings"
+description: "How in-app ride tips are authorized and captured, how QR tip links work, and how the driver earnings API reads balances and runs payouts"
+---
+
+Drivers earn money three ways on Yelo:
+
+- **Ride fares**, captured from the rider's payment. See [Payments and payouts](/concepts/payments-and-payouts).
+- **In-app ride tips**, left when the rider rates a completed trip.
+- **QR tip links**, paid through Stripe Checkout without a ride. Anyone can scan one, including people without a Yelo account.
+
+All three land in the same connected Stripe account: the driver's own, or their fleet's when the fleet manages payouts. The earnings API then reads that account to show balances and run payouts.
+
+## In-app ride tips
+
+### When tips are enabled
+
+Tips are enabled per ride. The mobile app sends `X-Features: tips` when it creates the ride, and the API stores `tips_enabled = true` on the row (`internal/utilities/features`). Rides created without that header never offer tips.
+
+For a tip-enabled paid ride:
+
+- **At accept**: the PaymentIntent authorizes the fare plus a **$5.00 tip buffer** (`models.TipBuffer`).
+- **At complete**: capture is deferred and `tip_window_expires_at` is set to **24 hours** after completion. The ride moves to `pending_rider_rating`.
+
+### Tip options
+
+`GET /ride/i/{id}/tip-options` returns the tip choices for the rider's ride while it's in `pending_rider_rating` with tips enabled:
+
+| Field | Value |
+| --- | --- |
+| `tip_options` | `[2, 5, 10]` dollars (`models.GetTipOptions`) |
+| `max_tip` | `100` dollars (`models.MaxTip`) |
+| `fare` | The ride's effective fare |
+| `currency` | `usd` |
+
+Custom tips are accepted between $0 and $100.00 and validated server-side.
+
+### Charging the tip
+
+The rider tips by rating: `POST /ride/i/{id}/rate` with an optional `tip_amount`. `RideService.captureTip` (`internal/service/ride/tip_charge.go`) picks the cheapest correct charge:
+
+<Steps>
+  <Step title="No tip">
+    If the ride is still pending, the fare is captured and the ride completes.
+  </Step>
+  <Step title="Tip within the buffer">
+    For a tip of $5.00 or less on a pending paid ride, one capture of fare + tip runs on the original PaymentIntent. The ride's `tip_amount` is set and `driver_payout` becomes fare + tip.
+  </Step>
+  <Step title="Tip over the buffer, or a free ride">
+    The fare is captured first, which releases the buffer. Then a separate **tip PaymentIntent** is created on the same connected account: automatic capture, off-session, using the rider's cloned payment method. For free rides, the payment method is cloned to the matched driver's or fleet's account at this point.
+  </Step>
+  <Step title="Authentication required">
+    If the card needs authentication, the rate call returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The app presents the confirmation sheet, then calls `POST /ride/i/{id}/confirm-tip`. The API retrieves the stored tip PaymentIntent from Stripe and records the tip only if the status is `succeeded`.
+  </Step>
+</Steps>
+
+The rate response includes `tip_status`: `none`, `captured`, or `requires_action`.
+
+Safeguards:
+
+- A ride that already has a tip is never charged again.
+- Tip PaymentIntents use the idempotency key `tip_{rideId}_{cents}`. A retried request doesn't double-charge, and a changed amount creates a fresh intent after canceling the old one.
+- If the tip-window sweeper settles the fare at the same moment a within-buffer tip arrives, the tip falls back to a dedicated tip charge instead of being lost.
+- A driver or fleet with no connected account can't receive tips, and the rider sees "This driver can't accept tips right now."
+
+### Tip-window sweeper
+
+`RideService.AutoCaptureTipWindowExpired` (`tip_capture.go`) runs every 5 minutes in the `TipCapture` background loop. Each run:
+
+1. Loads up to 50 rides that are `pending_rider_rating`, tip-enabled, have a PaymentIntent, and whose `tip_window_expires_at` has passed, oldest first.
+2. Captures the **fare only**, which releases the $5.00 buffer.
+3. Sets `tip_amount = 0`, `driver_payout = fare`, and `status = 'complete'`, but only if the ride is still pending. This lets a concurrent rating win cleanly.
+4. Records a `tip_window_expired` ride event.
+
+Failures are retried on the next run. A ride still stuck more than an hour past its window is logged as needing manual review.
+
+## QR tip links
+
+QR tip links let someone tip without a ride. They're served by the **tipping** service (`internal/service/tipping`) and the web tip page at `joinyelo.com/pay/tip/{slug}` (the signup site in `yelo-web`). The mobile app has a matching `tip/[slug]` route.
+
+A slug resolves to one of two targets:
+
+| Target | How it resolves | Amount rules | Paid to |
+| --- | --- | --- | --- |
+| **QR payment config** | An active config in the dashboard's QR payments section, matched by slug | The config's `fixed` amount, or its `custom` min and max | The config's fleet account. The fleet must have a Stripe account. |
+| **Driver link** | A driver's referral code. The driver must have a complete application and not be banned or deleted. If they're in a fleet, it must be active. | Custom, $1.00 to $500.00, preset $5.00 | The fleet's account when the fleet has custom payouts, otherwise the driver's own account |
+
+Every tip must be at least $0.50.
+
+Endpoints live under `/tips`:
+
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `GET /tips/{slug}` | Public | Tip page config: names, driver photo, amount rules. |
+| `POST /tips/{slug}/guest-checkout` | Public | Creates a Stripe Checkout session for a guest. |
+| `POST /tips/{slug}/visit` | JWT | Records a visit and sets the user's acquisition source to QR payment if it's still the default. |
+| `POST /tips/{slug}/checkout` | JWT | Creates a Checkout session with the user's email, name, and phone attached. |
+
+Checkout sessions are created on the connected account. Metadata includes `recipient_driver_id`, `fleet_id`, `qr_config_id`, and `yelo_user_id` when available. When Stripe sends `checkout.session.completed`, `PaymentService.CheckoutSessionCompleted` writes a `QrPayments` row with the amount, customer details, and fleet and driver attribution.
+
+## Driver earnings
+
+The earnings hub in the driver app (`yelo-frontend/app/(app)/driver-earnings/`) is backed by `/earnings`. Every endpoint resolves the signed-in user's own `Users.stripe_merchant_id` and calls Stripe on that account. If the driver has no connected account, the API returns "Finish setting up your driver payouts before viewing earnings."
+
+<Note>
+Earnings reads only the driver's own connected account. Fares and tips for drivers paid through a fleet with custom payouts land in the fleet's account, so they don't appear in that driver's balance or payouts.
+</Note>
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /earnings/balance` | Available, pending, and instantly available balance. |
+| `GET /earnings/external-account` | The default bank account or debit card, and whether it supports instant payouts. Returns `404` when none is set. |
+| `GET /earnings/payout-schedule` | Current cadence and next expected payout date. |
+| `PUT /earnings/payout-schedule` | Set `daily`, `weekly`, `monthly`, or `manual`. Weekly defaults to Friday. |
+| `GET /earnings/payouts` | Past payouts, newest first. 25 per page by default, 100 max. |
+| `GET /earnings/payouts/instant-quote` | Instant balance, fee, net amount, and eligibility. |
+| `POST /earnings/payouts/instant` | Cash out instantly. An amount of `0`, or more than available, sends the full instant balance. |
+| `GET /earnings/activity` | Balance transactions grouped by day, with `from`, `to`, `limit`, and `cursor`. |
+
+### Instant payouts
+
+- **Fee**: 1% of the amount, rounded up, with a $0.50 minimum, and never more than the amount (`instantFeeFor` in `internal/service/earnings/mappers.go`).
+- **Ineligible when** there's no external account, the bank doesn't support instant payouts, there's no instant balance, or the balance is $0.50 or less.
+- Payout requests carry an idempotency key built from the account, method, amount, and a time bucket, so a double tap doesn't send two payouts.
+
+### Activity feed
+
+`GET /earnings/activity` lists Stripe balance transactions, classified as charge, payment, payout, refund, adjustment, fee, or other. Each charge row is matched to its ride through the PaymentIntent. When a match is found, the row gets the rider's name, the tip amount, the ride ID, and the gross amount from `driver_payout`.
+
+On the first page, the "earned this week" headline and ride count come from the database, not Stripe. They sum `driver_payout` for the driver's `complete` and `pending_rider_rating` rides since Monday 00:00 UTC. Stripe books the full pre-authorization on partial-capture rides, so its totals would overstate earnings.
+
+### Payout notifications
+
+Stripe `payout.paid`, `payout.failed`, and `payout.canceled` events for a connected account trigger `EarningsService.HandlePayoutEvent`. It finds the driver who owns the account and sends a push that deep-links to `yelo://drive/earnings`, deduplicated by event ID. Payout events on the platform account, and accounts with no matching driver, are ignored.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Tip capture, dedicated tip charges, confirm-tip | `yelo-api/internal/service/ride/tip_charge.go` |
+| Tip-window sweeper | `yelo-api/internal/service/ride/tip_capture.go` |
+| Tip constants and options | `yelo-api/internal/models/tip.go` |
+| QR tip links | `yelo-api/internal/service/tipping/tipping.go`, `yelo-api/internal/server/http/tipping/` |
+| QR payment recording | `yelo-api/internal/service/payment/payment.go` (`CheckoutSessionCompleted`) |
+| Earnings service and payout webhook | `yelo-api/internal/service/earnings/` |
+| Stripe balance and payout calls | `yelo-api/internal/data/stripe/payout.go` |
+| Rider tip UI | `yelo-frontend/app/(app)/ride-complete/`, `yelo-frontend/app/(app)/tip/[slug].tsx` |
+| Web tip page | `yelo-web/src/shared/signup/steps/TipStep.tsx` |
+| Driver earnings hub | `yelo-frontend/app/(app)/driver-earnings/`, `yelo-frontend/hooks/driver-earnings/` |

@@ -1,0 +1,183 @@
+---
+title: "State and data"
+description: "React Query configuration and persistence, the Orval-generated API client, Zustand stores, local storage, and feature gating in the mobile app."
+---
+
+The app keeps three kinds of state:
+
+- **Server state** in TanStack Query, fetched through Orval-generated hooks. This is almost everything.
+- **App-lifetime context** in providers, such as the session, location, and the active ride or drive. See [Architecture](/engineering/mobile/architecture#provider-order).
+- **Transient UI state** in Zustand stores, a few of which persist.
+
+There is no Redux, XState, or WebSocket layer.
+
+## React Query
+
+### Client defaults
+
+`app/_layout.tsx` creates one `QueryClient`:
+
+| Option | Value | Why |
+| --- | --- | --- |
+| `staleTime` | 30s | Rehydrated or burst-mounted queries do not all refetch in the same boot frame. |
+| `gcTime` | 1 hour | Keeps data around across screen changes. |
+| `retry` | Up to 3, never on 401 or 403 | Auth failures never heal by retrying. |
+| `structuralSharing` | `shareQueryData` | Keeps unchanged subtrees, including revived `Date` values, referentially equal. |
+
+Two platform hooks make React Query behave correctly on React Native:
+
+- `focusManager` listens to `AppState`. Without it, the app is "focused" forever and background polling never pauses.
+- `onlineManager` listens to NetInfo, so retries and refetches pause without a network.
+
+### Persistence
+
+`PersistQueryClientProvider` writes a filtered cache to AsyncStorage through `createAsyncStoragePersister`, throttled to one write every 10 seconds.
+
+`lib/query/persistence.ts` decides what persists. Only successful queries with these roots are kept:
+
+- `currentUser`, `currentCommunity`, `communityFeed`
+- `/location/pois`, `/event/upcoming`, `/user/likes`
+- `/community/<id>/zones`
+- Up to 20 `/notification/bump/preview` responses from the last 24 hours, stored with errors stripped
+
+The persist `buster` is `map-first-paint-v1`. Changing it discards every device's persisted cache on next launch.
+
+<Note>
+Persisted data exists so the map can paint before the network responds. `SessionProvider` treats restored profile data as presentation-only until a request with the current token succeeds (`isProfileReady`).
+</Note>
+
+### Query keys
+
+- Orval hooks key queries by URL path, for example `['/user/status']`. `lib/notifications/pushInvalidation.ts` matches on these path roots, so keep them intact.
+- A few identity-bound queries use custom keys: `currentUser` (`GET /authv2/status`), `currentCommunity` (`GET /community/current`), and `communityFeed`. They do not embed the JWT. `SessionProvider.signIn` cancels and invalidates them instead.
+- Community-scoped keys are built in `lib/query/communityScope.ts` and append the community and user ids, for example `rideBoardQueryKey(communityId, userId)`. `isCommunityScopedQuery` lists every scoped root so a sign-in can cancel them.
+
+### Invalidation
+
+Use `invalidateFresh(client, filters)` from `lib/query/invalidateFresh.ts` when a push or event must refresh data. It marks matching queries stale, cancels any in-flight fetch that could return old data, and coalesces repeated requests into one refetch per frame.
+
+### Ride state protocol
+
+`api/rideStatusProtocol.ts` attaches to the shared axios instance at startup:
+
+- Requests to `/user/status` send `X-Ride-State-Protocol: 1` and, when a snapshot is cached, `X-Ride-State-Minimum-Revision`.
+- Responses are validated before the query sees them. A snapshot for a different user, with an unsupported `protocol_version`, or with an invalid revision throws an error. A snapshot older than the cached one never replaces it: the cache keeps the higher `session_revision`.
+- The accepted snapshot is projected back onto the legacy fields (`user_status`, `current_ride_id`, `current_ride_status`, `queued_rides`, `driver_is_online`) so existing readers keep working.
+
+## Generated API client
+
+The app never writes request code for Yelo endpoints by hand. Orval generates React Query hooks and plain functions from `openapi.json`.
+
+| Piece | Location |
+| --- | --- |
+| Contract | `openapi.json`, pinned to a yelo-api commit and SHA-256 in `openapi.lock.json` |
+| Config | `orval.config.ts`: `tags-split` mode, `react-query` client, `axios` HTTP client, dates enabled, form data enabled |
+| Excluded tags | `Auth v3`, `Dashboard`, `System` |
+| Output | `api/generated/endpoints/<tag>/<tag>.ts` and `api/generated/models/` |
+| Mutator | `customInstance` in `api/axios.ts` |
+| Helpers | `api/helpers/` (for example `useCurrentUser`, `useCurrentCommunity`, `useInvalidateUserStatus`) |
+
+Auth v3 is excluded because `lib/auth/client.ts` calls it with `fetch` and its own `AuthV3` authorization scheme. See [Auth and onboarding](/engineering/mobile/auth-and-onboarding).
+
+### The axios instance
+
+`api/axios.ts` exports `AXIOS_INSTANCE` with `baseURL` from `lib/config.ts`:
+
+- Production builds always use `https://api.rideyelo.com`.
+- Dev builds use `EXPO_PUBLIC_API_URL` if set, otherwise production.
+- E2E builds require an HTTPS, non-production origin and refuse the production API.
+
+The instance revives ISO 8601 strings in every response into `Date` objects, and logs failures as `<path>.<METHOD>.error`. `customInstance` merges headers, drops `Content-Type` for `FormData`, and attaches a cancel function so React Query can abort requests.
+
+Providers add more interceptors at runtime: bearer auth and the JWT gate (`AxiosProvider`), opt-in error modals (`AxiosErrorInterceptor`), and the ride state protocol.
+
+### Using generated hooks
+
+```tsx
+import { useRideGetRide } from '@/api/generated/endpoints/ride/ride';
+
+const { data } = useRideGetRide(rideId, {
+  query: { enabled: Boolean(rideId) },
+  request: { timeout: 15_000 },
+});
+```
+
+- Pass React Query options under `query` and axios options under `request`.
+- Read `/user/status` with `useUserGetUserStatus()` and no `refetchInterval`. `QueryPollers` owns its cadence.
+- Pass `expectedUserId` in request options for account-scoped work. `AxiosProvider` cancels the request if the signed-in user changed before dispatch.
+
+### Regenerating
+
+<Steps>
+  <Step title="Sync the contract">
+    Check out the matching yelo-api commit next to the app, or set `YELO_API_DIR`. Run `make api`. It copies `openapi.json`, updates `openapi.lock.json`, and runs Orval.
+  </Step>
+  <Step title="Verify">
+    Run `make api-check`. CI fails if `openapi.json` does not match the lock or the generated output is stale.
+  </Step>
+</Steps>
+
+Never hand-edit `api/generated/**`. For how the contract is produced on the API side, see [OpenAPI and clients](/engineering/openapi-and-clients).
+
+## Zustand stores
+
+Stores live in `stores/`. Most are in-memory. Persisted stores use `zustand/middleware` `persist` with AsyncStorage.
+
+| Store | Persisted | Holds |
+| --- | --- | --- |
+| `userStateStore` | SecureStore key `expoPushToken` (manual) | Last push token sent to the server |
+| `rideMatchingSnapshotStore` | AsyncStorage `ride-matching-snapshot` | Pickup, dropoff, price, and vehicle for the matching screens and request restart |
+| `rideSelectionStore` | AsyncStorage `ride-selection` | Badges, fleet name, and vehicle image of the chosen option |
+| `mapTutorialStore` | AsyncStorage, one key per user | Map tutorial progress |
+| `mapStartupStore` | No | `baseMapReady`, which gates network map content until the basemap paints |
+| `mapSearchIntentStore` | No | One-shot request to focus map search |
+| `requestRouteStore` | No | Pickup and dropoff labels for the request top bar |
+| `contactMatchStore` | No | Contact sync status and matched users |
+| `rideAccountStatusStore` | No | Per-provider status for the rideshare aggregator |
+| `providerDiagnosticConsentStore` | No | Whether provider diagnostics may be sent |
+
+`stores/recentLocationsStore.ts` is not a Zustand store. It exports a `RecentLocationsController` that caches recent locations in AsyncStorage and syncs them through `/user/recent-locations`.
+
+Use a store for UI state that crosses sibling subtrees. Use React Query for anything the server owns.
+
+## Local storage
+
+| Storage | Used for |
+| --- | --- |
+| SecureStore | `session` JWT, `authv3-onboarding-draft-v1`, `authv3-anonymous-id`, `expoPushToken`, `driver_should_share_location` |
+| AsyncStorage | React Query cache, persisted stores, PostHog storage, per-user flags |
+
+`createUserFlag('prefix:', 'log.tag')` in `lib/storage/userFlag.ts` creates a per-user, write-once boolean in AsyncStorage. Read it with `useUserFlag(flag, userId)`.
+
+<Warning>
+Every storage key and flag prefix is an on-device contract. Renaming one loses the data on every installed device.
+</Warning>
+
+## Feature gating
+
+### Experiments
+
+Experiments are server-driven. `lib/experiments/index.ts` defines every key in `EXPERIMENTS`:
+
+| Key | Gates |
+| --- | --- |
+| `glass_lab` | Settings, Glass Lab |
+| `rideshare-price-aggregator` | Third-party price quotes on the request sheet. Also requires the user to accept an in-app disclosure. |
+| `color-lab` | Settings, Color Lab |
+| `design-system-lab` | Settings, Design System Lab |
+
+An experiment is on only when both the user's and the community's `active_experiments` lists contain the key. Gate UI with:
+
+- `useExperimentEnabled(key)` for a boolean that is false while loading.
+- `useExperiment(key)` when you need `loading` and `error` before redirecting.
+- `<ExperimentGate experiment={...}>` for declarative gating.
+
+Never inline an experiment string. Add it to `EXPERIMENTS` first.
+
+### `X-Features` header
+
+`X-Features` is a per-request capability header. The only mobile caller is ride creation in `hooks/usePreRideRequest.ts`, which sends `X-Features: tips,driver-options` on `POST /ride/v2/`. The API parses it in `internal/utilities/features/features.go` and sets `TipsEnabled` and `DriverOptionsEnabled` on the ride. It tells the server this client can render tips and driver options. It is not a user-facing flag.
+
+### PostHog
+
+PostHog is used for product analytics and session replay only. The app does not read PostHog feature flags. See [Observability](/engineering/observability).

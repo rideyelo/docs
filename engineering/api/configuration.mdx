@@ -1,0 +1,240 @@
+---
+title: "Configuration"
+description: "How yelo-api loads configuration, which environment variables it reads and what each one controls, what startup validation requires, and the hard-coded constants that shape ride behavior."
+---
+
+All runtime configuration comes from environment variables. This page lists variable names and their purpose. It never lists values for secrets. For where production values are stored and bound to Cloud Run, see [Deployment](/engineering/deployment). For a working local `.env`, start from `.env.example` and see [Local development](/engineering/local-development).
+
+## How configuration loads
+
+`config.Load()` in `internal/utilities/config/config.go` builds a `*config.Config` once, behind a `sync.Once`, and returns the same pointer on every call.
+
+- It loads `.env` from the working directory if the file exists. A missing file is not an error.
+- Unset variables take the default shown in code. Unparseable booleans, integers, floats, and durations silently fall back to the default. Auth v3 durations are the exception: they record a parse error that fails validation.
+- List variables (`CORS_TRUSTED_ORIGINS`, `KEY_LEGACY`, `GOOGLE_PLAY_TRACKS`, and similar) accept commas or spaces.
+
+<Warning>
+Because `Load()` memoizes, changing an environment variable after startup has no effect. Tests that need a different value set it on the returned struct, for example `config.Load().Auth.AuthJwtKey = "..."`, or set the environment in `TestMain` before the first call.
+</Warning>
+
+A few values bypass the struct and read the environment directly: `PORT` (in `main.go`), `LOG_LEVEL` and `GOOGLE_CLOUD_PROJECT` (logger), `K_REVISION` (Postgres `application_name`), `BACKGROUND_TASKS_ENABLED` (background loops), and `CONTACT_HASH_PEPPER` (contact hashing, read on each use).
+
+## Startup validation
+
+`main.go` calls `cfg.Validate()` and panics on failure.
+
+<Tabs>
+  <Tab title="Normal mode">
+    These variables are required:
+
+    - `DSN`
+    - `KEY`
+    - `GOOGLE_ALLOWED_AUDIENCES`
+    - `STRIPE_API_KEY`
+    - `MAPBOX_API_KEY`
+    - `GOOGLE_MAPS_API_KEY`
+    - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`
+    - `OG_SIGNING_SECRET`
+    - `GOOGLE_PLAY_PACKAGE_NAME` and `GOOGLE_PLAY_TRACKS` when Google Play release monitoring is enabled
+
+    When `AUTH_V3_ENABLED` is true, the required Auth v3 origins, legal versions, Google and Apple provider settings, and keys must also be present and parse correctly.
+  </Tab>
+  <Tab title="E2E mode">
+    When `E2E_ENABLED=true` or `ENVIRONMENT=e2e`, `validateE2E` runs instead. It requires:
+
+    - Both `E2E_ENABLED=true` and `ENVIRONMENT=e2e`.
+    - `DSN`, `KEY`, `E2E_CONTROL_API_KEY` (at least 32 bytes), `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, and `E2E_PRODUCTION_DATABASE_PROJECT_REF`.
+    - The `DSN` database name to match `E2E_DATABASE_NAME`, and its Supabase project ref to match `E2E_DATABASE_PROJECT_REF` and differ from the production ref.
+    - Redis enabled on a nonzero logical database.
+    - `E2E_BACKGROUND_JOBS_ENABLED` false and `E2E_FIXTURE_TTL` between 0 and 24 hours.
+    - Stripe test keys (`sk_test_`, `pk_test_`).
+    - Messaging, Quo, Dub, Slack, Photon, Resend, and Auth v3 provider secrets unset, so E2E can never contact real people.
+  </Tab>
+</Tabs>
+
+Calendar settings are validated separately when the calendar services are built.
+
+## Environment variables
+
+<AccordionGroup>
+  <Accordion title="App and server">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `ENVIRONMENT` | `dev` | `dev` disables CORS and enables dev-only behavior. Also `production`, `e2e`, and others |
+    | `PORT` | `8080` | Listen port (Cloud Run sets it) |
+    | `API_URL` | `http://localhost:8080` | Public API URL |
+    | `API_VERSION` | `1.0.0` | Release name for Sentry |
+    | `APP_URL_SCHEME` | `com.rideyelo://` | Deep link scheme used by `/redirect` |
+    | `APP_STORE_URL` | App Store listing | Fallback for `/redirect` |
+    | `YELO_WEBSITE_URL` | `https://rideyelo.com` | Website URL used in links and Stripe |
+    | `YELO_DASHBOARD_URL` | `https://dash.rideyelo.com` | Dashboard URL used in links |
+    | `CORS_TRUSTED_ORIGINS` | Built-in list of Yelo web origins | Credentialed CORS allowlist |
+    | `SWAGGER_ENABLED` | `true` | Logs the Swagger URL at startup in `dev` |
+    | `ACTIVATION_ENABLED` | `true` | Enables the driver activation loop |
+    | `RIDE_STATE_SNAPSHOT_ENABLED` | `false` | Enables the ride state protocol. See [Rides implementation](/engineering/api/rides-implementation#ride-state-protocol) |
+    | `COMMUNITY_TIMEZONE_RECONCILIATION_ENABLED` | `false` | Reconciles community time zones in the maintenance job |
+    | `SKIP_TEST_SCHOOL_NOTIFICATIONS` | `true` | Suppresses notifications for test schools |
+    | `DRIVER_VERIFIED_PHONE_REQUIRED` | `false` | Requires a verified phone for driver flows |
+    | `BACKGROUND_TASKS_ENABLED` | unset | `false` disables in-process ticker loops |
+  </Accordion>
+  <Accordion title="Database and Redis">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `DSN` | none | Postgres connection string |
+    | `POSTGRES_POOL_LOG_INTERVAL` | `30s` | API pool monitor interval |
+    | `DISABLE_SLOW_QUERY_WARNINGS` | `false` | Silences slow query and slow request warnings |
+    | `REDIS_URL` | none | Redis URL. Empty disables Redis |
+    | `REDIS_ENABLED` | `true` | `false` forces in-memory fallbacks |
+    | `REDIS_STARTUP_TIMEOUT_SECONDS` | `180` | Startup connect budget |
+  </Accordion>
+  <Accordion title="Auth">
+    | Variable | Purpose |
+    | --- | --- |
+    | `KEY` | HS256 signing key for app JWTs |
+    | `KEY_LEGACY` | Previous signing keys accepted during rotation |
+    | `CLERK_SECRET_KEY` | Clerk backend key for dashboard sessions |
+    | `GOOGLE_ALLOWED_AUDIENCES`, `APPLE_ALLOWED_AUDIENCES` | Accepted OAuth ID token audiences |
+    | `INTERNAL_API_KEY` | `X-Internal-Key` secret for `/internal` |
+    | `AUTH_V3_ENABLED` | Enables the `/authv3` surface |
+    | `AUTH_V3_PUBLIC_WEB_ORIGIN`, `AUTH_V3_API_CALLBACK_ORIGIN` | Web and callback origins |
+    | `AUTH_V3_CORS_ORIGINS`, `AUTH_V3_CORS_ALLOW_CREDENTIALS` | Auth v3 CORS policy |
+    | `AUTH_V3_TRUSTED_PROXY_CIDRS`, `AUTH_V3_TRUSTED_GEO_HEADER` | Trusted proxies for client IP and coarse geo |
+    | `AUTH_V3_TERMS_VERSION`, `AUTH_V3_PRIVACY_VERSION` | Accepted legal document versions |
+    | `AUTH_V3_CLIENT_REDIRECT_ALLOWLIST` | JSON map of client IDs to allowed redirect URIs |
+    | `AUTH_V3_STATE_HMAC_KEYS` | State signing keys, newest first |
+    | `AUTH_V3_SUBJECT_HMAC_KEY` | Addresses denied-subject tombstones. Rotation requires a data migration |
+    | `AUTH_V3_RATE_LIMIT_HMAC_KEY` | Pseudonymizes rate-limit dimensions |
+    | `AUTH_V3_ONBOARDING_JWT_KEY` | Signs onboarding tokens |
+    | `AUTH_V3_REFRESH_TOKEN_KEYS` | Encrypts Apple refresh tokens, newest first |
+    | `AUTH_V3_GOOGLE_ISSUER`, `AUTH_V3_GOOGLE_CLIENT_ID`, `AUTH_V3_GOOGLE_CLIENT_SECRET`, `AUTH_V3_GOOGLE_CALLBACK_URL` | Google provider |
+    | `AUTH_V3_APPLE_ISSUER`, `AUTH_V3_APPLE_SERVICES_ID`, `AUTH_V3_APPLE_NATIVE_CLIENT_ID`, `AUTH_V3_APPLE_TEAM_ID`, `AUTH_V3_APPLE_KEY_ID`, `AUTH_V3_APPLE_PRIVATE_KEY`, `AUTH_V3_APPLE_CALLBACK_URL` | Apple provider |
+    | `AUTH_V3_STUDID_ENABLED`, `AUTH_V3_STUDID_BASE_URL`, `AUTH_V3_STUDID_REDIRECT_URL`, `AUTH_V3_STUDID_SERVICE_NAME` | StudID student verification |
+    | `AUTH_V3_TRANSACTION_TTL`, `AUTH_V3_PROVIDER_START_TTL`, `AUTH_V3_HANDOFF_CODE_TTL`, `AUTH_V3_ONBOARDING_TOKEN_TTL`, `AUTH_V3_WEB_ACCESS_TOKEN_TTL`, `AUTH_V3_WEB_SESSION_IDLE_TTL`, `AUTH_V3_WEB_SESSION_ABSOLUTE_TTL` | Go durations. Defaults: 10m, 5m, 2m, 15m, 1h, 90 days, 365 days |
+  </Accordion>
+  <Accordion title="Payments">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `STRIPE_API_KEY` | none | Stripe secret key |
+    | `STRIPE_PUBLISHABLE_KEY` | none | Returned to clients |
+    | `STRIPE_WEBHOOK_SECRET` | none | Webhook signing secret |
+    | `STRIPE_RETURN_URL` | `https://rideyelo.com` | Connect onboarding return URL |
+    | `STRIPE_RECONCILIATION_ENABLED` | `true` | Enables the reconciliation River job |
+    | `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` | none | Non-production earnings override |
+  </Accordion>
+  <Accordion title="Maps">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `MAPBOX_API_KEY` | none | Mapbox |
+    | `GOOGLE_MAPS_API_KEY` | none | Google Routes, Places, and Geocoding |
+    | `SEARCH_PROVIDER` | `google` | Primary place search provider |
+    | `GOOGLE_PLACES_BIAS_RADIUS_METERS` | `10000` | Autocomplete location bias radius |
+  </Accordion>
+  <Accordion title="Messaging">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` | none | Twilio SMS |
+    | `TWILIO_VERIFY_SERVICE_SID` | none | Routes OTPs through Twilio Verify |
+    | `TWILIO_OTP_FALLBACK_ENABLED` | `false` | Enables toll-free SMS fallback for undelivered OTPs |
+    | `TWILIO_OTP_FALLBACK_DELAY` | `60s` | Age before a code is re-sent (clamped to positive) |
+    | `TWILIO_OTP_SWEEP_INTERVAL` | `15s` | Fallback sweep interval (clamped to positive) |
+    | `TWILIO_EVENTS_WEBHOOK_USER`, `TWILIO_EVENTS_WEBHOOK_PASSWORD` | none | Optional basic auth on `/twilio-verify-events` |
+    | `PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET` | none | Routes bump texts through Photon when both set |
+    | `PHOTON_CLOUD_URL`, `PHOTON_IMESSAGE_ADDRESS` | Spectrum endpoints | Photon management API and gRPC host |
+    | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | none, `Yelo <admin@rideyelo.com>` | Transactional email |
+    | `SLACK_WEBHOOK_URL`, `SLACK_USER_UPDATES_WEBHOOK_URL`, `SLACK_DRIVER_UPDATES_WEBHOOK_URL` | none | Slack channels |
+    | `APP_STORE_WEBHOOK_SECRET` | none | App Store webhook HMAC secret |
+  </Accordion>
+  <Accordion title="Contact sync and CRM">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `QUO_API_KEY`, `QUO_DASHBOARD_API_KEY` | none | Quo credentials for sync and dashboard reads |
+    | `QUO_BASE_URL`, `QUO_CONTACT_BASE_URL` | OpenPhone API, Quo contacts UI | Quo endpoints |
+    | `QUO_REQUEST_INTERVAL_MS` | `200` (minimum 125) | Pacing for the main key. `QUO_REQUEST_INTERVAL_SECONDS` is a legacy fallback |
+    | `QUO_DASHBOARD_REQUEST_INTERVAL_MS` | `200` (minimum 125) | Pacing for the dashboard key |
+    | `QUO_ACCOUNT_KEY` | `default` | Contact sync account name for Quo |
+    | `CONTACT_SYNC_RESEND_ENABLED` | `false` | Enables Resend contact sync |
+    | `RESEND_CONTACTS_API_KEY`, `RESEND_ACCOUNT_KEY` | none | Resend contacts credentials and account name |
+    | `RESEND_REQUEST_INTERVAL`, `RESEND_CONTACT_REQUEST_INTERVAL` | `125ms`, `200ms` | Resend pacing |
+    | `CONTACT_SYNC_RECONCILE_INTERVAL` | `24h` | Full reconcile interval |
+    | `CONTACT_HASH_PEPPER` | none | Pepper for hashing uploaded contacts |
+  </Accordion>
+  <Accordion title="Links and storage">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID` | none | Dub |
+    | `INVITE_LANDING_BASE_URL` | `https://invite.yelo.link` | Invite landing base |
+    | `OG_IMAGE_BASE_URL` | `https://rideyelo.com` | OG card worker base |
+    | `OG_SIGNING_SECRET` | none | Signs OG card URLs (required) |
+    | `STORAGE_URL`, `STORAGE_TOKEN` | none | Supabase Storage |
+    | `STORAGE_PUBLIC_BUCKET_ID`, `STORAGE_PRIVATE_BUCKET_ID` | none | Buckets |
+  </Accordion>
+  <Accordion title="Google Calendar and Google Play">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_SYNC_ENABLED` | `false` | Owner connection and sync. Sync requires the connection |
+    | `GOOGLE_CALENDAR_OWNER_EMAIL`, `GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET` | none | OAuth client and owner |
+    | `GOOGLE_CALENDAR_CALLBACK_URL`, `GOOGLE_CALENDAR_DASHBOARD_URL` | none | Fixed HTTPS URLs (localhost allowed) |
+    | `GOOGLE_CALENDAR_TOKEN_KEYS` | none | Base64 32-byte token encryption keys |
+    | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` | `true` only in `production` | Enables the release check job |
+    | `GOOGLE_PLAY_PACKAGE_NAME`, `GOOGLE_PLAY_TRACKS`, `GOOGLE_PLAY_CONSOLE_URL` | `com.rideyelo`, `production`, console URL | Release monitoring targets |
+  </Accordion>
+  <Accordion title="Telemetry">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `LOG_LEVEL` | logger default | zerolog level |
+    | `POSTHOG_API_KEY` | none | PostHog project key |
+    | `SENTRY_DSN` | none | Enables Sentry |
+    | `OTEL_ENABLED` | `true` | Enables OTel metrics and the PostHog metrics provider |
+    | `OTEL_OTLP_ENDPOINT`, `OTEL_OTLP_AUTH_HEADER` | none | OTLP exporter |
+    | `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION` | `yelo-api`, `0.1.0` | Resource attributes. The name also fills `metadata.server` |
+    | `OTEL_TRACE_SAMPLING_RATIO` | `0.1` | Trace sampling |
+    | `METRICS_AUTH_TOKEN` | none | Bearer token for `/metrics` and pprof |
+    | `PPROF_ENABLED`, `PPROF_BLOCK_RATE`, `PPROF_MUTEX_RATE` | `true`, `0`, `0` | pprof endpoints and profiling rates |
+    | `SLOW_REQUEST_THRESHOLD_MS`, `SLOW_QUERY_THRESHOLD_MS` | `150`, `50` | Slow request and query thresholds |
+    | `POOL_STATS_INTERVAL_S` | `15` | Pool gauge interval |
+  </Accordion>
+  <Accordion title="E2E">
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `E2E_ENABLED` | `false` | Enables E2E mode and `/internal/e2e` |
+    | `E2E_CONTROL_API_KEY` | none | `X-E2e-Key` secret |
+    | `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` | none | Database isolation checks |
+    | `E2E_FIXTURE_TTL` | `30m` | Fixture lifetime |
+    | `E2E_BACKGROUND_JOBS_ENABLED` | `false` | Must stay false in E2E |
+  </Accordion>
+</AccordionGroup>
+
+## Command-line flags
+
+`cmd/api` also accepts flags. They override environment defaults.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--port` | `PORT` or `8080` | Listen port |
+| `--limiter-rps` | `50` | Per-IP requests per second |
+| `--limiter-burst` | `100` | Per-IP burst |
+| `--limiter-enabled` | `true` | Enables the rate limiter |
+| `--cors-trusted-origins` | `CORS_TRUSTED_ORIGINS` | Overrides the CORS allowlist |
+| `--stripe-key` | `STRIPE_API_KEY` | Overrides the Stripe key |
+
+## Constants
+
+`internal/utilities/config/constants.go` holds behavior constants that are not configurable at runtime:
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `RideRequestExpiry` | 10 minutes | Unmatched confirmed rides are expired after this |
+| `RideAcceptTimeout` | 25 seconds | Time a driver has to accept a request |
+| `NoDriversAvailableDelay` | 45 seconds | Delay before telling the rider no drivers are available |
+| `RecentlyOnlineDriverNotificationWindow` | 30 minutes | Window for "recently online" driver notifications |
+| `DriverExpiryInterval` | 30 minutes | Inactivity before a driver is set offline |
+| `DriverReminderInterval` | 30 seconds | Minimum gap between renew-online reminders per community |
+| `OfflineGraceInterval` | 5 minutes | Grace before unqueuing rides for an offline driver |
+| `CommunityWaitBuffer` | 5 minutes | Added to community wait estimates |
+| `OtpExpiry` | 15 minutes | Auth v2 OTP lifetime |
+| `WaitTimeCancellationCutoff` | 420 seconds | Driver wait before a cancellation fee applies |
+| `TimeAwayCancellationCutoff` | 300 seconds | Driver distance-from-pickup threshold for rider cancellation fees |
+| `DefaultBasePrice`, `DefaultPricePerMile`, `DefaultPricePerMinute` | 4.0, 2.0, 0.5 | Pricing fallbacks when no configured row exists |
+| `DefaultJwtDuration` | 6360 hours | Full app JWT lifetime |
+
+Other constants worth knowing live next to their code: the 24-hour tip window in `internal/service/ride/driver.go`, the 2-minute auto-queue minimum age in `internal/service/activation/activation.go`, pool sizes in `internal/data/repository/storage.go`, and cache TTLs in `internal/data/redis`. See [Pricing](/concepts/pricing) for how the pricing defaults are used.

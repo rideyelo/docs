@@ -1,0 +1,200 @@
+---
+title: "Authentication"
+description: "Every credential yelo-api accepts: app JWTs, presignup tokens, Auth v2 and Auth v3 flows, Auth v3 onboarding tokens, Clerk dashboard sessions and role gates, and shared-key and webhook authentication."
+---
+
+The API accepts several distinct credentials. Each route group picks exactly one. This page covers how each credential is issued and validated. For the product view of sign-in, see [Accounts and sign-in](/concepts/accounts-and-sign-in). For which middleware guards which prefix, see [Request lifecycle](/engineering/api/request-lifecycle#route-groups-and-auth).
+
+| Credential | Issued by | Validated by | Used for |
+| --- | --- | --- | --- |
+| Full app JWT (`user` role) | Auth v2, Auth v3, community switch | `getValidateJWTMiddleware` | Mobile and web app routes |
+| Presignup JWT (`presignup` role) | Auth v2 phone verification | `getValidatePresignupTokenMiddleware` | Auth v2 onboarding, World Cup, tips |
+| Auth v3 onboarding JWT (`authv3_onboarding` role) | Auth v3 | `ValidateOnboardingTokenMiddleware` | `/authv3` onboarding routes only |
+| Auth v3 web refresh cookie | Auth v3 | Auth v3 session handlers | Browser session continuity |
+| Clerk session JWT | Clerk | `getClerkAuthMiddleware` | `/dashboard/*`, River UI |
+| `X-Internal-Key` | Shared secret | `getInternalKeyMiddleware` | `/internal/*` automation |
+| `X-E2e-Key` | Shared secret | `getE2EKeyMiddleware` | `/internal/e2e/*` when E2E is enabled |
+| Provider signatures | Stripe, Twilio, Apple | Each webhook handler | Webhooks |
+
+<Note>
+App accounts are identified by Supabase user UUIDs. Dashboard actors are identified by Clerk user IDs. The two systems never share identities.
+</Note>
+
+## App JWTs
+
+`internal/utilities/jwt` mints and validates app tokens. Tokens are HS256, signed with `KEY`.
+
+```json
+{
+  "iss": "api.rideyelo.com",
+  "aud": "api.rideyelo.com",
+  "sub": "<user uuid>",
+  "app_metadata": {
+    "authorization": { "roles": ["user"] },
+    "community": "<community uuid or *>"
+  },
+  "iat": 1790000000,
+  "exp": 1812896000
+}
+```
+
+- `GetJWToken(uid, roles, community, duration)` issues full tokens. Callers pass `config.DefaultJwtDuration`, which is 6360 hours (about 265 days).
+- `community` is `*` when the user has no community.
+- Validation tries `KEY` first, then each key in `KEY_LEGACY`. It only falls through to a legacy key on a signature failure. Expired or malformed tokens fail immediately. Use `KEY_LEGACY` to rotate the signing key without logging everyone out.
+
+### `getValidateJWTMiddleware`
+
+<Steps>
+  <Step title="Parse the bearer token">
+    `jwt.ValidateJwt` strips the `Bearer ` prefix, verifies the signature, and extracts `sub`, roles, and community. A presignup token (`sub` of `pending`) is rejected here.
+  </Step>
+  <Step title="Check account status">
+    `AuthCache.Check` reads the user's deleted flag, banned flag, and current community from Redis (15-minute TTL), falling back to Postgres on a miss or when Redis is unavailable.
+  </Step>
+  <Step title="Reject deleted or banned users">
+    Deleted users get `AccountDeletedError` and banned users get `AccountBannedError`. Both map to 401.
+  </Step>
+  <Step title="Override the community">
+    If the cache has a community, it replaces the token's community. A community switch therefore takes effect without a new token once the cache is invalidated.
+  </Step>
+  <Step title="Populate context">
+    `SetContextRequestUser` stores the user ID, roles, and community, and the request logger gains `user_id` and `community_id` fields.
+  </Step>
+</Steps>
+
+`getRequireRoleMiddleware([]string{"user"})` then checks the roles in context. Every JWT-protected group pairs the two middlewares.
+
+`getOptionalAuthMiddleware` runs the same checks but never rejects. It is used on public ride routes that personalize output when a user is signed in. It passes a nil logger to skip diagnostics, because these routes also see Clerk RS256 tokens from the dashboard.
+
+## Auth v2
+
+Auth v2 is the phone-first mobile sign-up flow under `/authv2`. The router registers it in three phases.
+
+| Phase | Routes | Credential |
+| --- | --- | --- |
+| 1. Phone | `POST /authv2/phone/request-otp`, `POST /authv2/phone/verify-otp` | None |
+| 2. Email and community | `/email/verify-oauth`, `/email/request-otp`, `/email/verify-otp`, `/community/verify-oauth`, `/community/request-email-otp`, `/community/verify-email-otp` | Presignup or full JWT |
+| 3. Profile | `/profile/setup`, `/profile/draft`, `/status`, `/referral-source` | Presignup or full JWT |
+
+- Verifying the phone OTP returns a full JWT for a returning user whose sign-up is complete. Otherwise it returns a **presignup token**: HS256, 1-hour lifetime, role `presignup`, with the verified phone in `app_metadata.phone` and `sub` set to the user ID or `pending`.
+- `getValidatePresignupTokenMiddleware` accepts both presignup and full tokens, stores `PresignupClaims` in context under `PresignupClaimsKey`, and masks the phone in logs. It does not check that the user exists. Handlers read `claims.UserID` themselves.
+- The OTP send route shares the Auth v3 durable rate limiter through `authv2.WithPhoneSendRateLimit` when Auth v3 is enabled.
+- Email verification refreshes the presignup token with the user and community, or returns a full JWT when it authenticates a completed account.
+- Completing profile setup issues the full JWT.
+
+## Auth v3
+
+Auth v3 is a web-native sign-in surface under `/authv3`, used by the web sign-up site and native Sign in with Apple. It is disabled unless `AUTH_V3_ENABLED=true`. When disabled, the router registers no Auth v3 routes and answers `/authv3` and `/authv3/*` with `AuthV3UnavailableError` (503) so clients can fall back.
+
+`internal/service/authv3_composition.go` builds the components only when enabled and all required keys parse. Startup fails if a required Auth v3 setting is invalid.
+
+### Route groups
+
+<AccordionGroup>
+  <Accordion title="Public routes">
+    `GET /authv3/config`, `POST /authv3/authorize`, `/transaction/resume`, `/transaction/accept`, provider start and callback routes for Google and Apple, `/providers/apple/native`, `/providers/phone/send`, `/providers/phone/verify`, `POST /authv3/token` (exchange a handoff code), `/session/refresh`, and `/session/logout`.
+
+    `FunnelContextMiddleware` runs on the whole `/authv3` group.
+  </Accordion>
+  <Accordion title="Onboarding routes">
+    `GET /authv3/status`, `POST /authv3/profile`, and `POST /authv3/community/resolve`. These accept only an onboarding JWT. The OpenAPI spec labels them with the `AuthV3OnboardingJWT` security scheme.
+  </Accordion>
+  <Accordion title="Authenticated routes">
+    Mounted under `/authv3/user` with the standard JWT and `user` role middleware: `/link/authorize`, `/identities`, `/community/resolve`, and StudID student verification (`/student/studid/start`, `/student/studid/complete`, `/student/connections`, `DELETE /student/connections/{provider}`).
+  </Accordion>
+</AccordionGroup>
+
+### Tokens and sessions
+
+`internal/service/authv3/jwt.go` defines `JWTIssuer`, which signs with two separate keys:
+
+| Token | Key | Role | Lifetime |
+| --- | --- | --- | --- |
+| Native user token | `KEY` | `user` | `DefaultJwtDuration` (6360 hours) |
+| Web user token | `KEY` | `user` | `AUTH_V3_WEB_ACCESS_TOKEN_TTL`, at most 1 hour |
+| Onboarding token | `AUTH_V3_ONBOARDING_JWT_KEY` | `authv3_onboarding` | `AUTH_V3_ONBOARDING_TOKEN_TTL` (default 15 minutes) |
+
+Because onboarding tokens use a different key, the general JWT middleware cannot validate them. `ValidateOnboardingToken` accepts only HS256 with the exact role, issuer, audience, user UUID, `auth_transaction_id` claim, and expiry. It never tries legacy keys.
+
+Browser session continuity uses a rotating HttpOnly refresh cookie named `__Host-yelo_refresh`, never the short-lived access token. Session lifetimes are `AUTH_V3_WEB_SESSION_IDLE_TTL` (90 days) and `AUTH_V3_WEB_SESSION_ABSOLUTE_TTL` (365 days). Apple refresh tokens are encrypted with `AUTH_V3_REFRESH_TOKEN_KEYS`, newest key first.
+
+Other default TTLs: transaction 10 minutes, provider start 5 minutes, handoff code 2 minutes.
+
+### Rate limiting and OTP delivery
+
+- `DurableRateLimiter` reserves counters atomically in Postgres through the Auth v3 repository. Dimensions are pseudonymized with `AUTH_V3_RATE_LIMIT_HMAC_KEY`. E2E mode multiplies limits.
+- The requester resolver uses only the immediate peer IP unless the peer is in `AUTH_V3_TRUSTED_PROXY_CIDRS`.
+- Phone codes go through Twilio Verify when `TWILIO_VERIFY_SERVICE_SID` is set. Twilio posts delivery status to `/twilio-verify-events`, and the `AuthV3OtpFallback` background loop re-sends unconfirmed codes over SMS when `TWILIO_OTP_FALLBACK_ENABLED` is true. See [Background jobs](/engineering/api/background-jobs).
+- The `AuthV3Runtime` loop deletes expired transactions, handoffs, phone attempts, and rate counters every 5 minutes.
+
+## Clerk dashboard auth
+
+`/dashboard/*` routes use Clerk. `main.go` calls `clerk.SetKey(CLERK_SECRET_KEY)` when the key is set.
+
+<Steps>
+  <Step title="Verify the session">
+    `getClerkAuthMiddleware` wraps `clerkhttp.WithHeaderAuthorization`, which verifies the Clerk JWT from the `Authorization` header. A missing session returns 401.
+  </Step>
+  <Step title="Read custom claims">
+    `ClerkCustomClaims` reads `metadata.role`, `metadata.fleet_id`, `metadata.community_id`, `metadata.fleet_assignments`, and `metadata.onboarded` from the session claims. The legacy single `fleet_id` + `community_id` shape is converted into one fleet assignment.
+  </Step>
+  <Step title="Store the dashboard user">
+    The result is stored as `ClerkUserContext` under `ClerkUserContextKey`. Handlers read it with `GetClerkUserContext`.
+  </Step>
+  <Step title="Apply the scope gate">
+    `getDashboardScopeMiddleware` rejects the request with 401 unless the role and path are allowed.
+  </Step>
+</Steps>
+
+### Scope gate
+
+`dashboardScopeAllows` in `dashboard_scope.go` is a path-based allowlist that runs before any dashboard handler:
+
+- **`admin`**: every dashboard path.
+- **`intern`**: requires a valid `community_id`. Allows `GET /dashboard/rides`, `/dashboard/leads/drivers/*`, selected read-only community endpoints (`kpis`, `drivers`, `demographics`, `fleets`, `users`, `search-insights`, `search-map-data`), `top-locations`, and the intern's own community `events`, `locations`, and read-only `feed`, `zones`, and `map`.
+- **`fleet`**: requires at least one valid fleet assignment. Allows `GET /dashboard/rides`, `/dashboard/qr/*`, `/dashboard/calendar-owner/*`, and fleet- or community-scoped resources that match an assignment.
+- Any other role is rejected.
+
+Handlers still own object-level checks and mutation permissions. The gate only prevents a role from reaching a surface it should never see.
+
+### Role gates
+
+`getRequireClerkRoleMiddleware(roles)` adds a stricter gate on specific groups. It returns 401 without a Clerk user and 403 when the role is not listed.
+
+| Group | Allowed roles |
+| --- | --- |
+| Education claim routes (`/dashboard/education-claims/*`) | `admin` |
+| `/dashboard/users/*` (including fleet admin routes and user notifications) | `admin` |
+| `/dashboard/notifications/*` | `admin` |
+| `/dashboard/leads/drivers/*` | `admin`, `intern` |
+| `/riverui/*` and `POST /riverui/session` | `admin` |
+
+For the product view of these roles, see [Dashboard roles and access](/administration/dashboard-roles).
+
+### River UI session
+
+River UI is a browser-navigated app and cannot send an `Authorization` header. The dashboard first calls `POST /riverui/session` with its Clerk bearer token. The API copies the token into a `__session` cookie scoped to `/riverui` (`HttpOnly`, `Secure`, `SameSite=Lax`, 60-second max age). `getClerkCookieAuthMiddleware` then validates that cookie on `/riverui/*`. The dashboard re-mints the cookie every 45 seconds while the Jobs page is open.
+
+## Internal and E2E keys
+
+- `getInternalKeyMiddleware` compares `X-Internal-Key` with `INTERNAL_API_KEY` in constant time. It fails closed: an unset key rejects every request. `/internal/context/user` uses it for automation such as n8n.
+- `getE2EKeyMiddleware` compares `X-E2e-Key` with `E2E_CONTROL_API_KEY`. The `/internal/e2e` group exists only when `E2E_ENABLED=true`, and startup validation requires the key to be at least 32 bytes.
+
+## Webhooks
+
+Webhook routes are unauthenticated at the router and verify the provider's signature in the handler. See [Integrations](/engineering/api/integrations) for what each webhook does.
+
+| Route | Verification |
+| --- | --- |
+| `POST /stripe-webhook` | `webhook.ConstructEvent` with the `Stripe-Signature` header and `STRIPE_WEBHOOK_SECRET` |
+| `POST /appstore-webhook` | HMAC-SHA256 of the body against `X-Apple-Signature` (`hmacsha256=<hex>`) with `APP_STORE_WEBHOOK_SECRET` |
+| `POST /twilio-webhook` | Twilio request validator on `X-Twilio-Signature` |
+| `POST /twilio-verify-events` | Twilio signature on the body, plus optional basic auth when both `TWILIO_EVENTS_WEBHOOK_USER` and `TWILIO_EVENTS_WEBHOOK_PASSWORD` are set |
+
+<Warning>
+If only one of `TWILIO_EVENTS_WEBHOOK_USER` and `TWILIO_EVENTS_WEBHOOK_PASSWORD` is set, the Verify events webhook rejects every request until you fix the configuration.
+</Warning>
+
+## Metrics and pprof
+
+`/metrics` and `/debug/pprof/` require `Authorization: Bearer <METRICS_AUTH_TOKEN>` when `METRICS_AUTH_TOKEN` is set. When it is empty, they are open.

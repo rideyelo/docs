@@ -1,0 +1,163 @@
+---
+title: "Matching and auto-queue"
+description: "How confirmed rides reach drivers: the ride board, immediate and tiered notifications, direct requests, auto-queue assignment, and queue recovery"
+---
+
+Once a rider confirms, Yelo uses several mechanisms at once to get the ride matched:
+
+- **The ride board**: online drivers pull rides and accept them manually.
+- **Immediate (T0) notifications**: the ride's fleet drivers get a push as soon as the ride is confirmed.
+- **Direct requests**: the rider picks a specific driver, who gets 30 seconds to respond.
+- **Activation tiers**: offline drivers nearby get pushes in widening rings as the ride waits.
+- **Auto-queue**: after two minutes, the system assigns the ride to an online driver who opted in.
+
+For the statuses these mechanisms produce, see [Ride lifecycle](/concepts/ride-lifecycle).
+
+## The ride board
+
+The board is every ride with `status = 'confirmed'` and no `driver_id`.
+
+Drivers read it with `GET /ride/v2/board`, served by `RideService.GetEnrichedRideBoard`. That query (`GetEligibleEnrichedRideBoard` in `queries/ride_driver.sql`) runs against Postgres and returns rides that:
+
+- Are in the driver's community.
+- Belong to the fleet the driver is online under. A driver with no active session sees an empty board. Rides with a null `fleet_id` predate fleets and are visible to everyone.
+- Aren't in the ride's `declined_drivers` list for this driver.
+- Aren't reserved for a different driver by a direct request that is less than 30 seconds old.
+
+Results are ordered by `confirm_time`, oldest first. When the driver has a location, Mapbox adds pickup distance and duration to each row.
+
+The `RideBoardProvider` (`ride_board_redis.go`, with an in-memory fallback in `ride_board_memory.go`) mirrors board membership in Redis. It stores ride IDs in `rides:community:{communityId}`, ride details in the `ride:details` hash, and a 10-second `rides:refresh:{communityId}` key that signals clients to refresh. `GET /ride/board/{id}` reads details from it and falls back to Postgres for `confirmed` rides.
+
+### Manual accept
+
+`POST /ride/i/{id}/accept` runs `RideService.AcceptRide`. It checks that:
+
+- The driver is online and has an active driver session.
+- The driver's queue has fewer than `MaxQueueLength` (100) rides.
+- The ride is still `confirmed`.
+- The ride's fleet matches the driver's session fleet.
+
+For paid rides, it authorizes payment first and then assigns the ride. If the driver already has an active or queued ride, the accepted ride goes to `queued`. Otherwise it goes straight to `driver_en_route`.
+
+Declining (`POST /ride/i/{id}/decline`) appends the driver to `declined_drivers` and stores the reason. Decline reasons feed the **Pricing decline** layer on the [Ride pricing](/dashboard/ride-pricing) map.
+
+## Immediate (T0) notifications
+
+When a ride is confirmed or requeued, `notifyDriversAboutNewRide` pushes it to eligible members of the ride's fleet right away. The target query (`ListRideT0NotificationTargets`) requires that each driver:
+
+- Is an active member of the fleet with an active driver application.
+- Has a completed vehicle of the right type and seat count.
+- Is either offline, or online under this fleet.
+- Is payout-ready: either their own Stripe status is complete, or they're paid through a fleet with completed custom payouts.
+- Allows notifications and isn't banned, locked, or deleted.
+
+For the fleet named `Yelo`, only drivers tagged `Founding Driver` (or `founding driver` or `founding`) receive T0 pushes. Notified drivers are recorded in the Redis activation cache so later tiers don't repeat them.
+
+## Direct requests
+
+A rider can confirm with a `driver_id` to request a specific driver. `directAssignDriver` checks that the driver is online in the community, still in the same fleet and vehicle type, and less than an hour away. If any check fails, it falls back to normal matching and records a `direct_assign_fallback` event.
+
+On success, the ride is reserved with `potential_driver` and `offer_time`. Only that driver can accept for 30 seconds. If they decline, or the window lapses, the activation loop releases the reservation, sends T0 notifications to the rest of the fleet, and tells the rider their request fell back.
+
+## Activation tiers
+
+`ActivationService.ProcessUnmatchedRides` runs every 30 seconds in the `Operational` loop. For each unmatched ride confirmed within the last 10 minutes, it finds the highest tier whose delay has passed and notifies up to that tier's target number of drivers inside its radius.
+
+Each community can have its own tiers. Communities without a stored config use `DefaultActivationConfig` (`internal/models/activation_config.go`):
+
+| Tier | Delay after confirm | Radius | Target drivers | Warm age | Re-notify already notified? |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 45 s | 8 km | 5 | 15 min | No |
+| 2 | 120 s | 13 km | 10 | 60 min | No |
+| 3 | 300 s | 16 km | 15 | — | No |
+| 4 | 480 s | 16 km | 20 | — | Yes |
+
+Other defaults:
+
+- **Cooldown**: 15 minutes. A driver notified by activation for one ride isn't notified again for any ride during the cooldown.
+- **Rescue alert**: off by default. When enabled, a Slack alert fires once a ride has waited past the last tier's delay plus the grace period (default 5 minutes).
+
+Candidates come from two pools:
+
+1. **Warm pool**: the Redis sorted set `community:warm:{communityId}`, filtered by the tier's warm age and the ride's fleet. On `main`, no code path writes to this set, so it's effectively empty.
+2. **Inactive drivers**: offline drivers in the community with an active application, the right vehicle type, a known location inside the radius, and a push token. For rides in the community's primary fleet, drivers who belong to no fleet are included too.
+
+Declined drivers are always excluded. Admins edit tiers in the dashboard under **Notifications** > **Activation**, backed by `GET` and `PUT /dashboard/manage/{id}/activation-config`.
+
+### Drivers who come online
+
+The activation loop targets offline drivers, so a driver who goes online right after a ride was confirmed could miss it. `NotifyPendingRideForDriver` closes that gap. When a driver goes online, it finds the oldest board ride within the radius for that ride's age (at least tier 1's radius) that they haven't been notified about, and sends one push.
+
+## Auto-queue
+
+Auto-queue lets an online driver receive rides without tapping accept.
+
+### Driver settings
+
+Drivers control auto-queue from the drive screen. The API is under `/driver/auto-queue`:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /driver/auto-queue` | Current settings, personal and community limits. |
+| `PUT /driver/auto-queue` | Turn auto-queue on or off and set a personal max queue length in minutes. |
+| `POST /driver/auto-queue/pause` | Pause for up to 60 minutes. `0` resumes immediately. |
+
+The driver's effective capacity is their personal `auto_queue_max_minutes`, or the community's `auto_queue_default_minutes` when unset. It's always capped at the community's `auto_queue_max_minutes`.
+
+### Assignment
+
+After tier activation, the same loop runs an auto-queue pass over rides that have been unmatched for at least 2 minutes (`autoQueueMinAge`), oldest first. Each ride gets one attempt. A Redis `auto_queue_attempted` flag prevents retries.
+
+<Steps>
+  <Step title="Find eligible drivers">
+    `ListAutoQueueEligibleDrivers` returns drivers who are in the community, online, opted in, not paused, have an active application and a matching vehicle type, have an open session in the ride's fleet, and haven't declined the ride.
+  </Step>
+  <Step title="Filter by capacity">
+    Drivers whose cached queue total is already at or above their effective max minutes are skipped. The route origin is the driver's last queued dropoff, or their current location when the queue is empty.
+  </Step>
+  <Step title="Score">
+    Mapbox returns deadhead time from each origin to the pickup. Each driver gets two scores, normalized across candidates:
+    - **Time to start** = queued minutes + deadhead minutes + 2 × queued ride count.
+    - **Queue load** = 0.6 × queued ride count + 0.4 × queued fare.
+
+    The final score is 0.5 × time + 0.5 × load. Lowest wins. Scores within 0.05 of each other count as a tie, and the driver with fewer queued rides wins the tie.
+  </Step>
+  <Step title="Assign">
+    `RideService.AutoAssignRide` assigns the ride as `queued` with `auto_queued = true`, removes it from the board, and notifies both the driver and the rider. If the driver has no active ride, `RecoverIdleQueue` promotes it immediately.
+  </Step>
+</Steps>
+
+If no driver is eligible, `notifyFleetOfMissedRide` pushes an "unclaimed ride" alert to every driver in the ride's fleet.
+
+## Queue promotion and recovery
+
+A driver's queue is their `queued` rides ordered by `COALESCE(match_time, request_time)`, then `id`.
+
+- **After complete or cancel**: `PromoteNextQueuedRide` moves the next queued ride to `driver_en_route` in the same transaction. `advanceQueuedRide` then calculates the pickup route, authorizes payment, and notifies the rider.
+- **Idle recovery**: `RecoverIdleQueue` promotes the head of the queue when the driver has queued rides but no active one. The `QueueRefresh` loop runs it every 3 minutes for every driver with queued rides. It only promotes if the driver is online, pinged within the last 5 minutes, and has exactly one open session matching the ride's vehicle and fleet.
+- **Queue summaries**: the queue ETA and fare summary each driver sees is cached in Redis by `QueueSummaryService` and refreshed on every queue change.
+
+## Background loops
+
+All loops are registered in `startBackgroundTasks` in `cmd/api/main.go`. They're disabled when `BACKGROUND_TASKS_ENABLED=false`. Setting `ACTIVATION_ENABLED=false` disables only the activation and auto-queue pass.
+
+| Loop | Interval | Tasks |
+| --- | --- | --- |
+| `Operational` | 30 s | `PurgeOfflineDrivers`, `CancelUnmatchedRides`, `ProcessUnmatchedRides` |
+| `QueueRefresh` | 3 min | `RefreshQueueSummaries` (includes idle queue recovery) |
+| `TipCapture` | 5 min | `AutoCaptureTipWindowExpired` |
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Activation tiers, rescue, pending-ride push | `yelo-api/internal/service/activation/activation.go` |
+| Auto-queue scoring and assignment | `yelo-api/internal/service/activation/auto_queue.go` |
+| Queue summaries and ETAs | `yelo-api/internal/service/activation/queue_summary.go` |
+| Accept, auto-assign, promotion | `yelo-api/internal/service/ride/driver.go` |
+| Direct requests, T0 notifications | `yelo-api/internal/service/ride/rider.go` |
+| Board storage | `yelo-api/internal/service/ride/ride_board_redis.go`, `ride_board_memory.go` |
+| Matching SQL | `yelo-api/internal/data/repository/queries/ride_matching.sql`, `ride_driver.sql`, `user_driver.sql` |
+| Driver auto-queue settings | `yelo-api/internal/service/driver/driver.go` |
+| Driver app queue and auto-queue sheets | `yelo-frontend/app/(app)/drive/queue/`, `yelo-frontend/components/drive/AutoQueue*.tsx` |
+| Dashboard activation editor | `yelo-web/src/sites/dashboard/pages/ActivationPage.tsx` |

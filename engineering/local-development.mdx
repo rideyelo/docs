@@ -1,0 +1,189 @@
+---
+title: "Local development"
+description: "Install prerequisites, configure env files, and run the Yelo API, web sites, and mobile app locally against a local or production API"
+---
+
+Each repository runs on its own, but the clients are most useful when you pair them with a local API. Clone all three repositories as siblings so the tooling can find each other:
+
+```text
+~/Code/yelo/
+├─ yelo-api/
+├─ yelo-web/
+└─ yelo-frontend/
+```
+
+The web and mobile repositories look for the API at `../yelo-api` relative to their main checkout. If your layout differs, set `YELO_API_DIR` to the absolute path of your `yelo-api` checkout.
+
+## Prerequisites
+
+| Tool | Needed for | Notes |
+| --- | --- | --- |
+| Go | API | Version pinned in `yelo-api/go.mod` and `.go-version` |
+| Docker | API integration tests, local observability stack | Testcontainers starts Postgres and Redis |
+| `golang-migrate`, `gotestsum`, `pre-commit` | API | `brew install go golang-migrate gotestsum pre-commit` |
+| Node.js 22 | Web and mobile | Web requires `>=22.12.0`. CI runs Node 22 for both repositories |
+| pnpm | Web and mobile | Both repositories pin `pnpm@11.5.2` in `packageManager`. Run `corepack enable` |
+| Firebase CLI | Web deploys and `make serve` | Not needed for `make dev` |
+| Xcode, CocoaPods, watchman, tmux, jq, gh, fastlane | Mobile | `brew install node watchman cocoapods fastlane tmux jq gh` |
+| Expo account | Mobile builds and OTA | Run `npx expo login` |
+
+## Set up and run each repository
+
+<Tabs>
+  <Tab title="yelo-api">
+    <Steps>
+      <Step title="Install tools and hooks">
+        ```bash
+        cd yelo-api
+        cp .env.example .env
+        make lint-install sqlc-install mocks-install
+        pre-commit install
+        ```
+        The `make *-install` targets place pinned versions of golangci-lint, sqlc, and mockery in `./bin`.
+      </Step>
+      <Step title="Configure your .env">
+        Fill in `.env` for the providers you need. At minimum, set `DSN` to a development Postgres database and `KEY` to a JWT signing key. `ENVIRONMENT=dev` enables console logging, disables CORS, and exposes Swagger.
+
+        Never point `DSN` at the production database. `make migrate` reads `DSN` from `.env` and asks for confirmation before it applies anything.
+      </Step>
+      <Step title="Provide Redis">
+        `REDIS_URL` defaults to `redis://127.0.0.1:6379`. Run a local Redis or Valkey, or open an IAP tunnel to the development instance:
+        ```bash
+        make gcp-tunnel
+        ```
+        The tunnel forwards `localhost:6379` through the `yelo-dev-iap` host in `prod-yelo`, so you need `gcloud` access to that project.
+      </Step>
+      <Step title="Apply migrations and run">
+        ```bash
+        make migrate   # shows current version and pending files, then asks before applying
+        make run       # go run ./cmd/api --port 8080
+        ```
+        The server logs `Server is ready` with the healthcheck, metrics, and Swagger URLs. Check `http://localhost:8080/healthcheck`, and browse `http://localhost:8080/swagger/index.html` when `SWAGGER_ENABLED=true`.
+      </Step>
+    </Steps>
+
+    Useful targets:
+
+    | Target | What it does |
+    | --- | --- |
+    | `make run` / `make runb` | Run from source, or build `bin/api` and run it |
+    | `make rund` | Run the API plus Prometheus, Grafana, and Jaeger with Docker Compose |
+    | `make tf` | Unit tests in parallel, then integration tests sequentially |
+    | `make lf` | Lint with auto-fix |
+    | `make a` | `tidy`, `mocks`, `lint-fix`, `test-fast` in one pass |
+    | `make check` | Every CI gate, serialized. This is what the pre-commit hook runs |
+    | `make openapi` | Regenerate the committed `openapi.json` |
+    | `make sqlc-generate` / `make mocks` | Regenerate sqlc queries or mocks |
+    | `make migrate-down` | Revert the last applied migration, with confirmation |
+
+    See [configuration](/engineering/api/configuration) for every environment variable and feature flag.
+  </Tab>
+  <Tab title="yelo-web">
+    <Steps>
+      <Step title="Install dependencies">
+        ```bash
+        cd yelo-web
+        pnpm install
+        ```
+      </Step>
+      <Step title="Create .env">
+        Copy `env.example` (or `.env.example`) to `.env`. Vite inlines these at build time, and only variables a site references end up in its bundle.
+
+        | Variable | Needed by |
+        | --- | --- |
+        | `VITE_API_URL` | All sites. Leave unset locally to use the `/api` dev proxy |
+        | `VITE_API_PROXY_TARGET` | Dev server only. Selects the API behind `/api` |
+        | `VITE_CLERK_PUBLISHABLE_KEY` | Dashboard |
+        | `VITE_MAPBOX_API_KEY`, `VITE_SUPABASE_URL`, `VITE_SENTRY_DSN` | Dashboard and `maestro` |
+        | `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`, `VITE_APPLE_REDIRECT_URI` | Signup |
+        | `VITE_APP_ENV`, `VITE_POSTHOG_KEY`, `VITE_POSTHOG_HOST` | Signup Auth v3 analytics |
+      </Step>
+      <Step title="Run a site">
+        ```bash
+        make dev                  # dashboard on http://localhost:5173
+        SITE=signup make dev      # any site listed in sites.config.json
+        ```
+      </Step>
+    </Steps>
+
+    <Warning>
+    `VITE_API_PROXY_TARGET` defaults to `https://api.rideyelo.com`. If you do not set it, the local dashboard reads and writes production data.
+    </Warning>
+
+    To run the dashboard against a local API, set `VITE_API_PROXY_TARGET=http://localhost:8080` and leave `VITE_API_URL` unset. Use the Clerk development instance (`pk_test_...`) and make sure the local API's `CLERK_SECRET_KEY` belongs to the same Clerk instance, or every dashboard request fails authentication.
+
+    Other workflows:
+
+    - `pnpm dev:signup-device` serves the signup site on all interfaces with mocked Auth v3 responses, for testing the phone and OTP keyboard flow on a physical iPhone.
+    - `make serve` previews built sites in the Firebase Hosting emulator.
+    - `pnpm worker:og:dev` runs the OG image worker with Wrangler on port 8787. Create `workers/og/.dev.vars` first.
+
+    See [web multisite](/engineering/web/multisite) for how `SITE` drives the build.
+  </Tab>
+  <Tab title="yelo-frontend">
+    <Steps>
+      <Step title="Install dependencies">
+        ```bash
+        cd yelo-frontend
+        corepack enable
+        pnpm install
+        npx expo login
+        ```
+      </Step>
+      <Step title="Create .env.local">
+        Copy `.env.example` to `.env.local` and fill in the keys: `EXPO_PUBLIC_POSTHOG_API_KEY`, `EXPO_PUBLIC_SENTRY_DSN`, `EXPO_PUBLIC_DUB_PUBLISHABLE_KEY`, `EXPO_PUBLIC_DUB_DOMAIN`, `EXPO_PUBLIC_PROJECT_ID`, `EXPO_PUBLIC_IS_PRODUCTION`, `EXPO_PUBLIC_ENABLE_MOCK_DATA`. Android builds also need `GOOGLE_SERVICES_JSON`.
+
+        Linked Git worktrees symlink the main checkout's `.env` and `.env.local` automatically the first time you run `make dev` or `make sims`.
+      </Step>
+      <Step title="Start Metro and the API">
+        ```bash
+        make dev          # Metro + local API in this worktree's tmux session
+        make dev-status   # ports, Portless routes, tmux session, leased devices
+        make dev-attach   # open the Metro and API logs
+        ```
+        `make dev` runs `go run ./cmd/api` from your paired `yelo-api` checkout on a port allocated to this worktree, and routes it through Portless at `https://<name>.localhost`.
+      </Step>
+      <Step title="Open a simulator">
+        ```bash
+        make sims-local       # iOS simulator, local API
+        make asims-local      # Android emulator, local API
+        make sims-rebuild     # rebuild the native app after native changes
+        ```
+        Simulators come from a machine-wide pool. Each device is leased by one worktree at a time. Run `make dev-stop` to release your ports and devices.
+      </Step>
+    </Steps>
+
+    <Warning>
+    `make sims` and `make asims` without `-local` point the app at the production API. Never hardcode Metro or API ports, LAN IPs, or `10.0.2.2`.
+    </Warning>
+
+    The app resolves its API base URL in `lib/config.ts`. Development builds use `EXPO_PUBLIC_API_URL` when it is set and fall back to `https://api.rideyelo.com`. `scripts/dev.sh` writes the chosen URL to the generated `.env.development.local`, which takes precedence over your `.env.local`. Release builds always use the production URL, and E2E builds refuse to target it.
+
+    See [mobile architecture](/engineering/mobile/architecture) for the app layout.
+  </Tab>
+</Tabs>
+
+## Choose which API your clients call
+
+| Client | Local API | Production API |
+| --- | --- | --- |
+| Dashboard and other web sites | `VITE_API_PROXY_TARGET=http://localhost:8080 make dev` | `make dev` with no proxy target (default) |
+| Mobile app | `make dev`, `make sims-local`, `make asims-local` | `make sims`, `make asims` |
+
+There is no shared staging API. When you need production-like data without touching production, run the API locally against a development database.
+
+<Note>
+Before you change behavior that spans repositories, land the API change first. Then sync the contract into each client with `make openapi orval` (web) or `make api` (mobile). See [OpenAPI and generated clients](/engineering/openapi-and-clients).
+</Note>
+
+## Run the pre-push checks
+
+Each repository exposes the same gates CI runs:
+
+| Repository | Command |
+| --- | --- |
+| `yelo-api` | `make check` (also runs as the pre-commit hook) |
+| `yelo-web` | `pnpm nx run workspace-quality:ci` |
+| `yelo-frontend` | `make check` |
+
+See [testing](/engineering/testing) for what each gate covers.

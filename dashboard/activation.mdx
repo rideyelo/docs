@@ -1,0 +1,87 @@
+---
+title: "Driver activation"
+description: "Configure the tiers of push notifications Yelo sends to offline drivers when a ride request goes unmatched, per community."
+---
+
+Driver activation is how Yelo recruits offline drivers when a ride request isn't matched. Each community has a list of activation tiers. When a ride stays unmatched, each tier fires after its delay and sends push notifications to nearby offline drivers until it reaches its driver target.
+
+You configure activation on the **Activation** tab of the **Notifications** page. The old `/activation` URL opens this tab. For how activation fits into matching, see [Matching and auto-queue](/concepts/matching-and-auto-queue).
+
+## Prerequisites
+
+- An `admin` dashboard role. See [Dashboard roles and access](/administration/dashboard-roles).
+
+## How activation works
+
+When a ride goes unmatched, Yelo runs the community's tiers in order. For each tier:
+
+1. Yelo waits until the ride has been unmatched for the tier's **Delay**.
+2. It looks for offline drivers within the tier's **Radius** of the ride request.
+3. It fills the tier's **Drivers** target in two passes. First it picks drivers who went offline within the tier's **Recency** window. Then, if the target isn't met, it picks from all offline drivers.
+4. It sends each picked driver a push notification about the ride.
+
+Yelo never notifies a driver who already declined the ride. It also skips drivers who got an activation ping within the **Cooldown**, so no driver is pinged about several rides back to back.
+
+## Open the activation settings
+
+1. Open **Notifications** in the **Configuration** group of the sidebar.
+2. Select the **Activation** tab.
+3. Pick a **Community**.
+
+If the community has no saved configuration, the tab shows Yelo's defaults. See [Default tiers](#default-tiers).
+
+## Edit activation tiers
+
+The **Activation Tiers** card lists tiers as rows labeled **T1**, **T2**, and so on.
+
+| Column | Description |
+| --- | --- |
+| **Delay** | How long after the request the tier fires. Choose **sec** or **min**. |
+| **Radius** | The search radius around the ride request, in km. |
+| **Drivers** | The number of drivers the tier tries to notify. |
+| **Recency** | How recently, in minutes, a driver must have gone offline to count as recently offline. Set it to `0` to skip straight to all offline drivers. |
+| **Re-ping** | When on, the tier can notify drivers that an earlier tier already notified about this ride. |
+
+To change the tiers:
+
+- Select **Add Tier** to add a tier at the end, with a 60-second delay, 10 km radius, 5 drivers, and 15-minute recency.
+- Use the up and down arrows to reorder tiers.
+- Use the delete icon to remove a tier. You can't remove the last tier.
+
+Select **Save** to apply your changes to the community.
+
+### Rules
+
+The dashboard and the Yelo API reject a configuration that breaks these rules:
+
+- You need at least 1 tier and at most 10.
+- Each tier's **Delay**, **Radius**, and **Drivers** must be greater than zero.
+- **Recency** must be zero or greater.
+- Each tier's **Delay** must be longer than the tier before it.
+
+## Global settings
+
+The **Global Settings** card applies to every tier in the community.
+
+| Setting | Description |
+| --- | --- |
+| **Cooldown (minutes)** | How long before a driver can be notified about another ride. Must be greater than zero. |
+| **Send Slack alert when all tiers exhausted** | Sends a Slack alert when a ride is still unmatched after the last tier. |
+| **Grace period after last tier (minutes)** | Appears when the Slack alert is on. How long after the last tier fires Yelo waits before it sends the alert. Must be greater than zero. |
+
+Yelo sends at most one Slack alert per ride.
+
+## Reset to defaults
+
+Select **Reset to Defaults** to delete the community's saved configuration. The community goes back to the defaults right away.
+
+### Default tiers
+
+| Tier | Delay | Radius | Drivers | Recency | Re-ping |
+| --- | --- | --- | --- | --- | --- |
+| **T1** | 45 sec | 8 km | 5 | 15 min | Off |
+| **T2** | 2 min | 13 km | 10 | 60 min | Off |
+| **T3** | 5 min | 16 km | 15 | 0 | Off |
+| **T4** | 8 min | 16 km | 20 | 0 | On |
+
+The default **Cooldown** is 15 minutes. The Slack alert is off, with a 5-minute grace period.
