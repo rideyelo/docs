@@ -1,0 +1,114 @@
+---
+title: "Notification templates"
+description: "Edit notification copy and variants, validate variables, and review dispatch history and analytics in the dashboard."
+---
+
+The **Notifications** page in the dashboard lets you edit the copy your riders and drivers receive, split traffic between variants, and review what was sent. Use it when you want to reword a notification, A/B test copy, or check whether a notification reached its recipients.
+
+The page has these tabs:
+
+- **Templates**: edit template copy, variants, and settings. Only admins see this tab. It opens by default for admins.
+- **Analytics**: compare delivery and tap performance by notification and by variant.
+- **History**: browse individual dispatches with their sender, variant, outcomes, and status.
+- **Scheduled**: review notifications queued to send later.
+
+## Prerequisites
+
+- An admin account to edit templates. Non-admins can view **Analytics**, **History**, and **Scheduled**.
+- A selected community, or **All communities** turned on.
+
+## Find a template
+
+The **Templates** list shows every template with an **Enabled** or **Disabled** badge. SMS templates also show an **SMS** badge.
+
+Use the **Search code, title, or message…** field to filter the list. Search matches the template code and the title and body of every variant. It is case-insensitive. When you enter several words, the list only shows templates that contain all of them.
+
+## Edit variant copy
+
+Select a template to open it. The **Variants** section appears first, above **Template settings**, so you can get straight to the copy.
+
+<Steps>
+  <Step title="Open a variant">
+    Edit an existing variant, or click **Add variant** to create one.
+  </Step>
+  <Step title="Write the copy">
+    Update the **Title** and **Body**. SMS templates show a single **Message** field and an SMS segment count instead.
+  </Step>
+  <Step title="Insert variables">
+    Place your cursor where the value belongs. Then click one of the variable buttons below the field, such as `{{driver_first_name}}`. The dashboard inserts the placeholder at the cursor, so you never need to type braces.
+  </Step>
+  <Step title="Save">
+    Click **Save variant**.
+  </Step>
+</Steps>
+
+Each template only accepts the variables listed under its fields. If a template has no variables, the field shows **This template has no variables. Braces are not allowed.**
+
+### Traffic split
+
+Each variant has a **Label**, a **Traffic %**, and an **Active** toggle. Traffic percentage must be a whole number from 0 to 100. The percentages of all active variants must total exactly 100% while the template is enabled. To stage a new split, turn off **Enabled** on the template, adjust the percentages, and then turn the template back on.
+
+## Template validation
+
+The dashboard checks your copy as you type. The API runs the same checks when you save and rejects invalid copy with a `400 Bad Request`.
+
+Every `{` or `}` in the copy must belong to a `{{variable}}` placeholder. Literal braces are not allowed.
+
+| Copy | Result |
+| --- | --- |
+| `Your driver {{driver_first_name}} has arrived` | Valid, if `driver_first_name` is one of the template's variables |
+| `Save {20%} today` | Rejected: `Use {{variable}} for every brace, or insert a variable below.` |
+| `Hi {{driver_first_name` | Rejected: `Close the variable with }}.` |
+| `Hi {{ }}` | Rejected: `Malformed variable. Use {{variable}} or an insert button.` |
+| `Hi {{nickname}}` | Rejected: `Unknown variable "nickname". Choose one of the available variables.` |
+
+### Template settings
+
+When you click **Save configuration**, the API also checks that push presentation settings use a supported value:
+
+| Setting | Allowed values |
+| --- | --- |
+| **Priority** | `default`, `normal`, `high` |
+| **Haptic** | `default`, `none`, `success`, `warning`, `error` |
+| **Sound** | `default`, `kaching.wav` |
+| **Android channel** | `default`, `kaching-channel` |
+| **Client data type** | A registered notification type, `ride_request`, or `message_received` |
+
+If a value is not allowed, the API returns `400 Bad Request` with a message such as `priority must be one of: default, normal, high`. SMS templates hide these push settings.
+
+## Preview and test
+
+Under **Preview and test**, choose a **Variant**, fill in sample values, and click **Render preview**. After you review a valid preview, enter a phone number under **Admin test send** and click **Send test**. Test sends are marked **Test** in history.
+
+## Dispatch history
+
+The **History** tab lists every dispatch. It replaces the separate **Logs** and **History** views, and older `logs` links open this tab. The table shows **Time**, **Notification**, **Sender**, **Variant**, **Outcomes**, **Ride**, and **Status**. The table refreshes automatically every 30 seconds.
+
+The **Sender** column shows who triggered the notification:
+
+- The admin's full name, when an admin sent it from the dashboard.
+- **System / API**, when Yelo or an API integration sent it automatically.
+- **Deleted user**, when the admin who sent it no longer has a name on file.
+
+Filter the list by **Notification type**, **Status**, **Variant**, **Recipient**, **Ride**, and a **From** and **To** date range. Test traffic is excluded until you turn it on. Click a row to see its recipients, delivery receipts, and taps.
+
+The API also returns the sender in the `sender_name` field on notification log entries:
+
+```json
+{
+  "template_code": "driver_arrived",
+  "sender_name": "System / API",
+  "status": "sent",
+  "is_test": false
+}
+```
+
+## Analytics
+
+The **Analytics** tab summarizes performance for the filters you choose.
+
+- **Daily dispatches** charts dispatch counts per day in UTC. Days with no dispatches stay on the chart as zero.
+- **Performance by notification** shows dispatches, recipients, attempted, delivered, failed, opened, tap rate, and daily average for each notification type. Tap rate is tracked opens divided by delivered receipts. It does not confirm the recipient read the notification.
+- **Variant comparison** shows accepted rate (accepted ÷ attempted) and deliverability (delivered ÷ (delivered + failed)) for each variant. Deliverability uses receipts that have matured for 15 minutes.
+
+Click any row in either table to open the matching dispatch history in a side panel. From there, open a dispatch to inspect recipients, delivery receipts, and taps.
