@@ -1,0 +1,311 @@
+---
+title: "Community and school administration"
+description: "Admin CRUD for communities and schools: authorization, partial-update validation, optimistic geography locking, derived timezones, archival, school-to-community mapping, and the offline school catalog sync."
+---
+
+This page covers the write side of communities and schools: who can change them, how each field is validated and persisted, and what cascades from a save. For product behavior, see [Communities and zones](/concepts/communities-and-zones) and [Schools and communities](/administration/schools-and-communities).
+
+Other pages own adjacent topics:
+
+| Topic | Page |
+| --- | --- |
+| Assigning users to communities by location | [Community assignment](/engineering/location/community-assignment) |
+| Zone geometry, point-in-polygon, zone pricing | [Zones and geometry](/engineering/location/zones-geometry) |
+| Community feed and its cache | [Events and feed](/engineering/domains/events-and-feed) |
+| Fleet service rows and fleet calendars | [Service communities and calendars](/engineering/fleets/service-communities-and-calendars) |
+| Fleet manager scope rules | [Fleet manager authorization](/engineering/fleets/dashboard-authorization) |
+| Student email domain matching | [School verification](/engineering/identity/school-verification) |
+
+## Data touched
+
+| Store | What |
+| --- | --- |
+| `Communities` | Name, bounding box, flags, primary fleet and vehicle type, experiments, map window, timezone columns, `geography_revision`, `archived_at` |
+| `CommunityTimezoneHistory` | One row per `time_zone` change, with the revision that caused it |
+| `CommunityCacheInvalidations` | Durable, coalescing outbox. One row per community with a `version` counter |
+| `CommunityOperatingWindows` | Per-day windows, replaced wholesale by `UpsertOperatingWindows` |
+| `Schools` | Name, `extensions`, `logo_url`, coordinates, `community_id`, `is_synthetic`, `admin_otp` |
+| `SchoolCatalogMetadata` | IPEDS unit ID, address, website, source year, `synced_at` (written by the catalog sync) |
+| `SchoolCoordinateProvenance` | Source, URL, year, and accuracy for a school's current coordinates |
+| `Users.community_id`, `Users.home_community_id` | Rewritten when a community is archived |
+| `RidePriceParameters.end_time` | Closed when a community is archived |
+| Redis | `communities:all` (60 s TTL), `community:detail:{id}` (60 s TTL), `price:{community_id}:*` (5 min TTL), and their `:epoch` keys |
+| Offline sources | NCES EDGE, IPEDS HD, JetBrains SWOT, Hipo, and optionally ROR, Wikidata, HIFLD, Mapbox (catalog sync only) |
+
+## Endpoints
+
+Dashboard paths are mounted directly on `/dashboard` (`community.RegisterDashboardRoutes` in `internal/server/http/router.go`). Every dashboard route first passes Clerk auth and `getDashboardScopeMiddleware`.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/community/` | None | `GetAllCommunities`. Every non-archived community from `communities:all` |
+| `GET` | `/community/current` | App JWT, role `user` | `GetUserCommunity`. Caller's community from `community:detail:{id}` |
+| `GET` | `/community/{id}/zones` | App JWT, role `user` | `GetCommunityZones`. Active zones with `show_on_map` |
+| `GET` | `/school/` | None | `school.SchoolHandler.GetAll`. Schools whose community isn't the default |
+| `POST` | `/dashboard/manage/timezone-preview` | Admin (`assertAdmin`) | `PreviewCommunityTimezone` |
+| `POST` | `/dashboard/manage` | Admin | `CreateCommunityAdmin` |
+| `PATCH` | `/dashboard/manage/{id}` | Admin | `UpdateCommunityAdmin`. Partial update |
+| `DELETE` | `/dashboard/manage/{id}` | Admin | `DeleteCommunityAdmin`. Archives |
+| `POST` | `/dashboard/manage/{id}/schools/{school_id}` | Admin (inline) | `AddSchoolToCommunity` |
+| `DELETE` | `/dashboard/manage/{id}/schools/{school_id}` | Admin (inline) | `RemoveSchoolFromCommunity` |
+| `GET`, `PUT` | `/dashboard/manage/{id}/operating-windows` | Admin (inline) | `GetOperatingWindows`, `UpsertOperatingWindows` |
+| `POST` | `/dashboard/schools/mapping-preview` | Admin | `PreviewSchoolMapping` |
+| `GET` | `/dashboard/schools` | Admin via scope middleware. No handler gate | `GetSchools` |
+| `POST` | `/dashboard/schools` | Admin | `CreateSchool` |
+| `PUT` | `/dashboard/schools/{id}` | Admin | `UpdateSchool`. Partial despite the verb |
+| `GET` | `/dashboard/communities/{id}/zones` | Admin, or intern for own community (middleware). No handler gate | `GetCommunityZonesDashboard`. All zones |
+| `POST` | `/dashboard/zones` | Admin | `CreateZoneAdmin` |
+| `PATCH` | `/dashboard/zones/{id}` | Admin | `UpdateZoneAdmin` |
+| `DELETE` | `/dashboard/zones/{id}` | Admin | `DeleteZoneAdmin` |
+| `GET` | `/dashboard/drivers/global/{active,pending,in-process,inactive}` | Admin (inline) | `global_drivers_handler.go`. Cross-community driver lists |
+| `GET` | `/dashboard/{id}/users` | Admin, or intern pinned to own community | `GetUsers` via `resolveCommunityID` |
+
+## Authorization
+
+Two layers decide who can edit which community.
+
+**Layer 1, path scope.** `dashboardScopeAllows` in `internal/server/http/dashboard_scope.go` returns 401 with no body when it rejects:
+
+- `admin` passes everything.
+- `intern` needs a non-nil UUID `community_id` claim. `internDashboardScopeAllows` then allows, among others, `GET /dashboard/{own_community}/{kpis,drivers,demographics,fleets,users,search-insights,search-map-data}`, anything under `/dashboard/{own_community}/top-locations`, and `GET /dashboard/communities/{own_community}/{feed,zones,map}`. Paths whose second segment is `manage`, `schools`, `zones`, `drivers`, or `vehicle-types` never equal the community ID, so interns are rejected.
+- `fleet` managers never reach any route on this page. See [Fleet manager authorization](/engineering/fleets/dashboard-authorization).
+
+**Layer 2, handler checks** in `internal/server/http/community/community_handler.go`:
+
+| Helper | Rule |
+| --- | --- |
+| `assertAdmin` | `role == "admin"`, else 403 **Forbidden: Admins only** |
+| `resolveCommunityID` | Admin: parse the path ID. Anyone else: `ClerkUserContext.ResolveDashboardCommunity`, which pins them to the community in their claim regardless of the path |
+| Inline checks | `AddSchoolToCommunity`, `RemoveSchoolFromCommunity`, operating windows, `ReviewDriverApplication`, and the global driver lists repeat the admin comparison inline |
+
+In practice, every community, school, and zone mutation is admin-only. No role can edit "its own" community. Interns can only read.
+
+## Community create
+
+`CreateCommunityRequest.Validate` (`requests/community.go`) requires a non-empty `name`. `bounding_box` is optional. If any coordinate is non-zero, the box is normalized (swapped corners are reordered) and must pass `BoundingBox.IsValid`: latitudes in -90 to 90, longitudes in -180 to 180, and min at most max. `time_zone` is accepted and ignored.
+
+`sqlCommunityRepository.CreateCommunity` runs in one transaction:
+
+1. `CreateCommunity` inserts with `time_zone = 'UTC'`, `is_active = FALSE`, `rides_disabled = TRUE`, `is_hidden = FALSE`, `max_riders = 200`, `min_riders = 1`, `min_drivers = 1`.
+2. `persistDerivedTimezone` resolves the timezone from the box and writes it.
+
+After commit, `DashboardService.CreateCommunityAdmin` copies the default community's `primary_fleet_id` onto the new row when it has one, then calls `invalidateCommunityCaches`.
+
+An unresolved timezone doesn't block creation. The community stays `UTC` with `timezone_status = 'unresolved'`, and activation is blocked later.
+
+## Community partial update
+
+`PATCH /dashboard/manage/{id}` takes `AdminUpdateCommunityRequest`. Every field is a pointer. A missing field or JSON `null` means "leave unchanged".
+
+### Request validation
+
+| Field | Rule |
+| --- | --- |
+| `bounding_box` | Requires `expected_geography_revision`. Non-zero boxes are normalized and must be valid |
+| `expected_geography_revision` | Must be positive when present |
+| `min_riders`, `min_drivers`, `max_riders` | Must be absent. Any value fails with **capacity controls have been removed; reload the dashboard** |
+| `name` | Non-empty when present |
+| `map_moves_window_hours` | 1 to 720 |
+| `primary_vehicle_type` | Must be in the vehicle type registry (see [Vehicle types](/engineering/domains/vehicle-types-and-catalog#the-registry)) |
+| `time_zone` | Accepted and ignored. `ToModel` passes it, but `UpdateCommunity` always sends `TimeZone: nil` to SQL |
+| `is_active`, `is_hidden`, `rides_disabled`, `primary_fleet_id`, `active_experiments` | No validation. `active_experiments` replaces the whole list |
+
+### Persistence
+
+`sqlCommunityRepository.UpdateCommunity` runs in one transaction:
+
+<Steps>
+  <Step title="Lock">
+    `LockCommunityGeography` selects the row `FOR UPDATE`. A missing row returns 404 **community not found**.
+  </Step>
+  <Step title="Check the revision">
+    If `expected_geography_revision` is present and differs from the stored `geography_revision`, the save fails with `ErrorTypeDuplicate` (HTTP 409, **Community changed**).
+  </Step>
+  <Step title="Gate geography">
+    `validateCommunityGeographyUpdate` resolves the timezone for the effective box when the request changes the box, sets `is_active: true`, or sets `rides_disabled: false`. If the result is `unresolved`, the save fails with 400 and the resolver's message.
+  </Step>
+  <Step title="Write fields">
+    `UpdateCommunityFields` applies `COALESCE(new, old)` to every column.
+  </Step>
+  <Step title="Re-derive the timezone">
+    `persistDerivedTimezone` runs on every update, even a rename.
+  </Step>
+</Steps>
+
+`DashboardService.UpdateCommunityAdmin` then calls `invalidateCommunityCaches` and, in a detached goroutine, `priceCache.InvalidateCommunity`.
+
+### Geography revision
+
+Migration `000315_community_timezone_derivation` adds trigger `community_timezone_dirty` (`BEFORE UPDATE`):
+
+- A change to any box coordinate or `is_default` increments `geography_revision` and sets `timezone_status = 'pending'`.
+- Otherwise, a change to `time_zone` increments `geography_revision`.
+- Anything else keeps the revision.
+
+One save can bump the revision twice. Worked example, starting at revision 7:
+
+| Statement | Change | Revision after |
+| --- | --- | --- |
+| `UpdateCommunityFields` | Box moved | 8, status `pending` |
+| `SetCommunityDerivedTimezone` | Derived zone differs from the old `time_zone` | 9, status `resolved` |
+
+If the new box resolves to the same zone, the second statement doesn't change `time_zone`, and the revision stays at 8. The `PATCH` response is only `success: true`, so the dashboard must reload before the next geography save.
+
+## Timezone derivation
+
+`localtimezone.Resolve` in `internal/data/timezone/resolver.go` uses bundled `tzf` boundary data (`Version = "tzf-1.2.5-2026c-v1"`) and never calls the network.
+
+1. The box is normalized. `bounds_fingerprint` is the SHA-256 of `minLat|minLng|maxLat|maxLng` formatted with `%g`.
+2. `IsNonGeographic` is true only for the default community with a zero box or a near-world box (latitudes beyond ±85, longitudes beyond ±175). Those get status `non_geographic` and `UTC`.
+3. An invalid box, a zero-height or zero-width box, or a longitude span greater than 180 returns `unresolved` with **Draw a non-empty local service area to determine its timezone.**
+4. Five sample points are looked up: the center and four corners inset by 10 percent. Empty results and `Etc/` zones are skipped.
+5. Two different zones return `unresolved` with **This service area spans timezones. Narrow or split the community bounds.** No zone at all returns **No local timezone found. Adjust the service area to include the served land area.**
+6. Otherwise the status is `resolved`.
+
+Worked example for a box from latitude 40.0 to 41.0 and longitude -75.0 to -74.0:
+
+| Sample | Latitude | Longitude |
+| --- | --- | --- |
+| Center (0.5, 0.5) | 40.5 | -74.5 |
+| (0.1, 0.1) | 40.1 | -74.9 |
+| (0.1, 0.9) | 40.1 | -74.1 |
+| (0.9, 0.1) | 40.9 | -74.9 |
+| (0.9, 0.9) | 40.9 | -74.1 |
+
+The resolver checks only these points. A box whose middle crosses a timezone line between samples can still resolve.
+
+`SetCommunityDerivedTimezone` writes `time_zone` with `COALESCE(new, old)`. An `unresolved` result keeps the previous `time_zone` and only updates the status, message, fingerprint, resolver version, and `timezone_checked_at`.
+
+`PreviewCommunityTimezone` runs the same resolver without writing. If `community_id` is given, it must exist (404 otherwise), and the response includes its current `geography_revision`.
+
+### Background reconciliation and cache outbox
+
+Trigger `community_cache_invalidation` (`AFTER INSERT OR UPDATE ON "Communities"`) upserts `CommunityCacheInvalidations`, incrementing `version`, and appends `CommunityTimezoneHistory` when `time_zone` changes.
+
+The River job `community_geography_maintenance` (`internal/notify/queue/community_timezone.go`) is scheduled every 15 seconds with a 14-second uniqueness window and a 1-minute timeout:
+
+- When `COMMUNITY_TIMEZONE_RECONCILIATION_ENABLED` is true (default false), it loads up to 100 communities whose status is `pending` or whose resolver version differs from `Version`, and calls `UpdateCommunity` with an empty update on each.
+- It then drains up to 100 outbox rows with `InvalidateCommunityCaches`, deleting each row only if its `version` hasn't changed.
+
+`InvalidateCommunityCaches` sets a fresh random epoch for `communities:all` and `community:detail:{id}` (24-hour TTL), then deletes those keys and every `price:{id}:*` key. Readers capture the epoch before reading the database, so a slow read can't repopulate a stale value.
+
+## Community archive
+
+`DELETE /dashboard/manage/{id}` calls `sqlCommunityRepository.ArchiveCommunity`:
+
+<Steps>
+  <Step title="Find a replacement">
+    `FindCommunityArchiveReplacement` locks the target, which must not already be archived (404 otherwise). It picks the smallest-area active, non-test, non-default, non-archived community whose box contains the target's center, excluding the reserved community `87794dc9-7ef8-438c-b2e8-ba6fd77e66aa`. The fallback is a non-archived, non-test default community.
+  </Step>
+  <Step title="Refuse unsafe cases">
+    The default community returns 400 **the default community cannot be removed**. No replacement returns 400 **no active default or nearby replacement community exists**.
+  </Step>
+  <Step title="Move references">
+    `ReassignUsersCurrentCommunity`, `ReassignUsersHomeCommunity`, and `ReassignSchoolsCommunity` point every row at the replacement.
+  </Step>
+  <Step title="Close pricing">
+    `CloseCommunityRidePriceParameters` sets `end_time = NOW()` on open price rows.
+  </Step>
+  <Step title="Archive">
+    `ArchiveCommunity` sets `archived_at = NOW()`, `is_active = FALSE`, `is_hidden = TRUE`, `rides_disabled = TRUE`.
+  </Step>
+</Steps>
+
+Fleet service retirement on archive is covered in [Community archival](/engineering/fleets/service-communities-and-calendars#community-archival).
+
+## Schools
+
+### School-to-community mapping
+
+The database owns mapping. Migration `000301_automatic_school_community_mapping` defines `resolve_school_community` and two triggers. Migration `000307_school_synthetic_protection` exempts rows with `is_synthetic = true`.
+
+- `schools_assign_community_from_coordinates` runs `BEFORE INSERT OR UPDATE OF latitude, longitude, community_id`. A usable point (in range and not exactly `0, 0`) always overwrites `community_id` with the resolved community. An unusable point keeps the given `community_id`, or uses the default when it is null or the nil UUID.
+- `communities_reconcile_schools_after_update` runs after any statement that changes a community's box, `is_active`, `is_test`, or `archived_at`, and remaps every non-synthetic school with a usable point.
+
+Worked example. A school at `34.02, -118.28` sits inside community A (box 0.5 by 0.5 degrees, area 0.25) and community B (box 0.1 by 0.1, area 0.01). Both are active, non-test, non-default. B wins because its area is smaller. If B is deactivated, the statement trigger moves the school to A.
+
+The `school_management(school_id)` SQL function builds the `management` object on each school row in `GET /dashboard/schools`. Its `reason` is one of `synthetic_school`, `missing_coordinates`, `outside_active_bounds`, `smallest_overlapping_bounds`, or `inside_active_bounds`. Provenance joins `SchoolCoordinateProvenance` on exact latitude and longitude, so new coordinates show no source.
+
+### Manual assignment
+
+`AddSchoolToCommunity` runs `MoveSchoolToCommunity`, and `RemoveSchoolFromCommunity` runs `MoveSchoolToDefaultCommunity`. Both update `community_id`, which fires the `BEFORE` trigger. For a school with a usable point, the trigger immediately recomputes the community, so the call succeeds but changes nothing. Manual assignment only sticks for schools without usable coordinates and for synthetic schools.
+
+`AddCommunitySchool` always returns a nil user list. School moves never touch users.
+
+### Create and update
+
+| Rule | `POST /dashboard/schools` (`CreateSchool`) | `PUT /dashboard/schools/{id}` (`UpdateSchool`) |
+| --- | --- | --- |
+| Name | Required | Non-empty when present |
+| `extensions` | At least one | Non-empty when present |
+| Coordinates | Latitude -90 to 90, longitude -180 to 180. Omitted means `0, 0`, which is legacy mode | Each checked independently when present |
+| `community_id` | Optional fallback for legacy mode. Omitted is the nil UUID, which the trigger maps to the default | Optional. Overridden by the trigger when coordinates are usable |
+| `logo_url` | Optional | `COALESCE`, so it can't be cleared |
+| Server-set | `admin_otp = gen_random_uuid()::text` | None |
+
+`UpdateDashboardSchool` uses `COALESCE(new, old)` for every column.
+
+### Listing and preview
+
+`GetSchools` accepts `limit` 1 to 1000 (default 50), `offset` 0 or more, `sort` in `name`, `community_name`, `user_count`, `driver_count`, `order` of `asc` or `desc`, and `mapping` of `missing`, `outside`, or `protected`. `search` becomes an `ILIKE '%search%'` match on the name or the comma-joined extensions. User and driver counts exclude deleted, incomplete, provisional, and test users.
+
+`PreviewSchoolMapping` normalizes the box and requires it to be valid. A present `community_id` must be non-nil and exist (404 otherwise). Without one, the repository uses a random UUID named **New community**. `PreviewSchoolCommunityMapping` evaluates every school against the proposed box with `preview_school_community` and returns counts plus at most 500 rows, changed schools first, then by name and ID.
+
+## School catalog sync
+
+`internal/data/schoolcatalog` is used only by the offline command `cmd/sync-school-catalog`. No API route calls it.
+
+`schoolcatalog.Build` merges, in order:
+
+| Source | Default URL constant | Provides |
+| --- | --- | --- |
+| NCES EDGE | `DefaultEDGELayerURL` | Coordinates, paged 2,000 rows at a time |
+| IPEDS HD | `DefaultIPEDSURL` (`HD2024.zip`) | Unit ID, name, website, `CYACTIVE`, `SECTOR`, `NEWID`, `CLOSEDAT` |
+| Historical IPEDS | Repeatable flag | Aliases by unit ID |
+| ROR, Wikidata, HIFLD | Opt-in with `--with-supplemental-sources` | Review evidence only |
+| JetBrains SWOT | `DefaultSWOTURL` | Email domain candidates |
+| Hipo | `DefaultHipoURL` | Email domain candidates, US only |
+
+`School.ImportExclusion` in `eligibility.go` blocks a catalog row from creating or updating a school unless it is a current IPEDS institution with `CYACTIVE = 1`, no successor or closure, and a sector from 1 to 9. The `corroborated` domain policy (default) approves a SWOT domain, or a Hipo domain only when it equals the IPEDS website domain. `union` approves either.
+
+Command defaults (`cmd/sync-school-catalog/main.go`): `--dry-run=true`, `--min-catalog-schools=5000`, `--max-created-schools=500`, `--max-coordinate-changes=5000`, `--max-domain-additions=2000`, `--geocode-max-requests=100`. Downloads make up to 3 attempts with 1 and 2 second backoff, or a longer `Retry-After`. The default ROR source gets 4 attempts, alternating with a pinned mirror URL. Mapbox geocoding needs exactly one address result with `exact` or `high` confidence and `rooftop`, `parcel`, or `point` accuracy. See `cmd/sync-school-catalog/README.md` for apply constraints.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Routes | `internal/server/http/community/community_router.go` | `RegisterDashboardRoutes`, `registerCommunityManagementRoutes`, `registerSchoolRoutes` |
+| Handlers and authz helpers | `internal/server/http/community/community_handler.go` | `assertAdmin`, `resolveCommunityID`, `CreateCommunityAdmin`, `UpdateCommunityAdmin` |
+| Timezone and school preview handlers | `internal/server/http/community/timezone.go`, `school_management.go` | `PreviewCommunityTimezone`, `PreviewSchoolMapping` |
+| Zone handlers | `internal/server/http/community/zone_handler.go` | `CreateZoneAdmin`, `UpdateZoneAdmin`, `DeleteZoneAdmin` |
+| Global driver lists | `internal/server/http/community/global_drivers_handler.go` | `GetGlobalActiveDrivers` and siblings |
+| Request validation | `internal/server/http/community/requests/community.go`, `zone.go` | `CreateCommunityRequest`, `AdminUpdateCommunityRequest`, `UpsertOperatingWindowsRequest` |
+| Path scope | `internal/server/http/dashboard_scope.go` | `dashboardScopeAllows`, `internDashboardScopeAllows` |
+| Dashboard services | `internal/service/dashboard/community.go`, `school_management.go`, `zone.go` | `CreateCommunityAdmin`, `PreviewSchoolMapping`, `CreateZone` |
+| Community repository | `internal/data/repository/community.go`, `community_timezone.go` | `CreateCommunity`, `UpdateCommunity`, `ArchiveCommunity`, `persistDerivedTimezone` |
+| Resolver | `internal/data/timezone/resolver.go` | `Resolve`, `IsNonGeographic` |
+| Maintenance job | `internal/notify/queue/community_timezone.go` | `communityMaintenanceWorker` |
+| Cache invalidation | `internal/data/redis/community_invalidation.go` | `InvalidateCommunityCaches` |
+| Schools | `internal/data/repository/dashboard.go`, `school_management.go`, `queries/school_management.sql` | `CreateSchool`, `UpdateSchool`, `PreviewSchoolMapping` |
+| Public school list | `internal/service/school/school.go`, `internal/server/http/school/` | `SchoolService.GetAll` |
+| Models | `internal/models/community.go`, `community_timezone.go`, `schools.go`, `school_management.go` | `CommunityUpdate`, `CommunityTimezone`, `SchoolUpdate`, `SchoolManagement` |
+| Triggers | `migrations/000301_*`, `000303_*`, `000307_*`, `000315_*` | `resolve_school_community`, `mark_community_timezone_dirty` |
+| Catalog | `internal/data/schoolcatalog/`, `cmd/sync-school-catalog/` | `Build`, `ImportExclusion`, `ApprovedDomains` |
+
+## Gotchas and edge cases
+
+- **`primary_fleet_id` can't be cleared.** `CommunityUpdate` documents "null to clear", but `UpdateCommunityFields` uses `COALESCE`, and a JSON `null` decodes to a nil pointer. Neither path clears the column.
+- **Auto-queue limits have no writer.** `CommunityUpdate` and the SQL support `auto_queue_max_minutes` and `auto_queue_default_minutes`, but `AdminUpdateCommunityRequest` has no such fields. No API route sets them.
+- **Deactivating skips the timezone gate.** `validateCommunityGeographyUpdate` only runs when the box changes, `is_active` becomes true, or `rides_disabled` becomes false. You can hide or disable an unresolved community freely.
+- **Activation doesn't need a revision.** Only `bounding_box` requires `expected_geography_revision`. Two admins can toggle flags concurrently with last write wins.
+- **Manual school assignment is usually a no-op.** See [Manual assignment](#manual-assignment). The route still returns success.
+- **`RemoveSchoolFromCommunity` ignores the community in the path.** `MoveSchoolToDefaultCommunity` is keyed by school ID only.
+- **School writes don't invalidate community caches.** `school_ids`, `school_names`, and `extensions` on cached communities can lag by up to 60 seconds after a school change.
+- **Missing IDs return success.** `UpdateSchool`, `UpdateZone`, and `DeleteZone` run `:exec` statements without a row count check, so a wrong ID returns 200.
+- **API accepts a single coordinate.** `UpdateSchool` checks latitude and longitude independently. The "both or neither" rule is only in the dashboard.
+- **Two definitions of "protected".** The `mapping=protected` filter matches schools in a test community. `management.sync_protected` is `Schools.is_synthetic`.
+- **Search wildcards pass through.** `GetSchools` doesn't escape `%` or `_` in `search`.
+- **The public community list is broad.** `GET /community/` needs no auth and returns every non-archived community, including hidden, inactive, and test ones, with user counts and `active_experiments`.
+- **Archive doesn't refresh user sessions.** `ArchiveCommunity` rewrites `Users.community_id` in SQL but doesn't invalidate user profile caches. The cache outbox only clears community keys.
+- **Reconciliation stops on the first error.** `communityMaintenanceWorker` returns on the first failed `UpdateCommunity`, and the candidate query orders by ID, so one failing community can block the rest of the batch.
+- **Legacy community service writes are unused.** `CommunityService.CreateCommunity`, `UpdateCommunity`, `AddCommunitySchool`, and `RemoveCommunitySchool` in `internal/service/community/community.go` have no callers. The dashboard uses `DashboardService`.

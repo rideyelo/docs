@@ -1,0 +1,183 @@
+---
+title: "Pricing configuration and admin"
+description: "How pricing configs are versioned and validated, who can edit them, zone pricing overrides and backtesting, global jitter settings, and how dashboard previews and the pricing overview compute quotes."
+---
+
+This page covers the write side of pricing: the dashboard endpoints and services that create pricing configs, zone overrides, and jitter settings, plus the read-only preview and overview quotes. For the fare math itself, see [Pricing engine internals](/engineering/domains/pricing-engine). For the admin UI, see [Ride pricing](/dashboard/ride-pricing). Zone polygons and their CRUD are covered in [Zones geometry](/engineering/location/zones-geometry). Surge is set from [Supply and demand](/dashboard/supply-and-demand).
+
+## Data touched
+
+| Store | Table or key | Access |
+| --- | --- | --- |
+| Postgres | `RidePriceParameters` | Insert new versions, close old versions (`end_time`) |
+| Postgres | `RidePriceTiers` | Replace or copy per version |
+| Postgres | `FleetCommunityServices` (via `ActiveFleetCommunityServices`) | Checked and possibly created when pricing is saved |
+| Postgres | `ZonePricing` | Upsert on `(zone_id, fleet_id)`, delete |
+| Postgres | `PricingJitterSettings` | Single row keyed by `singleton = TRUE`, `settings` JSONB |
+| Postgres | `Rides` | Read for zone backtest |
+| Redis | `price:{community_id}:*` | Deleted after config, zone, surge, and community changes |
+
+Column definitions are in [Markets, communities, and zones](/reference/database/markets-communities-and-zones).
+
+## Endpoints
+
+All routes are under the `/dashboard` group, which runs `getClerkAuthMiddleware` and then `getDashboardScopeMiddleware` (`internal/server/http/dashboard_scope.go`). The scope middleware lets admins through. It admits fleet managers only on listed path shapes and interns only on their community's operational reads. See [Dashboard authorization](/engineering/fleets/dashboard-authorization).
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| GET | `/dashboard/communities/{id}/price-parameters` | Admin, or fleet with access to the community (fleet sees only its own fleets' rows) | `CommunityHandler.GetPriceParameters`: live configs |
+| GET | `/dashboard/communities/{id}/price-parameters/history` | Same as above | `GetPriceParameterHistory`: closed, future-dated, or unserviced configs |
+| POST | `/dashboard/communities/{id}/price-parameters` | Admin only (handler check) | `CreatePriceParameter`: returns 201 with `id` |
+| PATCH | `/dashboard/communities/{id}/price-parameters/{param_id}` | Admin, or fleet with `HasFleetAccess` on the config's fleet | `UpdatePriceParameter`: closes and re-creates the version |
+| DELETE | `/dashboard/communities/{id}/price-parameters/{param_id}` | Admin only | `DeletePriceParameter`: expires the live version |
+| GET | `/dashboard/communities/{id}/zone-pricing` | Admin only | `ListZonePricing` |
+| GET | `/dashboard/communities/{id}/zone-pricing/backtest?limit=` | Admin only | `SimulateZonePricing` |
+| PUT | `/dashboard/zone-pricing` | Admin only | `UpsertZonePricing` |
+| DELETE | `/dashboard/zone-pricing?zone_id=&fleet_id=` | Admin only | `DeleteZonePricing` |
+| GET | `/dashboard/pricing/overview` | Admin (scope middleware rejects other roles) | `pricing.Handler.GetOverview` |
+| POST | `/dashboard/pricing/preview` | Admin (scope middleware rejects other roles) | `pricing.Handler.PostPreview` |
+| GET | `/dashboard/pricing/jitter` | Admin only, `Cache-Control: no-store` | `pricingjitter.Handler.Get` |
+| PUT | `/dashboard/pricing/jitter` | Admin only, `Cache-Control: no-store` | `pricingjitter.Handler.Set` |
+
+Price-parameter and zone-pricing routes are registered in `internal/server/http/community/community_router.go`. The others are in `internal/server/http/pricing/pricing_router.go` and `internal/server/http/dashboard/pricingjitter/routes.go`.
+
+## Business rules
+
+### Config versioning
+
+A config is one `RidePriceParameters` row for a `(community_id, fleet_id, vehicle_type, pricing_type)` combination. It's live when `start_time` is at or before now and `end_time IS NULL`.
+
+<Steps>
+  <Step title="Create">
+    `sqlDashboardRepository.CreateRidePriceParameter` opens a transaction, locks the community and fleet (`lockFleetServiceParents`), and runs `ensureFleetPriceService`. It rejects a duplicate live row for the same combination with "Active price parameter already exists…". It inserts with `start_time = clock_timestamp()`, then inserts tiers with `sort_order` equal to their array index.
+  </Step>
+  <Step title="Update">
+    `UpdateRidePriceParameter` locks the community, loads the live row with `GetActiveDashboardRidePriceParameterForUpdate`, runs `prepareFleetPriceService`, and closes it with `end_time = clock_timestamp()`. It inserts a new row whose `start_time` is that exact `end_time`, so versions never overlap or gap. `mergePriceParamUpdate` carries forward any field the request omits.
+  </Step>
+  <Step title="Tiers on update">
+    If the request has no tiers, `CopyDashboardRidePriceTiers` copies the old version's tiers. Otherwise `replaceTiersInTx` inserts the new set.
+  </Step>
+  <Step title="Delete">
+    `ExpireRidePriceParameter` sets `end_time = NOW()` on the live row. Zero affected rows returns 404 "active price parameter not found".
+  </Step>
+  <Step title="Invalidate">
+    Each service method logs a `pricing_parameter_changed` audit line with `action`, `actor_user_id`, and IDs, then deletes the community's `price:` keys in a detached goroutine.
+  </Step>
+</Steps>
+
+`ensureFleetPriceService` requires an enabled `FleetCommunityServices` row. A disabled row fails with "Restore this fleet's service community before creating or updating pricing". A missing row is created with `origin = current_price` and `updated_by = pricing_configuration`. See [Service communities and calendars](/engineering/fleets/service-communities-and-calendars).
+
+Archiving a community runs `CloseCommunityRidePriceParameters`, which closes every live config in that community.
+
+### Validation
+
+| Rule | Where | Error |
+| --- | --- | --- |
+| `fleet_id`, `vehicle_type`, `pricing_type` present | `CreatePriceParameterRequest.Validate`, `CreateRidePriceParameter` | 400 |
+| `pricing_type` is `per_ride` or `per_person` | Request and service | 400 |
+| `base_price` and `price_per_minute` at least 0 | Request and service | 400 |
+| At least one tier | Request, then `validateTiers` | "Pricing config must include at least one tier." |
+| First tier starts at 0 (within `1e-6`) | `validateTiers` | "First tier must start at 0 miles." |
+| Each `price_per_mile` at least 0 | `validateTiers` | "Tier N has a negative price per mile." |
+| Only the last tier is open-ended, and it must be | `validateTiers` | "Only the last tier may be open-ended." / "Last tier must be open-ended…" |
+| `max > min` for bounded tiers | `validateTiers` | "Tier N: max distance must be greater than min distance." |
+| Tiers are contiguous within `1e-6` | `validateTiers` | "Gap between tier N and tier N+1." / "Overlap between…" |
+| `adjustment.mode` is `jitter`, `rounded`, `none`, or empty | `PricingAdjustment.Validate` | "adjustment mode must be jitter, rounded, or none" |
+| `display_name` at most 80 runes after trimming | `validatePricingDisplay` (`pricing_display.go`) | 400 |
+| `image_asset` empty, or at most 96 chars of letters, digits, `_`, and `-` ending in `.png`, `.jpg`, `.jpeg`, or `.webp` (`pricingImageAssetPattern`) | `validatePricingDisplay` | 400 |
+| `image_asset` exists in the mobile artwork catalog under `pricing` | `validateArtwork` | "mobile artwork catalog unavailable" if no validator is wired |
+| PATCH has at least one field | `UpdatePriceParameterRequest.Validate` | "must provide at least one field to update" |
+
+An empty adjustment mode is stored as `jitter`, because `PricingAdjustment.Value` and the repository both call `WithDefaults()`.
+
+### Zone pricing overrides
+
+A `ZonePricing` row overrides pricing for one fleet inside one zone. Null columns inherit the config default. `UpsertZonePricingRequest.Validate` requires `zone_id` and `fleet_id` and non-negative values. A row with all three rates null is valid and does nothing to the fare. The `ON CONFLICT (zone_id, fleet_id)` upsert replaces all three values, so omitted fields are cleared to null.
+
+`invalidatePriceCacheForZone` looks up the zone to find its community. If the lookup fails, it skips invalidation silently.
+
+### Zone backtest
+
+`SimulateZonePricing` answers "what would recent rides cost under the current zone config?"
+
+- `limit` defaults to `backtestDefaultLimit` (100) and is capped at `backtestMaxLimit` (500). Non-numeric or non-positive values fall back to 100.
+- `GetCommunityRidesForBacktest` returns the newest rides in `complete` or `pending_rider_rating` with a non-empty `route` and a `fleet_id`.
+- `backtestRide` finds the first live config with the ride's fleet and vehicle type. Rides with no match are dropped.
+- It calls `GetRidePrice` twice with surge 1.0: once with nil zoning and once with the community's zones and overrides. It reports `RawPrice` from each breakdown as `simulated_base` and `simulated_zoned`, and `zone_delta = zoned − base`.
+- `charged` is `BacktestRide.ChargedPrice()`: `discounted_price` if set, else `price`.
+- An unparseable route becomes an empty slice, which disables zoning, so the delta is 0.
+
+`RawPrice` is the truncated pre-adjustment fare, so the simulation excludes jitter, rounding, discounts, and surge.
+
+### Global jitter settings
+
+`PricingJitterSettings.Validate` (`internal/models/pricing_adjustment.go`) enforces:
+
+- Every value is finite and non-negative.
+- `min ≤ max`.
+- `clamp_overshoot_limit ≤ 1`, `clamp_range_min ≤ clamp_range_max`, and `clamp_range_max < 1`.
+- `1 ≤ anchor_inflation_min ≤ anchor_inflation_max`.
+
+The handler validates, then `PricingJitterStore.Set` validates again and updates the singleton row. `Get` also validates on read and returns a server error if the stored JSON is invalid. The PUT body replaces the whole object, so omitted fields become 0.
+
+Migration `000325_global_pricing_jitter` created the table, seeded the defaults, and stripped per-config jitter overrides from `RidePriceParameters.adjustment`, keeping only `mode`.
+
+### Preview quotes
+
+`POST /dashboard/pricing/preview` prices an unsaved config. `DashboardService.PreviewPricing` validates the adjustment, non-negative rates, and `validateTiers`. It reads the community's stored surge with `GetCommunitySurgeMultiplier`, then calls `pricing.ComputeDeterministicQuote` for each `QuotePresets` entry.
+
+`ComputeDeterministicQuote` (`preview.go`) uses the same base, meter, and time formula with a random source fixed at 0.5. It ignores zones, discounts, and flat fees. Presets (`presets.go`):
+
+| Label | Miles | Minutes | Default-rate raw fare | Jitter-mode actual | Display |
+| --- | --- | --- | --- | --- | --- |
+| `short` | 1 | 3 | 4.00 + 2.00 + 1.50 = 7.50 | 8.25 | 10.10 |
+| `average` | 3 | 9 | 4.00 + 6.00 + 4.50 = 14.50 | 15.25 | 18.68 |
+| `long` | 6 | 18 | 4.00 + 12.00 + 9.00 = 25.00 | 25.75 | 31.54 |
+
+The table uses a config equal to the fallback defaults ($4.00 base, one open tier at $2.00/mile, $0.50/minute), default jitter settings, and no surge. Each actual fare is raw plus `0.75`, and each display price is `trunc(actual × 1.225)`.
+
+### Overview quotes
+
+`GET /dashboard/pricing/overview` returns every non-archived community (`ListDashboardCommunityPricing`) and its live, serviced configs (`ListDashboardActiveRidePriceParameters`), each with `short`, `average`, and `long` quotes. `computeQuotes` converts each preset to integer meters and seconds and calls the production `GetRidePrice` with nil discount and nil zoning. Communities with configs sort first, and alphabetical order is kept within each group.
+
+`buildAllowedCommunitySet` returns nil for admins. For other roles it builds a set from `FleetAssignments` plus the legacy `CommunityID`.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Price-parameter handlers | `internal/server/http/community/community_handler.go` | `GetPriceParameters`, `CreatePriceParameter`, `UpdatePriceParameter`, `DeletePriceParameter`, `scopedPriceParameters` |
+| Price-parameter requests | `internal/server/http/community/requests/price_parameters.go` | `CreatePriceParameterRequest`, `UpdatePriceParameterRequest` |
+| Config service | `internal/service/dashboard/dashboard.go` | `CreateRidePriceParameter`, `UpdateRidePriceParameter`, `DeleteRidePriceParameter` |
+| Tier validation | `internal/service/dashboard/pricing_validation.go` | `validateTiers`, `tierTolerance` |
+| Display validation | `internal/service/dashboard/pricing_display.go` | `validatePricingDisplay` |
+| Versioned writes | `internal/data/repository/dashboard.go` | `CreateRidePriceParameter`, `UpdateRidePriceParameter`, `mergePriceParamUpdate`, `replaceTiersInTx`, `ExpireRidePriceParameter` |
+| Service-community guard | `internal/data/repository/fleet_community_service.go` | `ensureFleetPriceService`, `prepareFleetPriceService` |
+| Pricing SQL | `internal/data/repository/queries/community.sql` | `ListActiveRidePriceParameters`, `CreateDashboardRidePriceParameter`, `CloseDashboardRidePriceParameter`, `CopyDashboardRidePriceTiers` |
+| Zone pricing handlers | `internal/server/http/community/zone_pricing_handler.go` | `ListZonePricing`, `UpsertZonePricing`, `DeleteZonePricing`, `SimulateZonePricing` |
+| Zone pricing request | `internal/server/http/community/requests/zone_pricing.go` | `UpsertZonePricingRequest` |
+| Zone pricing service | `internal/service/dashboard/zone_pricing.go` | `UpsertZonePricing`, `SimulateZonePricing`, `backtestRide`, `invalidatePriceCacheForZone` |
+| Zone pricing SQL | `internal/data/repository/queries/driver_fleet_primitives.sql` | `ListZonePricingByCommunity`, `UpsertZonePricing`, `DeleteZonePricing` |
+| Backtest model and SQL | `internal/models/backtest.go`, `queries/ride_history.sql` | `BacktestRide`, `ZonePricingBacktestRow`, `GetCommunityRidesForBacktest` |
+| Preview and overview | `internal/service/dashboard/pricing_preview.go`, `pricing_overview.go` | `PreviewPricing`, `GetPricingOverview`, `computeQuotes`, `surgeFor` |
+| Preview math and presets | `internal/utilities/pricing/preview.go`, `presets.go` | `ComputeDeterministicQuote`, `QuotePresets` |
+| Preview and overview models | `internal/models/pricing_preview.go`, `pricing_overview.go` | `PricingPreviewRequest`, `CommunityPricingOverview`, `QuoteResult` |
+| Preview routes | `internal/server/http/pricing/pricing_router.go`, `pricing_handler.go`, `requests/pricing_preview.go` | `RegisterRoutes`, `PricingPreviewAPIRequest` |
+| Jitter routes and store | `internal/server/http/dashboard/pricingjitter/routes.go`, `internal/data/repository/pricing_jitter.go` | `Handler`, `PricingJitterStore` |
+| Dashboard scope | `internal/server/http/dashboard_scope.go` | `dashboardScopeAllows`, `fleetCommunityResourceScopeAllows` |
+
+## Gotchas and edge cases
+
+- **Overview quotes are random.** `computeQuotes` calls production `GetRidePrice`, which draws jitter and anchor with `rand.Float64`. Refreshing the overview changes jitter-mode quotes. Only the editor preview is deterministic.
+- **Overview and preview ignore surge expiry.** `surgeFor` and `GetCommunitySurgeMultiplier` read the stored `surge_multiplier` without checking `surge_expires_at`. An expired surge still inflates dashboard quotes, while riders pay 1.0×.
+- **Overview distances are slightly short.** `int(miles / 0.000621371)` truncates, so the 1-mile preset is 1,609 m, or 0.99979 miles. The default-rate short quote has a raw fare of 7.4996, not 7.50.
+- **Preview and overview skip zones.** Neither passes a `ZoningContext`, so zone overrides never appear in dashboard quotes. Use the backtest for zones.
+- **Overview role filtering is unreachable.** The scope middleware rejects fleet and intern roles on `/dashboard/pricing/*`, so `buildAllowedCommunitySet` only ever runs for admins.
+- **Fleet managers can change adjustment mode and pricing type.** `UpdatePriceParameter` allows any fleet user with access to the config's fleet to PATCH every field, including `adjustment` and `pricing_type`. Only create and delete are admin-only.
+- **Switching `pricing_type` hides a config from riders.** A PATCH to `per_person` creates a live `per_person` version, which `ListActiveRidePriceParameters` ignores. The update path doesn't re-run the duplicate check, so it can also create two live rows for the same combination.
+- **`vehicle_type` isn't validated on create.** The request only checks it's non-empty.
+- **Zone overrides aren't community-checked.** `PUT /dashboard/zone-pricing` takes `zone_id` and `fleet_id` from the body and doesn't verify the fleet serves the zone's community.
+- **Zone upsert clears omitted fields.** Sending only `per_mile` resets an existing `flat_fee` to null.
+- **Jitter PUT is a full replacement.** Omitting a field sets it to 0. For example, omitting `anchor_inflation_min` fails validation because it must be at least 1, but omitting `min` silently sets it to 0.
+- **Jitter changes aren't cache-invalidated.** See [Pricing engine internals](/engineering/domains/pricing-engine#gotchas-and-edge-cases).
+- **History includes unserviced live rows.** `ListDashboardRidePriceParameterHistory` returns live configs whose fleet no longer has an active service row, with `is_active = false`. The rider quote query `ListActiveRidePriceParameters` doesn't join `ActiveFleetCommunityServices`, so those rows can still price rides.

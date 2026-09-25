@@ -1,0 +1,216 @@
+---
+title: "Dashboard components and patterns"
+description: "The shared tables, filters, sheets, maps, charts, search, and utilities in yelo-web, with their props, where they are used, and how to reuse them in a new page"
+---
+
+This page catalogs the building blocks that dashboard pages share. Reach for these before writing a new table, map, or dropdown. [Dashboard architecture](/engineering/web/dashboard-architecture) covers the provider tree, routing, roles, and community scope; [Add a dashboard page](/engineering/web/adding-a-dashboard-page) shows how the pieces fit into a new route.
+
+Components reused across pages live in `src/components/`, grouped by domain. Components used by one dashboard page live in `src/sites/dashboard/components/`. shadcn primitives live in `src/components/ui/`.
+
+## shadcn primitives
+
+`src/components/ui/` contains `accordion`, `alert-dialog`, `avatar`, `badge`, `button`, `card`, `chart`, `collapsible`, `command`, `dialog`, `dropdown-menu`, `input`, `label`, `popover`, `radio-group`, `select`, `separator`, `sheet`, `sidebar`, `skeleton`, `switch`, `table`, `tabs`, `textarea`, and `tooltip`, plus the `use-mobile` hook. Add new primitives with the shadcn CLI (`components.json`) rather than copying them from another project.
+
+## Tables
+
+### appTableFeatures
+
+`src/lib/table.ts` exports one TanStack Table v9 feature set, `appTableFeatures`, and its type `AppTableFeatures`. It enables column sizing, column visibility, row pagination, row selection, row sorting, a sorted row model, and four sort functions: `alphanumeric`, `basic`, `datetime`, and `text`. 27 files use it. Keep new tables on the same set so column definitions stay type-compatible:
+
+```tsx
+import { useTable, type ColumnDef } from '@tanstack/react-table';
+import { appTableFeatures, type AppTableFeatures } from '@/lib/table';
+
+const columns: ColumnDef<AppTableFeatures, Row>[] = [/* ... */];
+const table = useTable({ features: appTableFeatures, data, columns, state: { sorting }, onSortingChange: setSorting });
+```
+
+### Pagination strategies in use
+
+| Strategy | Example | How |
+| --- | --- | --- |
+| Server offset paging | `RidesTab` | `pagination` state maps to `limit` and `offset` query params; **Next** disables at `total`. Filters and search reset `pageIndex` to 0. |
+| Infinite scroll with virtualization | `UsersPage` | `useInfiniteQuery` pages of 100, `getNextPageParam` from `total_count`, and `useVirtualizer` from `@tanstack/react-virtual` |
+| Client table with load-more | `ActivityTable` | Virtualized, 52 px estimated rows, `overscan: 8`, optional `onLoadMore` and `hasNextPage` |
+| Fully client-side | Most configuration tables | Load everything, sort with `appTableFeatures` |
+
+### ActivityTable
+
+`src/sites/dashboard/components/ActivityTable.tsx` is the closest thing to a generic data table. `RecentSearchesTable` and `IssuesAnalyticsTab` use it.
+
+| Prop | Type | Purpose |
+| --- | --- | --- |
+| `label` | `string` | Accessible name |
+| `columns` | `ActivityColumn[]` (`key`, `header`, `cell(row)`, `size`) | `size` defaults to 170 |
+| `data`, `loading`, `emptyLabel` | — | Rows and states |
+| `rowKey` | `(row, index) => string` | Becomes `getRowId` and the virtual item key |
+| `onRowClick` | optional | Row activation |
+| `totalCount`, `hasNextPage`, `fetchingNextPage`, `onLoadMore`, `loadError` | optional | Infinite loading |
+
+Its search box filters only string fields of the rows already loaded, and sorting is local.
+
+## Filters and scope controls
+
+| Component or hook | File | Use it for |
+| --- | --- | --- |
+| `CommunityDropdown` | `src/components/CommunityDropdown.tsx` | Picking one community from a list you pass in. Props: `communities`, `value`, `onChange(id, community)`, `isLoading`, `disabled`, `variant`, `placeholder`. The top bar uses it with the role-filtered list. |
+| `CommunityFilterDropdown` + `useGlobalCommunityFilter` | `src/components/CommunityFilterDropdown.tsx`, `src/hooks/useGlobalCommunityFilter.ts` | Pages that default to **All Communities**. The hook returns `communityId`, `setCommunityId`, `communityParam` (`undefined` for all), and `isAll`. Used by `TelemetryPage` and `PresencePanel`. |
+| `useActivityCommunity` | `src/hooks/useActivityCommunity.ts` | Community analytics inside `/rides`. Returns `needsCommunity` when an admin is on the global scope so the page can render `ActivityMarketPrompt` instead of guessing. |
+| `FleetDropdown` | `src/components/FleetDropdown.tsx` | Picking a fleet within a community. Pair it with `rememberFleetId` from `useCommunity()` so the choice survives navigation. |
+| `TimeRangeSelector` | `src/components/TimeRangeSelector.tsx` | `last_7_days`, `last_14_days`, `last_30_days`. These are the only values the KPI services understand. |
+| `TagCombobox`, `NotificationFilterSelect` | `src/components/users/`, `src/components/notifications/` | Searchable multi-option pickers built on `cmdk` |
+
+### URL-backed state
+
+Prefer query parameters for anything a teammate might link to. Existing conventions:
+
+| Parameter | Pages | Meaning |
+| --- | --- | --- |
+| `tab` | `/rides`, `/drivers`, `/manage`, `/communities` | Active tab |
+| `notification_tab` | `/notifications` | Active tab |
+| `community`, `scope` | `/rides`, `/pricing`, `/communities` | Admin market scope, or the community to open |
+| `status`, `fleet`, `older`, `ride_id` | `/rides` | Trips filters and the open ride sheet |
+| `user` | `/users` | Open user sheet |
+| `lead`, `user`, `userId` | `/drivers` | Open lead, or jump to the drivers tab |
+| `fleet` | `/manage` | Open fleet (also `/manage/:fleetId`) |
+| `section` | Any | One-time scroll target from global search; consumed and removed |
+
+Write them with `setSearchParams((current) => { const next = new URLSearchParams(current); ... }, { replace: true })` so other parameters survive and filter changes do not flood history.
+
+## Sheets and dialogs
+
+Detail and edit surfaces use the shadcn `Sheet` from the right. The recurring shape:
+
+1. The parent owns the selected ID, ideally in the URL.
+2. The sheet receives `id`, `isOpen`, and `onClose`, and enables its queries with `enabled: isOpen && !!id`.
+3. Mutations call `invalidateQueries` on the list key and show `toast.success` or `toast.error(getApiErrorMessage(...))`.
+
+| Kind | Examples |
+| --- | --- |
+| Read-mostly detail | `UserDetailSheet`, `RideDetailSheet`, `FleetDetailSheet`, `NotificationDetailSheet`, `DriverApplicationReviewSheet`, access detail sheets |
+| Forms with `react-hook-form` + `zod` | `PricingConfigSheet`, `SendNotificationSheet`, `MarketingSegments` |
+| Forms with local state | `FleetFormSheet`, `SchoolFormSheet`, `EventFormSheet`, `SpotFormSheet`, `LocationFormSheet`, `VehicleTypeFormSheet`, `InviteUserSheet` |
+| Confirmations (`AlertDialog`) | `CommunityDeleteDialog`, `CancelNotificationDialog`, `NotifyMarketDialog`, `PingDialog`, and inline confirms in `ManageFleetsPage`, `FleetDriverJoinLinkCard`, `SurgeSlider`, `UserDetailSheet` |
+
+`UserDetailSheet` is a role wrapper: it renders nothing unless `useRole().isAdmin`, then mounts `AdminUserDetailSheet`. Follow that pattern when a sheet's endpoints are admin-only, so interns never fire requests that the API rejects.
+
+## Maps
+
+All maps use `mapbox-gl` with `VITE_MAPBOX_API_KEY`. Each map module sets `mapboxgl.accessToken` at import time, and most render a fallback message instead of a map when the variable is absent. `CommunityMapPage` checks `HAS_MAPBOX_TOKEN` from `useMapboxMap.ts`.
+
+| Component | Used by | Style | Notes |
+| --- | --- | --- | --- |
+| `useMapboxMap` + layer hooks (`src/components/communitymap/`) | `CommunityMapPage` | Follows theme (`light-v11` / `dark-v11` via `mapboxStyleForTheme`) | One long-lived map. Community changes call `fitBounds`; theme changes call `setStyle`, which drops `styleReady` so layer hooks re-add their sources. |
+| `RidesExplorerMap` | `RidesTab` | Follows theme | Trips map with stored routes |
+| `CommunityMap` | `OverviewPage`, `SchoolMappingPreviewPanel` | Follows theme | Bounding box and school pins |
+| `CommunityManagementMap` | `CommunitiesPage`, `PricingPage` | Follows theme | Service-area overview |
+| `CommunityBoundingBoxPicker` | `CommunityEditor` | Follows theme | Draws the community bounding box; helpers in `communityBoundingBox.ts` |
+| `ZoneEditor` | `PricingZoneMap`, retired `ZonesPage` | `light-v11` only | `@mapbox/mapbox-gl-draw` polygon and trash controls |
+| `PresenceMap` | `PresencePanel` | `light-v11` only | Live user markers |
+| `SearchHeatmap` | `SearchesPage` | `light-v11` only | Search density |
+| `RideRouteMapPanel` → `RouteZonesMap` | `RideDetailSheet` | — | One ride's route over zones |
+
+### Writing a layer hook
+
+The community map splits every layer into a hook with the same signature: `{ mapRef, styleReady, visible, ...data }`. Follow `useZonesLayer.ts`:
+
+- Add the GeoJSON source and layers only when `styleReady` is true and `map.getSource(id)` is empty.
+- Update data with `setData` in a separate effect keyed on the data.
+- Toggle `visibility` layout properties instead of removing layers.
+- In cleanup, check `isMapRemoved(map)` (`mapLifecycle.ts`) before touching the style. The map may already be destroyed when a route unmounts.
+- Fetch the layer's data in the page with `enabled: visible` so hidden layers cost nothing. Add the layer to `LayerKey` and `DEFAULT_LAYER_VISIBILITY` in `types.ts`.
+
+Dark-mode popup styles live in `src/sites/dashboard/styles.css`.
+
+## Charts and metrics
+
+| Component | File | Props and behavior |
+| --- | --- | --- |
+| `ChartContainer`, `ChartTooltip`, `ChartTooltipContent`, `ChartLegend`, `ChartLegendContent` | `src/components/ui/chart.tsx` | shadcn Recharts wrapper. Pass a `ChartConfig` that maps series keys to labels and `var(--chart-n)` colors. |
+| `categoricalChartColors` | `src/lib/chart-colors.ts` | `--chart-1` to `--chart-5`, then three fixed hues for larger category sets |
+| `MetricCard` | `src/components/MetricCard.tsx` | `title`, `value`, `icon`, `isLoading`, optional `delta`, `percentage`, `description`, `precision`, `formatValue`, `showPercentage`. Green for positive delta, red for negative. Font size scales with value length through container query units. |
+| `MetricGroup` | `src/components/MetricGroup.tsx` | Wraps cards in a `role="group"` strip; more than five children wrap into two rows. |
+| `DistributionBarChart` | `src/components/DistributionBarChart.tsx` | `title`, `data` of `{ label, count }`, `limit` (default 10; the rest collapse into **Other**), `color`, `showTotal`. Height grows 34 px per bar. |
+| `DistributionPieChart` | `src/components/DistributionPieChart.tsx` | `title`, `data`, `controls` slot |
+| `HourlyActivity` | `src/components/HourlyActivity.tsx` | Day × hour heat grid from `{ time, count }` points, bucketed in the given `timeZone` or the browser's |
+
+`src/lib/telemetry.ts` holds distribution helpers (`cleanDistribution`, `bucketDistribution`, `osMajor`, `deviceFamily`, `deviceGeneration`, `permissionStatus`, `formatCompact`) that the telemetry page composes with these charts.
+
+## Global search and the command palette
+
+`GlobalSearch` (`src/sites/dashboard/search/GlobalSearch.tsx`) is a `cmdk` `Command` with `shouldFilter={false}`; ranking happens in `search.ts`.
+
+- **Shortcut.** Cmd+K or Ctrl+K toggles it.
+- **Entries.** The build-time `virtual:dashboard-search-index` (pages and sections), role-allowed communities, fleets found in the React Query cache under `/dashboard/fleets` or `/dashboard/{id}/fleets` keys (admins), users already loaded by the `users-directory` query, and live user results from `GET /dashboard/users?search=` (admins, 300 ms debounce, 15 results).
+- **Ranking** (`searchDashboard`). Text is NFKD-normalized, lowercased, and split on non-alphanumerics. An exact title match scores 100, a title substring 50. Each query token must match some word: exact 12, prefix 9, substring 5 (tokens of three or more characters), or an edit distance of 1 (2 for tokens of eight or more characters) with adjacent transpositions counted as one edit, for tokens of four or more characters. Tokens found in the title earn 8 more. Any unmatched token drops the entry. Results are capped at 24, ties sorted by title.
+- **Navigation.** Selecting an entry with a `communityId` switches the global community first. Section results carry `?section=`, which `SearchNavigation` resolves to an element whose `id` or `data-search-section` matches, or to a heading whose slug matches. It waits up to 10 seconds for lazy content, scrolls with a 6 rem margin, focuses the target, then removes `section` from the URL.
+
+The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
+
+## Shell helpers
+
+| Helper | File | Behavior |
+| --- | --- | --- |
+| `DashboardTitle` | `src/sites/dashboard/DashboardTitle.tsx` | Builds `document.title` as page · scope · selected tab labels · Yelo. Watches `main` with a `MutationObserver` for `[role="tab"][aria-selected="true"]` and `data-dashboard-scope` / `data-dashboard-fleet`. Trailing counts such as "(12)" are stripped from tab labels. |
+| `RecentViews` | `src/sites/dashboard/RecentViews.tsx` | In-memory list, one entry per path, newest first, titled from `document.title`. Not persisted. |
+| `GlobalLoadingBar` | `src/components/GlobalLoadingBar.tsx` | Visible whenever `useIsFetching()` is non-zero |
+| `CachedAvatar` | `src/components/CachedAvatar.tsx`, `src/utils/avatarCache.ts` | Loads when visible, resizes to 80 px at 0.78 quality, stores in Cache Storage `yelo-avatars-v2` for 30 days, at most six concurrent fetches. Pass `cacheNamespace` when IDs from different entity types could collide. |
+| `getApiErrorMessage` | `src/lib/api-error.ts` | First non-empty `detail`, `message`, or `title`, including a nested `error` object |
+| `formatElapsed`, `formatDuration`, `formatCents` | `src/lib/elapsed.ts` | Count-up timers between polls, durations, and USD from cents |
+| `getTagColor` | `src/lib/tag-colors.ts` | Fixed colors for known user tags, hashed hue otherwise |
+| `cn` | `src/lib/utils.ts` | `clsx` + `tailwind-merge` |
+
+## Browser storage used by the dashboard
+
+| Key | Store | Owner |
+| --- | --- | --- |
+| `selectedCommunityId` | `localStorage` | `CommunityProvider` |
+| `yelo-dashboard-theme` | `localStorage` | `ThemeProvider` |
+| `yelo-avatars-v2` | Cache Storage | `avatarCache` |
+| Route boundary retry counters | `sessionStorage` | `main.tsx`, `RouteBoundary` |
+
+## Domain folders in `src/components`
+
+| Folder | Contents | Used by |
+| --- | --- | --- |
+| `access/` | Invite and per-role detail sheets | `/access` |
+| `calendar/` | Week grid, zone map, zone list for fleet calendars | `FleetCalendar` |
+| `communitymap/` | Map hook, layer hooks, layer panel, zones panel, mobility feeds | `/map`, `/fleets` (admin) |
+| `drivers/` | Application review sheet and step, vehicle context | `/drivers`, `/fleets`, user sheet |
+| `events/` | Event form and table | `/events` |
+| `feed/` | Feed preview, operating hours | `/community` |
+| `kpi/` | Global KPI cards, charts, acquisition breakdown | `/kpi` |
+| `leads/` | Import dialog, next-action queue and rules | `/drivers`, `/kpi` |
+| `locations/` | Location form and table | `/map` |
+| `map/` | Ride route panel and route-over-zones map | Ride sheet |
+| `notifications/` | Templates, analytics, logs, scheduled, send, cancel | `/notifications` |
+| `qr-payments/` | Config cards, create and pricing modals, payments table | `/fleets` Payments tab |
+| `rides/` | Ride detail sheet | `/rides` |
+| `search/` | Search heatmap, top locations manager | `/rides` Searches tab |
+| `spot/` | Spot card, form, history | `/events` |
+| `supply-demand/` | Market list, sections, driver and ride tables, surge, notify, ping | `/supply-demand` |
+| `users/` | User sheet, profile editor, tags, Quo messages, contact matching | `/users`, `/rides`, `/drivers` |
+| `zones/` | Zone edit dialog, zone pricing editor | `/map`, `/pricing` |
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Shared components | `yelo-web/src/components/` |
+| shadcn primitives | `src/components/ui/`, `components.json` |
+| Dashboard-only components | `src/sites/dashboard/components/` |
+| Table features | `src/lib/table.ts` |
+| Map hook and layers | `src/components/communitymap/` |
+| Search | `src/sites/dashboard/search/`, `tools/vite/dashboard/search-index.ts` |
+| Shell | `src/components/DashboardLayout.tsx`, `Topbar.tsx`, `Sidebar.tsx`, `src/sites/dashboard/DashboardTitle.tsx`, `RecentViews.tsx` |
+| Tailwind sources | `src/sites/dashboard/styles.css` (`@source` lines) |
+
+## Gotchas and edge cases
+
+- **Three maps ignore dark mode.** `ZoneEditor`, `PresenceMap`, and `SearchHeatmap` hardcode `light-v11` while the rest follow `ThemeProvider`.
+- **`CommunityFilterDropdown` lists every community.** It calls the public `GET /community/` and does not filter by role or hide test communities. It is safe today only because its pages are admin-only.
+- **`getApiErrorMessage` prefers developer text.** API envelopes carry `message`, `title`, and user-facing `body`. The helper returns `message` first and never reads `body`, so toasts can show technical wording. `TipStep` and `EduClaimStep` read `body` directly.
+- **Changing `/manage` tabs drops other parameters.** `ManageFleetsPage` calls `setParams({ tab })`, which clears `fleet` and anything else in the query string.
+- **Duplicate presence UIs.** `pages/PresencePage.tsx` (retired route) and `components/PresencePanel.tsx` (live tab) duplicate the same three 10-second queries. Change the panel; the page is dead code.
+- **Search indexing depends on static copy.** Headings built from variables or placed inside tabs, sheets, or dialogs are not indexed. See [Add a dashboard page](/engineering/web/adding-a-dashboard-page).
+- **`RecentViews` resets on reload.** It is component state only.

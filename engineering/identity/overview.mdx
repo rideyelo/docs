@@ -1,0 +1,158 @@
+---
+title: "Identity system map"
+description: "Every identity component in Yelo: sign-in surfaces, credentials, database tables, signing keys, and config knobs, with links to the deep-dive pages for each."
+---
+
+This section documents Yelo identity and authentication at the level of the code: ordering, timing, failure modes, and the config that changes behavior. It assumes you have read [Accounts and sign-in](/concepts/accounts-and-sign-in), [Authentication](/engineering/api/authentication), and [Auth and onboarding](/engineering/mobile/auth-and-onboarding). Those pages describe what exists. The pages here describe how it behaves when things go wrong.
+
+## Deep-dive pages
+
+| Page | Covers |
+| --- | --- |
+| [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions) | The transaction state machine, request secret, PKCE, state, nonce, attempt rotation, legal acceptance, handoff codes, resume, and cleanup |
+| [Provider flows](/engineering/identity/provider-flows) | Apple (web callback and native), Google, and phone, per channel, with sequence diagrams |
+| [Identity resolution and linking](/engineering/identity/identity-resolution) | How a verified identity maps to a `Users` row, provisional shells, automatic recovery, explicit linking, denied subjects, and uniqueness rules |
+| [Tokens, sessions, and keys](/engineering/identity/tokens-and-sessions) | Every token type, expiry, refresh, revocation, the auth cache, and key rotation |
+| [Phone OTP and abuse controls](/engineering/identity/phone-otp-and-rate-limits) | OTP generation, Twilio Verify, the fallback sweep, delivery events, and every rate limit |
+| [School verification](/engineering/identity/school-verification) | Auth v2 email and OAuth verification, StudID, education proofs, disconnect, and what student status unlocks |
+| [Account states and requirements](/engineering/identity/user-requirements) | Banned, deleted, provisional, and incomplete accounts, and every gate on the API and mobile |
+| [Account deletion and retention](/engineering/identity/account-deletion) | Deletion order, Apple revocation, what is scrubbed and what is kept |
+| [Dashboard identity with Clerk](/engineering/identity/dashboard-clerk) | Clerk metadata, session claims, invites, and role changes |
+| [Test, E2E, and internal auth paths](/engineering/identity/test-and-internal-auth) | Reserved phones, fixed OTPs, test emails, E2E mode, and shared-key routes |
+
+## Two identity systems
+
+Yelo has two unrelated identity systems. They never share users.
+
+| System | Who | Identifier | Issuer | Validated by |
+| --- | --- | --- | --- | --- |
+| App identity | Riders and drivers | `Users.id` (UUID) | Yelo API (HS256 JWTs) | `jwt.ValidateJwt` in `internal/utilities/jwt/jwt.go` |
+| Dashboard identity | Admins, interns, fleet managers | Clerk user ID (`user_...`) | Clerk (RS256 session JWT) | `clerkAuthMiddleware` in `internal/server/http/clerk_middleware.go` |
+
+A staff member who also rides has two separate accounts. Nothing in the API maps a Clerk user to a `Users` row. See [Dashboard identity with Clerk](/engineering/identity/dashboard-clerk).
+
+## App sign-in surfaces
+
+| Surface | Routes | Status |
+| --- | --- | --- |
+| Auth v3 | `/authv3/*` | Primary sign-up and sign-in for mobile and web. Mounted only when `AUTH_V3_ENABLED=true`. |
+| Auth v2 phone OTP | `/authv2/phone/request-otp`, `/authv2/phone/verify-otp` | Still mounted. Used by the web `/delete-account` page. Issues full JWTs to complete v2 accounts. |
+| Auth v2 email and OAuth | `/authv2/email/*`, `/authv2/community/*` | Used by the mobile school verification screens and the World Cup claim. |
+| Auth v2 status | `GET /authv2/status` | The mobile `currentUser` query. Accepts presignup and full tokens. |
+| Legacy v1 `/auth/*` | None | Not registered in `internal/server/http/router.go`. |
+
+## Credential inventory
+
+| Credential | Format | Lifetime | Where it lives on the client |
+| --- | --- | --- | --- |
+| Auth v3 request secret | HMAC-sealed envelope (`authv3-request-v1`) | Transaction TTL, default 10 minutes | URL fragment `#request=`, then SecureStore draft (mobile) or `sessionStorage` (web) |
+| Provider state | HMAC-sealed envelope (`authv3-provider-v1`) | Provider start TTL, default 5 minutes | Round-trips through Google or Apple |
+| Handoff code | 32 random bytes, base64url | Handoff TTL, default 2 minutes, capped at transaction expiry | Callback query `?code=` |
+| Onboarding JWT | HS256, role `authv3_onboarding`, separate key | 15 minutes (app), 1 hour (web) | SecureStore draft |
+| Native user JWT | HS256, role `user` | 6,360 hours | SecureStore key `session` |
+| Web user JWT | HS256, role `user` | 1 hour | `sessionStorage` key `yelo_signup_jwt` |
+| Web refresh token | 32 random bytes, rotating | 90 days idle, 365 days absolute | `__Host-yelo_refresh` cookie |
+| Presignup JWT | HS256, role `presignup` | 1 hour | Mobile session or web `sessionStorage` |
+| Stripe reauth JWT | HS256, role `user` | 24 hours | Query string of the Stripe onboarding return URL |
+| Clerk session | RS256 | Clerk-managed | Clerk SDK |
+
+Details are in [Tokens, sessions, and keys](/engineering/identity/tokens-and-sessions).
+
+## Database tables
+
+All Auth v3 tables were introduced in `migrations/000256_auth_v3_storage.up.sql` and later migrations. Opaque secrets are only stored as SHA-256 hashes (`HashOpaqueSecret` in `internal/service/authv3/security.go`).
+
+| Table | Purpose | Retention |
+| --- | --- | --- |
+| `AuthTransactions` | One row per sign-in or link attempt. Holds hashes of the request secret, state, and nonce, the PKCE challenge, legal acceptance, coarse IP location, and status. | Deleted 30 days after `expires_at` if it has no handoff code |
+| `AuthIdentities` | One row per linked login method. Unique on `(provider, provider_subject)` and on `(user_id, provider)`. Holds the encrypted Apple refresh token. | Deleted on account deletion |
+| `AuthHandoffCodes` | One-time codes. Unique per transaction. | Deleted 24 hours after expiry or consumption |
+| `AuthWebSessions` | Rotating browser refresh sessions, grouped by `family_id` | Never cleaned up by the runtime loop |
+| `AuthPhoneAttempts` | One per transaction. Phone, HMAC bindings, send and verify counts, the OTP code at rest, Twilio SID, delivery status. | Deleted as soon as `expires_at` passes |
+| `AuthRateLimitCounters` | Fixed-window counters keyed by `(scope, subject_hash)` | Deleted as soon as the window expires |
+| `AuthDeniedSubjects` | HMAC of provider subjects that must never sign in again | Permanent |
+| `UserLegalAcceptances` | Immutable per `(user_id, document, version)` | Cascades with the user |
+| `AttributionTouches`, `UserAttribution` | Anonymous acquisition touches, bound to a user after sign-in | Kept after account deletion. `user_id` is only nulled if the `Users` row is hard-deleted. |
+| `EducationVerifications` | School proofs by provider | Kept after account deletion |
+| `StudIDVerificationAttempts` | Encrypted StudID secret per attempt | Not cleaned up |
+
+The runtime cleanup loop is described in [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions#cleanup).
+
+## Keys and secrets
+
+Never log or paste these values. The table lists names and rules only.
+
+| Env var | Used for | Rotation model |
+| --- | --- | --- |
+| `KEY` | Signs every app user and presignup JWT | Move the old value to `KEY_LEGACY`. Validation tries `KEY`, then each legacy key, only on signature failure. |
+| `KEY_LEGACY` | Comma-separated verification-only keys | Remove after the longest live token (6,360 hours) has expired |
+| `AUTH_V3_ONBOARDING_JWT_KEY` | Signs onboarding tokens | No legacy list. Rotating it invalidates in-flight onboarding tokens (15 minutes). |
+| `AUTH_V3_STATE_HMAC_KEYS` | Seals request secrets and provider state; derives attempt nonces | Newest first. Every key verifies. Rotating the first key changes derived nonces, so in-flight attempt retries get `409`. |
+| `AUTH_V3_SUBJECT_HMAC_KEY` | Addresses `AuthDeniedSubjects` | Rotation orphans every tombstone. Requires a data migration. |
+| `AUTH_V3_RATE_LIMIT_HMAC_KEY` | Pseudonymizes phones and IP prefixes in counters and attempts | Rotate only after counters from the old key expire (at most 1 hour) |
+| `AUTH_V3_REFRESH_TOKEN_KEYS` | AES-256-GCM for Apple refresh tokens and StudID secrets | Newest first. Each ciphertext carries an 8-byte key ID. Never drop a key while ciphertexts use it. |
+
+`hmacKeySeparationProblems` in `internal/utilities/config/authv3.go` refuses to start the API if any of these keys are shorter than 32 bytes, equal each other, or equal `KEY`, a `KEY_LEGACY` entry, the Google client secret, the Apple private key, or the Twilio auth token.
+
+## Config knobs
+
+<AccordionGroup>
+  <Accordion title="Auth v3 lifetimes">
+    Parsed by `loadAuthV3` and bounded by `AuthV3.validate` in `internal/utilities/config/authv3.go`. Values are Go durations such as `10m`.
+
+    | Env var | Default | Allowed range |
+    | --- | --- | --- |
+    | `AUTH_V3_TRANSACTION_TTL` | 10m | 1m to 30m |
+    | `AUTH_V3_PROVIDER_START_TTL` | 5m | 15s to 5m, and not above the transaction TTL |
+    | `AUTH_V3_HANDOFF_CODE_TTL` | 2m | 30s to 10m, and not above the transaction TTL |
+    | `AUTH_V3_ONBOARDING_TOKEN_TTL` | 15m | 5m to 1h |
+    | `AUTH_V3_WEB_ACCESS_TOKEN_TTL` | 1h | 5m to 1h |
+    | `AUTH_V3_WEB_SESSION_IDLE_TTL` | 90 days | 1 day to 180 days |
+    | `AUTH_V3_WEB_SESSION_ABSOLUTE_TTL` | 365 days | idle TTL to 730 days |
+  </Accordion>
+  <Accordion title="Auth v3 routing and origins">
+    | Env var | Rule |
+    | --- | --- |
+    | `AUTH_V3_ENABLED` | `false` by default. When false, `/authv3` and `/authv3/*` return `AuthV3Unavailable` (503). |
+    | `AUTH_V3_PUBLIC_WEB_ORIGIN` | Exact HTTPS origin of the hosted page. App transactions always start at this origin plus `/auth/v3`. |
+    | `AUTH_V3_API_CALLBACK_ORIGIN` | Google and Apple callback URLs must use exactly this origin. |
+    | `AUTH_V3_CLIENT_REDIRECT_ALLOWLIST` | JSON object of client ID to redirect URIs. Matched exactly, with no normalization. |
+    | `AUTH_V3_CORS_ORIGINS` | Must contain the public web origin. `AUTH_V3_CORS_ALLOW_CREDENTIALS` must be `true`. |
+    | `AUTH_V3_TRUSTED_PROXY_CIDRS` | Canonical CIDRs allowed to set `X-Forwarded-For`. Empty means only the immediate peer counts. |
+    | `AUTH_V3_TRUSTED_GEO_HEADER` | Optional proxy header with a `lat,lng` centroid. Requires trusted proxy CIDRs. |
+    | `AUTH_V3_TERMS_VERSION`, `AUTH_V3_PRIVACY_VERSION` | Current legal versions. Changing either invalidates every unaccepted in-flight transaction. |
+  </Accordion>
+  <Accordion title="Phone and messaging">
+    | Env var | Default | Effect |
+    | --- | --- | --- |
+    | `TWILIO_VERIFY_SERVICE_SID` | none | Required when Auth v3 is enabled outside E2E. Auth v2 also switches to Verify when set. |
+    | `TWILIO_OTP_FALLBACK_ENABLED` | `false` | Turns on the toll-free resend sweep |
+    | `TWILIO_OTP_FALLBACK_DELAY` | 60s | Minimum age of an undelivered attempt before resend. Zero or negative clamps to 60s. |
+    | `TWILIO_OTP_SWEEP_INTERVAL` | 15s | Sweep tick. Zero or negative clamps to 15s. |
+    | `TWILIO_EVENTS_WEBHOOK_USER`, `TWILIO_EVENTS_WEBHOOK_PASSWORD` | unset | Optional basic auth on `/twilio-verify-events`. Setting only one rejects every event. |
+    | `DRIVER_VERIFIED_PHONE_REQUIRED` | `false` | Enforces a verified phone on driver setup steps |
+  </Accordion>
+</AccordionGroup>
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Auth v3 core service | `yelo-api/internal/service/authv3/` |
+| Auth v3 HTTP layer | `yelo-api/internal/server/http/authv3/` |
+| Auth v3 composition and wiring | `yelo-api/internal/service/authv3_composition.go`, `yelo-api/internal/server/http/router.go` |
+| Auth v3 SQL | `yelo-api/internal/data/repository/authv3.go`, `yelo-api/internal/data/repository/queries/authv3.sql` |
+| Auth v3 config | `yelo-api/internal/utilities/config/authv3.go` |
+| Auth v2 | `yelo-api/internal/service/authv2/`, `yelo-api/internal/server/http/authv2/` |
+| App JWT utilities | `yelo-api/internal/utilities/jwt/jwt.go` |
+| JWT, presignup, and key middleware | `yelo-api/internal/server/http/middleware.go` |
+| Clerk middleware | `yelo-api/internal/server/http/clerk_middleware.go` |
+| Hosted sign-in page | `yelo-web/src/sites/signup/auth-v3/` |
+| Mobile sign-in | `yelo-frontend/providers/AuthV3Provider.tsx`, `yelo-frontend/lib/auth/` |
+
+## Gotchas and edge cases
+
+- **Two tokens with the same role, very different lifetimes.** Native and web user tokens are both role `user` signed with `KEY`. The API can't tell them apart. Only the `exp` claim differs.
+- **Auth v3 off does not turn Auth v2 off.** Auth v2 phone OTP remains a full sign-in path for accounts that have a phone, an email, and a finished profile. It shares Auth v3's rate limiter only when Auth v3 is enabled. See [Phone OTP and abuse controls](/engineering/identity/phone-otp-and-rate-limits#auth-v2-legacy-limits).
+- **Web sessions are not garbage collected.** `DeleteExpiredAuthV3RuntimeState` cleans transactions, handoffs, phone attempts, and counters, but never `AuthWebSessions`.
+- **The subject HMAC key is effectively permanent.** Rotating `AUTH_V3_SUBJECT_HMAC_KEY` silently un-bans every banned provider subject.

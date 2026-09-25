@@ -1,0 +1,158 @@
+---
+title: "Screen catalog"
+description: "Every route in the yelo-frontend app grouped by flow, with its purpose, render states, data calls, exits, and guard conditions."
+---
+
+This is the route-by-route reference for `app/`. Each entry lists what the screen renders in each state, the API it calls directly (generated hooks resolve to the paths shown), where it goes next, and what can redirect it away.
+
+[Navigation](/engineering/mobile/navigation) explains the route groups, guards, and deep links. The flow pages go deeper on behavior: [Rider experience](/engineering/mobile/rider-experience), [Driver experience](/engineering/mobile/driver-experience), [Social and contacts](/engineering/mobile/social-and-contacts), and [Auth and onboarding](/engineering/mobile/auth-and-onboarding).
+
+<Note>
+Paths below drop route groups the way URLs do, except where the group matters for `router.push` targets. "Status redirects" means `StatusGuard` (drivers to `/drive`) and `useRideLifecycleNavigation` (riders by ride status) can move the user away. Both leave `/scan-qr` and `/tip/` alone, and `StatusGuard` also leaves `/fleet-join/`.
+</Note>
+
+## Layouts
+
+| Layout | Mounts | Stack options and guards |
+| --- | --- | --- |
+| `app/_layout.tsx` | The full provider tree, `QueryPollers`, and headless observers. See [Architecture](/engineering/mobile/architecture#root-layout-and-provider-tree). | Renders `UpdateRequiredScreen` instead of `<Slot />` on a 426 from `/update-required`. |
+| `(auth-v3)/_layout.tsx` | `Stack` | Each screen bounces to the entry when the Auth v3 transaction is missing. |
+| `(app)/_layout.tsx` | `Stack` with explicit options per child | Signs out once if `profile_initialized` is false. Reconciles a stale JWT community with `PUT /user/community`. Mounts `useRideLifecycleNavigation`. Pushes `post-signup/14-student` once per pending World Cup claim. Warms Stripe, reports app version (`PUT /user/app-version`) and telemetry. Shows "Connection issues — retrying..." on non-401 profile errors. `gestureEnabled: false` on `index`, `post-signup`, `verify`, `(tabs)`, `drive`, `ride`, `ride-matching`, `ride-complete`, `driver-signup`, `profile`, `link`. |
+| `(tabs)/_layout.tsx` | `Stack` (not tabs) with `map` and `profile` | `profile` presents from the bottom. |
+| `(tabs)/map/_layout.tsx` | `MapFeedProvider`, `MapFocusProvider`, `MapBoundingBoxLabelProvider`, `MapTopBarProvider`, `MarkerProximityProvider`, `MapCameraFrameProvider`, `CenteredPoiProvider`, `MapTutorialProvider`, `MapSearchProvider`, the map, and a `GlassBottomSheet` hosting a nested `Stack` | `LocationGate` unless the route is `request`. Community change closes search, the friends hub, and POI, event, or vehicle routes. |
+| `ride/_layout.tsx` | `FeatureErrorBoundary feature="ride"`, `RideProvider`, `MessagingProvider`, a map, a `GlassBottomSheet`, `RiderChatSheet` | All children `gestureEnabled: false`. |
+| `ride-matching/_layout.tsx` | `RideMatchingProvider` | `index` redirects to `1-waiting`. |
+| `ride-complete/_layout.tsx` | `Stack` | none |
+| `drive/_layout.tsx` | `StartupReadyView`, `FeatureErrorBoundary feature="drive"`, `DriveProvider`, `MessagingProvider` (current plus queued rides, recent chats), `BottomSheetModalProvider` | `autoHideHomeIndicator`, fade. |
+| `drive/queue/_layout.tsx`, `drive/driver-hub/_layout.tsx` | `Stack` | Hub layout sets the status bar on focus. |
+| `driver-signup/_layout.tsx` | `DriverSignupProvider` | `index` redirects to `1-hub`. |
+| `driver-earnings/_layout.tsx` | `Stack` | Full-screen back gesture enabled from the parent. |
+| `profile/_layout.tsx`, `verify/_layout.tsx`, `post-signup/_layout.tsx` | `Stack` | none |
+
+## Auth
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `/(auth-v3)` (`index`) | Entry with parallax background and dither reveal. **Get Started**. After a browser cancel, "Having trouble? Continue in app". Repeated taps reveal the version and update id. | `POST /authv3/authorize` (prefetched) | Hosted web page, or `method` on fallback. |
+| `method` | Native method chooser: Apple, Google, phone | `/authv3/transaction/accept`, provider start endpoints | `phone`, provider sheets, `finish-profile`, `permissions` |
+| `phone`, `phone-confirm` | Phone entry and 5-digit OTP | `/authv3/providers/phone/send`, `/verify` | `finish-profile` or `permissions` |
+| `finish-profile` | First and last name, referral code, photo reuse | `POST /authv3/profile` | `permissions` |
+| `permissions` | **Yelo needs some permissions**. Blank while checking. Auto-requests after 2 s. | OS only | Map on success. Stays with "Location access is required…" if location is denied. Replaces to `error` with no draft. |
+| `error` | Terminal Auth v3 errors with a hosted-web fallback | none | Entry |
+| `/auth-return` | Callback landing, renders nothing | none | `/(app)/profile/accounts` when an identity link is pending, `/` with a JWT, else `/(auth-v3)` |
+
+## Home and map
+
+All routes in this group render inside the map sheet.
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `/(app)` (`index`) | Blank until the session read finishes | none | `/(app)/(tabs)/map` with a JWT, else `/(auth-v3)` |
+| `map` (`index`) | Feed (Moves, Friends, Likes, Featured rails) or search results. Inactive community swaps the Moves rail for a bump card and quiet-city card. | `GET /mapping/search-context`, `POST /mapping/search-suggestions`, `POST /mapping/search-result`, feed queries via `MapFeedProvider` | `poi/place` on a search pick, `moves`, `drops`, `featured`, `friends` via see-all |
+| `map/request` | Ride request sheet. See [Rider experience](/engineering/mobile/rider-experience#request-sheet). | `POST /mapping/distance`, `POST /ride/v2/`, `POST /ride/i/{id}/confirm`, aggregator quotes | Replaces to the map when there is no dropoff and `bump` isn't `true` |
+| `map/moves` | See-all list of moves. Empty: "Moves appear here as friends head out." | Feed context | Card taps |
+| `map/drops` | See-all list of drops. Empty: "Drops appear here as deals and events go live." | Feed context | Card taps |
+| `map/featured` | See-all featured cards | `useFeaturedCards` | Event, POI, or save-location |
+| `map/friends` | Friend list | `useFriendList` | `map/friend/[friendId]` |
+| `map/friend/[friendId]` | Friend profile. "Not found" for unknown ids. Distance and walking time, or "Location unavailable". "LAST SEEN" when not live. | `GET /map/friends` (cache) | **Bump** pushes `map/request?bump=true` |
+| `map/poi/[poiId]` | Community POI or venue sheet with likes, friend activity, events, and hours. Skeleton while loading, `PoiSheetNotFound` when missing. | `GET /location/pois`, `GET /user/likes`, `POST /mapping/poi-details` | **Ride** pushes `map/request` |
+| `map/poi/place` | Place sheet for search results and basemap POI taps | `POST /mapping/poi-details` | `map/request` |
+| `map/vehicle/[vehicleId]` | Fleet vehicle detail with hours, zone status ("Outside zone"), ETA estimate by vehicle type speed, and a fleet bio | `GET /map/vehicles` (cache), current zone | Request a ride |
+| `/(app)/save-location` | Saved and pinned spots with a search overlay (`focusSearch=1` opens it). Reorderable list, max 2 pinned. | `GET /user/likes`, `POST /user/likes`, `DELETE /user/likes/{id}` | Back, or `map/request` with the spot as dropoff |
+
+## Rider trip
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `ride-matching/1-waiting` | **FINDING YOUR SPOT**, rotating headline, driver placeholder, route and fare card, Share ETA and Bump | `GET /ride/{id}`, `GET /ride/i/{id}/ping` every 5 s (provider) | `leave-queue`. Status redirects on `queued` and assignment. |
+| `ride-matching/2-queued` | **QUEUED · ~N MIN**, position card, driver card, "Updating your driver and place in line…" recovery with **Refresh ride details** | Same | `leave-queue`, chat |
+| `ride-matching/leave-queue` | Reason list and **Sacrifice my spot** | `POST /ride/i/{id}/cancel-intent`, `POST /ride/i/{id}/cancel` | Back. The lifecycle hook stays here while matching. Target captured only for `confirmed` or `queued`. |
+| `ride/4-ride` | Active trip in four stages, or **Updating your ride** recovery | `GET /ride/{id}`, `GET /ride/i/{id}/map-details` every 3 s | Status redirect to `ride-complete` |
+| `ride/pickup`, `ride/dropoff`, `ride/3-ride-matching` | Legacy screens still registered in the ride stack | Legacy draft flow via `usePreRideRequest` | Not targeted by lifecycle navigation |
+| `ride` (`index`) | Redirect only | none | `<Redirect href="/(app)/(tabs)/map" />` |
+| `ride-complete` | Rate, tip, and comment. Android back is blocked. Buttons disable after save. | `GET /ride/{id}`, `GET /ride/i/{id}/tip-options`, `POST /ride/i/{id}/rate` | Status redirect to the map on `complete` |
+| `tip/[slug]` | Opens the web tip page in an in-app browser on mount. Invalid slug: **Invalid tip link**. | none | Back, or the map |
+
+## Driver
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `drive` (`index`) | Driver map with shift sheet (offline or online), ride card modal, current ride sheet, PIN sheet, navigation-app picker, location-required sheet, completion overlay. `openReadyToDrive=1` opens the go-online sheet. | `GET /driver/auto-queue`, `GET /driver/signup-status`, plus `DriveProvider` board, queue, map details, vehicles, demand dashboard | Driver hub, queue, earnings. `StatusGuard` sends `driving` users here from anywhere whose path lacks `/drive`. |
+| `drive/queue` (`index`) | Recent chats grouped by current, up next, earlier | `useDriverGetRecentChats` | `drive/queue/[rideId]` |
+| `drive/queue/[rideId]` | Chat thread with quick chips and persisted drafts | `GET /ride/{id}`, ride messages endpoints | Back. Replaces to the queue list when access to the thread is revoked. |
+| `drive/driver-hub/1-hub` | **Driver Profile**: account, earn, drive, support sections | `GET /driver/fleet`, `GET /driver/signup-status` | Photo, history, vehicles, earnings, `driver-signup/6-stripe`, `driver-signup/verify/1-oauth`, rider mode (blocked mid-ride) |
+| `drive/driver-hub/2-profile-photo` | Retake the driver photo | `POST /driver/profile-photo` | Back |
+| `drive/driver-hub/3-drive-history` | Past drives | `GET /user/drive-history` | `4-ride-details` |
+| `drive/driver-hub/4-ride-details` | One past drive, with Stripe fee when available | `GET /user/drive-history` (cache) | Back |
+| `drive/driver-hub/5-vehicle-basic`, `6-vehicle-details` | Add or edit a vehicle ("Add vehicle" or "Edit vehicle") | `POST /vehicle/`, `PUT /vehicle/{id}`, `GET /vehicle-types` | Back to the hub |
+| `driver-earnings/1-hub` | Fleet-managed earnings, personal Stripe balance and activity, error, or spinner | `GET /driver/signup-status`, `/earnings/*`, `/user/status`, `/user/drive-history` | `2-all-activity`, `3-all-payouts`, cash-out and schedule sheets |
+| `driver-earnings/2-all-activity`, `3-all-payouts` | Paged lists | `GET /earnings/activity`, `GET /earnings/payouts` | Fleet-managed drivers are replaced: activity goes to `drive/driver-hub/3-drive-history`, payouts goes to `driver-earnings/1-hub` |
+| `/(app)/driver-marketing` | "Why drive" stories carousel | none | Driver signup |
+
+## Driver signup
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `driver-signup/1-hub` | Task list with status pills and a fleet variant | `GET /driver/signup-status`, `GET /stripeaccount/onboarding-link` | Each step. Exit goes to `post-signup/10-marketing` (`from=onboarding`) or the profile. |
+| `2-profile-photo` | Photo capture or upload | `POST /driver/profile-photo` | `1-hub` |
+| `3-vehicle-basic` | Year, make, model, color | none | `4-vehicle-details` |
+| `4-vehicle-details` | Seats, plate state, plate | `POST /vehicle/` or `PUT /vehicle/{id}` | `5-license` |
+| `5-license` | Front and back license photos | `POST /driver/license-photos` | `6-stripe` |
+| `6-stripe` | Personal Stripe onboarding or **PAYOUTS READY** fleet variant | `GET /driver/signup-status`, `GET /stripeaccount/onboarding-link` | `7-student` once complete, or `1-hub` |
+| `7-student` | Optional student verification | `GET /authv2/status` | Replaces to `8-submitted` for verified students |
+| `verify/1-oauth`, `2-email`, `3-email-confirm` | Student verification inside signup | StudID and Auth v2 email endpoints | `8-submitted`, or `returnTo` |
+| `8-submitted` | Success with a friends-hub invite | none | `post-signup/10-marketing` or profile |
+
+## Profile and settings
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `(tabs)/profile` | Photo, name, community (switch), student status with **Verify**, share, **Drive Mode** / **Enable Driver Mode**, ride history. Empty history CTA queues a map search. | `GET /authv2/status`, `GET /user/ride-history`, `GET /community/` | `profile/settings`, `profile/community-switch`, `verify/1-oauth`, `profile/ride-details`, drive flow |
+| `profile/settings` | ACCOUNT (Name editable, Phone and Email locked with copy), CONNECTED ACCOUNTS, PREFERENCES (Refer a friend, Notifications, Experiments, and lab rows when their experiments are on), SUPPORT (Help and feedback, Terms, Privacy, Delete account), **Sign Out**, build info | `PUT /user/name`, `PUT /user/allow-notifications` | Accounts, labs, `https://yelo.link/terms`, `https://yelo.link/privacy`, delete-account modal |
+| `profile/accounts` | LOGIN METHODS (Apple, Google), RIDESHARE PROVIDERS, STUDENT VERIFICATION. `mode=rideshare` titles it "Rideshare accounts". | `GET /authv3/user/identities`, `POST /authv3/user/link/authorize` | `connect-*`, `verify/1-oauth` |
+| `profile/community-switch` | **Select a community** map and list | `GET /community/`, `PUT /user/community` | Replaces to the map once the new JWT settles |
+| `profile/ride-details?id=` | Rider receipt, or "Ride not found" | `GET /user/ride-history` (cache) | Back, Get help sheet |
+| `profile/experiments` | Toggle experiments. The price aggregator needs a disclosure dialog first. | `PUT /user/experiments` | Back |
+| `profile/glass-lab`, `color-lab`, `design-system-lab` | Internal labs | none | `<Redirect>` to settings unless the matching experiment is on |
+| `verify/1-oauth`, `2-email`, `3-email-confirm` | **Are you a student?** StudID, Google or Microsoft school OAuth, or `.edu` email code. Accepts an `email` param from the World Cup claim. | `/authv3/user/student/studid/*`, `/authv2/email/*` | Back |
+| `post-signup/10-marketing` | Rider-vs-driver pitch with **Continue** and **Interested in driving** | Requests notification permission | Map, or the drive flow |
+| `post-signup/14-student` | World Cup point verification or generic student prompt | `PATCH /world-cup/education-claim/prompt-dismissed` | `verify/1-oauth`, map, or `10-marketing` |
+
+## Social and utility
+
+| Route | Purpose and states | Data | Exits and guards |
+| --- | --- | --- | --- |
+| `invite/[code]` | Invite preview: loading, no preview, own link, already friends, add friend, signed out | `GET /referral/invite/{code}`, `POST /user/friends/connect` | `/`, or `/(auth-v3)` after saving the code |
+| `referral-share` | Referral share card (Reduce Motion aware) | `GET /referral/link` | Back |
+| `link?yeloLink=` | Decodes an encoded path and navigates. "Failed to open link" / "Link appears to be invalid." on failure. | `GET /link/decode` | The decoded route, or `/` |
+| `scan-qr` | Camera scanner, permission request, or simulator placeholder | none | Opens the URL, then back |
+| `connect-uber`, `connect-lyft`, `connect-empower` | Provider sign-in states via `ProviderAccountView`. Lyft adds phone, OTP, and email phases. | Provider APIs directly | `<Redirect>` to experiments unless `rideshare-price-aggregator` is on |
+| `events/[eventId]` | Event detail, slides up from the bottom with a vertical dismiss gesture | `GET /event/{id}`, `GET /event/{id}/attendees` | Tickets, bump sheet, `map/request` |
+| `deals/[dealId]` | Hard-coded placeholder deal | none | External deal URL |
+| `/fleet-join/[code]` | Fleet invite preview: invalid, preview failed, signed out (**Sign in or create account**), join, joined. Explains fleet-managed payouts or own Stripe. | `GET /fleet-join/{code}`, `GET /driver/fleet`, `POST /driver/fleet-join/{code}` | `/(auth-v3)` (code saved), `driver-signup/1-hub` if steps remain, else `drive/driver-hub/1-hub`. Auto-exits to `/` if already in the fleet. |
+| `+native-intent` | Rewrites incoming URLs. See [Navigation](/engineering/mobile/navigation#deep-links). | none | n/a |
+| `+not-found` | "This screen doesn't exist." with **Go to home screen!** | none | `/` |
+| `+html` | Web-only HTML shell with a responsive background | none | n/a |
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Route files | `app/` |
+| Root and group layouts | `app/_layout.tsx`, `app/(app)/_layout.tsx`, `app/(app)/(tabs)/map/_layout.tsx`, `app/(app)/ride/_layout.tsx`, `app/(app)/drive/_layout.tsx` |
+| Guards | `components/auth/StatusGuard.tsx`, `hooks/ride/useRideLifecycleNavigation.ts`, `lib/ride/lifecycleNavigation.ts`, `lib/navigation/onboardingRoute.ts` |
+| Deep links | `app/+native-intent.tsx`, `app/auth-return.tsx`, `app/(app)/link.tsx` |
+| Generated endpoints | `api/generated/endpoints/<tag>/<tag>.ts` |
+
+## Gotchas and edge cases
+
+- **The drive guard is a substring check.** `StatusGuard` tests `pathname.includes('/drive')`, which also matches `/driver-earnings`, `/driver-signup`, and `/driver-marketing`.
+- **The World Cup prompt can interrupt a ride.** `(app)/_layout.tsx:72` skips only `/tip/` paths before pushing `post-signup/14-student`.
+- **`ride/*` legacy routes are reachable by URL.** `com.rideyelo://ride/pickup` still opens the old pickup screen because `+native-intent` passes unknown paths through.
+- **The Stripe return URL points nowhere.** `lib/payments/paymentSheetConfig.ts:80` returns to `ride/2-select-ride`, which has no route file.
+- **The approval push targets a missing route.** The API's `driver_application_approved` push deep-links to `/driver-signup/1-application-status`. See [Driver onboarding](/concepts/driver-onboarding#admin-review).
+- **Deals ignore their id.** Any event tagged `deal` opens the same hard-coded deal page.
+- **`ride-details` depends on a cached list.** A ride outside the latest 200 history rows renders "Ride not found".
+- **`events/[eventId]` is the only `(app)` route with a vertical dismiss gesture.** Every other full-screen route either disables gestures or uses the horizontal default.
+- **Labs redirect silently.** Opening `glass-lab`, `color-lab`, or `design-system-lab` by URL without the experiment lands on settings with no message.
+- **`driver-earnings` sub-screens bounce.** For fleet-managed drivers, `2-all-activity` replaces to drive history and `3-all-payouts` replaces to the earnings hub, so the two "see all" links behave differently.

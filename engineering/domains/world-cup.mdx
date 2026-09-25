@@ -1,0 +1,173 @@
+---
+title: "World Cup campus race"
+description: "How the API records .edu claims, counts schools, awards the 25 winner slots, serves standings and the activity cursor, reconciles claims with email verification, and how the web site, signup flow, and app consume it."
+---
+
+The World Cup is a race between campuses. A student claims a `.edu` email, the claim counts toward that school right away, and the first 25 schools to reach 500 contributions become winners. For the product summary, see [Growth features](/concepts/growth-features#world-cup-campus-race). The browser pieces are documented in [Public sites](/engineering/web/public-sites#world-cup) (the race page) and [Signup and auth site](/engineering/web/signup-and-auth-site#world-cup-claim) (the claim form).
+
+## Data touched
+
+| Store | Object | Role |
+| --- | --- | --- |
+| Postgres | `"UserEducationClaims"` | One row per claim. `campaign_key` is constrained to `world_cup`. Status is `pending`, `verified`, or `superseded`. |
+| Postgres | `"WorldCupWinners"` | One row per winning school (`school_id` unique), with `reached_threshold_at`. Rows are never deleted by code. |
+| Postgres | `"Users"` | Verified `.edu` users count toward their `school_id`. `acquisition_source` can be promoted to `event_link`. |
+| Postgres | `"Schools"` | Domain matching through `extensions`. Name and logo for standings. |
+| Postgres advisory lock | `pg_advisory_xact_lock(hashtext('world_cup_winners'))` | Serializes winner checks across transactions. |
+| HTTP cache | `Cache-Control` on public routes | Standings `public, max-age=10, stale-while-revalidate=30`. Activity `public, max-age=5, stale-while-revalidate=15`. |
+
+There is no Redis state. The two partial unique indexes on `"UserEducationClaims"` enforce at most one current claim (`pending` or `verified`) per user, and per email, for each campaign. Column details are in [Users and identity](/reference/database/users-and-identity#usereducationclaims).
+
+## Endpoints
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/world-cup/standings` | Public | `GetStandings`. Ranked schools, totals, and a cursor pointing at the newest activity event. |
+| `GET` | `/world-cup/activity?after=&limit=` | Public | `GetActivity`. Anonymous `claim` and `unlock` events. `limit` is 1 to 100, default 50. |
+| `PUT` | `/world-cup/education-claim` | `getValidatePresignupTokenMiddleware` (pre-signup or full JWT) with a `user_id` claim | `ClaimEducationEmail`. Body `{"email": "..."}`. |
+| `PATCH` | `/world-cup/education-claim/prompt-dismissed` | Same | `DismissPrompt`. Stamps `prompt_dismissed_at` on the caller's pending claim. |
+| `GET` | `/dashboard/education-claims/unmatched` | Clerk, `admin` only | `GetUnmatchedDomains`. Current claims with no school, grouped by domain. |
+| `POST` | `/dashboard/education-claims/rematch` | Clerk, `admin` only | `RematchDomain`. Body `{"domain": "...", "school_id": "..."}`. Returns `{"updated": n}`. |
+
+The route groups are registered in `internal/server/http/router.go`. The dashboard pair sits in a zero-prefix group with `getRequireClerkRoleMiddleware([]string{"admin"})`. A token without a `user_id` gets 401 **Complete phone and account verification first.** from `requireUser`.
+
+## Constants
+
+| Constant | Value | File |
+| --- | --- | --- |
+| `WorldCupCampaignKey` | `world_cup` | `internal/models/world_cup.go` |
+| `WorldCupThreshold` | 500 | Same |
+| `WorldCupWinnerSlots` | 25 | Same |
+| `WorldCupStartTime()` | 2025-01-01 00:00 UTC | Same |
+| Activity page size | Default 50, range 1 to 100 | `internal/service/worldcup/world_cup.go` |
+
+## Business rules
+
+### Claiming an email
+
+`Service.ClaimEducationEmail`:
+
+<Steps>
+  <Step title="Normalize and validate">
+    Lowercase and trim the input. `mail.ParseAddress` must succeed and return exactly the same string, so a display-name form like `Name <a@x.edu>` is rejected. The domain from `GetEmailExtension` must end in `.edu` and be at least 5 characters. Failures return 400 **Invalid Email** or **School Email Required**.
+  </Step>
+  <Step title="Match a school">
+    `MatchSchoolByDomain` tries the full domain, then each parent domain up to the registrable domain (`helpers.ParentDomains`). `cs.umich.edu` tries `cs.umich.edu`, then `umich.edu`. Each candidate runs `FindSchoolsByExtension`, a case-insensitive match against `"Schools".extensions`. Two or more schools for one candidate count as ambiguous, which returns no school. Unmatched claims are still accepted, with `school_id` null.
+  </Step>
+  <Step title="Upsert the claim">
+    `UpsertWorldCupClaim` runs in one transaction. See the table below.
+  </Step>
+  <Step title="Award a winner slot">
+    If a school matched, `ensureWorldCupWinner` runs inside the same transaction.
+  </Step>
+  <Step title="Tag acquisition">
+    After commit, `SetAcquisitionSourceIfDefault` moves the user from `app_organic` to `event_link`. A failure is only logged.
+  </Step>
+</Steps>
+
+| Situation | Result |
+| --- | --- |
+| Caller's current claim has the same email | `UpdateCurrentEducationClaim` refreshes `domain` and `school_id`. Status is unchanged. |
+| Another user holds a current claim on this email | 400 **Email Already Claimed** |
+| Caller has a current claim with a different email | Old row becomes `superseded`. A new `pending` row is inserted with `source_intent = 'edu_capture'`. |
+| Caller has no current claim | New `pending` row |
+
+Both lookups use `FOR UPDATE`, so concurrent claims on the same user or email serialize.
+
+### Counting a school
+
+`ListWorldCupStandings`, `GetWorldCupTotals`, and `EnsureWorldCupWinner` share one definition of a contribution:
+
+- Every `pending` or `verified` claim with `claimed_at` on or after 2025-01-01 and a `school_id`.
+- Plus every `"Users"` row with `is_verified = true`, `is_deleted = false`, a `school_id`, an email ending in `.edu`, and `created_timestamp` on or after 2025-01-01, when that user has no current claim.
+
+A user is counted once: through their claim if they have one, otherwise through their account. Pending claims count, so no inbox proof is needed.
+
+### Awarding winners
+
+`EnsureWorldCupWinner` inserts a winner row when both conditions hold, under the `world_cup_winners` advisory lock:
+
+```sql
+(SELECT COUNT(*) FROM "WorldCupWinners") < 25
+AND (claims_for_school + unclaimed_verified_edu_users_at_school) >= 500
+```
+
+`ON CONFLICT (school_id) DO NOTHING` makes it idempotent. It runs only from three places: a claim upsert with a matched school, `ReconcileVerifiedEmail`, and a rematch that updated at least one row.
+
+**Worked example.** A school has 480 current claims and 25 verified `.edu` users without a claim, all since 2025-01-01. That totals 505, which is at least 500. If 24 winner rows exist, the next claim for this school inserts row 25 with `reached_threshold_at = NOW()`. A 26th school that later reaches 500 finds `COUNT(*) = 25` and gets nothing.
+
+### Standings
+
+`GetStandings` returns every school with at least one contribution. `rank` is `RANK() OVER (ORDER BY claim_count DESC, school_id)`, and rows are ordered by rank, then name. `is_winner` and `reached_threshold_at` come from a left join to `"WorldCupWinners"`. Totals are `claims` (all contributions, including unmatched ones), `matched_schools`, and `winners`.
+
+### Activity feed
+
+Events come from three sources, all anonymous. Each event has only `id`, `school_id`, `occurred_at`, and `type`:
+
+| `type` | Source | `occurred_at` |
+| --- | --- | --- |
+| `claim` | Current claims with a school | `claimed_at` |
+| `claim` | Unclaimed verified `.edu` users | `created_timestamp` |
+| `unlock` | `"WorldCupWinners"` | `reached_threshold_at` |
+
+| Call | Query | Order returned |
+| --- | --- | --- |
+| No `after` | `ListInitialWorldCupActivity`, newest `limit` rows | Reversed in Go to oldest first |
+| With `after` | `ListWorldCupActivityAfter`, keyset `(occurred_at, id) > cursor` | Oldest first |
+
+The cursor is `base64.RawURLEncoding` of `RFC3339Nano|uuid` for the last event returned. `next_cursor` is omitted when a page is empty, so a poller must keep its previous cursor. `GetStandings` fetches the single newest event and returns its cursor as `activity_cursor`, so a client can start polling from "now". A malformed cursor returns 400 **Invalid Cursor**.
+
+### Verification reconciliation
+
+When the user proves inbox ownership through Auth v2 email verification (`internal/service/authv2/email.go`), `ReconcileVerifiedEmail` runs for non-whitelist schools:
+
+1. Supersede other users' `pending` claims on the same email. Proof of ownership beats an unverified claim.
+2. Update the caller's current claim to the verified email, domain, and school, with `status = 'verified'` and `verified_at = NOW()`.
+3. If a row changed, run `ensureWorldCupWinner` and commit.
+
+`AuthV2Service.GetStatus` (`profile.go`) attaches current claims to the profile as `education_claims`, including `school_name`.
+
+### Admin rematch
+
+`GetUnmatchedDomains` groups current claims with no `school_id` by domain, most claims first. `RematchDomain` lowercases and trims the domain and sets `school_id` on every current unmatched claim with that exact domain. When at least one row changed, it then runs the winner check for that school.
+
+## Clients
+
+| Client | Where | Behavior |
+| --- | --- | --- |
+| Race page | `yelo-web/src/sites/world-cup/hooks/useWorldCupStandings.ts` | Calls same-origin `/world-cup/api/standings` and `/world-cup/api/activity` every 15 seconds and on tab focus. On the first load, it drains the backlog up to 60 pages of 50. |
+| Edge proxy | `yelo-web/workers/world-cup-router/src/index.ts` | Routes `rideyelo.com/world-cup*` and `joinyelo.com/world-cup*`. `/world-cup/api/*` goes to `https://api.rideyelo.com/world-cup/*`, and everything else goes to `https://yelo-world-cup.web.app`. Only `GET` and `HEAD` are allowed. Sets `X-Yelo-Proxy`. |
+| Claim route | `yelo-web/workers/experience-router` | The more specific `joinyelo.com/world-cup/claim*` route sends the claim path to the signup site with `intent=world-cup`, which then calls `PUT /world-cup/education-claim`. |
+| Race list | `yelo-web/src/sites/world-cup/lib/worldCup.ts` | 24 entries in `WORLD_CUP_CAMPUSES`, matched to API schools by email domain against `extensions`. A `baseline` is subtracted from the count shown. |
+| App prompt | `yelo-frontend/app/(app)/_layout.tsx`, `post-signup/14-student.tsx`, `api/helpers/worldCup.ts` | With a `pending` `world_cup` claim, no `prompt_dismissed_at`, and an initialized profile, the app pushes the student screen once per claim ID. **Choose verification method** opens `/(app)/verify/1-oauth` with the claim email. **Verify later** calls `PATCH .../prompt-dismissed`. |
+| Dashboard | None | No `yelo-web` code calls the unmatched or rematch endpoints. |
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Constants and models | `yelo-api/internal/models/world_cup.go` | `WorldCupThreshold`, `WorldCupStartTime`, `EducationClaim` |
+| Service | `yelo-api/internal/service/worldcup/world_cup.go` | `ClaimEducationEmail`, `GetStandings`, `GetActivity`, `encodeCursor` |
+| Repository | `yelo-api/internal/data/repository/education_claim.go` | `UpsertWorldCupClaim`, `ensureWorldCupWinner`, `ReconcileVerifiedEmail`, `RematchDomain` |
+| SQL | `yelo-api/internal/data/repository/queries/education_commerce.sql` | `EnsureWorldCupWinner`, `ListWorldCupStandings`, `ListInitialWorldCupActivity` |
+| Handlers and routes | `yelo-api/internal/server/http/worldcup/` | `Handler`, `requireUser`, `RegisterPublicRoutes` |
+| Route groups | `yelo-api/internal/server/http/router.go` | `worldCupPublicGroup`, `dashboardEducationClaimsGroup` |
+| Domain helpers | `yelo-api/internal/utilities/helpers/helpers.go` | `GetEmailExtension`, `ParentDomains` |
+| Email verification hook | `yelo-api/internal/service/authv2/email.go`, `profile.go` | `ReconcileVerifiedEmail` call, `GetStatus` |
+| Schema | `yelo-api/migrations/000235_world_cup_education_claims.up.sql` | Tables and partial indexes |
+| Web | `yelo-web/src/sites/world-cup/`, `workers/world-cup-router/` | `useWorldCupStandings`, `handleWorldCupRequest` |
+| App | `yelo-frontend/api/helpers/worldCup.ts` | `getPendingWorldCupClaim`, `dismissWorldCupEducationPrompt` |
+
+## Gotchas and edge cases
+
+- **Signups alone never unlock a school.** The winner check only runs on a claim write, a verification reconcile, or a rematch. A school that crosses 500 through verified `.edu` signups shows `claim_count` of 500 or more with `is_winner: false` until someone writes a claim for it.
+- **Winners are permanent and the cap is global.** Nothing deletes `"WorldCupWinners"` rows when counts drop. The 25-slot check counts every row in the table, not just rows since the start date.
+- **Ranks never tie.** Because `school_id` is part of the `RANK()` ordering, two schools with equal counts get different ranks, decided by UUID order.
+- **Claims count before proof.** Any account with a `user_id` claim can claim any unused `.edu` address and move a school's count at once. Switching to another address supersedes the old claim, so one account counts once, but it can move its point between schools.
+- **Users count by school, not by domain.** The `"Users"` branch trusts `school_id` and only checks that the email ends in `.edu`, so a verified user at School A with a School B address counts for A.
+- **Rematch has no validation.** It doesn't check that the school exists or owns the domain. A nil or unknown `school_id` fails the foreign key and returns 500. It matches the exact domain only, so subdomain variants need their own call.
+- **Reconcile can undo itself.** If the verifying user has no current claim, `ReconcileVerifiedEmail` returns without committing, so the deferred rollback also discards the supersession of other users' pending claims. If another user holds a `verified` claim on the same email, the update violates `user_education_claims_current_email_campaign`. The email verification request then fails with a server error after `completeSchoolVerification` has already run.
+- **The first activity page is the newest window.** Without `after`, the API returns the latest `limit` events in ascending order, not the oldest events. The race page's README describes an oldest-first drain, but in practice the drain stops after one or two calls.
+- **Displayed counts subtract a baseline, but unlocking doesn't.** `is_winner` uses the raw server count. The University of Vermont entry has `baseline: 296`, so it unlocks when the page shows 204.
+- **The README is out of date.** `src/sites/world-cup/README.md` says 23 race campuses. `WORLD_CUP_CAMPUSES` has 24.
+- **The proxy is read-only.** `world-cup-router` returns 405 for anything but `GET` and `HEAD` on `/world-cup*`. Writes work only because the claim form calls the API origin directly and the claim page is served by the experience router.

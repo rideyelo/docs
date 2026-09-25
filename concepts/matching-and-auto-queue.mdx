@@ -20,7 +20,7 @@ The board is every ride with `status = 'confirmed'` and no `driver_id`.
 Drivers read it with `GET /ride/v2/board`, served by `RideService.GetEnrichedRideBoard`. That query (`GetEligibleEnrichedRideBoard` in `queries/ride_driver.sql`) runs against Postgres and returns rides that:
 
 - Are in the driver's community.
-- Belong to the fleet the driver is online under. A driver with no active session sees an empty board. Rides with a null `fleet_id` predate fleets and are visible to everyone.
+- Belong to the fleet the driver is online under. A driver with no active session sees an empty board. The query would show rides with a null `fleet_id` to everyone, but the service always passes the session fleet, so those rides appear on no board. See [Ride board](/engineering/matching/ride-board).
 - Aren't in the ride's `declined_drivers` list for this driver.
 - Aren't reserved for a different driver by a direct request that is less than 30 seconds old.
 
@@ -61,7 +61,7 @@ On success, the ride is reserved with `potential_driver` and `offer_time`. Only 
 
 ## Activation tiers
 
-`ActivationService.ProcessUnmatchedRides` runs every 30 seconds in the `Operational` loop. For each unmatched ride confirmed within the last 10 minutes, it finds the highest tier whose delay has passed and notifies up to that tier's target number of drivers inside its radius.
+`ActivationService.ProcessUnmatchedRides` runs every 30 seconds in the `Operational` loop. For each unmatched ride confirmed within the last 10 minutes, it finds the lowest tier above the ride's current tier whose delay has passed and notifies up to that tier's target number of drivers inside its radius. A ride advances at most one tier per run, even when several delays have passed. See [Activation tiers](/engineering/matching/activation-tiers).
 
 Each community can have its own tiers. Communities without a stored config use `DefaultActivationConfig` (`internal/models/activation_config.go`):
 

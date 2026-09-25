@@ -1,0 +1,155 @@
+---
+title: "Public sites"
+description: "Internals of the event, invite, world-cup, home, and maestro sites: routes, data sources, app handoff, link previews, analytics, and hosting behavior"
+---
+
+Five `yelo-web` sites need no sign-in: `event`, `invite`, `world-cup`, `home`, and `maestro`. [Sites](/engineering/web/sites) lists what each one is for. This page covers how each one works, what it calls, and what a crawler or analytics tool sees. For domains and Workers in front of them, see [Edge and routing](/engineering/web/edge-and-routing).
+
+## At a glance
+
+| Site | Bootstrap | Router | Data | Link preview tags | Analytics |
+| --- | --- | --- | --- | --- | --- |
+| `event` | `renderSite({ query, router, toaster })` | React Router: `/:slug` | `GET /public/events/slug/{slug}` | None; static `<title>Yelo Event</title>`, runtime `document.title` | None |
+| `invite` | `renderSite({ query, router, dubAnalytics })` | React Router: `/fleet/:code`, `/:code` | `GET /referral/invite/{code}`, `GET /fleet-join/{code}` | Static `og:*` in `index.html` | Dub |
+| `world-cup` | `renderSite(<LandingV5 />)`, no providers | None | `GET /world-cup/standings`, `GET /world-cup/activity` through `/world-cup/api` | `<meta name="description">` only | None |
+| `home` | Plain `createRoot` | Custom pathname switch | None | Full `og:*` and `twitter:*`, plus per-route static HTML | None |
+| `maestro` | `renderSite(<App />, {})`, no providers | `?run=` query param | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
+
+## event
+
+The event site shows one published event at `/:slug`. The dashboard's event form previews and copies links as `https://event.yelo.link/<slug>` (`src/components/events/EventFormSheet.tsx:268`).
+
+### Data
+
+`EventPage` calls `usePublicEventGetBySlug` from `@/generated/event`, a client generated only from the public events tag. The API handler `GetPublicEventBySlug` (`yelo-api/internal/server/http/event/public_handler.go:107`) runs `GetPublishedEventBySlug` (`data/repository/queries/engagement.sql:108`):
+
+- The slug match is case-insensitive (`LOWER(e.slug) = LOWER(...)`), and a unique index keeps slugs global across communities (`migrations/000215_event_slug.up.sql`).
+- Only `status = 'published'` rows match. Drafts and archived events return `404`, which the page shows as "Event not found".
+- The response (`PublicEvent`) exposes name, description, photo, tags, ticket URL, price, timetable, and venue name, address, and coordinates. Community and internal IDs are not included.
+
+### Rendering and handoff
+
+| Element | Source | Behavior |
+| --- | --- | --- |
+| Hero photo | `event.photo_url` | Square, cover-cropped |
+| Date line | `timetable.start_time` / `end_time` | Formatted in the viewer's locale and time zone |
+| Map | `lib/staticMap.ts` | Mapbox Static Images `light-v11` with one pin, 640×320 @2x. Skipped when `VITE_MAPBOX_API_KEY` is missing or coordinates are `0,0`. Tapping opens Google Maps search. |
+| **Get Tickets** | `lib/poshCheckout.ts`, `lib/url.ts` | A `posh.vip` ticket URL becomes `https://posh.vip/embed/checkout/<last-path-segment>` in `CheckoutModal`, a full-screen iframe with `allow="payment"`. Any other `http(s)` URL opens in a new tab. Non-HTTP schemes are dropped by `safeHttpUrl`. |
+| **Open in Yelo** | `lib/openInApp.ts` | iOS goes to the App Store; everything else goes to `https://yelo.link`. Uses `window.open(_blank)` because the page may run inside Dub's link-cloaking iframe. It never deep-links to the event. |
+
+`lib/viewportHeight.ts` mirrors `visualViewport.height` into `--app-height` so the footer CTA and checkout iframe stay above Safari's toolbar.
+
+## invite
+
+The invite site handles two kinds of shared link. Firebase redirects `/` and `/index.html` to `https://signup.yelo.link/` with a `302` before the app loads (`src/sites/invite/firebase.json`).
+
+### Referral invites (`/:code`)
+
+<Steps>
+  <Step title="Apple devices leave immediately">
+    On mount, `referralFallbackURL()` (`referralHandoff.ts`) checks for iPhone, iPad, iPod, or a touch-capable Mac and replaces the location with the App Store URL plus `&ct=<code>` for campaign attribution. iOS normally opened the app from the original `join.yelo.link` universal link already, so this page is a store fallback. It never probes a custom scheme, because Safari shows an invalid-address alert when the app is missing.
+  </Step>
+  <Step title="Everyone else sees the inviter">
+    `useReferralGetInvitePreview` calls `GET /referral/invite/{code}` (`server/http/referral/referral_routes.go:33`), which resolves the code with `GetAuthUserByReferralCode` and returns the inviter's first name, photo thumbnail, and user ID. Without a photo, the avatar color comes from an FNV-1a hash of the user ID over a five-color palette. The app and `ogcard.DeterministicColor` in `yelo-api/internal/utilities/ogcard/color.go` implement the same function, and all three must agree.
+  </Step>
+  <Step title="Sign up on the web">
+    The primary button links to `https://joinyelo.com/auth/v3?code=<code>`. Auth v3's attribution capture reads `code` as `referral_code` (`src/sites/signup/auth-v3/attribution.ts`).
+  </Step>
+</Steps>
+
+### Fleet driver invites (`/fleet/:code`)
+
+`FleetInvitePage` calls `useFleetJoinGetPreview` → `GET /fleet-join/{code}` with `retry: false`. The service returns `404` for codes that fail `joinCodePattern` before touching the database (`service/fleetjoin/fleet_join.go:56`). When `available` is true, the page shows the fleet logo or initial, explains whether the fleet manages payouts, and links to `yelo:///fleet-join/<code>` (`appLink.ts`). Otherwise it asks the driver to get a current link from the fleet manager.
+
+### App links
+
+The `emit-site-app-associations` plugin in `tools/vite/base/config.ts` copies the shared `.well-known` files and, for `invite` only, appends `{"/": "/auth/*", "exclude": true}` and `{"/": "/*"}` to every `applinks.details` entry. That makes every invite path except `/auth/*` open the iOS app.
+
+## world-cup
+
+A single-page campus race built for the `/world-cup` path on `rideyelo.com` and `joinyelo.com`. `tools/vite/base/config.ts` sets `base: '/world-cup/'` and nests output in `dist/world-cup/world-cup/`.
+
+### Data loop
+
+`hooks/useWorldCupStandings.ts` owns all data. It does not use React Query.
+
+| Step | Call | Detail |
+| --- | --- | --- |
+| Standings | `worldCupGetStandings` with `url: ${BASE_URL}api/standings` and `baseURL: ''` | Same-origin, so it goes through the `world-cup-router` Worker to `api.rideyelo.com/world-cup/standings`. The API sets `Cache-Control: public, max-age=10, stale-while-revalidate=30`. |
+| Backlog drain | `worldCupGetActivity` with `after` cursor, `limit=50` | Runs once, up to 60 pages. Seeds the ticker without firing map pings. The cursor commits only after the full drain succeeds. |
+| Live poll | Same activity call from the saved cursor | Every 15 s and on `visibilitychange` to visible. Skipped while hidden or while another fetch is in flight. API cache header: `max-age=5, stale-while-revalidate=15`. |
+| Staleness | — | Two consecutive failures set `isStale`. |
+
+`lib/worldCup.ts` defines `WORLD_CUP_CAMPUSES`, the official race list, and `BACKGROUND_SCHOOLS`. Standings match campuses by email domain against each API school's `extensions`, including subdomain matches. Totals, ticker events, and map pings count only listed campuses; background schools only get map dots. A campus `baseline` is subtracted from its claim count.
+
+The claim CTA points at `VITE_SIGNUP_URL`, defaulting to `https://joinyelo.com/world-cup/claim` (`lib/brand.ts:19`), which the signup site handles.
+
+### Styling
+
+Fonts load from `api.fontshare.com` (Switzer) and Google Fonts (Instrument Serif, Inter, Space Mono, Caveat) in `index.html`. The site has its own `public/` with the US map TopoJSON (`us-nation-10m.json`) and artwork.
+
+## home
+
+The marketing site for `joinyelo.com`. It skips Tailwind, `renderSite`, and React Router; read `src/sites/home/README.md` before editing.
+
+### Routing
+
+`main.tsx` normalizes the pathname (trailing slashes removed, lowercased) and renders one of seven lazy pages. `navigation.ts` provides client-side navigation for `/`, `/drivers`, `/safety`, `/vision`, `/fleets`, and `/partner`. Any other same-origin link does a full page load. Unknown paths render the rider landing, because Firebase's `**` rewrite serves `index.html`.
+
+| Path | Component | Nav variant |
+| --- | --- | --- |
+| `/` | `NewLanding` with rider content | `rider` |
+| `/drivers` | `NewLanding` with `content/driver.tsx` | `driver` |
+| `/partner` | `partner/PartnerPage` | none |
+| `/fleets` | `fleets/FleetsPage` | none |
+| `/safety` | `safety/SafetyPage` | none, dark |
+| `/vision` | `vision/VisionPage` | none |
+| `/privacy`, `/tos`, `/terms` | `legal/LegalPage` with `legalContent.ts` | Nav hidden |
+
+`prepareRoute()` sets `data-page` and `data-variant` on `<html>`, adds route-specific motion classes, and updates `<title>`, `description`, `og:title`, and `og:description` at runtime.
+
+### Link previews
+
+Crawlers do not run JavaScript, so runtime titles are invisible to them. The `home` build target runs `scripts/emit-partner-html.mjs` after `vite build`. For each entry in its `PAGES` list (`partner`, `fleets`, `safety`, `vision`, `drivers`, `privacy`, `tos`, `terms`), it copies `dist/home/index.html` into `dist/home/<route>/index.html` with a new `<title>`, `description`, `og:title`, `og:description`, and `og:url`. The `/safety` copy also preloads its hero image per viewport. Every substitution is asserted, so renaming a meta tag in `index.html` fails the build. Firebase rewrites each route to its own file.
+
+The base document sets `og:url` to `https://joinyelo.com/`, the single source for the origin, and `og:image` to `https://joinyelo.com/og-yelo.png` (1200×630) from the site-local `public/`.
+
+### Contact and forms
+
+`contact.ts` is a module-level store: any `contact` link calls `openContact()` and the singleton `ContactModal` mounted in `HomeApp` opens. Phone, SMS, email, careers (Notion), and partner intake (Typeform) URLs are constants in the same file. There is no API call and no analytics script on this site.
+
+## maestro
+
+An internal viewer for Maestro end-to-end runs. It reads static JSON and media, not the Yelo API.
+
+| File | Role |
+| --- | --- |
+| `types.ts` | `ARTIFACT_ROOT` is `VITE_E2E_ARTIFACT_BASE_URL` or `VITE_SUPABASE_URL/storage/v1/object/public/e2e`. Runs live at `runs/<id>/`. |
+| `App.tsx` | Fetches `index.json`, filters by `passed` or `failed`, sorts pinned runs first. Pins persist in `localStorage` key `e2e-report:pins`. |
+| `RunViewer.tsx` | Loads `runs/<id>/manifest.json`, lists executions per device role, plays the MP4, and seeks the video when you click a timeline event. |
+| `evidenceLog.ts` | Parses NDJSON timing records into a step log with offsets. |
+| `WorkflowCoverage.tsx` | Renders the declared-workflow coverage report. |
+| `ThemeToggle.tsx` | Stores `theme` in `localStorage`. |
+
+The second entry, `auth/v3/index.html`, mounts the signup `AuthV3Page`. The Nx build target sets `VITE_API_URL=$VITE_E2E_API_URL` and `VITE_AUTH_V3_APP_SCHEME=com.rideyelo.e2e` so E2E app builds sign in against the E2E API and return to the E2E app.
+
+## Where this lives in code
+
+| Site | Paths |
+| --- | --- |
+| event | `yelo-web/src/sites/event/` (`EventPage.tsx`, `CheckoutModal.tsx`, `lib/`); API `yelo-api/internal/server/http/event/public_handler.go` |
+| invite | `src/sites/invite/` (`InvitePage.tsx`, `FleetInvitePage.tsx`, `referralHandoff.ts`, `appLink.ts`); API `server/http/referral/`, `server/http/fleetjoin/` |
+| world-cup | `src/sites/world-cup/` (`components/LandingV5.tsx`, `hooks/useWorldCupStandings.ts`, `lib/worldCup.ts`, `README.md`); API `server/http/worldcup/`, `service/worldcup/` |
+| home | `src/sites/home/` (`main.tsx`, `navigation.ts`, `contact.ts`, `README.md`), `scripts/emit-partner-html.mjs`, `tools/vite/home/gen-home-images.ts` |
+| maestro | `src/sites/maestro/` |
+| App association | `public/.well-known/`, `tools/vite/base/config.ts` (`emit-site-app-associations`) |
+
+## Gotchas and edge cases
+
+- **The invite `og:image` does not exist.** `src/sites/invite/index.html` points at `https://invite.yelo.link/og-invite.png`, but no `og-invite.png` exists in the repo, and Firebase's `**` rewrite answers that path with `index.html`. Shared invite links normally carry a Dub-served image from the `og` Worker instead; this fallback only matters for direct links.
+- **Event pages have no server-side preview.** `event/index.html` has no `og:*` tags and a generic title, so crawlers see "Yelo Event" unless Dub supplies metadata.
+- **The event Mapbox token is in the image URL.** `staticMapUrl` embeds `VITE_MAPBOX_API_KEY` in a public `<img src>`. Scope that token to static images and URL restrictions.
+- **Crawler titles must be kept in two places.** `PAGES` in `emit-partner-html.mjs` and `prepareRoute()` in `home/main.tsx` duplicate every title and description. A route missing from `PAGES` still works for readers but shares the landing's card.
+- **Case matters to Firebase, not to `home`.** `/Partner` normalizes to `/partner` in `main.tsx`, but Firebase rewrites are case-sensitive, so a crawler gets the landing document.
+- **World Cup polls pause when hidden.** Both the 15-second interval and the visibility handler check `document.visibilityState`, so background tabs never poll.
+- **Maestro's CSP is narrower than signup's.** `maestro/firebase.json` allows `connect-src` only to `'self'`, `*.run.app`, and PostHog. `VITE_E2E_API_URL` must be a Cloud Run URL, and a relative value would fall back to `api.joinyelo.com`, which the CSP blocks.

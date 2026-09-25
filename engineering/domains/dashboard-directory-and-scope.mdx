@@ -1,0 +1,221 @@
+---
+title: "Dashboard directory and scope"
+description: "How the dashboard user directory searches, filters, tags, and sorts users in SQL, how user edits and dashboard access changes are applied, and which roles can reach each analytics endpoint."
+---
+
+This page covers the people-facing half of the dashboard API: the user directory, the user detail sheet's mutations, dashboard access management, and the effective role scope for analytics endpoints. Metric definitions live in [Dashboard analytics internals](/engineering/domains/dashboard-analytics). The generic scope middleware and fleet manager rules live in [API authentication](/engineering/api/authentication) and [Fleet manager authorization](/engineering/fleets/dashboard-authorization).
+
+Paths are relative to `yelo-api/`.
+
+## Data touched
+
+| Store | Objects | Purpose |
+| --- | --- | --- |
+| Postgres | `Users` (`tags`, `is_test`, `is_banned`, `account_type`, `community_id`, `home_community_id`, `last_pinged_driver`, `location_updated_at`) | Directory rows, filters, edits |
+| Postgres | `DeviceTelemetry.updated_at` | Last active |
+| Postgres | `DriverApplications.is_active`, `FleetDrivers.is_active`, `Fleets.deleted_at` | Driver filter and derived fleet tags |
+| Postgres | `Schools`, `Communities` | Name columns and sorting |
+| Postgres function | `dashboard_user_tags(user_id, manual_tags)` | Manual tags plus derived `Fleet: ` tags |
+| Redis | `presence:{userId}` field `ts` | Fresher last seen on the detail sheet |
+| Redis | User profile cache | Invalidated after tag, test, move, and profile edits |
+| Clerk | `user.List`, `user.Get`, `user.UpdateMetadata` | Dashboard access users |
+| Quo | Messages by participant phone | Recent contact on the detail sheet |
+
+## Endpoints
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| GET | `/dashboard/users` | Admin (scope and group role gate) | `DashboardUsersHandler.GetUsers`: global directory with optional `community_id` |
+| GET | `/dashboard/{id}/users` | Admin, or intern for own community | `CommunityHandler.GetUsers`: community directory |
+| GET | `/dashboard/users/detail/{id}` | Admin | `GetUserDetail`: profile, 10 recent rides, 10 recent drives |
+| PUT | `/dashboard/users/detail/{id}/tags` | Admin | `SetUserTags`: replace manual tags |
+| PUT | `/dashboard/users/detail/{id}/test-status` | Admin | `SetUserTestStatus` |
+| POST | `/dashboard/users/detail/{id}/move-to-yelo` | Admin | `MoveUserToYelo` |
+| PUT | `/dashboard/users/detail/{id}/profile` | Admin (also checked in service) | `UpdateUserProfile` |
+| GET | `/dashboard/users/detail/{id}/messages` | Admin (also checked in service) | `ListUserMessages`: last 20 Quo messages |
+| GET | `/dashboard/users/detail/{id}/notifications` | Admin (users group role gate) | `GetUserNotifications`: limit default 50, max 100 |
+| GET | `/dashboard/access/users?role=` | Admin (scope and handler) | `AccessHandler.ListUsers` |
+| PATCH | `/dashboard/access/users/{clerk_user_id}` | Admin | `AccessHandler.UpdateUser` |
+| POST | `/dashboard/access/invite` | Admin | `AccessHandler.InviteUser` |
+| GET | `/dashboard/communities/{id}/locations/user-coords` | Admin (handler) | Up to 5000 user coordinates for the map layer |
+| GET | `/dashboard/communities/{id}/locations/ride-destinations` | Admin (handler) | Every ride destination in the community |
+
+## Directory query
+
+Both directory routes end in `sqlDashboardRepository.getDashboardUsers` (`internal/data/repository/dashboard.go`), which runs `CountDashboardUsers` and then `ListDashboardUsers` (`queries/analytics.sql`).
+
+### Parameters
+
+| Parameter | Rule |
+| --- | --- |
+| `limit` | Default 50 when 0. Must be 1 to 1000, else 400 (`validateUserListParams`). |
+| `offset` | Must be 0 or more, else 400. |
+| `sort` | Default `last_active`. Must be one of `first_name`, `last_name`, `ride_count`, `last_active`, `created_timestamp`, `school_name`, `community_name`, `graduation_year`, else 400. |
+| `order` | Default `desc`. Must be `asc` or `desc`, else 400. |
+| `type` | Empty, `all`, `student`, `community`, `driver`, `test`, or `banned`, else 400. Passed through context with `WithUserListFilter`. |
+| `tag` | Trimmed and passed with `WithUserTagFilter`. Empty means all tags. |
+| `search` | At most 256 bytes and 8 whitespace-separated words, else 400 (`ValidateUserListSearch`). |
+| `community_id` | Global route only. Invalid UUID returns 400. |
+
+Every sort ends with `u.id ASC` as a tiebreaker, so pagination is stable.
+
+### Search matching
+
+A row matches when any of these is true:
+
+1. `email ILIKE pattern` or `phone_number ILIKE pattern`, where `dashboardUserSearchPattern` collapses whitespace and escapes `\`, `%`, and `_` before wrapping in `%`.
+2. `u.id` equals the search when the trimmed search parses as a UUID.
+3. Every name pattern from `dashboardUserSearchPatterns` matches `concat_ws(' ', first_name, last_name)` with the case-insensitive `~*` operator.
+
+`dashboardUserSearchPatterns` lowercases and splits the search on whitespace. For each token:
+
+- Tokens shorter than 4 or longer than 24 runes become a quoted literal. The regex matches them anywhere in the name.
+- Other tokens become `(literal|\m(variants)\M)`. The variants are one-edit forms of the token, each anchored to word boundaries: each letter deleted, each letter replaced by any character, a wildcard inserted before each letter, each adjacent pair swapped, and a wildcard appended.
+
+Worked example: searching `jonh smtih` produces two patterns. `jonh` includes the variant `john` from swapping `n` and `h`. `smtih` includes `smith` from swapping `t` and `i`. Both must match, so John Smith is returned. Searching `jo` only matches names containing the literal `jo`.
+
+An empty search yields no name patterns. `NOT EXISTS` over an empty set is true, so every user matches.
+
+### Filters
+
+| `type` | Predicate |
+| --- | --- |
+| `student`, `community` | `account_type` equals the value |
+| `driver` | `DriverApplications.is_active = TRUE` exists |
+| `test` | `is_test = TRUE` |
+| `banned` | `is_banned = TRUE` |
+
+The tag filter unnests `dashboard_user_tags(u.id, u.tags)` and compares `lower(btrim(tag))` to `lower(tag_filter)`. Deleted users are always excluded. Test users are not excluded unless you filter on them.
+
+### Columns
+
+| Column | Definition |
+| --- | --- |
+| `last_active` | `GREATEST(last_pinged_driver, location_updated_at, DeviceTelemetry.updated_at, created_timestamp)`. Postgres `GREATEST` ignores nulls, so signup time is the floor. |
+| `ride_count` | Rides as rider with `status = 'complete'` and no `cancel_phase` |
+| `is_driver` | Active driver application exists |
+| `tags` | `dashboard_user_tags(u.id, u.tags)` |
+| `school_name`, `community_name` | Joined names, empty string when missing |
+
+`available_tags` comes from `ListDashboardUserTags` only when `offset` is 0. It returns one spelling per case-insensitive tag (`min(btrim(tag))`), limited to the community when one is set, sorted case-insensitively.
+
+### Derived fleet tags
+
+`dashboard_user_tags` (migration `000344_scope_fleet_tag_activation`) returns the distinct, sorted union of:
+
+- Manual tags from `Users.tags`.
+- `Fleet: ` plus the fleet name for each active `FleetDrivers` row in a non-deleted fleet, but only when the user's driver application is active.
+
+A manual tag that starts with `Fleet: ` survives only if it equals a tag the user currently qualifies for. `SetUserTags` strips every `Fleet: ` tag before writing (`manualDashboardTags`), so derived tags cannot be persisted from the dashboard. Driver lead tag updates use the same stripping.
+
+## User detail and edits
+
+`GetUserDetail` loads the detail row, then `GetRecentRides` and `GetRecentDrives` with limit 10 each. Ride history failures are logged and replaced with empty lists. `resolveLastSeen` reads `presence:{userId}.ts` and uses it when it is later than the stored value, so an offline user keeps their durable last seen.
+
+| Edit | Behavior |
+| --- | --- |
+| Tags | `SetDashboardUserTags` replaces `Users.tags` for a non-deleted user. 404 when no row changes. The response returns the stripped manual tags, not the derived list. |
+| Test status | `SetDashboardUserTestStatus` sets `is_test`. Test users are excluded from KPIs and receive free ride pricing. |
+| Move to Yelo | `MoveUserToYeloCommunity` sets `home_community_id` to the hardcoded Yelo community `87794dc9-7ef8-438c-b2e8-ba6fd77e66aa`. `community_id` is unchanged. The handler always answers `home_community_name: "Yelo"`. |
+| Profile | See below |
+
+All four invalidate the user profile cache on a best-effort basis.
+
+### Profile update
+
+<Steps>
+  <Step title="Validate">
+    `UpdateUserProfile` requires the admin role (`fleetServiceAdmin`). It trims names and normalizes the phone with `phone.Normalize`. It rejects an empty first name, names over 100 characters, an invalid phone, or a nil community or home community with **Enter a valid name, phone number, and communities**.
+  </Step>
+  <Step title="Lock">
+    The repository opens a transaction and runs `LOCK TABLE "Users" IN SHARE ROW EXCLUSIVE MODE` to serialize with signup phone writes, because historical phone columns are not unique.
+  </Step>
+  <Step title="Conditional update">
+    `UpdateDashboardUserProfile` writes name, phone, community, and home community only if no other non-deleted user has the same digits-only phone and both communities exist and are not archived.
+  </Step>
+  <Step title="Map the result">
+    A unique violation (`23505`) returns **This phone number is already assigned to an account or lead**. Zero updated rows returns **User or community is unavailable, or the phone number belongs to another account**.
+  </Step>
+</Steps>
+
+`ListUserMessages` returns an empty list when no Quo message provider is wired or the phone has no valid E.164 form. Otherwise it returns the last 20 messages for that participant.
+
+## Dashboard access management
+
+Access users are Clerk users, not database rows.
+
+| Operation | Behavior |
+| --- | --- |
+| List | `ListAccessUsers` pages through **every** Clerk user 100 at a time and keeps those whose `public_metadata.role` equals `role`. `role` must be `intern`, `fleet`, or `admin`. |
+| Update | `UpdateAccessUser` loads metadata, optionally sets `role` (admin, intern, or fleet) and `onboarded = true`, then applies `community_id` only if the resulting role is intern, and `fleet_assignments` only if it is fleet. |
+| Fleet assignments | `applyFleetAssignments` writes the array and sets legacy `fleet_id` and `community_id` to null. |
+| Read shape | `clerkUserToAccessUser` reports `community_id` for interns and `fleet_assignments` for fleet users, falling back to legacy `fleet_id` and `community_id`. |
+
+Invitations and fleet assignment merging are covered in [Fleet manager authorization](/engineering/fleets/dashboard-authorization). Changes take effect only after the target's Clerk session token refreshes.
+
+## Effective scope for analytics endpoints
+
+`dashboardScopeAllows` (`internal/server/http/dashboard_scope.go`) runs before every handler and answers 401 when it refuses. Handler checks run after it. The combination produces this matrix.
+
+| Endpoint | admin | intern | fleet |
+| --- | --- | --- | --- |
+| `/dashboard/{id}/kpis`, `/demographics`, `/search-insights`, `/search-map-data`, `/users` (GET) | Any community | Own community | 401 |
+| `/dashboard/community/{id}/cancellations...`, `/uncompletes...` (GET) | Any community | Own community | 401 |
+| `/dashboard/fleet/{fleet_id}/kpis`, `/histogram` (GET) | Any fleet | 401 | Assigned fleet |
+| `GET /dashboard/rides` | Any community, or `all=true` | Own community | Assigned fleets in a resolved community |
+| `/dashboard/rides/{id}/events`, `/route` | Yes | 401 | 401 |
+| `/dashboard/kpi/*`, `/supply-demand/*`, `/driver-ops`, `/presence/*`, `/telemetry/*` | Yes | 401 | 401 |
+| `/dashboard/users/*`, `/dashboard/notifications/*`, `/dashboard/access/*` | Yes | 401 | 401 |
+| `/dashboard/communities/{id}/locations/user-coords`, `/ride-destinations` | Yes | 403 from handler (own community passes scope) | 401 |
+
+For the intern `community` branch, the scope check only inspects the fourth path segment. Any GET under `/dashboard/community/{own}/cancellations` or `/uncompletes`, including `/kpis` and `/breakdowns`, passes.
+
+### Handler-level community resolution
+
+Several handlers resolve scope themselves as defense in depth, even though the middleware already blocks non-admins.
+
+| Helper | Admin | Non-admin |
+| --- | --- | --- |
+| `CommunityHandler.resolveCommunityID` | Parses the path ID | `ResolveDashboardCommunity(pathID)` |
+| `SupplyDemandHandler.resolveCommunityScope` | Nil (all markets) unless `community_id` is given | Claim `community_id`, 403 when empty |
+| `SupplyDemandHandler.resolveCommunityID` | Path ID required | Claim `community_id`; the path ID is ignored |
+| `PresenceDashboardHandler.resolveCommunityScope` | `AllCommunities()` unless `community_id` is given | `OneCommunity(claim)` |
+| `LocationHandler.resolveCommunityID` | Path ID required | Claim `community_id`; the path ID is ignored |
+| `DashboardRidesHandler.resolveCommunityID` | `community_id` query required unless `all=true` | `ResolveDashboardCommunity(query)` |
+
+## Map analytics layers
+
+| Layer | Query | Rules |
+| --- | --- | --- |
+| User coordinates | `ListCommunityUserCoordinates` (`queries/places.sql`) | `Users.community_id` match, not deleted, non-null and non-zero latitude and longitude, `LIMIT 5000` with no ordering |
+| Ride destinations | `ListCommunityRideDestinations` | All rides in the community with valid, non-origin destination coordinates. `confirmed` is `status != 'requested'`. No time bound and no limit. |
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Global directory route | `internal/server/http/dashboard/users/handler.go`, `routes.go` | `GetUsers`, `getUsersGlobal`, `RegisterRoutes` |
+| Community directory route | `internal/server/http/community/community_handler.go` | `CommunityHandler.GetUsers` |
+| Parameter validation | `internal/service/dashboard/dashboard.go`, `internal/models/user_list_filter.go` | `validateUserListParams`, `ValidateUserListSearch`, `IsValidUserListFilter` |
+| Query assembly | `internal/data/repository/dashboard.go` | `getDashboardUsers`, `safeUserSort`, `dashboardUserFilter` |
+| Fuzzy search | `internal/data/repository/dashboard_user_search.go` | `dashboardUserSearchPatterns`, `dashboardUserSearchPattern` |
+| Directory SQL | `internal/data/repository/queries/analytics.sql` | `CountDashboardUsers`, `ListDashboardUsers`, `ListDashboardUserTags` |
+| Derived tags | `migrations/000344_scope_fleet_tag_activation.up.sql` | `dashboard_user_tags` |
+| Tag stripping, profile, messages | `internal/service/dashboard/profile.go` | `manualDashboardTags`, `UpdateUserProfile`, `ListUserMessages` |
+| Profile write | `internal/data/repository/dashboard_profile.go`, `queries/user_profile.sql` | `UpdateUserProfile`, `UpdateDashboardUserProfile`, `LockDashboardProfileWrites` |
+| Access users | `internal/service/dashboard/dashboard.go`, `internal/models/access.go` | `ListAccessUsers`, `UpdateAccessUser`, `UpdateAccessUserRequest` |
+| Scope middleware | `internal/server/http/dashboard_scope.go` | `dashboardScopeAllows`, `internDashboardScopeAllows`, `fleetDashboardScopeAllows` |
+| Map layers | `internal/server/http/dashboard/location/location_handler.go` | `ListUserCoords`, `ListRideDestinations` |
+
+## Gotchas and edge cases
+
+- **`ride_count` misses rides awaiting a rating.** It counts `status = 'complete'` only, while every KPI counts `complete` and `pending_rider_rating`.
+- **The directory counts tags per row.** When `tag` is set, `CountDashboardUsers` and `ListDashboardUsers` call `dashboard_user_tags` for every candidate user, and each call runs two `FleetDrivers` subqueries.
+- **Sorting by `ride_count` runs a correlated count twice per row.** The select list and the `ORDER BY` both embed the rides subquery.
+- **Invalid parameters fail, they don't fall back.** Unlike dashboard rides, a bad `limit`, `sort`, or `order` on the directory returns 400.
+- **Role switches leave stale metadata.** Changing an intern to fleet without `fleet_assignments` keeps the old `community_id`. Changing a fleet user to intern keeps `fleet_assignments`.
+- **Listing access users scans Clerk.** Each `GET /dashboard/access/users` pages through every Clerk account, including app users if they exist in the same instance.
+- **Profile edits lock the whole `Users` table.** `SHARE ROW EXCLUSIVE` blocks concurrent row writes to `Users` until the edit commits.
+- **Moving to Yelo only changes the home community.** The active `community_id` stays the same, so community-scoped analytics keep counting the user.
+- **User coordinates are an arbitrary 5000.** `LIMIT 5000` has no `ORDER BY`, so large communities return an unstable subset.
+- **Path IDs are ignored for some non-admin calls.** Supply and demand, location, and presence handlers use the claim community for non-admins, so a mismatched path ID silently returns the caller's own community rather than an error.

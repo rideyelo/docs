@@ -1,0 +1,168 @@
+---
+title: "Payouts and earnings internals"
+description: "How the /earnings API reads a driver's connected account, computes instant payout fees and eligibility, deduplicates cash-outs, changes payout schedules, enriches the activity feed with rides, and backfills Stripe fees onto rides."
+---
+
+The driver earnings hub reads live data from the driver's Stripe Express account. Yelo stores almost none of it. This page covers how each endpoint maps Stripe data, the fee and idempotency rules for instant payouts, and the background job that copies Stripe fees onto rides. The endpoint list is in [Tips and earnings](/concepts/tips-and-earnings#driver-earnings).
+
+## Account resolution
+
+Every earnings method starts with `Service.getMerchantID`:
+
+1. If the dev override is set, return it. `earningsOverrideForEnv` only passes `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` through when `ENVIRONMENT` is `dev`, `development`, `local`, or `test`. The service logs `DEV OVERRIDE ACTIVE` at startup when it's in effect.
+2. Otherwise read `Users.stripe_merchant_id`. Blank returns an input error: "Earnings unavailable. Finish setting up your driver payouts before viewing earnings."
+
+<Note>
+Only the driver's **own** account is read. Rides paid to a fleet account with custom payouts never appear in balances or payouts, but they do count in the weekly headline, which comes from the database. See [Weekly headline](#weekly-headline).
+</Note>
+
+## Balance and external account
+
+| Endpoint | Stripe call | Mapping |
+| --- | --- | --- |
+| `GET /earnings/balance` | `Balance.Get` | `available`, `pending`, `instant_available` take the **first** entry of each Stripe array (`primaryAmount`). An empty array reads as 0 `usd` |
+| `GET /earnings/external-account` | `Accounts.GetByID` | `pickDefaultExternalAccount` returns the first entry with `default_for_currency`, else the first bank or card. None returns 404 |
+
+`InstantEligible` on the external account is true when Stripe's `available_payout_methods` includes `instant`, for both bank accounts and debit cards.
+
+## Instant payouts
+
+### Quote
+
+`GET /earnings/payouts/instant-quote` (`GetInstantQuote`) makes two Stripe calls, balance and account, then:
+
+```go
+fee := int64(math.Ceil(float64(amount) * 0.01)) // instantFeePct
+fee = max(fee, 50)                               // instantFeeMinCents
+fee = min(fee, amount)
+net := amount - fee
+```
+
+These constants mirror Stripe's standard Instant Payout pricing. They're display-only: Yelo doesn't charge the fee, Stripe deducts it. If the platform's negotiated pricing changes, update `instantFeePct` and `instantFeeMinCents` in `internal/service/earnings/earnings.go`.
+
+Eligibility is evaluated in this order (`applyInstantEligibility`):
+
+| Condition | `ineligible_reason` |
+| --- | --- |
+| No external account | `no external account on file` |
+| Account doesn't support instant | `your bank doesn't support Instant Payouts` |
+| Instant balance at most 0 | `no instantly-available balance` |
+| Instant balance at most $0.50 | `balance is below the instant cash-out minimum` |
+| Otherwise | eligible |
+
+### Cash out
+
+`POST /earnings/payouts/instant` with body `amount` in cents (`gte=0`). `createPayout`:
+
+1. Rejects a negative amount.
+2. Reads the balance and picks `instant_available`.
+3. Returns "Nothing to cash out" when the bucket is at most 0.
+4. Uses the full bucket when `amount` is 0 or exceeds it.
+5. Calls `Payouts.New` with `method=instant`, the explicit amount, the bucket's currency, and description `Yelo instant cash-out`.
+
+The server doesn't re-check the quote's eligibility rules. An ineligible request goes to Stripe, which returns its own error.
+
+### Idempotency
+
+`payoutIdempotencyKey` builds:
+
+```text
+payout:{connectedAccountID}:{method}:{amountCents}:{unixMinuteBucket}
+```
+
+The bucket is `time.Now().UTC().Truncate(time.Minute)`. Two identical taps in the same UTC minute share a key, and Stripe returns the first payout. Taps that straddle a minute boundary get different keys, but the second one usually fails because the instant balance is already spent.
+
+Because the amount is resolved from the live balance before the key is built, a "cash out everything" retry after new funds arrive uses a different amount and a different key.
+
+## Payout schedule
+
+`GET /earnings/payout-schedule` maps `settings.payouts.schedule`. A missing schedule reads as `daily`. `next_payout_at` is Yelo's estimate from `computeNextPayoutAt`, not Stripe's:
+
+| Interval | Estimate |
+| --- | --- |
+| `daily` | Next weekday after today |
+| `weekly` | Next occurrence of the anchor, never today. Unknown anchors default to Friday |
+| `monthly` | Next occurrence of `monthly_anchor`, default day 1 |
+| `manual` | None |
+
+`PUT /earnings/payout-schedule` validates `interval` as `daily`, `weekly`, `monthly`, or `manual`, and `weekly_anchor` as a weekday name. `weekly` with no anchor sends `friday`. The call is `Accounts.Update` on the connected account. It fires an `account.updated` webhook, which re-runs the status mapping on [Connect accounts](/engineering/payments/connect-accounts).
+
+The estimate ignores `delay_days`, holidays, and the time of day Stripe runs payouts.
+
+## Payouts list
+
+`GET /earnings/payouts` calls `Payouts.List` with `limit` (default 25, max 100, `normalizeLimit`) and `starting_after = cursor`. `next_cursor` is the last payout's ID when `has_more`. Each payout maps status, method, failure code and message, arrival date, and the destination bank name or card brand with last 4.
+
+## Activity feed
+
+`GET /earnings/activity` accepts `from`, `to`, `limit`, and `cursor`. It calls `BalanceTransactions.List` with `expand[]=data.source`, so each charge carries its PaymentIntent.
+
+<Steps>
+  <Step title="Classify">
+    `classifyTransactionType` maps `charge` and `payment` to charge or payment, `payout`, `payout_cancel`, and `payout_failure` to payout, three refund types to refund, `adjustment` to adjustment, `application_fee` and `stripe_fee` to fee, and everything else to other.
+  </Step>
+  <Step title="Group">
+    `buildActivityPage` groups rows by UTC date (`2006-01-02`) and sums `net` per day. It also computes a page-local week total and ride count.
+  </Step>
+  <Step title="Enrich">
+    `enrichActivityWithRides` collects PaymentIntent IDs and runs `GetRideEarningsByPaymentIntents`, matching `Rides.payment_intent_id`. Matched rows get `ride_id`, `rider_name`, `tip_amount` in cents, and `gross` from `driver_payout`. Lookup failures leave bare rows.
+  </Step>
+  <Step title="Replace the headline">
+    On the first page only (`cursor` empty), `weeklySummary` replaces the page-local totals.
+  </Step>
+</Steps>
+
+### Weekly headline
+
+`GetDriverWeekEarnings` sums `driver_payout` and counts rows where:
+
+- `driver_id` is the driver,
+- `status` is `complete` or `pending_rider_rating`,
+- `complete_time` is on or after Monday 00:00 UTC, and
+- `driver_payout` is not null.
+
+Canceled rides have `status = complete` too. A cancellation fee ride counts once its webhook sets `driver_payout`. A $0 cancellation leaves `driver_payout` null and doesn't count.
+
+## Payout notifications
+
+`payout.paid`, `payout.failed`, and `payout.canceled` on a connected account send the driver a push through `NotifyPayout`, deduplicated by `{eventType}:{eventID}`. See [Stripe webhooks](/engineering/payments/webhooks).
+
+## Stripe fee backfill
+
+Drive history shows a per-ride Stripe fee from `Rides.stripe_fee_cents`. Two River jobs fill it from balance transactions:
+
+| Job | Schedule | Queue | Work |
+| --- | --- | --- | --- |
+| `stripe_drive_fee_scan` | Every 10 minutes, `RunOnStart`, unique by 9-minute period | `stripe`, 2 workers | `GetDriversWithMissingStripeFees`: up to 100 driver and merchant pairs with rides that have a `payment_intent_id`, no fee, and a due `stripe_fee_repair_after`. Enqueues one repair job per pair |
+| `stripe_drive_fee_repair` | On demand | `stripe` | Pages balance transactions from `oldest missing request_time - 8 days`, 100 per page, up to 10 pages per run |
+
+Each repair page runs `PersistStripeFees`, which maps `source.charge.payment_intent` to `fee` and updates matching rides. Then:
+
+- No rides left missing: done.
+- Stripe has no more pages: `DeferMissingStripeFeeRepair` sets `stripe_fee_repair_after = now + 24h` for the rest.
+- 10 pages read and still missing: enqueue a continuation with the cursor, 1 second later, up to 25 attempts.
+
+Jobs are unique by merchant, driver, and cursor across active states (`activeJobUniqueOpts`).
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Earnings service | `yelo-api/internal/service/earnings/earnings.go` |
+| Mapping, fee, eligibility, schedule estimate | `yelo-api/internal/service/earnings/mappers.go` |
+| Payout webhook | `yelo-api/internal/service/earnings/webhook.go` |
+| Routes and request validation | `yelo-api/internal/server/http/earnings/` |
+| Stripe balance and payout calls | `yelo-api/internal/data/stripe/payout.go` (`CreatePayout`, `payoutIdempotencyKey`, `ListBalanceTransactions`, `FeeByPaymentIntent`) |
+| Dev override gate | `yelo-api/internal/service/service.go` (`earningsOverrideForEnv`) |
+| Fee backfill jobs | `yelo-api/internal/service/user/drive_fee_jobs.go`, `yelo-api/internal/data/repository/queries/ride_history.sql` |
+| Mobile hub | `yelo-frontend/app/(app)/driver-earnings/`, `yelo-frontend/hooks/driver-earnings/` (`useInstantCashOut`, `useUpdatePayoutSchedule`) |
+
+## Gotchas and edge cases
+
+- **Headline versus balance.** The weekly headline counts every ride the driver drove, including rides paid to a fleet account. The balance and activity only show the driver's own account.
+- **Overwritten tips.** The headline sums `driver_payout`, which the fare webhook can reset after an over-buffer tip. See [Ride tip charging](/engineering/payments/ride-tips#races).
+- **Dedicated tip charges.** Tip PaymentIntents aren't in `payment_intent_id`, so their activity rows aren't enriched and their fees never land in `stripe_fee_cents`.
+- **Never-resolving rides.** Rides whose hold was canceled have a `payment_intent_id` but no charge, so the fee backfill can't resolve them. They're deferred and rescanned every 24 hours indefinitely.
+- **Multi-currency.** `primaryAmount` takes the first currency entry. A connected account holding a second currency would show only one.
+- **Cached errors.** Stripe replays the first response for a reused idempotency key, including an error. A failed cash-out retried within the same minute returns the same failure.
+- **Fleet accounts.** There's no earnings API for fleet accounts. Fleet admins use the Express dashboard login link from `GET .../stripe/status`.

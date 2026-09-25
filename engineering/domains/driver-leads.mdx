@@ -1,0 +1,231 @@
+---
+title: "Driver leads internals"
+description: "How the API creates, deduplicates, links, stages, scopes, and activates driver leads, and how it reads Quo messages for the lead sheet."
+---
+
+Driver leads are the recruiting CRM behind the dashboard **Pipeline** tab. A lead is one row in `"DriverLeads"`, keyed by a normalized phone number. Leads come from three places: dashboard imports, database triggers that fire when a user starts a driver application, and a one-time historical backfill in migration `000306_driver_leads_crm`.
+
+The pipeline stage is never stored. The API derives it on every read from the linked user, their `"DriverApplications"` row, their latest vehicle, and their completed rides.
+
+For the operator workflow, see [Driver leads pipeline](/dashboard/driver-leads). For column definitions, see [Fleets and vehicles schema](/reference/database/fleets-and-vehicles). For outbound CRM sync, see [Contact sync internals](/engineering/domains/contact-sync).
+
+## Data touched
+
+| Store | Object | Use |
+| --- | --- | --- |
+| Postgres | `"DriverLeads"` | One row per normalized phone. Unique index `driver_leads_phone_digits_unique` on `normalize_driver_lead_phone(phone_number)`. `user_id` is `UNIQUE` |
+| Postgres | `"DriverLeadNotes"` | Append-only activity log. `CHECK (length(trim(body)) > 0)`, `ON DELETE CASCADE` from the lead |
+| Postgres | `"Users"` | Linked account, name, photo, community, `tags`, `quo_contact_id` |
+| Postgres | `"DriverApplications"`, `"Vehicles"`, `"Rides"`, `"EducationVerifications"`, `"FleetDrivers"`, `"Fleets"` | Read-only inputs to stage and card fields |
+| Postgres functions | `normalize_driver_lead_phone`, `dashboard_user_tags`, `link_driver_lead_to_user`, `create_driver_lead_for_application`, `create_driver_lead_for_vehicle_application` | Dedup key, tag merge, and triggers |
+| Quo API | `GET /v1/phone-numbers`, `GET /v1/messages` | Recent texts on the lead sheet, through the dashboard Quo client |
+| Notifications | `CodeDriverApplicationApproved` | Push after an admin approves an application step |
+
+## Endpoints
+
+Every lead route is mounted at `/dashboard/leads/drivers` in `internal/server/http/router.go`. The group runs Clerk auth, the dashboard scope middleware, and `getRequireClerkRoleMiddleware([]string{"admin", "intern"})`. Handlers then apply `requireAdmin` or `leadCommunityScope`.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| GET | `/dashboard/leads/drivers` | Admin or intern | `Handler.List`. Admins may pass `community_id`. Interns are forced to their Clerk `CommunityID` |
+| POST | `/dashboard/leads/drivers` | Admin | `Handler.Create`. Upserts one lead |
+| POST | `/dashboard/leads/drivers/import` | Admin | `Handler.Import`. 1 to 100 rows, per-row results |
+| GET | `/dashboard/leads/drivers/{id}` | Admin, or intern in the lead's community | `Handler.Detail`. Interns get `user: null` |
+| GET | `/dashboard/leads/drivers/{id}/messages` | Admin, or intern in the lead's community | `Handler.Messages`. Up to 25 Quo messages plus `phone_invalid` |
+| POST | `/dashboard/leads/drivers/{id}/notes` | Admin, or intern in the lead's community | `Handler.AddNote` |
+| PATCH | `/dashboard/leads/drivers/{id}/referrer` | Admin | `Handler.UpdateReferrer`. Overwrites both referrer columns |
+| PUT | `/dashboard/leads/drivers/{id}/tags` | Admin | `Handler.UpdateTags`. Replaces lead and user tags |
+| POST | `/dashboard/leads/drivers/{id}/disqualify` | Admin | `Handler.Disqualify`. Requires a non-blank `reason` |
+| POST | `/dashboard/leads/drivers/{id}/activate` | Admin | `Handler.Activate`. Manual release after background review |
+| GET | `/dashboard/users/detail/{id}/messages` | Admin | `DashboardService.ListUserMessages`. Same Quo lookup for any user, 20 messages |
+| POST | `/dashboard/drivers/review` | Admin | `ReviewDriverApplicationStep`. Approving a step sends the approval push described below |
+
+The dashboard scope middleware in `internal/server/http/dashboard_scope.go` only lets interns through when the path is `/dashboard/leads/drivers...` and their `CommunityID` is a valid, non-nil UUID. Fleet managers get `401` before the lead handlers run.
+
+## Business rules
+
+### Phone normalization and the dedup key
+
+Two different normalizers run on every import.
+
+<Steps>
+  <Step title="Character allowlist">
+    `normalizeDriverLeadImport` rejects any phone character outside `0123456789+().-`, space, tab, CR, or LF. Letters, `x` extensions, and commas fail with **phone number must not contain extensions, letters, or multiple numbers**.
+  </Step>
+  <Step title="E.164 normalization">
+    `phone.Normalize` parses the number with `phonenumbers` and default region `US`. Numbers that start with `555` (10 digits) or `1555` (11 digits) are accepted without parsing. Failure returns **invalid phone number; use a US number or include the international country code**.
+  </Step>
+  <Step title="Database dedup key">
+    The unique index uses `normalize_driver_lead_phone`. It strips every non-digit, then drops a leading `1` from 11-digit results. Everything else is kept as-is.
+  </Step>
+</Steps>
+
+Worked example: `+1 (555) 010-0001`, `555.010.0001`, and `15550100001` all reduce to `5550100001`. The second and third imports hit `ON CONFLICT` and merge into the first lead. A UK number such as `+44 20 7946 0000` reduces to `442079460000` and stays distinct.
+
+### Import normalization
+
+`normalizeDriverLeadImport` in `internal/service/dashboard/driver_lead_import.go` also enforces:
+
+| Field | Rule |
+| --- | --- |
+| `source` | Trimmed. Required. At most 200 runes |
+| `first_name`, `last_name`, `community_name`, `referrer_name` | Trimmed. At most 200 runes. Blank becomes `null` |
+| `community_name` | If it parses as a UUID and `community_id` is empty, it moves to `community_id` |
+| `last_correspondence_at` | Rejected when more than 5 minutes in the future |
+| `tags` | At most 50. Each trimmed and at most 80 runes. Blanks dropped. Exact duplicates removed (case-sensitive) |
+
+`resolveLeadCommunity` then looks up `"Communities"` by ID and/or `lower(trim(name))` with `LIMIT 2`. Zero or two matches fail with **community must match exactly one existing community; use its ID for ambiguous names**.
+
+### Upsert merge rules
+
+`sqlDashboardRepository.UpsertDriverLead` inserts one row and resolves conflicts on the normalized phone. It first looks for a non-deleted user with the same normalized phone, newest `created_timestamp` first.
+
+| Column | On conflict |
+| --- | --- |
+| `user_id` | Replaced by the matched user if one exists, otherwise kept |
+| `community_id` | Existing value wins. Insert uses the matched user's community before the imported one |
+| `first_name`, `last_name` | Existing non-empty value wins |
+| `referrer_user_id`, `referrer_name` | Only written when the lead has no referrer of either kind |
+| `tags` | Set union with the imported tags |
+| `sources` | Set union of existing `sources`, existing `source`, and the imported `source`. `source` itself never changes |
+| `last_correspondence_at` | `GREATEST` of existing and imported |
+| `disqualified_at` | Untouched. A re-import never requalifies a lead |
+
+The same statement copies the lead's merged tags into the linked `"Users".tags` as a set union.
+
+### Import endpoint
+
+`Handler.Import` calls `CreateDriverLead` once per row. Each row commits on its own, so a failed row never rolls back earlier rows. Each result carries `row` (1-based), `status` (`saved` or `failed`), `lead_id`, and `message`. Input errors return their own message. Any other error returns **Could not save this row. Retry or check the supplied community/referrer.**
+
+### Automatic lead creation and linking
+
+Migration `000306_driver_leads_crm.up.sql` installs three triggers.
+
+| Trigger | Fires on | Effect |
+| --- | --- | --- |
+| `driver_applications_create_lead` | `"DriverApplications"` insert or update of `profile_picture_status`, `profile_picture_submission_time`, `license_status`, `license_submission_time`, `is_active` | Upserts a lead with `source = 'driver_app'` once any of those is non-default. Conflict sets `user_id` and fills an empty `community_id` |
+| `vehicles_create_driver_lead` | `"Vehicles"` insert or update of `application_status`, `application_submission_time` | Same upsert once the vehicle leaves `not_applied` or has a submission time |
+| `users_link_driver_lead` | `"Users"` insert or update of `phone_number` | Links the lead whose normalized phone matches, and merges leads when a user's phone changes |
+
+When a linked user changes phone to a number that already has another lead, `link_driver_lead_to_user` moves notes to the target lead, merges names, sources, referrer, tags, and `last_correspondence_at`, then deletes the user's old lead.
+
+The historical backfill only imported inactive, non-test applicants with no completed ride and a license or vehicle submission in the last year. It tagged them `Historical` on both the lead and the user.
+
+### Stage derivation
+
+`driverLeadSelect` in `internal/data/repository/driver_leads.go` computes `stage` with the first matching branch:
+
+| Order | Condition | Stage |
+| --- | --- | --- |
+| 1 | `disqualified_at` is set | `disqualified` |
+| 2 | No linked, non-deleted user | `new` |
+| 3 | `is_active` and a `complete` ride as driver with `cancel_phase IS NULL`, and a referrer user or name | `pending_referral_payout` |
+| 4 | `is_active` | `zero_drives` |
+| 5 | Profile picture, license, Stripe, or latest vehicle is `not_applied`, `failed`, or `restricted` | `application` |
+| 6 | Any of those four is `pending` | `pending_approval` |
+| 7 | Otherwise | `pending_background_check` |
+
+Worked example: a linked user has profile picture `complete`, license `pending`, Stripe `complete`, vehicle `complete`, and is inactive. Branch 5 misses and branch 6 matches, so the lead is `pending_approval`. After an admin approves the license, branch 7 matches and the lead moves to `pending_background_check`.
+
+The latest vehicle is chosen by `application_submission_time DESC NULLS LAST, id DESC`. The dashboard maps `pending_referral_payout` to the **Referral payouts** tab in `LeadsPage.tsx`, not to a board column.
+
+### Other derived fields
+
+- `first_name` and `last_name` prefer the linked user's non-empty values.
+- `community_id` is `COALESCE(u.community_id, dl.community_id)`. List filtering uses the same expression.
+- `tags` is the union of lead tags and `dashboard_user_tags(u.id, u.tags)`. `Fleet: <name>` tags only appear for activated drivers. See [Automatic fleet tags](/dashboard/user-directory#automatic-fleet-tags).
+- `referrer_name` falls back to the referrer user's full name.
+- `quo_contact_id` prefers `"Users".quo_contact_id`.
+- `student_verified_at` is `max(verified_at)` from `"EducationVerifications"`.
+- `fleet_name` joins active, non-deleted fleet memberships with `, `. `fleet_joined_at` is `DriverApplications.payout_fleet_joined_at`.
+- List order is `last_correspondence_at ASC NULLS FIRST, created_at ASC`, so never-contacted leads come first.
+
+### Notes, referrer, tags, and disqualification
+
+- `AddDriverLeadNote` rejects a blank body and stores the trimmed body with the caller's Clerk `UserID` as `author_id`.
+- `UpdateDriverLeadReferrer` writes both columns exactly as sent. Sending both as `null` clears attribution.
+- `UpdateDriverLeadTags` strips any tag starting with `Fleet: ` through `manualDashboardTags`. It then sets `"DriverLeads".tags` and the linked `"Users".tags` to the same array in one statement.
+- `DisqualifyDriverLead` runs in one transaction. It sets `disqualified_at = now()` and the trimmed reason, then inserts the note `Lead disqualified: <reason>`.
+
+### Manual activation
+
+`ActivateDriverLead` in `internal/service/dashboard/driver_lead_activation.go` is the only path that releases a personal-payout driver after background review. Approving application steps never activates them.
+
+<Steps>
+  <Step title="Check the lead">
+    The lead must not be disqualified and must have a linked `user_id`.
+  </Step>
+  <Step title="Check the application">
+    `DriverApplication.IsComplete()` must be true. It requires profile picture, vehicle, and license complete, and `EffectivePayoutStatus()` complete. The payout status comes from the payout fleet when `payout_fleet_id` is set, otherwise from Stripe.
+  </Step>
+  <Step title="Reconcile">
+    It calls `DriverService.ReconcileDriverActivation`, wired through `SetDriverLeadActivator` in `internal/service/service.go`. That applies the normal activation rules and fleet assignment. See [Active fleet, membership, and payout routing](/engineering/fleets/membership-and-payout-routing).
+  </Step>
+  <Step title="Verify">
+    It re-reads the application. If `is_active` is still false, it fails with **driver could not be activated; check application and payout requirements**. It never reports success for a no-op.
+  </Step>
+  <Step title="Log">
+    If the driver was inactive before the call, it adds the note **Driver activated by admin after manual background review.**
+  </Step>
+</Steps>
+
+Calling activate on an already active driver succeeds and adds no note.
+
+### Approval push notifications
+
+`ReviewDriverApplicationStep` sends `sendDriverApplicationApprovedNotification` only when a step moves to `complete` from a different status. Stripe can't be reviewed manually and returns **Stripe payout status is managed automatically by Stripe**.
+
+| Step | Label in the push |
+| --- | --- |
+| Profile picture | `photo` |
+| License | `license` |
+| Vehicle | `vehicle` |
+| Stripe | `payout info` |
+
+The event key is `driver_approved_<userID>_<step>_<reviewTimeUnix>`. The review time comes from the step's `ReviewTime`. If it's missing, the push is skipped. Failures are logged and never fail the approval. The template lives under `CodeDriverApplicationApproved`. See [Notification catalog](/engineering/notifications/catalog).
+
+### Quo messages on the lead sheet
+
+`GetDriverLeadMessages` runs these checks in order:
+
+1. `quo.ParticipantE164` converts the stored phone. Ten digits get a `1` prefix. Fewer than 2 or more than 15 digits, or a leading `0`, sets `phone_invalid: true` and returns no messages with HTTP 200.
+2. If no message provider is wired, it returns an empty list.
+3. Otherwise `QuoService.ListMessagesForParticipant` runs with a 20-second timeout and limit 25.
+
+`Client.ListMessagesForParticipant` clamps the limit to 1 to 100. It lists workspace numbers from `GET /v1/phone-numbers`, cached for 5 minutes per process. It then calls `GET /v1/messages` once per workspace number with `maxResults` set to the limit. It sorts all results by `createdAt` ascending and keeps the newest `limit` messages.
+
+Worked example: with 3 workspace numbers and limit 25, the API makes 1 phone-number call (if the cache is cold) plus 3 message calls. It can fetch up to 75 messages, then returns the newest 25.
+
+The dashboard uses `QUO_DASHBOARD_API_KEY` when it's set and differs from `QUO_API_KEY`. That client gets its own `PostgresGate` keyed by the SHA-256 of the dashboard key, paced by `QUO_DASHBOARD_REQUEST_INTERVAL_MS` (default 200 ms, minimum 125 ms). `getJSON` retries a read once when Quo returns 429 with a `Retry-After` of 2 seconds or less.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Model and stages | `internal/models/driver_lead.go` | `DriverLead`, `DriverLeadStage`, `CreateDriverLead` |
+| Routes | `internal/server/http/dashboard/leads/routes.go` | `RegisterRoutes` |
+| Handlers and scope | `internal/server/http/dashboard/leads/handler.go` | `requireAdmin`, `leadCommunityScope`, `scopedDetail` |
+| Bulk import | `internal/server/http/dashboard/leads/import.go` | `Handler.Import` |
+| Import validation | `internal/service/dashboard/driver_lead_import.go` | `normalizeDriverLeadImport`, `normalizeLeadTags` |
+| Service methods | `internal/service/dashboard/dashboard.go` | `CreateDriverLead`, `GetDriverLeadMessages`, `UpdateDriverLeadTags` |
+| Activation | `internal/service/dashboard/driver_lead_activation.go` | `ActivateDriverLead` |
+| Approval push | `internal/service/dashboard/driver_application_notification.go` | `sendDriverApplicationApprovedNotification` |
+| SQL | `internal/data/repository/driver_leads.go` | `driverLeadSelect`, `UpsertDriverLead`, `resolveLeadCommunity` |
+| Triggers and backfill | `migrations/000306_driver_leads_crm.up.sql` | `link_driver_lead_to_user`, `create_driver_lead_for_application` |
+| Fleet tag function | `migrations/000344_scope_fleet_tag_activation.up.sql` | `dashboard_user_tags` |
+| Quo message reads | `internal/data/quo/quo.go` | `ParticipantE164`, `ListMessagesForParticipant` |
+| Intern path gate | `internal/server/http/dashboard_scope.go` | `internDashboardScopeAllows` |
+
+## Gotchas and edge cases
+
+- **Stage ignores fleet payouts.** Stage branch 5 checks `da.stripe_status`, but activation checks `EffectivePayoutStatus()`. A fleet-payout driver with no personal Stripe account can be activatable while the board still shows `application`.
+- **`pending_referral_payout` is sticky.** No column records that a referral was paid. Once an active, referred driver completes a ride, the lead stays in that stage forever.
+- **Referral stage counts only `complete` rides.** Contact sync counts `complete` and `pending_rider_rating`. A driver whose first ride awaits a rider rating stays in `zero_drives`.
+- **Tag edits skip import limits.** `PUT .../tags` doesn't enforce the 50-tag or 80-character limits, and it replaces `"Users".tags` wholesale.
+- **Referrer edits skip validation.** `PATCH .../referrer` doesn't trim or length-check `referrer_name`.
+- **Disqualification is one-way.** No endpoint clears `disqualified_at`, and re-importing the phone doesn't clear it.
+- **Community scope follows the user.** Scope uses `COALESCE(u.community_id, dl.community_id)`. A lead can leave an intern's view when the linked user moves communities.
+- **Interns still load full user detail.** `scopedDetail` calls `GetUserDetail` before checking scope and then drops it. `authorizeLead` repeats that for notes and messages.
+- **Profile-photo changes create leads.** `create_driver_lead_for_application` fires on `profile_picture_status` or `profile_picture_submission_time`. The backfill comment in the same migration says profile photos aren't driver-specific.
+- **Case-sensitive tag dedup.** `normalizeLeadTags` treats `EDU` and `edu` as different tags.
+- **Unused constants.** `driverApplicationStatusDeeplink` and `driverApprovedTitle` are declared in `driver_application_notification.go` but never read. The push content comes from the notification template.

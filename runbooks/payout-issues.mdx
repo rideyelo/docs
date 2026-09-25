@@ -1,0 +1,115 @@
+---
+title: "Payout issues"
+description: "Fix restricted or pending Stripe accounts for drivers and fleets, fleets that aren't payout-ready, stale Stripe status, and failed payouts"
+---
+
+Yelo keeps a copy of each connected account's state: `DriverApplications.stripe_status` for owner-operator drivers and `Fleets.stripe_status` for fleets. Going online, fleet joins, and ride pushes read that copy, not Stripe. Most payout incidents are either a real Stripe requirement or a stale copy.
+
+| Stripe account state | Stored status |
+| --- | --- |
+| Any `past_due` or `currently_due` requirement | `restricted` |
+| No requirements, `payouts_enabled` false | `pending` |
+| Otherwise | `complete` |
+
+## Symptoms
+
+- A driver can't go online: **Payment Setup Required**.
+- The fleet editor shows **Stripe Onboarding Required** or **Stripe Account Restricted**.
+- A driver can't select a fleet: **Fleet Payouts Unavailable**.
+- A fleet's invitation card shows **Invitations unavailable**, or drivers see "The fleet can't accept drivers right now".
+- **Assign active payout fleet** doesn't list the fleet.
+- A driver got a payout failed or canceled push, or no payout.
+
+## Diagnose
+
+<Steps>
+  <Step title="Fleet: compare live Stripe with the stored status">
+    Open the fleet editor's **Operations** tab. The top of the tab shows the stored Stripe status. The **Stripe Account** card is fetched live from Stripe (`GET .../stripe/status`) and shows **Payouts**, **Charges**, the disabled reason, and **Outstanding requirements**. Fetching it doesn't update `Fleets.stripe_status`.
+
+    If Stripe shows payouts enabled and nothing outstanding, but the stored status isn't `complete`, the copy is stale. Go to [Option 2](#fix).
+  </Step>
+  <Step title="Check payout readiness in the database">
+    A fleet is payout-ready (`Fleet.IsDriverPayoutReady`) only when it's active, not deleted, `fleet_merchant`, has custom payouts on, has a `stripe_merchant_id`, and has `stripe_status = 'complete'`. **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT id, name, is_active, deleted_at, payment_model, has_custom_payouts,
+           stripe_merchant_id, stripe_status
+    FROM "Fleets" WHERE id = '<fleet-id>';
+
+    SELECT user_id, is_active, stripe_status, payout_fleet_id
+    FROM "DriverApplications" WHERE user_id = '<driver-id>';
+
+    -- Reconciliation state for the account
+    SELECT merchant_id, status, error_category, next_due_at,
+           last_succeeded_at, last_attempted_at, job_id
+    FROM "StripeReconciliation" WHERE merchant_id = '<acct-id>';
+
+    ROLLBACK;
+    ```
+
+    A `failed` row with `error_category = 'stripe_account_invalid'` means Stripe rejected the account itself. Those accounts are only rechecked every 7 days.
+  </Step>
+  <Step title="Check the jobs and webhooks">
+    On the **Jobs** page, filter by kind `stripe_reconcile_account` and look for retrying or discarded jobs for the account. Each job retries up to 12 times. In Cloud Logging, look for `account.updated` handling for the account ID.
+  </Step>
+</Steps>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Finish Stripe onboarding">
+    **Fleet.** On the **Operations** tab, select **Open Stripe Onboarding**, or **Refresh Link** to make a new link, and send it to the fleet manager. Links expire in about 24 hours. When Stripe sends `account.updated` with no outstanding requirements, Yelo sets `Fleets.stripe_status = 'complete'`, activates the fleet, and reconciles drivers waiting to join it.
+
+    **Owner-operator driver.** The driver opens the Stripe step of the driver signup flow in the app, which calls `GET /stripeaccount/onboarding-link`. Expired links go through `GET /stripe-reauth/onboarding`, which issues a fresh one. Once details are submitted, the driver manages bank details through the Stripe Express dashboard (`GET /stripeaccount/login-link`).
+
+    See [Stripe Connect payouts](/concepts/driver-onboarding#stripe-connect-payouts).
+  </Accordion>
+  <Accordion title="Option 2: Refresh a stale stored status">
+    **Driver.** Ask the driver to open the drive screen or the driver hub. Both call `GET /driver/signup-status`, which reads the account from Stripe and writes `DriverApplications.stripe_status` for owner-operators.
+
+    **Fleet or driver, without the user.** Reconciliation re-reads every account about once every 24 hours. To pull one account forward, make it due now:
+
+    ```sql
+    -- WRITE. Makes one account due for the next stripe_reconciliation_dispatch run (every minute).
+    UPDATE "StripeReconciliation"
+    SET next_due_at = now()
+    WHERE merchant_id = '<acct-id>' AND job_id IS NULL;
+    ```
+
+    <Warning>
+    This is a write to production. It only changes when the account is next checked, and the job then runs the same `AccountUpdated` logic as the webhook, with notifications suppressed. Change one row at a time. Don't touch `status` or `job_id`. If `job_id` is set, a job is already queued, so find it on the **Jobs** page instead.
+    </Warning>
+
+    Dispatch skips every account while an integration cooldown is active. Logs show `Stripe reconciliation deferred by integration cooldown`, and the end time is in `StripeReconciliationControl.cooldown_until`.
+  </Accordion>
+  <Accordion title="Option 3: Replace a broken fleet account">
+    **Unlink Stripe Account** on the **Operations** tab disconnects the current account and creates a new one.
+
+    <Warning>
+    Unlinking deactivates the fleet until the new onboarding is complete, and you can't undo it. Every ride routed to the fleet account stops being payable to the fleet in the meantime. Use it only when the old account can't be recovered.
+    </Warning>
+  </Accordion>
+  <Accordion title="Option 4: Move a driver onto a payout-ready fleet">
+    On the user detail sheet, open **Driver fleet enrollment**, pick a fleet under **Select a payout-ready fleet**, and select **Assign active payout fleet**. This sets the driver's payout fleet, marks fleet-managed payouts complete, and makes it the active fleet. The driver must be offline and not on a ride.
+  </Accordion>
+  <Accordion title="Option 5: Failed or canceled payout">
+    Stripe's `payout.failed` and `payout.canceled` events send the driver a push that opens the earnings screen. The fix is on the Stripe side, usually bank details. The driver uses the Stripe Express dashboard link in the app. For a fleet, use **Open Stripe dashboard** on the **Operations** tab. Yelo can't retry a payout.
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- `Fleets.stripe_status` or `DriverApplications.stripe_status` is `complete`, and the fleet is active.
+- `StripeReconciliation.status` is `succeeded` with a recent `last_succeeded_at`.
+- The fleet appears under **Select a payout-ready fleet**, and its invitation card can create links.
+- The driver can go online.
+
+## Root causes seen in code
+
+- **Missed webhooks.** Stored status only changes on `account.updated`, daily reconciliation, or, for owner-operators, the signup-status call. Reconciliation exists because webhooks get missed.
+- **The live card doesn't write.** `GetFleetStripeStatus` reads Stripe for display only, so the dashboard can look healthy while the stored status blocks drivers.
+- **Payout readiness needs more than Stripe.** A fleet with a complete account still isn't payout-ready if it's inactive, deleted, `owner_operator`, or has custom payouts off.
+- **Owner-operator fleets with custom payouts on** can't accept joins at all (`CanAcceptDriverJoins`).
+- **Unlinking** deactivates the fleet by design.

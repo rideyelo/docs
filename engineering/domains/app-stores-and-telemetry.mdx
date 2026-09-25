@@ -1,0 +1,290 @@
+---
+title: "App stores, telemetry, and system endpoints"
+description: "App Store Connect webhook, Google Play release monitor, device telemetry ingestion, the Twilio Verify delivery webhook, the internal user-context and E2E control routes, and the health and update-gate endpoints."
+---
+
+This page covers the small system-facing domains in `yelo-api` that don't belong to a product feature. None of them change ride, payment, or matching state, except the E2E control routes, which exist only in the isolated E2E environment.
+
+For how the shared-secret and webhook signatures fit into the wider auth model, see [Authentication](/engineering/api/authentication). For Slack routing, see [Slack alerts](/engineering/notifications/slack-alerts). For the dashboard view over telemetry rows, see [Dashboard analytics](/engineering/domains/dashboard-analytics).
+
+## Endpoints
+
+| Method | Path | Auth | Handler |
+| --- | --- | --- | --- |
+| `POST` | `/appstore-webhook` | HMAC `X-Apple-Signature` | `appstore.Handler.HandleAppStoreEvent` |
+| `POST` | `/twilio-verify-events` | Twilio `X-Twilio-Signature`, optional basic auth | `verifyevents.Handler.HandleVerifyEvent` |
+| `POST` | `/telemetry/` | User JWT, role `user` | `telemetry.TelemetryHandler.RecordTelemetry` |
+| `GET` | `/internal/context/user` | `X-Internal-Key` | `internalctx.Handler.GetUserContext` |
+| `POST` | `/internal/e2e/runs` | `X-E2e-Key`, only when `E2E_ENABLED` | `e2econtrol.Handler.Create` |
+| `GET` | `/internal/e2e/runs/{id}` | `X-E2e-Key` | `e2econtrol.Handler.Get` |
+| `POST` | `/internal/e2e/runs/{id}/ride-transition` | `X-E2e-Key` | `e2econtrol.Handler.TransitionRide` |
+| `DELETE` | `/internal/e2e/runs/{id}` | `X-E2e-Key` | `e2econtrol.Handler.Delete` |
+| `GET` | `/healthcheck` | Public | `healthcheck.HttpHandler.Healthcheck` |
+| `GET` | `/healthcheck/deep` | Public | `HttpHandler.DeepHealth` |
+| `GET` | `/update-required?version=` | Public | `HttpHandler.NeedsUpdate` |
+| `GET` | `/error` | Public, hidden from OpenAPI | `HttpHandler.SampleError` |
+| `POST` | `/score-driver` | Public, hidden from OpenAPI | `HttpHandler.ScoreDriver` |
+| `GET` | `/metrics` | Bearer `METRICS_AUTH_TOKEN` when set | `promhttp.Handler` |
+
+All routes are registered in `internal/server/http/router.go`. The Google Play monitor has no endpoint. It runs as a River job.
+
+## App Store Connect webhook
+
+`POST /appstore-webhook` turns App Store Connect events into Slack messages. It never writes to the database.
+
+<Steps>
+  <Step title="Read the body">
+    The body is capped at 65,536 bytes with `http.MaxBytesReader` (`maxBodyBytes`).
+  </Step>
+  <Step title="Check configuration">
+    If `APP_STORE_WEBHOOK_SECRET` is empty, the handler returns 500 **app store webhook not configured**.
+  </Step>
+  <Step title="Verify the signature">
+    `verifySignature` requires the header to start with `hmacsha256=`, computes HMAC-SHA256 of the raw body, and compares hex digests with `hmac.Equal`. The provided signature is lowercased first. Failure returns 401.
+  </Step>
+  <Step title="Route by event type">
+    `notify` matches on a prefix of `data.type`, so suffixes such as `EventInstances` still match.
+  </Step>
+</Steps>
+
+| `data.type` prefix | Slack title | State fields used |
+| --- | --- | --- |
+| `appStoreVersionAppVersionStateUpdated` | `🚀 App Store Review Update` | `newValue`, `oldValue` |
+| `buildUploadStateUpdated` | `📦 Build Upload Update` | `newState`, `oldState` |
+| `buildBetaDetailExternalBuildStateUpdated` | `✈️ TestFlight External Build Update` | `newExternalBuildState` only |
+| `webhookPing` | Plain text ping message | none |
+| anything else | `📬 Unhandled App Store Connect event` with the type | none |
+
+The **ID** field uses `relationships.instance.data.id` and falls back to `data.id` (`eventPayload.instanceID`). Colors and emoji come from `slack.StateStyle`, which checks negative terms first because `INVALID` contains `VALID`.
+
+## Google Play release monitor
+
+The monitor polls the Android Publisher API and posts lifecycle changes to Slack.
+
+| Setting | Env var | Default |
+| --- | --- | --- |
+| Enabled | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` | `true` only when `ENVIRONMENT=production` |
+| Package | `GOOGLE_PLAY_PACKAGE_NAME` | `com.rideyelo` |
+| Tracks | `GOOGLE_PLAY_TRACKS` (comma or space separated) | `production` |
+| Console link | `GOOGLE_PLAY_CONSOLE_URL` | Play Console releases overview URL |
+
+`cmd/api/main.go` builds the monitor only when enabled. `playrelease.NewClient` uses Application Default Credentials with the `androidpublisher` scope. A client init failure is fatal at startup.
+
+### Schedule
+
+`internal/notify/queue/queue.go` registers a River periodic job with kind `google_play_release_check`:
+
+- Interval: 5 minutes, `RunOnStart: true`.
+- Uniqueness: `ByPeriod: 4 * time.Minute`.
+- When the monitor is nil (disabled), the job factory returns `nil` and nothing is enqueued.
+
+### Check algorithm
+
+`Monitor.Check` loops over tracks. Each `ListReleases` call has a 30-second timeout (`playRequestTimeout`). Version codes come from `ActiveArtifacts` and are sorted ascending.
+
+For each release, `PostgresStateStore.Observe` runs one transaction against `GooglePlayReleaseStates`, keyed by `(package_name, track, release_name)`:
+
+1. `SELECT ... FOR UPDATE` the existing row. If found, update `lifecycle_state`, `version_codes`, `observed_at` and report `Changed` when the state differs.
+2. If missing, `INSERT ... ON CONFLICT DO NOTHING`. One inserted row means `FirstSeen`.
+3. If the insert lost a race, re-lock and update as in step 1.
+
+`shouldNotify` alerts when the state changed, or when the release is first seen and its state doesn't contain `PUBLISHED`. That keeps the first production run from posting every historical release.
+
+## Device telemetry ingestion
+
+The mobile app posts device facts to `POST /telemetry/`. `reportTelemetry` in `yelo-frontend/lib/observability/TelemetryService.ts` throttles to once per 5 minutes (`THROTTLE_MS`). `app/(app)/_layout.tsx` calls it normally, and `components/ContactMatchSync.tsx` forces a send after contact permission changes.
+
+### Validation
+
+`TelemetryRequest.Validate` in `internal/server/http/telemetry/requests` enforces:
+
+| Field | Rule |
+| --- | --- |
+| `platform` | `ios` or `android` |
+| `os_version`, `device_model`, `device_manufacturer`, `app_version`, `build_number`, `locale`, `timezone` | Non-empty |
+| `screen_width`, `screen_height`, `pixel_ratio` | Greater than zero |
+| `location_permission` | `always`, `when_in_use`, `denied`, or `undetermined` |
+| `contact_permission` | Empty, `granted`, `denied`, or `undetermined` |
+| `contact_access_privileges` | Empty, `all`, `limited`, or `none` |
+
+`expo_update_id`, `push_notification_token`, `carrier`, `install_referrer`, and `total_memory_mb` are optional.
+
+### Writes
+
+`TelemetryService.RecordTelemetry` (`internal/service/telemetry/telemetry.go`) does two writes:
+
+1. `UpsertDeviceTelemetry` (`internal/data/repository/user_profile.go`) runs one transaction. It upserts one `DeviceTelemetry` row per user with `UpsertDeviceTelemetryWithoutPushToken` (`queries/push_tokens.sql`). If a push token is present, `setCanonicalPushNotificationToken` stores it on `Users` only.
+2. `UpdateAppVersion` sets `Users.app_version` and `Users.expo_update_id`. A failure here is logged as a warning and doesn't fail the request.
+
+The upsert has field-specific merge rules:
+
+| Column | On conflict |
+| --- | --- |
+| `contact_permission` | Keeps the stored value when the request sends an empty string. Inserts default to `undetermined`. |
+| `contact_access_privileges` | Takes the new value when non-empty. Clears to `''` when the permission changed and no privileges were sent. Otherwise keeps the stored value. |
+| `contact_permission_updated_at` | Set to `NOW()` only when a permission was sent. Otherwise the stored timestamp is kept. |
+| Everything else | Overwritten by the new payload |
+
+`screen_width`, `screen_height`, and `total_memory_mb` pass through `checkedInt32`. Values outside the PostgreSQL integer range fail with a 500, not a 400.
+
+### Push token ownership
+
+`setCanonicalPushNotificationToken` enforces that one Expo token belongs to one user:
+
+- An empty token clears the deprecated `DeviceTelemetry` token shadow for this user.
+- A non-empty token clears the deprecated shadow on other owners.
+- Either way, `ClearCanonicalPushTokenOtherOwners` then `SetCanonicalPushToken` move the token to this user on `Users`.
+
+For push delivery, see [Send pipeline](/engineering/notifications/send-pipeline).
+
+## Twilio Verify delivery webhook
+
+Twilio Event Streams posts Verify message status to `POST /twilio-verify-events`. The OTP fallback sweep reads this status to skip codes that already reached the handset. See [Identity overview](/engineering/identity/overview) for the fallback itself.
+
+<Steps>
+  <Step title="Bound the input">
+    The body is capped at 1 MiB. More than 200 events in one array (`maxEventsPerPayload`) returns 400.
+  </Step>
+  <Step title="Basic auth">
+    `checkBasicAuth` passes when neither `TWILIO_EVENTS_WEBHOOK_USER` nor `TWILIO_EVENTS_WEBHOOK_PASSWORD` is set. If exactly one is set, every request fails with 401. If both are set, both must match in constant time.
+  </Step>
+  <Step title="Signature">
+    `TWILIO_AUTH_TOKEN` must be set (otherwise 500). `publicURL` rebuilds the signed URL from `X-Forwarded-Proto` (default `https`), `X-Forwarded-Host` (default `r.Host`), the path, and the raw query, which includes Twilio's `bodySHA256`. `RequestValidator.ValidateBody` checks `X-Twilio-Signature`.
+  </Step>
+  <Step title="Record">
+    Events missing `verification_sid` or `message_status` are skipped. The status is lowercased and passed to `RecordPhoneDeliveryStatus`, which updates `AuthPhoneAttempts` by verification SID. Unknown SIDs match zero rows and log a warning.
+  </Step>
+</Steps>
+
+Each event records `RecordOTPDeliveryStatus(status, matched)`. The metric never carries phone numbers, SIDs, or attempt IDs. A database error on any event fails the whole request, so earlier events in the batch may already be written. Re-delivery is safe because the update is idempotent.
+
+## Internal user context
+
+`GET /internal/context/user` serves a read-only summary for automation such as n8n SMS flows. `getInternalKeyMiddleware` compares `X-Internal-Key` with `INTERNAL_API_KEY` in constant time. An unset key rejects every request.
+
+### Lookup
+
+`resolveUserID` accepts one identifier. `phone` wins when both are sent.
+
+- `phone` is normalized with `phone.Normalize` and resolved through `GetAuthUserByPhoneNumber`.
+- `user_id` must parse as a UUID, otherwise 400.
+- Neither returns 400 **Provide a phone or user_id query parameter**.
+
+A missing user returns 200 with `found: false` and no other blocks.
+
+### Response blocks
+
+| Block | Source | Notes |
+| --- | --- | --- |
+| `user` | `Users` | `id`, `first_name`, RFC 3339 `created_at`, test, banned, deleted, and terms flags |
+| `onboarding` | `User.IsSignupComplete()` | `profile_completed`, `phone_verified`, `profile_initialized` |
+| `community` | `Community.GetByID(user.CommunityID)` | Market status, wait time, active, hidden, rides disabled, asleep, low supply, waitlisted, and `is_home_community` |
+| `driver` | `Users` plus `DriverApplications` | `status`, `is_online`, and per-step statuses |
+| `quo` | `Users.quo_contact_id` | `contact_url` is `QUO_CONTACT_BASE_URL` with trailing slashes trimmed, plus the ID |
+
+`driverSteps` returns `nil` when the user never applied. Unlike `DriverService.GetSignupStatus`, it never refreshes Stripe or activates a driver. A failed community lookup logs a warning and omits the block.
+
+## E2E control plane
+
+The `/internal/e2e` group is mounted only when `config.Load().E2E.Enabled` is true. `validateE2E` in `internal/utilities/config/config.go` refuses to start unless all of these hold:
+
+| Check | Rule |
+| --- | --- |
+| Environment | `E2E_ENABLED=true` and `ENVIRONMENT=e2e` together |
+| Required | `DSN`, `KEY`, `E2E_CONTROL_API_KEY`, `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` |
+| Key length | `E2E_CONTROL_API_KEY` at least 32 bytes |
+| Jobs | `E2E_BACKGROUND_JOBS_ENABLED` must be false |
+| Fixture TTL | `E2E_FIXTURE_TTL` greater than 0 and at most 24 hours. Default 30 minutes |
+| Database | DSN database name equals `E2E_DATABASE_NAME`. The Supabase project ref (from `db.<ref>.supabase.co` or the pooler username suffix) equals `E2E_DATABASE_PROJECT_REF` and differs from the production ref |
+| Integrations | Redis, Auth v3, and outbound integrations are validated by `validateE2ERedis`, `AuthV3.validateE2E`, and `validateE2EIntegrations`. Google Play monitoring must be off |
+
+### Scenarios
+
+`POST /internal/e2e/runs` takes `scenario` and `idempotency_key` (required, at most 200 characters). A repeated key returns the existing run. Before creating, the handler expires up to 100 active runs past `expires_at`.
+
+| Scenario | Creates |
+| --- | --- |
+| `auth_existing_rider` | Rider only |
+| `auth_rider_driver_pair` | Rider and an activated driver with a vehicle and fleet membership |
+| `ride_confirmed_rider` | Rider plus a free `confirmed` ride |
+| `ride_queued_pair` | Rider, driver, confirmed ride, an online driver session, and a second active rider and ride |
+| `ride_notification_rider` | Rider only. The ride is created later by `prepare` |
+
+Each run creates its own test community (`is_test`), owner-operator fleet with vehicle type `x`, synthetic school with extension `e2e.invalid`, and a `per_ride` price parameter: base $3.00, $0.50 per minute, one tier at $2.00 per mile. Phones are `+1555` plus 7 digits from an FNV-32a hash of the run ID and role (`testPhoneForRole`). Emails use `@e2e.invalid`.
+
+### Transitions
+
+`POST /internal/e2e/runs/{id}/ride-transition` takes an `action`:
+
+| Action | Required scenario | Effect |
+| --- | --- | --- |
+| `prepare` | `ride_notification_rider` | Seeds the confirmed ride if missing |
+| `expire` | `ride_notification_rider` | Moves `confirm_time` back by `config.RideRequestExpiry` plus 1 second, then runs `CancelUnmatchedRides` |
+| `prepare_assignment` | `auth_rider_driver_pair` | Seeds the ride and a queued pair |
+| `prepare_idle_assignment` | `auth_rider_driver_pair` | Same, then completes the active ride and sets `auto_queue=true` |
+| `prepare_idle_queue` | `auth_rider_driver_pair` | Same as idle, then queues the ride onto the driver's open session |
+| `accept` | `auth_rider_driver_pair` | Calls the production `RideService.AcceptRide` as the driver |
+| `auto_assign` | `auth_rider_driver_pair` | Calls `RideService.AutoAssignRide` |
+| `recover_idle_queue` | `auth_rider_driver_pair` | Calls `RideService.RecoverIdleQueue` |
+
+Before calling a production service, the handler checks that the ride is free (`price=0`, no payment intent) and either `confirmed` and unassigned, or `queued` to this driver for `recover_idle_queue`.
+
+`DELETE /internal/e2e/runs/{id}` removes the run's rides, auth rows, sessions, vehicles, users, school, fleet, and community in one transaction, then marks the run `cleaned`. Expired sweeps mark it `expired`. Both are idempotent.
+
+## Health and update gate
+
+| Endpoint | Behavior |
+| --- | --- |
+| `/healthcheck` | Always returns `"OK"` |
+| `/healthcheck/deep` | 5-second timeout. Pings Postgres and reports pool stats, disk, and Go runtime stats. Returns 503 when Postgres fails or disk is unhealthy |
+| `/update-required` | Compares `version` with `minimumFrontendVersion` (`5.7.3`) via `helpers.VersionStringLessThan`. Below the floor returns 426 with `app_link` (from `App.StoreUrl`) both at the top level and in `data`. Otherwise 200 with `needs_update: false`. Sets `Cache-Control: no-store` |
+| `/error` | Always returns a test server error, for Sentry and alert checks |
+| `/score-driver` | Runs `matching.GetDriverScore` on a posted config and inputs. See [Auto-queue scoring](/engineering/matching/auto-queue-scoring) |
+
+`evaluateDiskHealth` marks disk unhealthy only when free space is below 1 GiB **and** usage is at least 90%. The mobile app calls `/update-required` from `checkRequiredAppUpdate` with a 10-second timeout. `ensureRideEntryVersion` gates only new ride entry, never cancel, pickup, or completion.
+
+`internal/server/http/routeopt` isn't an endpoint. It holds `routeopt.Errors` and `routeopt.Error`, which add the standard error responses to the OpenAPI spec. `Errors` panics at startup on a status code with no standard description.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Route registration | `internal/server/http/router.go` | `Server.router`, `mountRiverUI` |
+| Internal and E2E key checks | `internal/server/http/middleware.go` | `getInternalKeyMiddleware`, `getE2EKeyMiddleware` |
+| Metrics auth | `internal/server/http/middleware_metrics_auth.go` | `metricsAuthMiddleware` |
+| App Store webhook | `internal/server/http/appstore/appstore.go` | `HandleAppStoreEvent`, `verifySignature`, `notify` |
+| Play client | `internal/service/playrelease/client.go` | `Client.ListReleases` |
+| Play monitor | `internal/service/playrelease/monitor.go` | `Monitor.Check`, `shouldNotify`, `SlackNotifier` |
+| Play state | `internal/service/playrelease/repository.go` | `PostgresStateStore.Observe` |
+| Play job | `internal/service/playrelease/worker.go`, `internal/notify/queue/queue.go` | `CheckArgs`, periodic job |
+| Telemetry HTTP | `internal/server/http/telemetry/handler.go`, `requests/` | `RecordTelemetry`, `TelemetryRequest.Validate` |
+| Telemetry service | `internal/service/telemetry/telemetry.go` | `TelemetryService.RecordTelemetry` |
+| Telemetry SQL | `internal/data/repository/user_profile.go`, `queries/push_tokens.sql` | `UpsertDeviceTelemetry`, `setCanonicalPushNotificationToken` |
+| Verify events | `internal/server/http/verifyevents/verifyevents.go` | `HandleVerifyEvent`, `checkBasicAuth`, `publicURL` |
+| Delivery status write | `internal/data/repository/authv3.go` | `RecordPhoneDeliveryStatus` |
+| Internal context | `internal/server/http/internalctx/context.go` | `GetUserContext`, `assemble` |
+| E2E fixtures | `internal/server/http/e2econtrol/routes.go`, `ride_fixture.go`, `queued_fixture.go` | `Handler.create`, `cleanupWithStatus` |
+| E2E transitions | `internal/server/http/e2econtrol/ride_transition.go`, `assignment_transition.go` | `transitionExpiry`, `transitionAssignment` |
+| E2E config | `internal/utilities/config/config.go` | `validateE2E`, `validateE2EDatabase` |
+| Health | `internal/server/http/healthcheck/healthcheck_handler.go` | `DeepHealth`, `NeedsUpdate`, `evaluateDiskHealth` |
+| Mobile telemetry | `yelo-frontend/lib/observability/TelemetryService.ts` | `reportTelemetry` |
+| Mobile update gate | `yelo-frontend/lib/platform/appUpdateGate.ts` | `checkRequiredAppUpdate`, `ensureRideEntryVersion` |
+
+## Gotchas and edge cases
+
+- **Slack only posts in production.** The App Store webhook still verifies and returns 200 elsewhere, but `slack.SendRichMessage` only logs outside production.
+- **Unknown App Store events still post.** Any unrecognized type produces a Slack message, so new Apple event types show up as noise, not silence.
+- **The TestFlight message has no previous state.** `buildBetaDetailExternalBuildStateUpdated` passes an empty `oldState`.
+- **One failing Play track stops the rest.** `Monitor.Check` returns on the first `ListReleases` error, so later tracks wait until the next 5-minute run.
+- **State is committed before Slack.** `Observe` commits, then `Notify` runs. A lost Slack post is never retried because the next run sees no change.
+- **Published first-seen releases are silent.** A release that goes from nothing straight to a state containing `PUBLISHED` between two polls never alerts.
+- **Telemetry overwrites, it doesn't append.** `DeviceTelemetry` holds one row per user. Switching phones replaces the old device's data.
+- **Telemetry can move a push token between accounts.** Signing into a second account on the same device reassigns the token to the new user.
+- **`app_version` sync failure is silent.** A failed `UpdateAppVersion` only logs, so `Users.app_version` can lag `DeviceTelemetry.app_version`.
+- **Verify basic auth half-configured blocks all events.** Setting only one of the two env vars rejects every request, which silently disables the fallback's delivery signal.
+- **`/internal/context/user` prefers phone.** If both `phone` and `user_id` are sent, `user_id` is ignored.
+- **Deleted users are still found.** The context route returns `found: true` with `is_deleted: true`.
+- **Assignment fixture errors are 500s.** `transitionAssignment` wraps a missing or wrong-scenario run as a plain error, so it returns 500 instead of the 404 that `transitionExpiry` returns.
+- **`/score-driver` and `/error` are public.** They're hidden from OpenAPI but need no auth. `/score-driver` is pure computation and reads no data.
+- **`/metrics` is open when `METRICS_AUTH_TOKEN` is unset.** `metricsAuthMiddleware` skips the check entirely for an empty token.
+- **The update floor is a constant.** Raising `minimumFrontendVersion` requires a deploy, and it compares only the native store version, not the OTA bundle.

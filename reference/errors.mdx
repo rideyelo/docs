@@ -1,0 +1,316 @@
+---
+title: "Errors"
+description: "Catalog of yelo-api error types, HTTP statuses, and user-facing messages, and how the mobile app and web sites detect, display, and retry each error"
+---
+
+This page lists every error type the API can return and what each client does with it. For how the error envelope is built, see [Request lifecycle](/engineering/api/request-lifecycle#error-handling). That page covers the v1 and v2 envelope shapes, `errorHandler` normalization, and responses with a `null` body.
+
+<Note>
+API paths are relative to `yelo-api`. Mobile paths are relative to `yelo-frontend`. Web paths are relative to `yelo-web`.
+</Note>
+
+## Error model
+
+Every API error is an `errors.Error` (`internal/utilities/errors/error.go:47`). It carries five fields that reach the client.
+
+| Field | v2 envelope key | v1 body key | Source | Notes |
+| --- | --- | --- | --- | --- |
+| Type | `error.code` | `code` | `GetType()` | The machine-readable code. Clients key off this. |
+| Message | `error.message` | `error` | `Error()` | Internal message. `errors.Wrap` prefixes it with context, so it can contain wrapped causes. |
+| Title | `error.title` | `title` | `Title()` | User-facing heading. |
+| Body | `error.body` | `body` | `Body()` | User-facing sentence. |
+| Fingerprint | `error.fingerprint` | Not sent | `Fingerprint()` | SHA-256 of type plus message. `ServerError` hashes the first three stack lines instead (`error.go:104`). |
+
+Handler errors always use the v2 envelope. Middleware errors use v2 only when the request sends `X-Api-Version: v2` (`internal/utilities/json/json.go:105`). The mobile app's main Axios client doesn't send that header, so mobile sees v1 bodies for middleware errors, including `AccountDeletedError` and `AccountBannedError`.
+
+<Warning>
+`error.message` is not safe to show users. `NewServerErrorFromError(err)` uses the raw Go error as the message (`error.go:169`). A 500 can therefore expose driver or SQL error text in `message`. Show `body` or `title` instead.
+</Warning>
+
+### Constructors
+
+| Constructor | Type | Default title | Default body |
+| --- | --- | --- | --- |
+| `NewServerError`, `NewServerErrorFromError`, `Wrap` of a non-`errors.Error` | `ServerError` | Something Went Wrong | Oops! Something didn't go as planned. Try again, or come back later. |
+| `NewBadRequestError` | `InputError` | Something Went Wrong | Oops! Something didn't go as planned. Try again, or come back later. |
+| `NewUnauthorizedError` | `UnauthorizedError` | Unauthorized | You are not authorized to access this resource. |
+| `NewForbiddenError` | `ForbiddenError` | Access Denied | You are not authorized to access this resource. |
+| `NewNotFoundError` | `NotFoundError` | Not Found | The resource you are looking for could not be found. |
+| `NewError(message, type, title, body)` | Any | Caller-supplied | Caller-supplied |
+| `NewErrorWithCause` | Any | Caller-supplied | Caller-supplied. The cause is kept for `errors.Is` but not included in `Error()`. |
+
+`errors.Wrap` keeps the wrapped error's type, title, body, and fingerprint. It only prefixes the message.
+
+## Error catalog
+
+The status comes from `httperrors.MapErrorToStatusCode` (`internal/server/http/httperrors/errors.go:84`). **API retry** is the server-side policy in `internal/utilities/retry/retry.go:16`. **Trips breaker** is `IsSuccessful` in `internal/utilities/circuitbreaker/circuitbreaker.go:119`. "No" means the error counts as a success for the breaker.
+
+| Code | Status | Default title / body | Raised by | API retry | Trips breaker |
+| --- | --- | --- | --- | --- | --- |
+| `ServerError` | 500 | Something Went Wrong / Oops! ... | Unexpected failures, any unmapped error | Yes | Yes |
+| `ValidationError` | 400 | Oh no! / the field messages | `validator.ErrorOrNil` (`internal/utilities/validator/validator.go:47`), a few handlers | No | No |
+| `InputError` | 400 | Varies (see [domain messages](#domain-messages)) | 229 call sites. Also every Fuego decode or validation failure (`middleware_error.go:30`) | No | No |
+| `MissingFieldsError` | 400 | None | Never constructed. `user_handler.go:60` still checks for it. | No | Yes |
+| `PickupAddressRequired` | 400 | Confirm your pickup / Choose the address or entrance where your driver should meet you. | `internal/service/ride/ride_locations.go:17` | No | No |
+| `DestinationAddressRequired` | 400 | Confirm your destination / Choose the address or entrance where you want to arrive. | `ride_locations.go:29` | No | No |
+| `AlreadyInRideError` | 400 | Existing ride in progress / Cannot create another ride while a ride is in progress | `internal/data/repository/ride_command.go:145`, `ride_lifecycle.go:644` | No | No |
+| `HandoffCodeInvalidError` | 400 | Invalid Sign-in / Return to the app and start sign-in again. | `internal/service/authv3/token.go:27` | No | No |
+| `UnauthorizedError` | 401 | Unauthorized / This user could not be authenticated | JWT parsing (`internal/utilities/jwt/jwt.go`), internal and E2E key checks, some ride ownership checks | No | No |
+| `AccountDeletedError` | 401 | Invalid Login / User not found. Please login again. | JWT middleware when the auth cache reports the user deleted (`internal/server/http/middleware.go:272`) | No | No |
+| `AccountBannedError` | 401 | Account Suspended / Your account has been suspended. Please contact support. | JWT middleware when the user is banned (`middleware.go:279`) | No | No |
+| `ForbiddenError` | 403 | Forbidden / varies | 52 call sites, mostly dashboard scope and ride membership | No | No |
+| `NotFoundError` | 404 | Not Found / The resource you are looking for could not be found. | 62 call sites | No | No |
+| `NoDriversError` | 404 | None | Never constructed. "No drivers" is returned as `InputError` (`internal/service/ride/ride.go:438`). | No | No |
+| `DuplicateError` | 409 | Varies | Slug, OTP, and revision conflicts | No | No |
+| `IdentityConflictError` | 409 | Account Conflict / This sign-in method is already associated with another account. Contact support for help. | `internal/service/authv3/resolver.go`, `user_profile.go:207` | No | No |
+| `AccountMergeRequiredError` | 409 | Connect Your Existing Account / Your verified phone belongs to an existing account. ... | `resolver.go:415`, `internal/data/repository/authv3.go:350` | No | No |
+| `ExistingAccountVerificationRequiredError` | 409 | Verify Your Existing Account / This sign-in method cannot be added until the existing account is verified. ... | `internal/data/repository/auth_constraint_error.go:33` | No | No |
+| `ProfileRequiredError` | 409 | Finish Your Profile / Add your first and last name before continuing. | `internal/service/userrequirements/user.go:34` | No | No |
+| `PhoneRequiredError` | 409 | Phone Number Required / Verify a phone number before continuing. ... | `userrequirements/user.go:14` | No | No |
+| `FleetJoinBusyError` | 409 | Finish Driving First or Invitation Changed | `internal/data/repository/fleet_join.go:78`, `:158`, `user_fleet.go:67` | No | No |
+| `FleetPayoutUnavailableError` | 409 | Fleet Payouts Unavailable | `fleet_join.go:134`, `user_fleet.go:83`, `internal/service/fleetjoin/fleet_join.go:242` | No | No |
+| `AuthTransactionExpiredError` | 410 | Sign-in Expired / Start sign-in again to continue. | `internal/service/authv3/service.go`, `resume.go`, `native.go` | No | No |
+| `RateLimitError` | 429 | Varies (see [rate limits](#rate-limit-messages)) | Auth v2 and v3 limiters, provider throttling, bumps, contact sync | Yes | Yes |
+| `AuthV3UnavailableError` | 503 | Sign-in Unavailable / Sign-in is temporarily unavailable. Please try again later. | Auth v3 disabled or misconfigured (`internal/server/http/router.go:293`, `authv3/handler.go`) | Yes | Yes |
+| `ProviderUnavailableError` | 503 | Sign-in Unavailable / That sign-in method is temporarily unavailable. ... | Auth v3 providers, Google Maps (`internal/data/googlemaps/googlemaps.go:71`), GTM snapshot (`internal/service/dashboard/gtm.go:152`) | Yes | Yes |
+| `RideStateUnavailableError` | 503 | Ride State Unavailable / Ride state is not ready. Please retry. | Ride snapshot and queue reads (`internal/data/repository/ride_snapshot.go:36`, `internal/service/ride/ride.go:611`) | Yes | No |
+
+<Note>
+When you add an error type, update all three switches: `MapErrorToStatusCode`, `retry.shouldRetry`, and the breaker's `IsSuccessful`. Unlisted types map to 500, are retried, and trip breakers.
+</Note>
+
+### Responses without an error body
+
+Some middleware writes a status code with a `null` body. There is no `code` for clients to read.
+
+| Status | When | Source |
+| --- | --- | --- |
+| 401 | The user lacks the required role | `getRequireRoleMiddleware` |
+| 401 | The auth cache lookup fails, for example a Redis or Postgres error | `internal/server/http/middleware.go:266` |
+| 401 | The Clerk token is missing or invalid, or the dashboard scope check fails | `internal/server/http/clerk_middleware.go:56`, `:88` |
+| 403 | The Clerk role gate fails | `clerk_middleware.go:97` |
+| 429 | The per-IP token bucket rejects the request | `middleware.go:196` |
+| 401 | `/metrics` bearer token mismatch. The body is plain text `Unauthorized`. | `internal/server/http/middleware_metrics_auth.go:19` |
+
+## Auth v3 error codes
+
+Auth v3 reports errors through two channels. JSON endpoints return the v2 envelope with the `ErrorType` as `error.code`. Browser callbacks redirect to the client's `redirect_uri` with `?error=<code>&state=...&request_id=...` (`internal/server/http/authv3/handler.go:1015`). `stableCallbackError` (`handler.go:1111`) collapses the type to a small public set.
+
+| `ErrorType` | Callback `error` value |
+| --- | --- |
+| `IdentityConflictError` | `identity_conflict` |
+| `AccountMergeRequiredError` | `account_merge_required` |
+| `ExistingAccountVerificationRequiredError` | `verify_existing_account` |
+| `AuthTransactionExpiredError` | `transaction_expired` |
+| `ProviderUnavailableError`, `AuthV3UnavailableError` | `temporarily_unavailable` |
+| Anything else | `authentication_failed` |
+
+The hosted web flow can also send the app `error=web_recovery` (`yelo-web/src/sites/signup/auth-v3/redirects.ts:36`).
+
+### Phone verification outcomes
+
+`POST /authv3/providers/phone/send` and `/verify` return an `outcome` field rather than an error for expected results (`internal/service/authv3/phone/policy.go:29`).
+
+| Outcome | Meaning |
+| --- | --- |
+| `sent` | Code sent |
+| `verified` | Code accepted |
+| `invalid` | Wrong code or undeliverable number |
+| `expired` | Code expired |
+| `rate_limited` | Provider or Yelo limit hit |
+| `provider_unavailable` | Twilio unavailable |
+
+When the phone step fails as an error instead, the service returns `InputError` with one of these titles (`internal/service/authv3/phone_orchestration.go:511`):
+
+| Title | Body |
+| --- | --- |
+| Wrong Code | That code didn't match. Check it and try again, or request a new one. |
+| Can't Text That Number | That number can't receive verification codes. Check it and try again. |
+| Code Expired | That code expired. Request a new one to continue. |
+
+### Retry-After
+
+Auth v2 and v3 rate-limit responses set `Retry-After` as an HTTP date (`internal/server/http/authv3/handler.go:855`, `internal/server/http/authv2/handler.go:127`). CORS exposes the header on `/authv3` routes. The per-IP limiter never sets it.
+
+## Validation errors
+
+`validator.ErrorOrNil` joins every failed check into one string in the form `key: message, key: message`. It uses that string as both `message` and `body`, with the title `Oh no!` (`internal/utilities/validator/validator.go:47`). There is no per-field array. Clients that need field-level errors must parse the string.
+
+Fuego struct-tag failures and JSON decode failures become `InputError` with Fuego's `Detail` as the message and the generic "Something Went Wrong" title and body (`internal/server/http/middleware_error.go:30`).
+
+## Domain messages
+
+Most domain errors are `InputError` (400) with a specific title. Clients show the title and body. The mobile app matches two of them by string.
+
+<AccordionGroup>
+<Accordion title="Rides">
+
+| Title | Body | Type | Source |
+| --- | --- | --- | --- |
+| No Drivers Available | There are currently no drivers available for this ride. | `InputError` | `internal/service/ride/ride.go:438` |
+| Ride Unavailable | This ride is no longer available for this action. | `InputError` | `ride.go:440` |
+| Ride Unavailable | This ride is no longer available. Please request a new ride. | `InputError` | `internal/data/repository/ride_lifecycle.go:428` |
+| Ride Unavailable | This ride has changed. Refresh and try again. | `InputError` | `ride_command.go:113` |
+| Unavailable Ride | This ride is for a different fleet and is no longer available. | `InputError` | `internal/service/ride/driver.go:805` |
+| Incorrect Confirm Code | Invalid confirm code, please ask the rider for their confirm code. | `InputError` | `driver.go:498` |
+| Pickup Outside Service Area | The pickup location is outside the service area. ... | `InputError` | `rider.go:630` |
+| Destination Outside Service Area | The destination is outside the service area. ... | `InputError` | `rider.go:634` |
+| Rides Unavailable | Rides aren't available in your area yet. We'll let you know when they go live. | `InputError` | `rider.go:742` |
+| Payment Required | Please select a payment method to confirm this ride. | `InputError` | `rider.go:362` |
+| Driver Not Online | Driver not online | `InputError` | `driver.go:679` |
+| Driver Queue Length Exceeded | Driver queue length exceeded | `InputError` | `driver.go:683` |
+| Unauthorized | User is not authorized to cancel this ride | `UnauthorizedError` (401) | `ride.go:101`, `:206` |
+| Unauthorized | User is not authorized to view this ride | `UnauthorizedError` (401) | `ride.go:581` |
+| Unauthorized | User is not authorized to rate this ride | `InputError` (400) | `ride.go:255` |
+| Ride Not Found | Ride details not found for the given ride ID | `NotFoundError` | `ride.go:675` |
+| Forbidden | user is not part of the ride (message) | `ForbiddenError` | `internal/data/repository/messaging.go:113` |
+
+</Accordion>
+<Accordion title="Routing and maps">
+
+| Title | Body | Type | Source |
+| --- | --- | --- | --- |
+| Route Unavailable | We couldn't calculate a route between these locations. Please try different addresses. | `InputError` | `internal/data/googlemaps/googlemaps.go:118` |
+| Route Unavailable | Same body | `ServerError` | `googlemaps.go:290` |
+| Route Service Unavailable | Route calculations are temporarily unavailable. Please try again shortly. | `ProviderUnavailableError` | `googlemaps.go:71` |
+| Please try a different route | No directions from the pickup to destination could be found | `InputError` | `internal/data/googlemaps/dto/routes.go:34` |
+| Invalid Trip | No routes found from pickup to destination | `ServerError` | `internal/data/mapbox/dto/directions.go:17` |
+| Route Unavailable | We couldn't calculate distances for this route. | `InputError` | `internal/data/mapbox/mapbox.go:668` |
+
+</Accordion>
+<Accordion title="Payments, tips, and earnings">
+
+| Title | Body | Type | Source |
+| --- | --- | --- | --- |
+| Payment Failed | Payment processing failed | `ServerError` | `internal/service/ride/driver.go:1066` |
+| Payment Failed | Payment method connection failed | `ServerError` | `driver.go:982` |
+| Payment Setup Required | Your payment account needs attention. ... | `InputError` | `internal/service/driver/driver.go:201` |
+| Payment Setup Required | Please complete your payment setup before continuing | `InputError` | `internal/service/stripeaccount/stripeaccount.go:118` |
+| Payment Setup Incomplete | Please complete your payment setup before accessing earnings | `InputError` | `stripeaccount.go:45` |
+| Tip unavailable | This driver can't accept tips right now. | `InputError` | `internal/service/ride/tip_charge.go:122` |
+| Tip unavailable | Add a payment method to leave a tip. | `InputError` | `tip_charge.go:131` |
+| Tip incomplete | The tip payment was not completed. | `InputError` | `tip_charge.go:222` |
+| Nothing to cash out | There are no instantly-available funds on your account right now. | `InputError` | `internal/service/earnings/earnings.go:309` |
+| Earnings unavailable | Finish setting up your driver payouts before viewing earnings. | `InputError` | `earnings.go:457` |
+| Coupon already claimed | You have already claimed this coupon | `InputError` | `internal/data/repository/coupon.go:195` |
+| Coupon is out of stock | Please try again later or contact support. | `InputError` | `coupon.go:203` |
+
+</Accordion>
+<Accordion title="Drivers and fleets">
+
+| Title | Body | Type | Source |
+| --- | --- | --- | --- |
+| Outside Service Area | You are currently outside the service area. ... | `InputError` | `internal/service/driver/driver.go:224` |
+| No Vehicle | Please add a vehicle before going online | `InputError` | `driver.go:259` |
+| Finish Driving First | Go offline and finish your current ride before joining this fleet. | `FleetJoinBusyError` | `internal/data/repository/fleet_join.go:158` |
+| Invitation Changed | The fleet invitation changed while this request was running. Try again. | `FleetJoinBusyError` | `fleet_join.go:78` |
+| Fleet Payouts Unavailable | This fleet cannot accept drivers right now. ... | `FleetPayoutUnavailableError` | `fleet_join.go:134` |
+| Service changed | Refresh and try again | `DuplicateError` | `internal/data/repository/fleet_community_service.go:110` |
+
+</Accordion>
+<Accordion title="Sign-in and accounts">
+
+| Title | Body | Type | Source |
+| --- | --- | --- | --- |
+| Login Failed | This login method is not supported. Please try a different option. | `InputError` | `internal/service/authv2/email.go:665` |
+| Login Failed | This login could not be verified. Please try again. | `InputError` | `internal/data/repository/oauth.go:268` |
+| Use Student Signup | This looks like a school email. Please go back and use the student signup option instead. | `InputError` | `internal/service/authv2/community.go:472` |
+| School Email Required | Enter an email address ending in .edu. | `InputError` | `internal/service/worldcup/world_cup.go:39` |
+| Sign in already started | Start sign in again. | `DuplicateError` | `internal/data/repository/authv3.go:108` |
+| Duplicate OTP | An OTP already exists for this email | `DuplicateError` | `internal/data/repository/emailOTP.go:39` |
+
+</Accordion>
+</AccordionGroup>
+
+### Rate limit messages
+
+| Title | Body | Source |
+| --- | --- | --- |
+| Try Again Later | Too many sign-in attempts. Try again later. | `internal/server/http/authv3/handler.go:882` |
+| Try Again Later | Too many phone verification attempts. Try again later. | `internal/service/authv3/phone_orchestration.go:485`, `:535` |
+| Try Again Later | Too many verification requests. Try again later. | `internal/server/http/authv2/handler.go:130` |
+| Please Wait | Please wait N seconds before requesting another code. | `internal/service/authv2/authv2.go:144` |
+| Try Again Later | Phone verification is temporarily busy. Please try again later. | `internal/data/twilio/twilio.go:174` |
+| Try Again Later | Messaging is temporarily busy. Please try again later. | `internal/data/photon/photon.go:338` |
+| Rate Limit Exceeded | Too many requests to Mapbox API | `internal/data/mapbox/mapbox.go:95` |
+| Slow down | You've sent a lot of bumps recently. Try again in a little while. | `internal/service/notifications/bump.go:63` |
+| Slow down | Contact sync was attempted too many times; try again later. | `internal/service/user/contacts.go:183` |
+
+## Mobile handling
+
+The mobile app uses one Axios instance (`api/axios.ts:37`) for generated API calls and a separate `fetch` client for Auth v3 (`lib/auth/client.ts:177`).
+
+### Special-cased codes and statuses
+
+| Match | Where | Behavior |
+| --- | --- | --- |
+| 401 with `AccountDeletedError` in `code` or `error.code` | `providers/AxiosProvider.tsx:123`, `lib/auth/accountDeleted.ts:39` | Signs out once with reason `accountDeleted`. A re-entry guard ignores the burst of parallel 401s. |
+| `GET /authv2/status` returns 200 with `status: "deleted"` | `api/helpers/authUser.ts:117` | Signs out with reason `accountDeleted` |
+| 401 on `useCurrentUser` | `api/helpers/authUser.ts:130` | Signs out if the JWT is expired. Otherwise refetches once and signs out if that also returns 401. |
+| 401 on the user status poller | `providers/QueryPollers.tsx:85` | Stops polling until the JWT changes |
+| 400 with `error.code` `PickupAddressRequired` or `DestinationAddressRequired` | `hooks/usePreRideRequest.ts:233` | Reopens the pickup or destination stop with an inline prompt |
+| Other 4xx on ride creation | `usePreRideRequest.ts:255` | Shows `error.body`. 5xx and network errors show a generic retry message. |
+| 400 `InputError` with title `Incorrect Confirm Code` | `lib/ride/pickupError.ts:4` | Shows the wrong-PIN state. Also accepts the v1 shape. |
+| 403, 404, or 410 on ride messages, or 400 with message `user is not part of the ride` | `hooks/drive/messageErrors.ts:15` | Treats message access as terminal and stops retrying |
+| 404 on the messaging inbox | `providers/MessagingProvider.tsx:138` | Marks the inbox unsupported and stops the fallback poll |
+| 404 on a fleet join preview | `app/fleet-join/[code].tsx:149` | Shows the invalid-link state. Join failures show `error.body`. |
+| 426 on the update check | `lib/updateRequired.ts:29` | Treated as a valid response. The app reads `app_link` and blocks booking until the user updates. |
+| `showErrorModal` or `showWarningModal` request option | `providers/AxiosErrorInterceptor.tsx:29` | Shows a modal with `title` and `body` from either envelope. Only `components/modals/CouponModal.tsx:33` sets it. |
+
+### Auth v3 client
+
+`lib/auth/client.ts` sends `X-API-Version: v2` with a 15-second timeout. It normalizes envelope codes to the callback codes (`client.ts:81`), so one set of checks covers both channels. Network failures become synthetic codes: `request_timeout`, `network_unavailable`, or `invalid_server_response`. A non-envelope HTTP error becomes `http_<status>`.
+
+| Condition | Where | Behavior |
+| --- | --- | --- |
+| Code is `identity_conflict`, `account_merge_required`, `verify_existing_account`, `transaction_expired`, `temporarily_unavailable`, or `authentication_failed` | `client.ts:107` (`isAuthV3Terminal`) | Leaves the current step and shows the typed error screen |
+| 503, `http_503`, or `temporarily_unavailable` | `client.ts:111` (`isAuthV3Unavailable`) | The error screen offers the hosted web flow (`app/(auth-v3)/error.tsx:15`) |
+| `transaction_expired`, 410, 401, `http_401`, or `UnauthorizedError` | `providers/AuthV3Provider.tsx:188` | Starts a fresh transaction transparently |
+| 429 on phone send or verify | `client.ts:222`, `client.ts:65` | Parses `Retry-After` and shows "Too many attempts. Try again in N seconds." |
+| Any `?error=` on the callback URL | `lib/auth/security.ts:183` | Throws `callback_error`. The specific code is discarded. |
+
+## Web handling
+
+| Match | Where | Behavior |
+| --- | --- | --- |
+| Any Axios error on the dashboard | `src/lib/api-error.ts:17` (`getApiErrorMessage`, used in 33 files) | Toasts the first of `detail`, `message`, or `title`, checked at the top level and then under `error` |
+| 401 with `AccountDeletedError` on signup requests | `src/shared/signup/signupSession.ts:51` | Clears the signup token and redirects to `/` |
+| Other 401 on signup requests (`/authv2/`, `/user/`, `/world-cup/`, `/tips/`) | `signupSession.ts:57` | Refreshes the Auth v3 web session once, then replays the request |
+| 401 or 404 during account deletion | `src/sites/signup/delete-account/deleteAccount.ts:24` | Treated as "already deleted" |
+| 401 loading a tip link | `src/shared/signup/steps/TipStep.tsx:59` | Calls `onUnauthorized` |
+| Auth v3 errors | `src/sites/signup/auth-v3/authV3Errors.ts:28` | Maps code or status to a kind (table below) |
+
+| Auth v3 kind | Matched by | Web copy |
+| --- | --- | --- |
+| `account_merge_required` | `AccountMergeRequiredError` | Server `body`, or a default |
+| `verify_existing_account` | `ExistingAccountVerificationRequiredError` | Verify your existing account before adding this sign-in method. ... |
+| `conflict` | `IdentityConflictError` or any 409 | That sign-in method belongs to another account. Nothing was changed. ... |
+| `expired` | `AuthTransactionExpiredError` or 410 | For your security, return to the app and begin sign-in again. |
+| `rate_limit` | `RateLimitError` or 429 | Too many attempts. Try again in N seconds. |
+| `provider_unavailable` | `ProviderUnavailableError`, `AuthV3UnavailableError`, or 503 | That sign-in method is temporarily unavailable. ... |
+| `invalid` | `AccountDeletedError` or any other 4xx | That code didn't work. ... on phone verify, otherwise the server `body` |
+| `server` | 5xx | Server `body` or `title` |
+| `network` | Fetch failure or 12-second timeout | Offline or timed-out copy |
+
+The web Auth v3 client (`src/sites/signup/auth-v3/authV3Fetch.ts:25`) sends `X-API-Version: v2`. It shows `error.body`, then `error.title`, then "We couldn't continue sign-in."
+
+## Retry behavior
+
+| Client | Scope | Retries | Backoff | Never retried |
+| --- | --- | --- | --- | --- |
+| API | `NewCriticalRetrier` (payments, confirmations) | 3 attempts | Full jitter, 100 ms base, 5 s max | Types marked "No" in the [catalog](#error-catalog) |
+| API | `NewNetworkRetrier` (provider calls) | 5 attempts | Full jitter, 200 ms base, 10 s max | Same, unless a provider-specific `RetryIf` is passed |
+| API | Analytics retrier | 2 attempts | 50 ms base, 2 s max | Same |
+| Mobile | React Query default (`app/_layout.tsx:127`) | 3 retries | React Query default | 401, 403 |
+| Mobile | `useCurrentUser` (`api/helpers/authUser.ts:67`) | 3 retries | `min(1000 × 2^n, 10000)` ms | 401 |
+| Mobile | Community feed, map feed, feed card (`api/helpers/community.ts:232`, `providers/MapFeedProvider.tsx:130`, `components/map/feed/MapFeedCard.tsx:176`) | 3 retries | Default | 400 only |
+| Mobile | Driver map overlay (`components/drive/DriverMapOverlay.tsx:122`) | 2 retries | `min(1000 × 2^n, 4000)` ms | None |
+| Mobile | Fleet join preview and profile accounts | 1 retry | Default | None |
+| Mobile | Ride matching screen, bump preview, POI details | None | None | Everything |
+| Mobile | Contact match upload (`lib/contacts/contactMatchRetry.ts:30`) | 3 attempts | `min(750 × 2^n, 4000)` ms plus 0 to 250 ms jitter | 429 and other 4xx. Retries network errors and 5xx only. |
+| Mobile | Auth v3 resume (`lib/auth/resumeTransaction.ts:5`) | 1 retry | 300 ms | Anything other than timeouts, network failures, invalid responses, and 5xx |
+| Mobile | Auth v3 phone verify (`lib/auth/client.ts:349`) | Falls back to `resume` | None | The code exchange itself is never retried |
+| Mobile | Mutations | None | None | React Query doesn't retry mutations by default |
+| Web | Dashboard React Query (`src/sites/dashboard/main.tsx:86`) | 1 retry | Default | None |
+| Web | Public sites (`src/shared/bootstrap/renderSite.tsx:18`) | 1 retry | Default | None |
+| Web | Signup Axios 401 (`src/shared/signup/signupSession.ts:57`) | 1 replay after session refresh | None | `AccountDeletedError` |

@@ -154,11 +154,11 @@ The protocol is a read-ordering foundation only. Payment authorization and captu
 
 ## Ride events
 
-`rideevents.EventRecorder` writes the ride timeline to the `ride_events` table asynchronously.
+`rideevents.EventRecorder` writes the ride timeline to the `"RideEvents"` table asynchronously. See [Ride events](/reference/ride-events).
 
 - `Record` pushes onto a channel with a buffer of 500. If the channel stays full for 100 ms, the event is dropped with a warning.
 - One goroutine started by `EventRecorder.Start` inserts events. Insert failures log a warning and never fail the request.
-- `main.go` calls `Stop` during shutdown, which closes the channel and drains it.
+- `main.go` calls `Stop` during shutdown. `Stop` closes the channel and returns without waiting for it to drain, and the insert goroutine uses the already-canceled signal context. Events still buffered at shutdown can be lost.
 
 Event types are defined in `internal/models/ride_event.go`, for example `ride_requested`, `ride_confirmed`, `ride_accepted`, `ride_auto_queued`, `queue_promoted`, `driver_at_pickup`, `rider_picked_up`, `ride_completed`, `ride_canceled`, `auto_requeued`, `direct_assigned`, `tip_captured`, and `rescue_alert_sent`. Actor types are `rider`, `driver`, and `system`. Add new timeline entries through a `record*Event` helper in `internal/service/ride/events.go`.
 

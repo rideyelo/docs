@@ -1,0 +1,170 @@
+---
+title: "Slack alerts"
+description: "Every Slack message yelo-api posts: trigger, webhook channel, exact format, dedupe, delay, test-account filtering, and how the Slack client behaves when a webhook is missing or slow."
+---
+
+The API posts internal alerts to Slack through incoming webhooks. Users never see them. This page lists every alert the code sends today and how the Slack client behaves.
+
+## The Slack client
+
+`internal/utilities/slack/slack.go` exposes four functions:
+
+| Function | Payload | Channel |
+| --- | --- | --- |
+| `SendMessage` | `{"text": …}` | Alerts |
+| `SendMessageTo` | `{"text": …}` | Any |
+| `SendRichMessage` | Block Kit blocks inside one colored attachment | Alerts |
+| `SendRichMessageTo` | Same | Any |
+
+### Channels and webhooks
+
+| `slack.Channel` | Environment variable | Fallback when unset |
+| --- | --- | --- |
+| `ChannelAlerts` | `SLACK_WEBHOOK_URL` | none: message dropped |
+| `ChannelUserUpdates` | `SLACK_USER_UPDATES_WEBHOOK_URL` | **none**: message dropped. Signup data must never land in the general alerts channel. |
+| `ChannelDriverUpdates` | `SLACK_DRIVER_UPDATES_WEBHOOK_URL` | `SLACK_WEBHOOK_URL` |
+
+### Delivery rules
+
+`post` applies these rules in order:
+
+1. **Production only.** If `ENVIRONMENT` is not `production`, the payload is logged at info level as `Slack message skipped (non-production environment)` and nothing is sent. Local, dev, staging, and E2E never post.
+2. **Missing webhook.** Logs `Slack webhook URL not found` and returns.
+3. **Host pinning.** The URL's scheme and host are overwritten with `https://hooks.slack.com`, then checked again. A webhook configured for another host is rewritten, not rejected.
+4. **Send.** Uses `http.DefaultClient`, which has no timeout. Only the caller's context bounds the request.
+5. **Result.** Transport errors are logged. The HTTP status and response body are never read, so a `4xx` from Slack (a revoked webhook, for example) looks like success.
+
+There are no retries, no rate limiting, and no dedupe in the client. Each alert handles its own dedupe, listed below.
+
+### Test-account filtering
+
+`NotificationService.shouldSkipSlackForUser` suppresses alerts about test users when `SKIP_TEST_SCHOOL_NOTIFICATIONS` is true (the default). A user is a test user if:
+
+- `SchoolName` is `Yelo University`, or `SchoolID` is `c9817564-6850-4497-a248-67ea43e32d78`.
+- The email, lowercased, starts with `test`.
+
+Only alerts that pass a user through this helper are filtered: signup, driver application, and issue alerts. Guest signups, breaker alerts, and ops alerts are not.
+
+## Alert catalog
+
+### User and growth
+
+| Alert | Trigger | Channel | Format |
+| --- | --- | --- | --- |
+| Signup | Auth v3: `NotificationService.NotifyAuthV3Signup` from `authv3` resolver. Auth v2: `NotifyUserSignedUpDetailed` from `AuthV2Service` profile completion. | User updates | One line of text, see below |
+| Web guest signup | `AuthV2Service.notifyGuestSignup` for web guest accounts | User updates | `🌐 Web guest signup: {First Last} — {email} ({community})` |
+
+#### Signup alert
+
+Signup alerts are River jobs, not direct posts:
+
+- `notify.EnqueueSignupAlert` inserts `signup_slack_alert` with `ScheduledAt = now + 90s`, `MaxAttempts: 3`, and uniqueness on `user_id` only. A second enqueue for the same user is ignored while the first job exists.
+- The 90-second delay lets the account transaction commit and lets onboarding set the community and location.
+- `signupAlertWorker` has a 30-second timeout. `SendSignupAlert` reloads the user with a join to `AuthTransactions`, `Communities`, `Schools`, and the latest `AttributionTouches` row. If the user was deleted during the delay, the job succeeds silently.
+- The test filter runs at enqueue time for Auth v2 and again at send time for both paths.
+- If the user has coordinates, `enrichSignupCity` reverse-geocodes a city and caches it in Redis under `signup:city:{lat}:{lng}`, rounded to 2 decimals, for 24 hours.
+
+`buildSignupAlertMessage` joins `key=value` pairs with ` • `. Each value is cleaned: control characters become spaces, whitespace collapses, `&`, `<`, and `>` are escaped, and values are cut to 160 characters.
+
+```text
+🎉 New signup • name=Sam Lee • email=sam@school.edu • source=app • sign-in=apple • community=Campus • city=Austin, TX • school=State U • grad=2027 • referrer=example.com/path • attribution=instagram • utm=src/medium/campaign/content • referral=ABC123 • user=<https://dashboard…/users?user={id}|{id}>
+```
+
+- `community` is omitted when the user is still in the default community.
+- `attribution` uses the touch's `source_channel` unless it equals `source`, then falls back to `acquisition_source`.
+- Empty fields are omitted.
+
+### Driver applications
+
+| Alert | Trigger | Condition |
+| --- | --- | --- |
+| `🚗 Driver Application: Profile Photo` | `DriverService` profile photo upload | Only when no photo existed before (`!photoExisted`) |
+| `🚗 Driver Application: License Photos` | `DriverService` license upload | Only when no license existed before |
+| `🚗 Driver Application: Vehicle Created` | `VehicleService` create | Only when the driver now has exactly one vehicle |
+| `🚗 Driver Application: Stripe Signup` | `PaymentService.handleDriverAccountUpdated` on Stripe `account.updated` | Account status is `complete` and the call is not from reconciliation |
+
+All four go to the driver updates channel through `notifyDriverApplicationStep` in a background goroutine (`async.Go` with a detached context). The Block Kit message has a blue sidebar (`#1166E2`) and contains:
+
+- A header with the step.
+- `*Name* · Community`, falling back to the school name.
+- **Status** (driver application status) and **Signed up** (in the community's timezone, `Jan 2, 2006 3:04 PM MST`).
+- A **View application** button to `{YELO_DASHBOARD_URL}/drivers?userId={id}`, and a **Quo contact** button when the user has a Quo contact ID.
+- A context line with `user_id`.
+
+### Support
+
+| Alert | Trigger | Channel | Format |
+| --- | --- | --- | --- |
+| Issue reported | `IssueService.CreateIssue`, after the issue row is written, in a background goroutine | Alerts | `[New Issue Reported]` then `*User:* First Last (School)`, `*Category:*`, `*Comment:*`, and `*Ride ID:*` when present |
+| Safety issue | Same, when the category or comment contains `safety` (case-insensitive) | Alerts | Header becomes `@here [SAFETY ISSUE REPORTED]` |
+
+`@here` is sent as literal text. Slack incoming webhooks only notify the channel for the `<!here>` syntax, so the safety header is likely rendered as plain text and does not page anyone.
+
+### Operations
+
+| Alert | Trigger | Channel | Format | Dedupe |
+| --- | --- | --- | --- | --- |
+| Unmatched ride rescue | `ActivationService.checkRescue`, when the community's activation config has the rescue alert enabled and the ride is still unmatched after the last tier delay plus the grace period | Alerts | `Unmatched ride needs attention` then Community ID, Ride ID, Pickup, Destination, Price, Waiting minutes, and `Drivers notified: {n or unknown} across {tiers} tiers` | Redis `TrySetRescueSent` per ride. Also records `rescue_alert_sent` on the ride timeline. |
+| Breaker opened | `circuitbreaker.NewSettings` `OnStateChange` to open | Alerts | ``🔴 `{name}` breaker tripped — requests to this dependency are being rejected.`` | Once per state change, per instance |
+| Breaker recovered | Transition to closed from half-open | Alerts | ``🟢 `{name}` breaker closed — dependency service recovered.`` | Same |
+
+Breaker alerts run in their own goroutine with a 3-second timeout (`alertTimeout`) and no logger. Named breakers include `stripe`, `mapbox`, `google-maps`, `google-places`, `google-geocoding`, `resend`, `twilio`, `twilio-verify`, and `photon`. See [Integrations](/engineering/api/integrations#circuit-breakers).
+
+### Releases
+
+| Alert | Trigger | Channel | Title |
+| --- | --- | --- | --- |
+| App Store review state | `POST /appstore-webhook`, event type prefix `appStoreVersionAppVersionStateUpdated` | Alerts | `🚀 App Store Review Update` |
+| Build upload | Prefix `buildUploadStateUpdated` | Alerts | `📦 Build Upload Update` |
+| TestFlight external build | Prefix `buildBetaDetailExternalBuildStateUpdated` | Alerts | `✈️ TestFlight External Build Update` |
+| Webhook ping | Prefix `webhookPing` | Alerts | Text `🔄 App Store Connect webhook ping received` |
+| Anything else | Other types | Alerts | Text ``📬 Unhandled App Store Connect event: `{type}` `` |
+| Google Play release | `google_play_release_check` River job every 5 minutes, when a track's release changes | Alerts | `🤖 Google Play Release Update` |
+
+State messages use `slack.NewStateMessage`. It adds **Status** and **Previous** fields plus the listed fields, and picks the emoji and color by keyword:
+
+- Red for `REJECT`, `FAIL`, `INVALID`, `EXCEPTION`, `NOT_APPROVED`, checked first because `INVALID` contains `VALID`.
+- Green for `READY`, `ACCEPT`, `COMPLETE`, `VALID`, and similar.
+
+App Store events are verified with the `X-Apple-Signature` HMAC before posting. Google Play monitoring is on by default only in production (`GOOGLE_PLAY_RELEASE_MONITORING_ENABLED`). On its first run it stores already-published releases without alerting.
+
+## Defined but not sent
+
+`NotifyUnrecognizedEmailDomain` (`[Unrecognized Email Domain]`) and `NotifySubdomainFallback` (`[Subdomain Fallback Used]`) exist in `internal/service/notifications/notification.go`, but nothing calls them.
+
+## Where this lives in code
+
+| Alert | Path |
+| --- | --- |
+| Client, channels, Block Kit types | `yelo-api/internal/utilities/slack/slack.go`, `state_message.go` |
+| Signup | `yelo-api/internal/service/notifications/signup_alert.go`, `internal/notify/signup_alert.go`, `internal/notify/queue/signup_alert.go` |
+| Guest signup | `yelo-api/internal/service/authv2/community.go` (`notifyGuestSignup`) |
+| Driver application | `yelo-api/internal/service/notifications/driver_application_alert.go`, callers in `internal/service/driver/driver.go`, `internal/service/vehicle/vehicle.go`, `internal/service/payment/payment.go` |
+| Issues and test filter | `yelo-api/internal/service/notifications/notification.go` (`NotifyIssueCreated`, `shouldSkipSlackForUser`), `internal/service/issue/issue.go` |
+| Rescue | `yelo-api/internal/service/activation/activation.go` (`checkRescue`) |
+| Breakers | `yelo-api/internal/utilities/circuitbreaker/circuitbreaker.go` |
+| App Store | `yelo-api/internal/server/http/appstore/appstore.go` |
+| Google Play | `yelo-api/internal/service/playrelease/monitor.go` |
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Stripe Signup alerts repeat">
+    `notifyDriverStripeCompletion` runs on every `account.updated` webhook whose account computes to `complete`, not only on the transition to complete. Stripe sends `account.updated` for many unrelated changes, so the driver updates channel gets a new **Stripe Signup** alert each time.
+  </Accordion>
+  <Accordion title="Breaker alerts are per instance">
+    Breakers live in process memory. When a dependency fails, every Cloud Run instance trips its own breaker and posts its own alert, then posts again when it recovers.
+  </Accordion>
+  <Accordion title="Nothing posts outside production">
+    You can't test a Slack alert locally by setting a webhook. Set `ENVIRONMENT=production` only in a throwaway environment, or read the `Slack message skipped` log line, which contains the full payload.
+  </Accordion>
+  <Accordion title="Slack failures are invisible">
+    The client ignores Slack's HTTP status. A deleted or rotated webhook fails silently. If a channel goes quiet, test the webhook with `curl` before debugging the trigger.
+  </Accordion>
+  <Accordion title="Signup alerts contain personal data">
+    Signup alerts include name, email, city, school, and graduation year. That's why the user updates channel never falls back to the general alerts webhook.
+  </Accordion>
+  <Accordion title="Issue alerts are not filtered by environment in the service">
+    `NotifyIssueCreated` always calls Slack. It is only the client's production check that keeps non-production issues out of Slack.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,398 @@
+---
+title: "Analytics events"
+description: "Every PostHog event the Yelo API, signup site, and mobile app capture, with source locations, triggers, and properties"
+---
+
+This page lists every PostHog event in the API (Go), the web signup site, and the mobile app, and shows where each one fires in code. For SDK setup, E2E disabling, and the high-level masking rules, see [Observability](/engineering/observability).
+
+<Note>
+Source paths are relative to each repository root: `yelo-api`, `yelo-web`, and `yelo-frontend`. Line numbers point to the capture call, or to the hook call site for mobile events.
+</Note>
+
+## API business events
+
+The API sends events to PostHog in two ways:
+
+- **Metrics provider.** `PostHogMetricsProvider` in `internal/utilities/metrics/posthog.go` turns `IncrementCounter`, `RecordHistogram`, and `SetGauge` calls into captures. It drops names that start with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` (`isBusinessMetric`, line 222). `cmd/api/main.go:175` wires it into `MultiMetricsProvider` only when `cfg.Telemetry.OtelEnabled` is true. Otherwise the API uses `NoOpMetricsProvider` and sends no business events.
+- **Direct client.** `AuthV2Service.captureEvent` (`internal/service/authv2/authv2.go:189`) calls `posthog.Enqueue` directly. It skips the metrics provider and the `OtelEnabled` gate.
+
+Every other `IncrementCounter`, `RecordHistogram`, or `SetGauge` call in `internal/` uses a dropped prefix (`http.server.*`, `db.pool.*`, `rate.limiter.*`). Right now `authv3.step` is the only metric that reaches PostHog.
+
+### Metrics provider events
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `authv3.step` | `internal/server/http/authv3/telemetry.go:106` | Once per Auth v3 handler call, through a deferred finisher (`handler.step`). Logs success or failure. | `step`, `stage`, `operation` (all the same step name), `outcome` (`ok` or the error type), `result` (`success` or `failure`), `failure_reason` (empty on success), `count` |
+
+`enqueueCapture` (`internal/utilities/metrics/posthog.go:73`) adds these properties to every `authv3.step` event:
+
+| Property | Value |
+| --- | --- |
+| `event_schema_version` | `2` |
+| `surface` | `api` |
+| `platform` | `server` |
+| `environment` | `cfg.App.Environment` |
+| `transaction_id` | Auth v3 transaction, from the funnel carrier |
+| `request_id` | Request context ID |
+| `client_id`, `channel`, `attempt_id`, `provider`, `auth_surface`, `is_test`, `is_internal` | Set through `metrics.SetFunnelProperty` in `internal/server/http/authv3/telemetry.go:145-155` and `internal/service/authv3/telemetry.go:103-135`. They appear only when the handler resolves them. |
+
+The distinct ID is chosen in this order: the authenticated user ID, then the transaction ID, then `yelo-api`. The last two set `$process_person_profile: false`.
+
+The `step` values and where each is recorded:
+
+| `step` | Handler (`internal/server/http/authv3/`) |
+| --- | --- |
+| `configuration` | `PublicConfiguration`, `handler.go:225` |
+| `authorize` | `Authorize`, `handler.go:309` |
+| `authorize_link` | `AuthorizeLink`, `handler.go:344` |
+| `accept` | `Accept`, `handler.go:377` |
+| `resume` | `Resume`, `resume_handler.go:23` |
+| `provider_start` | `startProvider`, `handler.go:429`; `nativeAppleStart`, `handler.go:487` |
+| `callback` | `nativeAppleCallback`, `handler.go:519`; `GoogleCallback`, `handler.go:547`; `AppleCallback`, `handler.go:587` |
+| `token` | `Token`, `handler.go:688` |
+| `phone_send` | `SendPhone`, `handler.go:730` |
+| `phone_verify` | `VerifyPhone`, `handler.go:781` |
+| `status` | `OnboardingStatus`, `onboarding_handler.go:17` |
+| `profile` | `FinishProfile`, `onboarding_handler.go:39` |
+| `community_resolve` | `ResolveOnboardingCommunity`, `community_handler.go:19`; `ResolveAuthenticatedCommunity`, `community_handler.go:47` |
+
+`StepSessionRefresh` (`session_refresh`, `telemetry.go:35`) is declared but no handler records it.
+
+### Auth v2 direct events
+
+All Auth v2 events come from `captureEvent`. These events never set `$process_person_profile`.
+
+| Event | Source (`internal/service/authv2/`) | When fired | Distinct ID | Properties |
+| --- | --- | --- | --- | --- |
+| `auth.v2.phone_otp_requested` | `phone.go:90` | Phone OTP stored, before the SMS is sent | Masked phone | `phone` (masked), `is_resend`, `request_count`, `via_verify` |
+| `auth.v2.phone_otp_failed` | `phone.go:187`, `:236`, `:244`, `:263` | Wrong code, no OTP on record, too many attempts, or Twilio Verify expiry | Masked phone | `phone` (masked), `reason` (`incorrect`, `not_found`, `max_attempts`, `verify_expired`) |
+| `auth.v2.phone_otp_verified` | `phone.go:216`, `:304`, `:335` | Code accepted, for a new user or a returning user | Masked phone (new user) or user ID | `phone` (masked), `is_returning_user` |
+| `auth.v2.email_oauth_completed` | `email.go:80` | School-email OAuth (Google or Microsoft) finishes | Masked email | `method`, `email` (masked), `has_existing_user` |
+| `auth.v2.email_otp_requested` | `email.go:128` | Email OTP stored | Masked email | `email` (masked), `is_resend` |
+| `auth.v2.email_otp_failed` | `email.go:221` | Too many attempts only | Masked email | `email` (masked), `reason` (`max_attempts`) |
+| `auth.v2.email_otp_verified` | `email.go:238` | Email code accepted | Masked email | `email` (masked) |
+| `auth.v2.email_verified_new_user` | `email.go:498` | New user created from a verified school email | User ID | `email` (masked), `is_whitelist` |
+| `auth.v2.community_email_otp_requested` | `community.go:442` | Community email OTP stored | Masked email | `email` (masked), `is_resend` |
+| `auth.v2.community_email_otp_failed` | `community.go:564`, `:580`, `:600` | No OTP, too many attempts, or wrong code | Masked email | `email` (masked), `reason` |
+| `auth.v2.community_email_otp_verified` | `community.go:605` | Community email code accepted | Masked email | `email` (masked) |
+| `auth.v2.community_oauth_completed` | `community.go:135` (name passed at `:73`) | Community OAuth signup finalized | User ID | `email` (masked), `community_id`, `existing_user`, `source` |
+| `auth.v2.community_email_otp_completed` | `community.go:135` (name passed at `:618`) | Community email OTP signup finalized | User ID | Same as above |
+| `auth.v2.profile_completed` | `profile.go:141` | Profile setup done and full JWT issued | User ID | `user_id` |
+| `auth.v2.signup_completed` | `profile.go:145` | Fires right after `profile_completed` | User ID | `user_id` |
+
+`maskEmail` (`authv2.go:174`) returns `j***@school.edu`. `phone.MaskPhone` (`internal/utilities/phone/phone.go:90`) returns `***` plus the last four digits.
+
+### Unused API capture paths
+
+- `Logger.CaptureError` (`internal/utilities/logger/posthog.go:12`) would capture an event named after the error message, with `method`, `path`, and `trace`. Nothing calls it.
+- `PostHogMetricsProvider.RecordError` (`posthog.go:152`) is a no-op. Its comment says `logger.ErrorC` already sends errors to PostHog, but `ErrorC` only reports to Sentry.
+
+## Web (signup Auth v3)
+
+Only `src/sites/signup/auth-v3/analytics.ts` imports `posthog-js`. Nothing else in `yelo-web/src` captures events. Every event goes through `captureAuthV3Event` (line 200) or `captureAuthV3Abandonment` (line 211). Both return early unless capture is enabled.
+
+Capture is enabled only when all of these hold (`shouldCaptureAuthV3`, line 104):
+
+- `VITE_POSTHOG_KEY` is set.
+- The environment is `production`.
+- The context is not an emulator or a test account (`is_test` comes from the API's `analyticsExcluded` flag).
+- The context email does not end in `@rideyelo.com`.
+
+If a later context update makes capture disallowed, `updateAuthV3AnalyticsContext` stops session recording and turns capture off.
+
+Every event carries `stage`, `operation`, and `outcome`, plus the safe context: `attempt_id`, `transaction_id`, `request_id`, `client_id`, `channel`, `distribution`, `app_version`, `app_build`, `is_emulator`, `is_test`. The table lists only the extra fields. All sources are in `src/sites/signup/auth-v3/AuthV3Page.tsx`.
+
+| Event | Source | When fired | Stage, operation, outcome, and extra properties |
+| --- | --- | --- | --- |
+| `auth_v3_page_viewed` | `:561` | Page mounts | `entry`, `page_rendered`, `viewed` |
+| `auth_v3_entry_viewed` | `:213` | `EntryWithoutTransaction` renders, either during bootstrap or after a bootstrap error | `entry`, `bootstrap` or `bootstrap_failed`, `viewed` or `failed`; `failure_reason: web_bootstrap` |
+| `auth_v3_step_viewed` | `:569` | `view` changes | `method`, `phone`, `otp`, or `handoff`; `{view}_viewed`; `viewed` |
+| `auth_v3_legal_screen_viewed` | `:575` | Providers view shown | `legal`, `legal_copy_viewed`, `viewed` |
+| `auth_v3_methods_displayed` | `:580` | Providers view shown | `method`, `methods_displayed`, `viewed` |
+| `auth_v3_configuration_requested` | `:733` | First config fetch starts | `configuration`, `load`, `started` |
+| `auth_v3_configuration_loaded` | `:747` | Config fetch returns valid data | `configuration`, `load`, `succeeded`; `request_id` |
+| `auth_v3_configuration_failed` | `:769` | Config fetch fails | `configuration`, `load`, `failed`; `failure_reason`, `request_id` |
+| `auth_v3_legal_acceptance_requested` | `:795` | First method tap triggers terms acceptance | `legal`, `accept`, `started` |
+| `auth_v3_legal_acceptance_completed` | `:810` | Acceptance succeeds | `legal`, `accept`, `succeeded`; `request_id`, `duration_ms` |
+| `auth_v3_legal_acceptance_failed` | `:821` | Acceptance fails | `legal`, `accept`, `failed`; `failure_reason`, `request_id`, `duration_ms` |
+| `auth_v3_method_selected` | `:896`, `:924`, `:1055` | Google or Apple tapped (`:896`), phone button tapped (`:1055`), or phone send started (`:924`) | `method` or `phone`; `method_selected` or `phone-send`; `started`; `provider`, `is_retry` |
+| `auth_v3_provider_redirect_started` | `:909` | Safe provider URL received, just before redirect | `provider`, `redirect`, `succeeded`; `provider`, `request_id`, `duration_ms` |
+| `auth_v3_otp_resend_requested` | `:924` | Resend code tapped | `phone`, `phone-resend`, `started`; `provider: phone`, `is_retry: true` |
+| `auth_v3_otp_requested` | `:938` | SMS send succeeds | `phone`, `phone-send` or `phone-resend`, `succeeded`; `request_id`, `duration_ms`, `is_retry` |
+| `auth_v3_otp_verification_requested` | `:965` | Code submitted | `otp`, `verify`, `started`; `provider: phone` |
+| `auth_v3_otp_verification_completed` | `:982`, `:995` | Code accepted, before the web or app redirect | `otp`, `verify`, `succeeded`; `request_id`, `duration_ms` |
+| `auth_v3_handoff_attempted` | `:263`, `:1005` | Web completion screen (`web_completion`), or app handoff after phone verify (`app_open`) | `handoff`, `succeeded`; `provider`, `request_id` |
+| `auth_v3_handoff_retry_tapped` | `:1267` | "Try again" tapped on the handoff screen | `handoff`, `app_open_retry`, `started`; `is_retry: true` |
+| `auth_v3_back_tapped` | `:1101`, `:1113` | Back from OTP (`change_phone`) or from phone entry (`back`) | `otp` or `phone`, `cancelled`; `duration_ms` on the view |
+| `auth_v3_operation_failed` | `:875` | Any provider, phone send, or phone verify action throws | `provider`, `phone`, or `otp`; the action name; `failed`; `provider`, `failure_reason`, `request_id` |
+| `auth_v3_error_viewed` | `:286` | `TerminalError` renders | `error`, `terminal_error`, `failed`; `failure_reason`, `request_id` |
+| `auth_v3_abandoned` | `analytics.ts:213` (registered on `pagehide` at `AuthV3Page.tsx:562`) | Page hides before handoff succeeds or before navigation is expected | `stage` is the last stage seen, `operation: leave`, `outcome: abandoned` |
+
+The web client never calls `identify`, `group`, or `alias`. Events stay anonymous and are linked to the API through `attempt_id` and `transaction_id`.
+
+## Mobile
+
+Mobile events go through the `EventRecorder` interface (`lib/analytics/types.ts`). Its PostHog implementation is `lib/analytics/recorder/posthog.ts`. Hooks in `lib/analytics/events/` call `analytics.track`. Auth v3 events use `trackAuthV3` in `lib/auth/analytics.ts:170`. A few screens call `usePostHog().capture` directly.
+
+<AccordionGroup>
+<Accordion title="Auth v3 (40 fired, 41 defined)">
+
+All Auth v3 events go through `AuthV3Provider.track` (`providers/AuthV3Provider.tsx:316`), which calls `trackAuthV3`. `trackAuthV3` drops the event when `shouldExcludeAuthV3Analytics()` (staging, development, or emulator builds) or `isResolvedAccountAnalyticsExcluded()` (test or `@rideyelo.com` account) is true.
+
+Every event includes:
+
+- `stage`
+- Build properties from `authV3BuildProperties()`: `event_schema_version` (2), `environment`, `deployment_channel`, `distribution`, `platform`, `app_version`, `app_build`, `runtime_version`, `is_device`, `is_emulator`, `analytics_excluded`
+- The attempt context: `attempt_id`, `transaction_id`, `attempt_number`, `is_retry`
+
+| Event | Source | When fired | Extra properties |
+| --- | --- | --- | --- |
+| `auth_v3_entry_viewed` | `app/(auth-v3)/index.tsx:81` | Entry screen mounts | none |
+| `auth_v3_get_started_tapped` | `app/(auth-v3)/index.tsx:140` | Get started tapped | `prefer_native` |
+| `auth_v3_authorize_requested` | `providers/AuthV3Provider.tsx:611` | Transaction authorize starts, including prefetch | `prefetch` |
+| `auth_v3_authorize_completed` | `providers/AuthV3Provider.tsx:660` | Authorize succeeds | `prefetch` |
+| `auth_v3_authorize_failed` | `providers/AuthV3Provider.tsx:689`, `:693`, `:1097`, `:1104` | Authorize fails, or a provider start fails (terminal or recoverable) | `prefetch`, or `failure_reason`, `request_id`, `duration_ms`, or `method`, `recoverable` |
+| `auth_v3_method_viewed` | `app/(auth-v3)/method.tsx:24` | Method screen mounts | none |
+| `auth_v3_method_selected` | `app/(auth-v3)/method.tsx:69`, `providers/AuthV3Provider.tsx:1070` | Phone tapped, or Google or Apple started | `method` |
+| `auth_v3_accept_completed` | `providers/AuthV3Provider.tsx:1017` | Terms accepted | none |
+| `auth_v3_phone_submitted` | `providers/AuthV3Provider.tsx:1133` | Phone number submitted | none |
+| `auth_v3_phone_code_sent` | `providers/AuthV3Provider.tsx:1138` | Send-code call returns | `outcome` |
+| `auth_v3_phone_resend_requested` | `app/(auth-v3)/phone-confirm.tsx:69` | Resend tapped | none |
+| `auth_v3_phone_verified` | `providers/AuthV3Provider.tsx:1182` | Verify-code call returns | `outcome` |
+| `auth_v3_phone_failed` | `providers/AuthV3Provider.tsx:1154`, `:1159`, `:1185`, `:1206` | Send or verify fails. Terminal errors also go through `failFlow`. | `operation`, `failure_reason`, and from `failFlow`: `request_id`, `duration_ms` |
+| `auth_v3_browser_launch_requested` | `providers/AuthV3Provider.tsx:770`, `:1052` | Before the hosted or provider auth session opens | none |
+| `auth_v3_browser_opened` | `providers/AuthV3Provider.tsx:780`, `:1057` | Auth session returns | none |
+| `auth_v3_browser_cancelled` | `providers/AuthV3Provider.tsx:783`, `:1060` | User cancels or dismisses the browser | none |
+| `auth_v3_browser_failed` | `providers/AuthV3Provider.tsx:777`, `:787`, `:875`, `:1064` | Browser fails to open, returns a non-success result, or falls back to native | `failure_reason`, `fallback` |
+| `auth_v3_native_recovery` | `providers/AuthV3Provider.tsx:877`, `:884` | Hosted flow falls back to native screens | `reason`, `fallback`, `consecutive_cancellations`, `previous_attempt_id`, `previous_transaction_id`, `outcome` (`requested`, `completed`, or `failed`) |
+| `auth_v3_callback_received` | `providers/AuthV3Provider.tsx:576` | Redirect URL received | none |
+| `auth_v3_callback_validated` | `providers/AuthV3Provider.tsx:578` | Redirect URL parsed and state matched | none |
+| `auth_v3_exchange_requested` | `providers/AuthV3Provider.tsx:538` | Code exchange starts | none |
+| `auth_v3_exchange_completed` | `providers/AuthV3Provider.tsx:547` | Code exchange succeeds | `status` |
+| `auth_v3_exchange_failed` | `providers/AuthV3Provider.tsx:799` | Callback error that can be recovered natively | `failure_reason`, `recoverable`, `fallback` |
+| `auth_v3_profile_viewed` | `app/(auth-v3)/finish-profile.tsx:58` | Finish-profile screen has an onboarding token | none |
+| `auth_v3_profile_submit_tapped` | `providers/AuthV3Provider.tsx:1285` | Profile submitted | none |
+| `auth_v3_profile_completed` | `providers/AuthV3Provider.tsx:1294` | Profile saved | none |
+| `auth_v3_profile_failed` | `providers/AuthV3Provider.tsx:1271`, `:1305` | Status fetch or profile save fails | `operation`, `failure_reason` |
+| `auth_v3_permissions_viewed` | `providers/AuthV3Provider.tsx:518` | Permissions screen queued | none |
+| `auth_v3_permission_requested` | `app/(auth-v3)/permissions.tsx:103`, `:109`, `:118` | Before each system prompt | `permission` (`location`, `notifications`, `contacts`) |
+| `auth_v3_permission_completed` | `app/(auth-v3)/permissions.tsx:105`, `:114`, `:123`; `providers/AuthV3Provider.tsx:504` | After each prompt, or when the permission preflight fails | `permission`, `outcome`, `failure_reason` |
+| `auth_v3_permissions_skipped` | `providers/AuthV3Provider.tsx:512` | Every permission is already resolved | none |
+| `auth_v3_permissions_completed` | `app/(auth-v3)/permissions.tsx:132` | All three prompts done and location allowed | none |
+| `auth_v3_handoff_started` | `providers/AuthV3Provider.tsx:408` | Session completion begins | `permission_path` |
+| `auth_v3_handoff_completed` | `providers/AuthV3Provider.tsx:409` | Right after `handoff_started` | `duration_ms`, `permission_path` |
+| `auth_v3_handoff_failed` | `providers/AuthV3Provider.tsx:473` | Session completion throws | `failure_reason` |
+| `auth_v3_community_resolved` | `providers/AuthV3Provider.tsx:450` | Active community resolution returns | `reason`, `resolved` |
+| `auth_v3_community_failed` | `providers/AuthV3Provider.tsx:457` | Community resolution throws | `failure_reason` |
+| `auth_v3_error_viewed` | `app/(auth-v3)/error.tsx:18` | Error screen mounts | `failure_reason` |
+| `auth_v3_retry_tapped` | `app/(auth-v3)/error.tsx:44`, `:52` | Try again, or Use the browser instead | `fallback` |
+| `auth_v3_exit_tapped` | `app/(auth-v3)/finish-profile.tsx:89`, `providers/AuthV3Provider.tsx:1321` | Back from profile, or exit from the error flow | `action` |
+
+`auth_v3_callback_failed` is declared in the `AuthV3Event` union (`lib/auth/analytics.ts:65`) but never fired.
+
+</Accordion>
+<Accordion title="Onboarding and account">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `onboarding_started` | `lib/analytics/events/onboarding.ts:13`; fired at `app/(auth-v3)/index.tsx:80` | Auth v3 entry screen mounts (not gated by Auth v3 exclusion) | none |
+| `sign_out` | `lib/analytics/events/account.ts:9`; fired at `providers/SessionProvider.tsx:219`, `api/helpers/authUser.ts:133`, `:144` | `signOut()` runs, or `useCurrentUser` gets a 401 on an expired JWT | none |
+| `account_deletion_started` | `account.ts:10`; `app/(app)/profile/settings.tsx:70` | Delete account tapped | none |
+| `account_deletion_confirmed` | `account.ts:11`; `components/modals/AccountDeletion.tsx:117` | Deletion confirmed | none |
+| `name_updated` | `account.ts:12`; `components/bottom-sheets/profile-sheets/PersonalInformationSheet.tsx:67` | Name saved | none |
+| `notification_preferences_updated` | `account.ts:13`; `components/bottom-sheets/profile-sheets/NotificationsSheet.tsx:59` | Notification toggle saved | `allow_notifications` |
+| `community_switched` | `account.ts:15`; `app/(app)/profile/community-switch.tsx:138` | Community change succeeds | `from_community_id`, `to_community_id` |
+
+</Accordion>
+<Accordion title="Rider ride flow">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `confirm_destination` | `app/(app)/ride/dropoff.tsx:110` (direct `postHog.capture`) | Destination confirmed | `name`, `address`, `mapboxId`, `eventId` |
+| `dropoff_search_tap` | `app/(app)/ride/dropoff.tsx:287` (direct) | Search result tapped | `name`, `address`, `latitude`, `longitude`, `mapbox_id` |
+| `create_ride` | `lib/analytics/events/ride.ts:19`; `hooks/usePreRideRequest.ts:213` | Pre-ride draft created (before payment) | `ride_id`, `pickup_name`, `pickup_lat`, `pickup_lng`, `dropoff_name`, `dropoff_lat`, `dropoff_lng` |
+| `confirm_ride` | `components/ride/StripePaymentScreen.tsx:293` (direct) | Payment and ride confirmation succeed | `id`, `vehicle_type` |
+| `rider_waiting` | `ride.ts:21`; `lib/analytics/observers/RiderFlowObserver.tsx:83` | Status first becomes `requested` or `confirmed` | `ride_id` |
+| `rider_queued` | `ride.ts:23`; `RiderFlowObserver.tsx:89` | Status becomes `queued` | `ride_id`, `seconds_since_request` |
+| `rider_driver_en_route` | `ride.ts:25`; `RiderFlowObserver.tsx:95` | Status becomes `driver_en_route` | `ride_id`, `eta_seconds` |
+| `rider_driver_arrived` | `ride.ts:28`; `RiderFlowObserver.tsx:103` | Status becomes `driver_waiting` | `ride_id` |
+| `rider_ride_started` | `ride.ts:30`; `RiderFlowObserver.tsx:109` | Status becomes `in_progress` | `ride_id` |
+| `rider_arrived` | `ride.ts:32`; `RiderFlowObserver.tsx:115` | Status becomes `complete` | `ride_id`, `duration_seconds` |
+| `ride_queue_left` | `ride.ts:35`; `app/(app)/ride-matching/leave-queue.tsx:88` | Queue cancellation succeeds | `ride_id`, `seconds_in_queue` |
+| `ride_tip_selected` | `lib/analytics/events/rating.ts:14`; `app/(app)/ride-complete/index.tsx:68` | Tip amount chosen | `ride_id`, `tip_amount_cents`, `is_preset` |
+| `ride_rating_submitted` | `rating.ts:9`; `ride-complete/index.tsx:99` | Rating saved with stars | `ride_id`, `stars`, `has_comment`, `tip_amount_cents` |
+| `ride_rating_skipped` | `rating.ts:12`; `ride-complete/index.tsx:109` | Review saved without stars | `ride_id` |
+
+The typed hooks declare `driver_id` for the `rider_*` events, but `RiderFlowObserver` never passes it.
+
+</Accordion>
+<Accordion title="Rideshare aggregator and provider accounts">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `ride_aggregator_prices_loaded` | `lib/analytics/events/rideAggregator.ts:111`; `app/(app)/(tabs)/map/request.tsx:625` | Quotes settle for a new route (`initial`) or after a refresh (`refresh`) | `trigger`, `experiment_enabled`, `provider_count`, `option_count`, `connected_provider_count`, `providers`, `options[]` (each has `provider`, `key`, `name`, `price_label`, `price_value`, `eta_minutes`, `eta_max_minutes`, `seats`, `needs_connect`, `error_kind`), `cheapest_provider`, `cheapest_price`, `fastest_provider`, `fastest_eta_minutes`. `pickup_*` and `dropoff_*` are sent only with diagnostics consent. |
+| `ride_aggregator_option_selected` | `rideAggregator.ts:113`; `request.tsx:233` | Any option selected, including through the cheapest or fastest pills | `provider`, `option_key`, `price_value`, `price_label`, `eta_minutes` |
+| `ride_aggregator_cheapest_selected` | `rideAggregator.ts:115`; `components/map/request/useAggregatorSheet.ts:71` | Cheapest pill tapped | Same as `option_selected` |
+| `ride_aggregator_fastest_selected` | `rideAggregator.ts:117`; `useAggregatorSheet.ts:85` | Fastest pill tapped | Same as `option_selected` |
+| `ride_aggregator_prices_refreshed` | `rideAggregator.ts:119`; `request.tsx:261` | Refresh tapped | `provider_count` |
+| `ride_aggregator_accounts_opened` | `rideAggregator.ts:121`; `request.tsx:715`, `:900` | Connect accounts from the action bar or the sign-in call to action | `source`, `unconnected_count` |
+| `ride_aggregator_provider_opened` | `rideAggregator.ts:126`; `components/map/request/aggregatorHandoff.ts:34` | Rider deep-links out to a provider to book | Selection fields, `sign_in_mode`. Route fields are sent only with consent. |
+| `ride_provider_accounts_viewed` | `lib/analytics/events/rideProviders.ts:20`; `app/(app)/profile/accounts.tsx:44` | Accounts screen viewed | none |
+| `ride_provider_card_tapped` | `rideProviders.ts:22`; `accounts.tsx:191` | Provider card tapped | `provider`, `connected` |
+| `ride_provider_connect_started` | `rideProviders.ts:25`; `app/(app)/connect-uber.tsx:52`, `connect-lyft.tsx:99`, `connect-empower.tsx:35` | Connect flow begins | `provider`, `browserSession` (Uber only) |
+| `ride_provider_connect_cancelled` | `rideProviders.ts:28`; `connect-uber.tsx:72`, `connect-empower.tsx:42` | Browser dismissed | `provider`, `browserSession`, `browserResult`, `durationMs` (Uber only) |
+| `ride_provider_connect_succeeded` | `rideProviders.ts:30`; `connect-uber.tsx:88`, `connect-lyft.tsx:109`, `connect-empower.tsx:53` | Account connected | `provider`, `browserSession`, `durationMs` (Uber only) |
+| `ride_provider_connect_failed` | `rideProviders.ts:32`; `connect-uber.tsx:107`, `connect-lyft.tsx:86`, `connect-empower.tsx:59` | Connect flow throws | `provider`, `phase`, `browserSession`, `durationMs` |
+| `ride_provider_request_completed` | `lib/analytics/events/providerDiagnostics.ts:41`; called from `lib/ride/providerDiagnostics.ts:36` | Every Uber or Lyft API call wrapped by `diagnoseProviderRequest` (`lib/ride/uberProvider.ts`, `lib/ride/lyftProvider.ts`) | `schema_version`, `request_id`, `provider`, `operation`, `started_at_ms`, `duration_ms`, `processing_ms`, `status`, `outcome`, `response` summary (first 30 fares), `quotes` (first 30 options), `detailed_diagnostics`. `route` is sent only with consent. |
+| `ride_provider_request_options` | `providerDiagnostics.ts:48` | For each extra chunk of 30 rows past the first | `schema_version`, `request_id`, `provider`, `operation`, `chunk_index`, `chunk_count`, `fares`, `parsed_options` |
+| `ride_provider_session_changed` | `providerDiagnostics.ts:90`; called from `lib/ride/providerDiagnostics.ts:23` (from `lib/ride/tokenStore.ts`) | Provider token saved, loaded, cleared, or refreshed | `provider`, `action`, `reason` |
+| `ride_provider_diagnostics_consent_changed` | `providerDiagnostics.ts:94`; called from `stores/providerDiagnosticConsentStore.ts:20` | Consent flips, including the forced disable in `signOut` | `enabled`, `scope: experiment`, `disclosure_version: 1` |
+
+</Accordion>
+<Accordion title="Driver">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `driver_went_online` | `lib/analytics/events/driver.ts:9`; `providers/DriveProvider.tsx:337` | Go-online succeeds | `vehicle_id` |
+| `driver_went_offline` | `driver.ts:11`; `DriveProvider.tsx:349` | Go-offline succeeds | `seconds_online` |
+| `driver_ride_request_card_shown` | `driver.ts:16`; `DriveProvider.tsx:152` | Ride request card appears | `ride_id`, `source` (`automatic` or `manual`) |
+| `driver_ride_accepted` | `driver.ts:13`; `components/drive/DriverMapOverlay.tsx:264` | Accept succeeds | `ride_id`, `pickup_distance_meters` |
+| `driver_ride_decline_opened` | `driver.ts:19`; `DriverMapOverlay.tsx:292` | Decline sheet opened | `ride_id` |
+| `driver_ride_decline_submitted` | `driver.ts:23`; `DriverMapOverlay.tsx:309` | Decline reason chosen | `ride_id`, `reason` |
+| `driver_ride_declined` | `driver.ts:26`; `DriverMapOverlay.tsx:315` | Decline API succeeds | `ride_id`, `reason`, `duration_ms` |
+| `driver_ride_decline_failed` | `driver.ts:29`; `DriverMapOverlay.tsx:317` | Decline API fails | `ride_id`, `reason`, `duration_ms`, `error_type` |
+| `driver_ride_decline_cancelled` | `driver.ts:21`; `DriverMapOverlay.tsx:331` | Decline sheet dismissed | `ride_id` |
+| `driver_at_pickup` | `driver.ts:32`; `components/drive/CurrentRideBottomSheet.tsx:622` | Arrival confirmed | `ride_id` |
+| `driver_ride_started` | `driver.ts:34`; `CurrentRideBottomSheet.tsx:642`, `components/drive/SecurityPinBottomSheet.tsx:67` | Pickup confirmed without or with a PIN | `ride_id`, `pin_used` |
+| `driver_ride_completed` | `driver.ts:36`; `CurrentRideBottomSheet.tsx:675` | Completion confirmed | `ride_id`, `duration_seconds` |
+| `driver_auto_queue_toggled` | `driver.ts:39`; `DriverMapOverlay.tsx:240`, `components/drive/AutoQueuePauseSheet.tsx:64` | Auto-queue turned on or off | `enabled` |
+| `driver_auto_queue_paused` | `driver.ts:41`; `AutoQueuePauseSheet.tsx:49` | Auto-queue paused | `duration_minutes` |
+| `driver_intro_stories_opened` | `lib/analytics/events/driverIntroStories.ts:14`; `components/onboarding/why-drive/WhyDriveStories.tsx:256` | Why-drive stories open | none |
+| `driver_intro_stories_screen_viewed` | `driverIntroStories.ts:15`; `WhyDriveStories.tsx:262`, `:264` | Each story page | `index`, `variant` |
+| `driver_intro_stories_completed` | `driverIntroStories.ts:17`; `WhyDriveStories.tsx:273` | Last story finished | none |
+| `driver_intro_stories_dismissed` | `driverIntroStories.ts:18`; `WhyDriveStories.tsx:130` | Swipe, back, or background | `via`, `last_index` |
+| `driver_signup_started` | `lib/analytics/events/driverSignup.ts:9`; `app/(app)/driver-signup/1-hub.tsx:155` | Driver signup hub opened | none |
+| `driver_signup_profile_photo_uploaded` | `driverSignup.ts:10`; `driver-signup/2-profile-photo.tsx:49` | Photo uploaded | none |
+| `driver_signup_vehicle_basic_completed` | `driverSignup.ts:11`; `driver-signup/3-vehicle-basic.tsx:67` | Vehicle basics saved | none |
+| `driver_signup_vehicle_details_completed` | `driverSignup.ts:12`; `driver-signup/4-vehicle-details.tsx:83` | Vehicle details saved | none |
+| `driver_signup_license_uploaded` | `driverSignup.ts:13`; `driver-signup/5-license.tsx:92` | License uploaded | none |
+| `driver_signup_stripe_connected` | `driverSignup.ts:14`; `driver-signup/6-stripe.tsx:78` | Stripe Connect done | none |
+| `driver_signup_submitted` | `driverSignup.ts:15`; `driver-signup/8-submitted.tsx:35` | Application submitted | none |
+
+</Accordion>
+<Accordion title="Social, likes, and contacts">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `friends_hub_opened` | `lib/analytics/events/friends.ts:12`; `components/bottom-sheets/friends-hub/FriendsHubContent.tsx:159` | Friends hub opened | `friend_count`, `sent_invite_count` |
+| `friends_hub_searched` | `friends.ts:15`; `FriendsHubContent.tsx:174` | Search query entered | `query_length` |
+| `friends_invite_sent` | `friends.ts:17`; `components/bottom-sheets/friends-hub/useFriendsHubData.ts:114`, `components/bottom-sheets/bump-friends/BumpFriendsContent.tsx:371`, `hooks/useContactsAccessAction.ts:27` | Invite sent through SMS, in-app, or the share sheet | `channel`, `recipient_count` |
+| `bump_sheet_opened` | `friends.ts:22`; `components/bottom-sheets/BumpFriendsBottomSheet.tsx:93` | Bump sheet opened | `ride_id`, `eta_seconds` |
+| `bump_sent` | `friends.ts:24`; `BumpFriendsContent.tsx:442` | Bump sent | `ride_id`, `channel: push_sms`, `recipient_count` |
+| `contacts_prompt_action` | `friends.ts:9`; `hooks/useContactsAccessAction.ts:37` | Contacts prompt call to action tapped | `surface`, `action`, `permission`, `scope` |
+| `contacts_snapshot_sync` | `components/ContactMatchSync.tsx:137`, `:184`, `:235`, `:254` (inline) | Contact match sync ends: read failure, unchanged, success, or error | `submitted_count`, `truncated`, `matched_user_count`, `trigger`, `duration_ms`, `outcome`, `sync_id` (success only) |
+| `like_added` | `lib/analytics/events/likes.ts:9`; `components/save-location/SearchOverlay.tsx:214` | Place liked | `mapbox_id`, `name`, `categories`, `source` |
+| `like_removed` | `likes.ts:12`; `app/(app)/save-location/index.tsx:202` | Like removed | `mapbox_id`, `name` |
+| `like_pinned` | `likes.ts:14`; `save-location/index.tsx:130` | Like pinned | `mapbox_id` |
+| `like_unpinned` | `likes.ts:16`; `save-location/index.tsx:138` | Like unpinned | `mapbox_id` |
+| `like_used_as_dropoff` | `likes.ts:18`; `save-location/index.tsx:159` | Like chosen as destination | `mapbox_id`, `name` |
+
+</Accordion>
+<Accordion title="Permissions, location, push, and tutorial">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `permission_requested` | `lib/analytics/events/permissions.ts:11`; `providers/LocationProvider.tsx:116`, `providers/PushNotificationProvider.tsx:172`, `providers/ContactPermissionProvider.tsx:143`, `hooks/useDriverProfilePhotoPicker.ts:36`, `app/(app)/driver-signup/5-license.tsx:39` | Before a system permission prompt | `channel` (`location`, `notifications`, `contacts`, `camera`) |
+| `permission_granted` | `permissions.ts:12`; same files, lines 119, 176, 148, 39, 42 | Prompt granted | `channel` |
+| `permission_denied` | `permissions.ts:13`; same files, lines 121, 178, 150, 41, 44 | Prompt denied | `channel` |
+| `location_resolution_completed` | `lib/analytics/events/location.ts:9`; `providers/LocationProvider.tsx:178` | Device location resolver finishes | `source`, `outcome`, `elapsed_ms`, `fix_age_ms`, `accuracy_m`, `native_error` |
+| `location_upload_failed` | `location.ts:10`; `LocationProvider.tsx:272` | Location upload to the API fails | none |
+| `push_notification_opened` | `lib/analytics/events/push.ts:10`; passed at `providers/PushNotificationProvider.tsx:279`, called in `lib/notifications/processNotificationTap.ts:39` | Push notification tapped | `cohort_id`, `deep_link_path`, `notification_delivery_id`, `notification_id`, `notification_type`, `variant_id` |
+| `tutorial_map_started` | `lib/analytics/events/mapTutorial.ts:10`; `providers/MapTutorialProvider.tsx:369`, `:393` | Map tutorial begins | none |
+| `tutorial_map_step_completed` | `mapTutorial.ts:11`; `MapTutorialProvider.tsx:439`, `:456`, `:500`, `:524`, `:542` | Step finished | `step` (`like`, `friends`, `bump`) |
+| `tutorial_map_skipped` | `mapTutorial.ts:12`; `MapTutorialProvider.tsx:472`, `:478` | Tutorial skipped | `step` |
+| `tutorial_map_completed` | `mapTutorial.ts:13`; `MapTutorialProvider.tsx:596` | Tutorial finished | none |
+
+</Accordion>
+<Accordion title="Experiments and feedback">
+
+| Event | Source | When fired | Properties |
+| --- | --- | --- | --- |
+| `experiments_screen_viewed` | `lib/analytics/events/experiments.ts:10`; `app/(app)/profile/experiments.tsx:80` | Experiments screen loads community data | `available_count` |
+| `experiment_toggled` | `experiments.ts:12`; `experiments.tsx:150` | Experiment switched | `experiment`, `enabled` |
+| `experiment_disclaimer_shown` | `experiments.ts:15`; `experiments.tsx:159` | Price aggregator disclaimer shown on first enable | `experiment` |
+| `experiment_disclaimer_confirmed` | `experiments.ts:16`; `experiments.tsx:179` | Disclaimer accepted | `experiment` |
+| `experiment_disclaimer_cancelled` | `experiments.ts:17`; `experiments.tsx:196` | Disclaimer cancelled | `experiment` |
+| `experiment_save_failed` | `experiments.ts:19`; `experiments.tsx:116` | Opt-in save fails | none |
+| `app_feedback_prompt_shown` | `lib/analytics/events/feedbackPrompt.ts:13`; `providers/FeedbackPromptProvider.tsx:84` | Feedback funnel starts (`ride-positive`, `first-like`, `driver-approved`, `driver-shift`) | `role`, `trigger_reason` |
+| `app_feedback_sentiment` | `feedbackPrompt.ts:15`; `FeedbackPromptProvider.tsx:120` | Love or meh chosen | `sentiment`, `role`, `trigger_reason` |
+| `app_feedback_declined` | `feedbackPrompt.ts:27`; `FeedbackPromptProvider.tsx:134` | Text step declined | `sentiment`, `role`, `trigger_reason` |
+| `app_feedback_submitted` | `feedbackPrompt.ts:20`; `FeedbackPromptProvider.tsx:150` | Free-text feedback submitted | `sentiment`, `has_text`, `text`, `role`, `trigger_reason` |
+| `review_prompt_requested` | `lib/analytics/events/reviewPrompt.ts:11`; `FeedbackPromptProvider.tsx:70` | Native store review requested at the end of the funnel | `reason`, `was_shown`, `cooldown_active` |
+
+</Accordion>
+<Accordion title="Exceptions">
+
+`EventRecorder.captureException` maps to PostHog `captureException`, which records the `$exception` event.
+
+| Source | When fired | Extra properties |
+| --- | --- | --- |
+| `app/_layout.tsx:270` | Root Sentry error boundary catches an error | `component_stack` |
+| `app/(app)/connect-uber.tsx:102` | Uber connect fails | `area`, `phase`, `browserSession`, `durationMs`, provider error summary |
+| `app/(app)/connect-lyft.tsx:81`, `:121` | Lyft login or email sync fails | `area`, `phase`, provider error summary |
+| `app/(app)/connect-empower.tsx:58` | Empower connect fails (raw error) | `area` |
+| `app/(app)/profile/experiments.tsx:115` | Experiment save fails | `area` |
+
+</Accordion>
+</AccordionGroup>
+
+## Identify and person properties
+
+| Platform | Call | Source | Distinct ID | Person properties |
+| --- | --- | --- | --- | --- |
+| API | none | — | User ID, transaction ID, or `yelo-api` for `authv3.step`; masked phone, masked email, or user ID for Auth v2 | None. The API never sends `$set` or `Identify`. |
+| Web | none | — | Anonymous `posthog-js` ID | None |
+| Mobile | `analytics.identify` | `api/helpers/authUser.ts:91` (in `useCurrentUser`, after every successful `currentUser` fetch) | `user.id` | `name`, `email`, `phone`, `community_id`, `home_community_id`, `is_test`, `email_domain`, `analytics_excluded` |
+| Mobile | `analytics.reset` | `providers/SessionProvider.tsx:221`, `api/helpers/authUser.ts:134`, `:145` | Clears identity and super properties | — |
+
+## Group analytics
+
+Only the mobile app uses groups. It uses one group type, `community`, keyed by community ID, with no group properties:
+
+- `api/helpers/authUser.ts:110` sets it after identify when `user.community_id` is present.
+- `app/(app)/profile/community-switch.tsx:146` sets it after a community switch.
+
+The API and web client never call `group` or `GroupIdentify`.
+
+## Super properties and default context
+
+| Platform | Property | Source | Value |
+| --- | --- | --- | --- |
+| Web | `event_schema_version`, `environment`, `platform`, `surface` | `src/sites/signup/auth-v3/analytics.ts:172` (`loaded` callback) | `2`, `production`, `web`, `auth_v3` |
+| Web | Analytics context fields | `analytics.ts:177`, `:191` | Registered at init and again on each context update, with `email: undefined` |
+| Mobile | `glass_usable`, `glass_liquid_available`, `glass_effect_api_available` | `lib/analytics/AnalyticsProvider.tsx:31` | From `glassCapability()` |
+| Mobile | `user_role`, `community_id`, `is_test`, `is_internal` | `api/helpers/authUser.ts:102` | `user_role: rider` on every `currentUser` fetch. `is_internal` is true for `@rideyelo.com` emails. |
+| Mobile | `user_role` | `providers/DriveProvider.tsx:333`, `:346`, `:365` | `driver` on go-online; `rider` on go-offline or error |
+| Mobile | `community_id` | `app/(app)/profile/community-switch.tsx:144` | New community after a switch |
+| API | `authv3.step` defaults | `internal/utilities/metrics/posthog.go:73` | See [API business events](#api-business-events) |
+
+### Redaction and exclusion
+
+- **Web email.** The context can hold `email` only to check the `@rideyelo.com` exclusion. `persist`, `safeAuthV3EventContext`, and `register` (`analytics.ts:138`, `:194`, `:191`) strip it. Query parameters are cut down to an allowlist by `sanitizedAuthV3Search` (`:121`).
+- **API Auth v2.** Phone and email go through `phone.MaskPhone` and `maskEmail` before they are used as properties or distinct IDs.
+- **API funnel.** `SetFunnelProperty` only accepts bounded values. `recordUserClassification` (`internal/service/authv3/telemetry.go:129`) sends `is_internal` but not the email.
+- **Mobile Auth v3.** `trackAuthV3` drops events for staging, development, and emulator builds, and for test or `@rideyelo.com` accounts. `safeFailureReason` keeps only `error.code`, capped at 80 characters.
+- **Mobile route data.** `withConsentedAggregatorRoute` (`lib/analytics/events/rideAggregator.ts:71`) and `diagnoseProviderRequest` send pickup and dropoff coordinates only when provider diagnostics consent is current.
+
+## Session replay specifics
+
+| Platform | Setting | Value | Source |
+| --- | --- | --- | --- |
+| Web | `disable_session_recording` | `false` (replay on whenever capture is enabled) | `src/sites/signup/auth-v3/analytics.ts:165` |
+| Web | `maskAllInputs` | `true` | `analytics.ts:167` |
+| Web | `maskTextSelector` | `.ph-mask`, `[data-ph-mask]`, `.auth-v3-error`, `.auth-v3-request-id` | `analytics.ts:168` |
+| Web | `blockSelector` | `.ph-no-capture`, `[data-ph-no-capture]` | `analytics.ts:169` |
+| Web | Autocapture, pageview, pageleave | All off | `analytics.ts:162-164` |
+| Mobile | `enableSessionReplay` | `false` at init; `SessionReplayObserver` starts it once the app is interactive | `app/_layout.tsx:296`, `components/SessionReplayObserver.tsx:37` |
+| Mobile | `captureLog`, `maskAllTextInputs`, `maskAllImages` | `false`, `true`, `false` | `app/_layout.tsx:301-303` |
+| Mobile | Exclusion | Replay does not start for excluded builds, and stops if the account resolves as excluded | `components/SessionReplayObserver.tsx:25-32` |

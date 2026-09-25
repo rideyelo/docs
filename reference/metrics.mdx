@@ -1,0 +1,378 @@
+---
+title: "Metrics"
+description: "Every OpenTelemetry and Prometheus metric yelo-api emits, with labels and exported names, plus span naming, span attributes, and the SQL behind the dashboard KPI cards"
+---
+
+This page lists the metrics, spans, and KPI queries in `yelo-api`. For how telemetry is initialized and where to look, see [Observability](/engineering/observability). For how PostHog receives business counters, see [Analytics events](/reference/analytics-events).
+
+<Note>
+Paths are relative to `yelo-api` unless they start with `yelo-web/`.
+</Note>
+
+## How metrics are exported
+
+`otel.InitializeOTel` (`internal/utilities/otel/otel.go:79`) creates a `MeterProvider` with the OpenTelemetry Prometheus exporter (`go.opentelemetry.io/otel/exporters/prometheus` v0.68.0) whenever `OTEL_ENABLED` is true. `GET /metrics` serves `promhttp.Handler()` (`internal/server/http/router.go:201`), which reads the default Prometheus registry.
+
+The exporter uses its default `UnderscoreEscapingWithSuffixes` strategy, so OpenTelemetry names change on export:
+
+| Rule | OpenTelemetry | Prometheus |
+| --- | --- | --- |
+| Dots become underscores | `redis.cache.hit` | `redis_cache_hit_total` |
+| Counters get `_total` | `rate.limiter.rejected` | `rate_limiter_rejected_total` |
+| Units become suffixes | `s`, `By`, `ms` | `_seconds`, `_bytes`, `_milliseconds` |
+| Curly-brace units are dropped | `{request}` | No suffix |
+| Histograms expand | `redis.operation.duration` (unit `s`) | `redis_operation_duration_seconds_bucket`, `_sum`, `_count` |
+| Label dots become underscores | `http.route` | `http_route` |
+
+The default registry also exposes a `target_info` series with resource attributes, plus the `go_*` and `process_*` collectors that `client_golang` registers by default.
+
+### Providers
+
+`cmd/api/main.go:168` builds a `MultiMetricsProvider` with two backends when `OTEL_ENABLED` is true:
+
+- `OtelMetricsProvider` (`internal/utilities/metrics/otel.go`) records everything below.
+- `PostHogMetricsProvider` (`internal/utilities/metrics/posthog.go`) forwards only `IncrementCounter`, `RecordHistogram`, and `SetGauge` calls whose name doesn't start with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` (`posthog.go:222`). Today that's only `authv3.step`. The `auth.v2.*` events go to the PostHog client directly and don't pass through this provider.
+
+When `OTEL_ENABLED` is false, both backends are replaced by `NoOpMetricsProvider`, which also stops `authv3.step` from reaching PostHog. Direct `auth.v2.*` captures are unaffected.
+
+## Metric catalog
+
+"Recorded" means production code calls the instrument. "Never" means the instrument is registered in `NewOtelMetricsProvider` but nothing records to it, so no series is exported.
+
+<AccordionGroup>
+<Accordion title="HTTP server (Yelo middleware)">
+
+Recorded in `otelInstrumentation` (`internal/server/http/middleware_otel.go:48`) for every request.
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `http.server.errors` | `http_server_errors_total` | Counter | `http.method`, `http.route`, `http.status_code`, `error_type` (`client_error`, `server_error`, `response_write`) | Responses with status 400 or higher, or a failed write | Yes, `middleware_otel.go:161` |
+| `http.server.slow.requests` | `http_server_slow_requests_total` | Counter | `http.method`, `http.route`, `http.status_code` | Requests slower than `SLOW_REQUEST_THRESHOLD_MS` (default 150) | Yes, `middleware_otel.go:130` |
+| `http.server.request.size` | `http_server_request_size_bucket` | Histogram, default buckets, no unit | `http.method`, `http.route` | Request `Content-Length` when positive | Yes, `middleware_otel.go:109` |
+| `http.server.response.size` | `http_server_response_size_bucket` | Histogram, default buckets, no unit | `http.method`, `http.route` | Bytes written | Yes, `middleware_otel.go:122` |
+| `http.server.inflight` | `http_server_inflight` | Gauge | None | In-flight requests, sampled after each request completes | Yes, `middleware_otel.go:118` |
+| `http.server.requests` | `http_server_requests_total` | Counter | `http.method`, `http.route`, `http.status_code` | Request count | Never. `RecordHTTPRequest` has no callers. |
+| `http.server.duration` | `http_server_duration_seconds` | Histogram, buckets 0.001 to 10 s | `http.method`, `http.route`, `http.status_code` | Request latency | Never. `RecordHTTPRequest` has no callers. |
+
+`http.route` is the Chi route pattern, or the raw path when no route matched (`middleware_otel.go:205`).
+
+The size, inflight, and error metrics are recorded through the generic `RecordHistogram`, `SetGauge`, and `IncrementCounter` methods. Those create instruments on demand with no unit or custom buckets. The typed fields registered for the same names in `otel.go:222-266` are never used.
+
+</Accordion>
+<Accordion title="HTTP server and client (otelhttp)">
+
+`otelhttp.NewHandler` wraps every request, and `NewInstrumentedHTTPClient` (`internal/utilities/otel/http.go:12`) wraps the Mapbox and Quo clients. The library emits OpenTelemetry semantic-convention metrics on its own.
+
+| OpenTelemetry name | Prometheus name | Type | Labels |
+| --- | --- | --- | --- |
+| `http.server.request.duration` | `http_server_request_duration_seconds` | Histogram | `http.request.method`, `http.response.status_code`, `url.scheme`, `server.address`, `server.port`, `network.protocol.name`, `network.protocol.version`, `http.route` when the request has a pattern |
+| `http.server.request.body.size` | `http_server_request_body_size_bytes` | Histogram | Same |
+| `http.server.response.body.size` | `http_server_response_body_size_bytes` | Histogram | Same |
+| `http.client.request.duration` | `http_client_request_duration_seconds` | Histogram | Method, status, server address and port |
+| `http.client.request.body.size` | `http_client_request_body_size_bytes` | Histogram | Same |
+
+These are the only request-latency series the API exports today.
+
+</Accordion>
+<Accordion title="Database">
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `pool.max` | `pool_max` | Gauge | `pool` (`postgres`, `redis`) | Configured pool size | Yes, every `POOL_STATS_INTERVAL_S` seconds (default 15), `cmd/api/main.go:453` |
+| `pool.total` | `pool_total` | Gauge | `pool` | Open connections | Yes, same |
+| `pool.idle` | `pool_idle` | Gauge | `pool` | Idle connections | Yes, same |
+| `pool.acquired` | `pool_acquired` | Gauge | `pool` | Connections in use. For Redis this is total minus idle. | Yes, same |
+| `db.pool.total_conns` | `db_pool_total_conns` | Gauge | None | Postgres open connections | Yes, `internal/data/repository/storage.go:533` |
+| `db.pool.idle_conns` | `db_pool_idle_conns` | Gauge | None | Postgres idle connections | Yes, `storage.go:534` |
+| `db.pool.acquired_conns` | `db_pool_acquired_conns` | Gauge | None | Postgres connections in use | Yes, `storage.go:535` |
+| `db.pool.max_conns` | `db_pool_max_conns` | Gauge | None | Postgres pool size | Yes, `storage.go:536` |
+| `db.pool.utilization` | `db_pool_utilization` | Gauge | None | Acquired divided by max | Yes, `storage.go:537` |
+| `db.pool.empty_acquire_count` | `db_pool_empty_acquire_count_total` | Counter | None | pgx `EmptyAcquireCount`, added on every tick | Yes, `storage.go:540` |
+| `db.pool.acquire_duration` | `db_pool_acquire_duration_bucket` | Histogram | None | pgx cumulative `AcquireDuration` in seconds, sampled every tick | Yes, `storage.go:541` |
+| `db.pool.leaked_conns` | `db_pool_leaked_conns` | Gauge | None | Connections held longer than 5 minutes, set only when nonzero | Yes, `storage.go:581` |
+| `db.query.count` | `db_query_count_total` | Counter | `db.operation`, `db.table`, `status` | Query count | Never. `RecordDBQuery` has no callers. |
+| `db.query.duration` | `db_query_duration_seconds` | Histogram | `db.operation`, `db.table`, `status` | Query latency | Never |
+
+Per-query timing is only available as `db.query.postgres` spans. See [Spans](#spans).
+
+</Accordion>
+<Accordion title="Redis and caches">
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `redis.operation.count` | `redis_operation_count_total` | Counter | `redis.operation`, `status` | Redis commands. Operations include `get`, `set`, `setnx`, `del`, `eval`, `pipeline`, `hset`, `zadd`, and other hash, set, and sorted-set commands. | Yes, `internal/data/redis/client.go` (25 sites) |
+| `redis.operation.duration` | `redis_operation_duration_seconds` | Histogram, buckets 0.0005 to 0.5 s | `redis.operation` | Command latency | Yes, same |
+| `redis.cache.hit` | `redis_cache_hit_total` | Counter | `cache_name` | Cache hits | Yes |
+| `redis.cache.miss` | `redis_cache_miss_total` | Counter | `cache_name` | Cache misses | Yes |
+
+`cache_name` values: `auth_cache`, `community_cache`, `community_detail_cache`, `driver_earnings_cache`, `place_resolve_cache`, `polyline_cache`, `presence_cache`, `price_cache`, `school_signup_stats_cache`, `search_session_cache`, `user_profile_cache`.
+
+</Accordion>
+<Accordion title="Circuit breakers, rate limiting, external calls">
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `circuit.breaker.state` | `circuit_breaker_state` | Gauge | `name` | 0 closed, 1 half-open, 2 open. Set on state change only. | Yes, for `google-maps` (`internal/utilities/circuitbreaker/circuitbreaker.go:86`) and `redis` (`internal/data/redis/client.go:209`) |
+| `circuit.breaker.trip.count` | `circuit_breaker_trip_count_total` | Counter | `name` | Transitions to open | Yes, same breakers |
+| `circuit.breaker.success` | `circuit_breaker_success_total` | Counter | `name` | Calls counted as success | Yes, `redis` and `google-maps/<operation>` (`internal/data/googlemaps/googlemaps.go:391`) |
+| `circuit.breaker.failure` | `circuit_breaker_failure_total` | Counter | `name` | Calls counted as failure | Yes, same |
+| `rate.limiter.rejected` | `rate_limiter_rejected_total` | Counter | None | Per-IP limiter rejections (429) | Yes, `internal/server/http/middleware.go:195` |
+| `rate.limiter.active_clients` | `rate_limiter_active_clients` | Gauge | None | IPs in the limiter map, sampled every minute | Yes, `middleware.go:153` |
+| `external.call.count` | `external_call_count_total` | Counter | `service`, `status` | Outbound calls | Never. `RecordExternalCall` has no callers. |
+| `external.call.duration` | `external_call_duration_seconds` | Histogram | `service`, `status` | Outbound latency | Never |
+
+The `resend`, `google-places`, `google-geocoding`, `twilio`, `photon`, `mapbox`, and `stripe` breakers call `circuitbreaker.NewSettings` without a metrics provider, so their state changes are only logged and sent to Slack.
+
+</Accordion>
+<Accordion title="Errors">
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `error.count` | `error_count_total` | Counter | `error.type` (the `ErrorType`), `error.fingerprint` | Errors logged through `Logger.ErrorC` | Yes, `internal/utilities/logger/logger.go:251` |
+
+`httperrors.LogError` sends only 5xx errors through `ErrorC`. 4xx errors log at WARN and don't increment this counter. See [Errors](/reference/errors).
+
+</Accordion>
+<Accordion title="Notifications">
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `notifications.sent` | `notifications_sent_total` | Counter | `notification.type` (template code), `status` | One per orchestration outcome | Yes, `internal/notify/queue/orchestrate.go` |
+| `notifications.recipients` | `notifications_recipients_total` | Counter | `notification.type`, `status` | Eligible recipients per orchestration | Yes, same |
+| `notifications.receipt.status` | `notifications_receipt_status_total` | Counter | `status` (`delivered`, `failed`) | Push receipts | Yes, `internal/notify/queue/maintenance.go:120`, `:166` |
+| `notifications.queue.depth` | `notifications_queue_depth` | Gauge | None | Queue depth | Never |
+| `notifications.queue.dropped` | `notifications_queue_dropped_total` | Counter | None | Dropped queue entries | Never |
+| `notifications.send.duration` | `notifications_send_duration_milliseconds` | Histogram | `notification.type` | Send latency | Never |
+| `notifications.dedup.hit` | `notifications_dedup_hit_total` | Counter | `notification.type` | Dedup hits | Never |
+| `notifications.rate_limited` | `notifications_rate_limited_total` | Counter | `notification.type` | Rate-limited sends | Never |
+
+`notifications.sent` `status` values: `dispatched`, `suppressed`, `no_recipients`, `deduped`, `expired_before_orchestration`, `skipped_inactive`, `skipped_no_variant`. Test sends aren't counted.
+
+</Accordion>
+<Accordion title="Auth and OTP">
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `authv3.step` | `authv3_step_total` | Counter | `step`, `stage`, `operation` (all the same value), `outcome` (`ok` or an `ErrorType`), `result` (`success`, `failure`), `failure_reason` | One per Auth v3 handler call. Also sent to PostHog. | Yes, `internal/server/http/authv3/telemetry.go:106` |
+| `otp_delivery_status_total` | `otp_delivery_status_total` | Counter | `status` (Twilio message status, lowercased), `matched` | Twilio Verify delivery webhooks | Yes, `internal/server/http/verifyevents/verifyevents.go:167` |
+| `otp_fallback_sent_total` | `otp_fallback_sent_total` | Counter | None | OTPs re-sent through the toll-free fallback | Yes, `internal/service/authv3/phone_fallback.go:174` |
+
+`step` values: `configuration`, `authorize`, `authorize_link`, `accept`, `resume`, `provider_start`, `callback`, `phone_send`, `phone_verify`, `token`, `status`, `profile`, `community_resolve`, `session_refresh` (`telemetry.go:21`).
+
+</Accordion>
+<Accordion title="Go runtime">
+
+`runtime.Start` (`internal/utilities/otel/otel.go:89`, contrib runtime v0.71.0) emits the current semantic-convention metrics. The deprecated `runtime.go.*` names are only emitted when `OTEL_GO_X_DEPRECATED_RUNTIME_METRICS=true`, which the repo doesn't set.
+
+| OpenTelemetry name | Prometheus name |
+| --- | --- |
+| `go.memory.used` | `go_memory_used_bytes` |
+| `go.memory.limit` | `go_memory_limit_bytes` |
+| `go.memory.allocated` | `go_memory_allocated_bytes_total` |
+| `go.memory.allocations` | `go_memory_allocations_total` |
+| `go.memory.gc.goal` | `go_memory_gc_goal_bytes` |
+| `go.goroutine.count` | `go_goroutine_count` |
+| `go.processor.limit` | `go_processor_limit` |
+| `go.config.gogc` | `go_config_gogc_percent` |
+| `go.schedule.duration` | `go_schedule_duration_seconds` |
+
+</Accordion>
+</AccordionGroup>
+
+### Label cardinality
+
+- `http.route` falls back to the raw URL path for unmatched requests, so scanners and 404s create a series per path.
+- `error.fingerprint` on `error.count` is a hash of the message for non-server errors. Messages that embed IDs or wrapped causes create a new series per unique message.
+- `notification.type` is the template code, which admins create.
+
+## Local alert rules and dashboards
+
+`monitoring/prometheus/alert-rules.yml` and `monitoring/grafana/dashboards/*.json` are for the local stack. Several reference series the API doesn't export.
+
+| Rule or panel | Metric referenced | Problem |
+| --- | --- | --- |
+| `HighErrorRate`, `ElevatedErrorRate`, `HighRequestVolume`, API performance panels | `http_server_requests_total` | Never recorded |
+| `HighP99Latency`, `SlowRouteDetected`, latency panels | `http_server_duration_bucket` | Never recorded, and the exported name would be `http_server_duration_seconds_bucket` |
+| `SlowRouteDetected` | `external_dependency` label | Never set on metrics. `MarkExternalRoute` has no callers. |
+| `SlowDBQueries`, database panels | `db_query_duration_bucket`, `db_query_count_total` | Never recorded |
+| `ExternalServiceDegraded`, external dependency panels | `external_call_duration_bucket`, `external_call_count_total` | Never recorded |
+| `RedisHighLatency`, Redis panels | `redis_operation_duration_bucket` | Exported as `redis_operation_duration_seconds_bucket` |
+| `HighMemoryUsage`, `HighGoroutineCount`, `GCPressure`, system panels | `process_runtime_go_*` | Not exported. Use `go_memory_used_bytes` and `go_goroutine_count`, or the `client_golang` `go_*` collectors. |
+| API performance panels | `http_server_request_size_bucket`, `http_server_response_size_bucket`, `http_server_slow_requests_total` | Match what's exported |
+| Pool, circuit breaker, rate limiter, cache hit and miss rules | `pool_*`, `circuit_breaker_state`, `rate_limiter_rejected_total`, `redis_cache_*_total` | Match what's exported |
+
+For request error rate and latency today, use `http_server_request_duration_seconds` from otelhttp or `http_server_errors_total`.
+
+## Spans
+
+| Source | Tracer | Span name | Kind |
+| --- | --- | --- | --- |
+| Every HTTP request (`middleware_otel.go:50`) | otelhttp | `METHOD /chi/route/pattern`, falling back to `METHOD /raw/path` | Server |
+| Every pgx query (`internal/utilities/otel/pgx_tracer.go:44`) | `pgx` | `db.query.postgres` | Client |
+| Mapbox and Quo HTTP calls (`internal/utilities/otel/http.go:17`) | otelhttp | `<service>.<METHOD> <host>`, for example `mapbox.GET api.mapbox.com` | Client |
+| Service methods (`otel.CustomSpan`, `otel.Span`) | Domain tracer (below) | `<Type>.<Method>`, for example `UserService.GetCurrentUser`, `Client.NewPaymentIntent` | Internal |
+| Auth v3 service (`internal/service/authv3/telemetry.go:18`) | `service.authv3` | `authv3.<Step>`, for example `authv3.Callback`, `authv3.PhoneVerify` | Internal |
+
+Service tracer names in use, by number of spans: `user-service` (18), `ride-service` (18), `driver-service` (17), `stripe-client` (15), `service.authv3` (13), `dashboard` (13), `authv2-service` (11), `earnings-service` (9), `mapbox-client` (7), `qrpayment-service` (6), `notification-service` (6), `mapping-service` (6), `vehicle-service` (5), `payment-service` (4), `activation` (4), `twilio-client` (3), `community-service` (2), `telemetry`, `quo-service`, `queue_summary`, `photon-client`, `heartbeat` (1 each).
+
+The span end function from `CustomSpan` records the returned `errors.Error` and sets the status to Error. Otherwise it sets the status to Ok.
+
+### Span attributes
+
+<AccordionGroup>
+<Accordion title="HTTP request span">
+
+| Attribute | Set by | Value |
+| --- | --- | --- |
+| `http.request_id` | `middleware_otel.go:77` | Request UUID, same as `metadata.request_id` |
+| `http.method`, `http.path` | `middleware_otel.go:78` | From request context |
+| `user.id`, `user.community_id` | `middleware_otel.go:84` | Only when a user is already in context. Group auth middleware runs later, so this is usually unset here. Auth v3 adds `user.id` later with `AddAttributes`. |
+| `http.route` | `middleware_otel.go:105` | Chi route pattern, set after the handler runs |
+| `http.status_code` | `middleware_otel.go:143` | Final status |
+| `external_dependency` | `middleware_otel.go:94` | `true` for routes marked with `MarkExternalRoute`. No route is marked. |
+| Semantic-convention attributes | otelhttp | Method, URL, status, peer, user agent |
+
+Status is set to Error for 400 and above and for failed writes.
+
+</Accordion>
+<Accordion title="Database span">
+
+| Attribute | Value |
+| --- | --- |
+| `db.system` | `postgresql` |
+| `db.statement` | The SQL text, truncated to 500 characters. Bind values aren't included because sqlc uses positional parameters. |
+| `db.rows_affected` | Set when greater than zero |
+
+Queries slower than `SLOW_QUERY_THRESHOLD_MS` also log a warning unless `DISABLE_SLOW_QUERY_WARNINGS` is true.
+
+</Accordion>
+<Accordion title="Business attribute keys">
+
+Defined in `internal/utilities/otel/helpers.go:14`. Use these constants instead of string literals.
+
+| Constant | Key |
+| --- | --- |
+| `AttrKeyUserID` | `user.id` |
+| `AttrKeyCommunityID` | `community.id` |
+| `AttrKeyRideID` | `ride.id` |
+| `AttrKeyDriverID` | `driver.id` |
+| `AttrKeyRiderID` | `rider.id` |
+| `AttrKeyFleetID` | `fleet.id` |
+| `AttrKeyVehicleID` | `vehicle.id` |
+| `AttrKeyVehicleType` | `vehicle.type` |
+| `AttrKeyPaymentIntent` | `payment_intent.id` |
+| `AttrKeyStripeCustomer` | `stripe.customer_id` |
+| `AttrKeyStripeMerchant` | `stripe.merchant_id` |
+| `AttrKeyCancelReason` | `cancel.reason` |
+| `AttrKeyEventType` | `event.type` |
+| `AttrKeyDistance` | `ride.distance` |
+| `AttrKeyDuration` | `ride.duration` |
+| `AttrKeyPrice` | `ride.price` |
+| `AttrKeyCancellationFee` | `cancellation.fee` |
+| `AttrKeyPaymentAmount` | `payment.amount` |
+| `AttrKeyPickupDistance` | `pickup.distance` |
+| `AttrKeyPickupDuration` | `pickup.duration` |
+| `AttrKeyNotificationType` | `notification.type` |
+| `AttrKeyNotificationLogID` | `notification.log_id` |
+| `AttrKeyNotificationRecipients` | `notification.recipient_count` |
+
+</Accordion>
+<Accordion title="Auth v3 attribute keys">
+
+Defined in `internal/service/authv3/telemetry.go:27` and `internal/server/http/authv3/telemetry.go:42`. These are span-only because transaction IDs have unbounded cardinality.
+
+| Key | Value |
+| --- | --- |
+| `authv3.step` | Funnel step name |
+| `authv3.outcome` | `ok` or the `ErrorType` |
+| `authv3.transaction_id` | Auth transaction UUID |
+| `authv3.attempt_id` | Attempt UUID |
+| `authv3.provider` | `apple`, `google`, `phone`, and so on |
+| `authv3.channel` | `app` or `web` |
+| `authv3.client_id` | OAuth client ID |
+| `authv3.auth_surface` | `native` or `hosted` |
+| `authv3.purpose`, `authv3.token_scope`, `authv3.status`, `authv3.exchange_status` | Step-specific state |
+
+Phone numbers, verification SIDs, provider subjects, secrets, PKCE verifiers, and handoff codes must never become attributes.
+
+</Accordion>
+</AccordionGroup>
+
+## Dashboard KPI definitions
+
+[Ride metrics](/dashboard/ride-metrics) defines Ride Requests, Confirmed Requests, Completed Rides, Completion Rate, Cancelled Rides, and Uncompleted Rides. This section covers the queries and the remaining cards. All queries are in `internal/data/repository/queries/analytics.sql`.
+
+### Shared predicates
+
+| Predicate | SQL |
+| --- | --- |
+| Counted user | `u.is_deleted = FALSE AND profile_completed AND NOT auth_v3_provisional AND NOT u.is_test` |
+| Counted driver | Counted user joined to `"DriverApplications"` with `da.is_active = TRUE` |
+| Completed ride | `status IN ('complete', 'pending_rider_rating') AND cancel_phase IS NULL` |
+| Ride fare | `COALESCE(discounted_price, price)` |
+| Test markets | Global queries also require `NOT c.is_test` on the user's or ride's community |
+| Time bucket | Rides use `request_time`. Users use `COALESCE(UserAttribution.profile_completed_at, created_timestamp)`. Drivers use `COALESCE(da.activated_at, created_timestamp)`. Attenders use `EventAttendees.created_at`. |
+
+### Community overview and fleet overview
+
+`GET /dashboard/{id}/kpis` (`community.GetMarketKPIs`) runs `GetDashboardMarketMetrics`. `GET /dashboard/fleet/{fleet_id}/kpis` (`fleet.GetFleetKPIs`) runs `GetDashboardFleetMetrics`. The `range` query parameter is `last_7_days` (default), `last_14_days`, or `last_30_days`. The prior period is the window of the same length immediately before (`internal/service/dashboard/dashboard.go:178`). Ride counts use a half-open window: `request_time >= start AND request_time < end`.
+
+| Card | Field | Definition |
+| --- | --- | --- |
+| **Active Users** | `users` | Counted users in the community whose profile completion time is before the window end. A running total, not a period count. |
+| **Active Drivers** | `drivers` | Counted drivers in the community activated before the window end |
+| **Ride Searches** | `RideSearches` | Rows in `"LocationSearches"` for the community in the window (`CountDashboardSearches`) |
+| **Total Earnings** (fleet) | `earnings + qr_payment_earnings` | `SUM(driver_payout)` for completed fleet rides, plus `SUM(amount_total) / 100` for fleet `"QrPayments"` not marked `unpaid` |
+| **Market Users** (fleet) | `market_users` | Counted users in the fleet's community before the window end |
+| **QR Payments** (fleet) | `qr_payment_count` | Fleet `"QrPayments"` created in the window, excluding `unpaid` |
+
+Each card's delta is `current - previous`. `PercentageChange` is `delta / previous × 100`, rounded to two decimals. When the previous value is 0 and the current value is positive, it's reported as 100 (`dashboard.go:161`).
+
+### Global KPIs
+
+`GET /dashboard/kpi/global` (`dashboard.GetGlobalKPIs`) runs `GetGlobalKPITotals` three times: all time, the current ISO week from Monday 00:00 UTC to now, and the previous full week (`internal/service/dashboard/kpi.go:31`). The card value is the all-time total. The delta compares this week with last week. When last week is 0, `PercentageChange` is 0.
+
+| Card | Definition |
+| --- | --- |
+| **Total Users** | Counted users in non-test communities |
+| **Total Drivers** | Distinct counted drivers in non-test communities |
+| **GMV** | Sum of ride fare for completed rides in non-test communities |
+| **Attenders** | Distinct counted users in `"EventAttendees"` |
+| **Completed Rides** | Completed rides in non-test communities |
+
+`ListWeeklyKPISeries` returns 12 weeks (`kpiSeriesWeeks`) bucketed by `date_trunc('week', ...)` with the same predicates.
+
+### Signup acquisition
+
+`GET /dashboard/kpi/acquisition` runs `ListKPIAcquisitionChannels`. Each counted user gets exactly one source from the first rule that matches, in this order:
+
+| Order | Source | Rule |
+| --- | --- | --- |
+| 1 | `world_cup` | First touch `landing_surface` contains "world" then "cup" |
+| 2 | `driver_page` | `landing_surface` or `referrer_path` contains "driver" |
+| 3 | `invite_link` | Touch has a `referral_code` |
+| 4 | `join_link` | `landing_surface` or `referrer_path` contains "join", or `source_channel` contains "community" |
+| 5 | `dub` | Touch has a `dub_click_id` |
+| 6 | `utm:<source>` | Touch has a `utm_source` |
+| 7 | `<source_channel>` | Touch has a `source_channel` |
+| 8 | `web` | `landing_surface` is `web` or `/auth/v3` |
+| 9 | `app` | `landing_surface` is `app`, `ios`, `android`, or `native` |
+| 10 | `invite_link` | A `"Referrals"` row names the user as referee |
+| 11 | `self_reported:<source>` | Earliest non-empty `referral_sources.source`, slugified |
+| 12 | `<channel>` | Channel of the first verified or completed sign-in `"AuthTransactions"` row from 5 minutes before to 24 hours after signup |
+| 13 | `invite_link`, `app`, `join_link`, or the raw value | Legacy `Users.acquisition_source`: `app_referral`, `app_organic`, `event_link`, or anything else |
+| 14 | `legacy_unattributed` | User created before the first `"AttributionTouches"` row |
+| 15 | `unknown` | Nothing matched |
+
+The touch is the user's `first_touch_id`, then `last_touch_id`, then their earliest touch.
+
+### Other dashboard queries
+
+| Surface | Query | Notes |
+| --- | --- | --- |
+| Rides > Issues, uncompleted outcomes | `GetDashboardUncompleteMetrics`, `ListDashboardUncompleteCategories` | See [Ride metrics](/dashboard/ride-metrics#uncompleted-rides). Uses `BETWEEN start AND end`. |
+| Matched cancellations | `GetDashboardMatchedCancellationMetrics` | `cancel_phase IS NOT NULL AND driver_id IS NOT NULL`. System cancels are total minus rider minus driver. |
+| Search funnel | `GetDashboardFunnelRideCounts`, `CountDashboardBrowses`, `CountDashboardSearches` | Request-to-complete rate uses all non-`requested` rides, not confirmed rides, so it differs from Completion Rate (`internal/data/repository/dashboard.go:998`) |
+| Community ride histogram | `ListDashboardCommunityRideHistogram` | Hourly, excludes `status = 'requested'` |
+| Fleet ride histogram | `ListDashboardFleetRideHistogram` | Hourly, includes `requested` rides |
+| Telemetry | `CountDashboardCommunityTelemetryDevices`, `CountDashboardGlobalTelemetryDevices`, `ListDashboardTelemetryDistribution` | One row per device in `"DeviceTelemetry"`. See [Telemetry](/dashboard/telemetry). |

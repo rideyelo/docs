@@ -1,0 +1,158 @@
+---
+title: "Fleet joins and invitation links"
+description: "How fleet join codes are generated, published through Dub, rotated under concurrency, previewed, and redeemed, plus admin assignment, legacy add-by-email, and the email whitelist."
+---
+
+Drivers enter a fleet through five paths. Only two of them, invitation redeem and admin assign, go through the fleet join service and its locked enrollment transaction. This page covers all five. For the user-facing flow, see [Fleet driver invitations](/fleets/driver-invitations). For what the active fleet and payout fleet mean afterwards, see [Membership and payout routing](/engineering/fleets/membership-and-payout-routing).
+
+| Path | Endpoint | Auth | Service |
+| --- | --- | --- | --- |
+| Invitation redeem | `POST /driver/fleet-join/{code}` | Driver session | `fleetjoin.Service.Redeem` |
+| Admin assign | `PUT /dashboard/users/detail/{id}/fleet` | `admin` (group middleware) | `fleetjoin.Service.Assign` |
+| Legacy add by email | `POST /dashboard/fleet/{fleet_id}/drivers` | `admin` in practice | `DashboardService.AddDriverToFleet` |
+| Email whitelist | `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist` | `admin` or assigned fleet manager | `DashboardService.CreateFleetWhitelistEntry` |
+| Primary-fleet fallback | None, automatic | Not applicable | `reconcileFleetAssignmentForUser` |
+
+## Join codes
+
+`newJoinCode` in `internal/service/fleetjoin/fleet_join.go` reads 16 bytes from `crypto/rand` and encodes them with `base64.RawURLEncoding`, which gives a 22-character code. Codes are validated against `^[A-Za-z0-9_-]{20,64}$` (`joinCodePattern`) before any database read. The mobile app uses the same pattern in `normalizeFleetJoinCode` (`yelo-frontend/lib/storage/fleetJoinIntent.ts`).
+
+The public URL is `https://yelo.link/fleet-<code>`. The Dub short link redirects to `cfg.Dub.InviteLandingBaseURL + "/fleet/" + code`.
+
+The code is stored in `Fleets.driver_join_code` behind a partial unique index. A fleet has at most one live code. Disabling sets it to `NULL`.
+
+### Link endpoints
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| `GET` | `/dashboard/fleets/driver-join-link/{fleet_id}` | Returns `url`, `enabled` (code present), `available` (`CanAcceptDriverJoins()`), and `rotated_at`. |
+| `POST` | `/dashboard/fleets/driver-join-link/{fleet_id}/rotate` | Creates or replaces the code. Fails with 409 if the fleet can't accept joins. |
+| `DELETE` | `/dashboard/fleets/driver-join-link/{fleet_id}` | Sets the code to `NULL`. Works even when the fleet can't accept joins. |
+
+All three call `authorizeFleet` in `internal/server/http/fleetjoin/handler.go`: `admin`, or `fleet` with `HasFleetAccess(fleet_id)`. The scope middleware also allows them for fleet managers through `fleetNamedResourceScopeAllows`. See [Manager authorization](/engineering/fleets/dashboard-authorization).
+
+### Rotation and concurrency
+
+`RotateLink` does this:
+
+<Steps>
+  <Step title="Serialize in process">
+    Takes `rotateMu`, a `sync.Mutex` on the service. This only serializes rotations inside one API instance.
+  </Step>
+  <Step title="Check joinability">
+    Loads the fleet (`GetFleetForJoinByID`, no deleted filter) and requires `CanAcceptDriverJoins()`.
+  </Step>
+  <Step title="Read the old code">
+    `GetFleetJoinCode` (filters deleted fleets).
+  </Step>
+  <Step title="Publish to Dub first">
+    Calls `dub.UpsertLink` with key `fleet-<new code>`, `ExternalID` `fleet-driver-join:<fleet_id>`, the `fleet-driver` tag, `cfg.Dub.SystemFolderID`, and a title and description that depend on the payment model.
+  </Step>
+  <Step title="Compare and set">
+    `SetFleetJoinCode` updates only if `driver_join_code IS NOT DISTINCT FROM` the old code. Zero rows means another instance rotated first, and the call fails with `ErrorTypeFleetJoinBusy` (409, **Invitation Changed**).
+  </Step>
+  <Step title="Reconcile on failure">
+    If the compare-and-set fails, `reconcileJoinLink` re-reads the current code on a detached context and upserts the Dub link again for that code. Because the external ID is stable per fleet, this points the Dub record back at the winning code.
+  </Step>
+</Steps>
+
+<Note>
+  `DisableLink` only clears the database column. It doesn't touch Dub, so the short link still resolves to the landing page. The preview then returns 404 because no fleet has that code.
+</Note>
+
+## Preview
+
+`GET /fleet-join/{code}` is public. `GetFleetJoinPreviewByCode` returns the fleet, its home community, `payouts_managed_by_fleet` (`payment_model = 'fleet_merchant'`), and `available`, which is the SQL copy of `CanAcceptDriverJoins()`. An invalid pattern and an unknown code both return 404 **fleet join link not found**. A deleted fleet keeps its code, so its preview returns `available: false` rather than 404.
+
+## Enrollment transaction
+
+`Redeem` calls `Preview` and rejects `available: false` early. `Assign` loads the fleet and checks `CanAcceptDriverJoins()` in Go. Both then call `enroll`, which runs `EnrollDriver` in `internal/data/repository/fleet_join.go`:
+
+```mermaid
+stateDiagram-v2
+  [*] --> LockUser: LockFleetJoinUser FOR UPDATE
+  LockUser --> Forbidden: deleted or banned
+  LockUser --> LockFleet: LockFleetForJoin FOR UPDATE
+  LockFleet --> Unavailable: ready = false
+  LockFleet --> EnsureApp: EnsureDriverApplicationForFleetJoin
+  EnsureApp --> CheckJoined: IsDriverJoinedToFleet
+  CheckJoined --> AlreadyJoined: joined and same community
+  CheckJoined --> Busy: online, ride, or open session
+  CheckJoined --> Write: otherwise
+  Write --> Committed: deactivate others, upsert membership, payout fleet, community
+  AlreadyJoined --> [*]
+  Committed --> [*]
+```
+
+Details that matter:
+
+- **Lock order is user, then fleet.** Vehicle inventory writes (`lockFleetVehicleUsers`) and go-online use the same user-first order.
+- **Readiness is rechecked under the fleet row lock** (`LockFleetForJoin.ready`), so a Stripe webhook or unlink that commits between preview and redeem is honored.
+- **A driver application row is created if missing** (`INSERT ... ON CONFLICT DO NOTHING`). Joining is how a rider becomes a driver applicant.
+- **"Already joined" depends on the payment model.** `IsDriverJoinedToFleet` returns true only if the membership is active and, for fleet-merchant fleets, `payout_fleet_id` equals the fleet. For owner-operator fleets, `payout_fleet_id` must be `NULL`. A member whose payout fleet is out of sync goes through the full write path again, which repairs it.
+- **The short circuit also requires the same community.** An already-joined driver whose `community_id` has drifted goes through the busy check and gets moved back.
+- **Writes run in this order:** `DeactivateOtherDriverFleets`, then `UpsertDriverFleetMembership` (`ON CONFLICT DO UPDATE SET is_active = TRUE`), then `SetDriverApplicationPayoutFleetOnJoin` or `ClearDriverApplicationPayoutFleet`, then `SetUserCommunityForFleetJoin`. The upsert fires `select_fleet_default_vehicle`. See [Vehicles](/engineering/fleets/vehicles#automatic-selection-triggers).
+
+### After commit
+
+`enroll` then:
+
+1. Invalidates the auth cache and the user profile cache (logging but ignoring profile-cache errors).
+2. Calls `DriverActivator.ActivateDriver`. `ErrorTypePhoneRequired` is ignored. Any other error is returned to the caller, even though the enrollment has already committed.
+3. Reads the application and returns `FleetJoinResult` with `result` (`joined` or `already_joined`), `community_changed`, `driver_application_active`, and `remaining_steps`.
+
+`community_changed` compares the community read under the user lock with the fleet's home community. For an already-joined driver on the short-circuit path it is always `false`.
+
+## Mobile deep-link handling
+
+| Step | Code | Behavior |
+| --- | --- | --- |
+| Link capture | `app/+native-intent.tsx` | On host `yelo.link`, a first path segment starting with `fleet-` rewrites to `/fleet-join/<code>`. On host `invite.yelo.link`, a path `/fleet/<code>` does the same. |
+| Pending intent | `setPendingFleetJoinCode` | Stores the normalized code under `@yelo/fleet_join_code` in AsyncStorage when the user must sign in first. |
+| Restore | `components/FleetJoinIntentObserver.tsx` | After a JWT is available, navigates once per session to the pending code, unless it is already on a `/fleet-join/` route. |
+| De-duplication | `markFleetJoinCodeHandled`, `hasHandledFleetJoinCode` | Keeps the last 20 handled codes under `@yelo/fleet_join_handled_codes_v1`. A handled pending code is cleared without navigating. |
+| Screen | `app/fleet-join/[code].tsx` | Preview, join, then driver setup or the driver hub. |
+
+## Legacy add by email
+
+`POST /dashboard/fleet/{fleet_id}/drivers` looks up the user by email, checks the fleet exists (`GetFleetById`, which returns deleted fleets too), and calls `sqlUserRepository.AddDriverToFleet`. That function deactivates other memberships and upserts this one.
+
+It doesn't check joinability, busy state, or bans. It doesn't set `payout_fleet_id`, change the community, or invalidate caches. The handler allows fleet managers of that fleet, but `fleetDirectScopeAllows` rejects non-`GET` requests on `/dashboard/fleet/...` for the `fleet` role, so in practice only admins reach it.
+
+## Email whitelist
+
+The whitelist pre-assigns a fleet to someone who hasn't signed up yet. `CreateFleetWhitelistEntry`:
+
+- Lowercases the email and checks a minimal shape (`isValidEmail`: one `@` and a dot in the domain).
+- Rejects emails ending in `.edu`.
+- Rejects emails that already belong to any user (`GetCountByEmail`).
+- Runs `assertFleetInCommunity` in the handler, which requires the fleet to appear in `GetCommunityFleets` for the path community. That list comes from `ActiveFleetCommunityServices`, so the fleet must be active and actively serve that community.
+- Upserts on the globally unique `email`, which moves an existing entry to the new fleet and reactivates it.
+
+`PUT .../whitelist/{entry_id}` toggles `is_active` after `assertWhitelistEntryInFleet`.
+
+The whitelist is consumed only by `reconcileFleetAssignmentForUser`, which runs on activation, and only when the driver has no memberships. It goes through `AddDriverToFleet`, so none of the enrollment guarantees apply.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Join service | `yelo-api/internal/service/fleetjoin/fleet_join.go` |
+| Enrollment transaction | `EnrollDriver` in `yelo-api/internal/data/repository/fleet_join.go` |
+| Join SQL | `yelo-api/internal/data/repository/queries/fleet_join.sql` |
+| Routes and handlers | `yelo-api/internal/server/http/fleetjoin/routes.go`, `handler.go`; registration in `internal/server/http/router.go` |
+| Legacy add and whitelist handlers | `AddDriverToFleet`, `CreateFleetWhitelistEntry`, `UpdateFleetWhitelistEntry` in `yelo-api/internal/server/http/community/community_handler.go` |
+| Whitelist service | `CreateFleetWhitelistEntry` in `yelo-api/internal/service/dashboard/dashboard.go` |
+| Error types | `ErrorTypeFleetJoinBusy`, `ErrorTypeFleetPayoutUnavailable` in `yelo-api/internal/utilities/errors/error.go`, both mapped to 409 in `internal/server/http/httperrors/errors.go` |
+| Mobile | `yelo-frontend/app/fleet-join/[code].tsx`, `lib/storage/fleetJoinIntent.ts`, `components/FleetJoinIntentObserver.tsx`, `app/+native-intent.tsx` |
+| Design note | `yelo-api/docs/owner-operator-fleet-joins.md` |
+
+## Gotchas and edge cases
+
+- **Success can look like failure.** If `ActivateDriver` fails with anything but `ErrorTypePhoneRequired`, `Redeem` returns that error, but the membership, payout fleet, and community change have already committed. Retrying returns `already_joined`.
+- **The rotation mutex is per instance.** Cross-instance races rely on the compare-and-set and surface as 409 **Invitation Changed**. The losing request has already upserted a Dub link for its own code, and reconciliation repoints it only if the database read succeeds.
+- **Disabling doesn't unpublish.** Old short links keep resolving until Dub is cleaned up by hand. They preview as 404 in the app.
+- **Deleted fleets keep their code.** `DeactivateDashboardFleet` doesn't clear `driver_join_code`. The preview shows `available: false`, and redeem fails with **Fleet Payouts Unavailable**. Rotate and disable return 404 because they filter `deleted_at`.
+- **The error title is always about payouts.** Both unavailable paths use `ErrorTypeFleetPayoutUnavailable` titled **Fleet Payouts Unavailable**, even for an inactive owner-operator fleet.
+- **Owner-operator fleets with custom payouts are never joinable.** `CanAcceptDriverJoins` requires `has_custom_payouts = FALSE` for owner-operator fleets. Turning on custom payouts for an owner-operator fleet disables its invitations and admin assignment.
+- **Banned users can be added by the legacy path.** Only `EnrollDriver` checks `is_deleted` and `lock`.

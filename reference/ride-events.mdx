@@ -1,0 +1,345 @@
+---
+title: "Ride events"
+description: "Reference for the RideEvents audit log in the Yelo API: every event type, when it is recorded, who the actor is, what metadata it carries, how the dashboard reads it, and how to query it in SQL"
+---
+
+The ride event log is an append-only audit trail of what happened to a ride. The API writes rows to the `"RideEvents"` table, and admins read them in the dashboard ride timeline. This page lists every event type, where it is recorded, and what each row contains.
+
+For the statuses and transitions themselves, see [Ride lifecycle](/concepts/ride-lifecycle). For cancellation rules and fees, see [Cancellations](/concepts/cancellations). For how the ride service is structured, see [Rides implementation](/engineering/api/rides-implementation). For the dashboard UI, see [Rides](/dashboard/rides#open-ride-details).
+
+<Note>
+All file paths on this page are relative to the `yelo-api` repository unless they start with `yelo-web/`.
+</Note>
+
+<Warning>
+Ride events are best-effort diagnostics, not a source of truth. Most rows are written asynchronously after the ride change commits, and the recorder can drop them. Never use the log to drive lifecycle decisions. Read the `"Rides"` row for current state.
+</Warning>
+
+## Table schema
+
+Migration `migrations/000186_ride_events.up.sql` creates the table. No later migration alters it. The table name is `"RideEvents"`, quoted and in PascalCase like the other tables. It is not `ride_events`.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `BIGINT GENERATED ALWAYS AS IDENTITY` | Primary key. Breaks ties when two events share a `created_at`. |
+| `ride_id` | `UUID NOT NULL` | Foreign key to `"Rides"(id)`, with no `ON DELETE` action. |
+| `event_type` | `TEXT NOT NULL` | One of the values below. There is no enum or `CHECK` constraint. |
+| `actor_id` | `UUID` | The user who caused the event. Null for most system events. |
+| `actor_type` | `TEXT` | `rider`, `driver`, or `system` (`internal/models/ride_event.go:47`). Not constrained. |
+| `old_status` | `TEXT` | Ride status before the transition, if the event records one. |
+| `new_status` | `TEXT` | Ride status after the transition, if the event records one. |
+| `metadata` | `JSONB` | Event-specific payload. See each event below. |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | Set by Postgres at insert time, not when the event happened. |
+
+| Index | Columns | Used for |
+| --- | --- | --- |
+| `idx_ride_events_ride_id` | `(ride_id, created_at)` | One ride's timeline |
+| `idx_ride_events_type` | `(event_type, created_at)` | Fleet-wide queries by event type |
+
+The Go model is `models.RideEvent` in `internal/models/ride_event.go:55`. `models.RideEventWithActor` (`internal/models/ride_event.go:67`) adds `actor_name`.
+
+Ride statuses in `old_status` and `new_status` use the values from `internal/models/ride.go:41`. A finished or canceled ride is stored as `complete`, not `completed`.
+
+## How events are written
+
+### The async recorder
+
+Almost every event goes through `rideevents.EventRecorder` in `internal/service/rideevents/recorder.go`:
+
+1. The caller runs `Record(ctx, RecordOpts)`, which builds a `models.RideEvent` and pushes it onto a buffered channel. The buffer holds 500 events (`recorder.go:15`).
+2. If the channel stays full for 100 ms (`recorder.go:16`), the event is dropped. The recorder logs `Ride event dropped: channel full after timeout`.
+3. One goroutine started by `Start` (`cmd/api/main.go:239`) reads the channel and calls `InsertRideEvent` for each event. It uses the sqlc query `InsertRideEvent` in `internal/data/repository/queries/engagement.sql:530`.
+4. Insert failures log `Failed to insert ride event` and are never retried or returned to the caller (`recorder.go:100`).
+
+The recorder instance is built once in `internal/service/service.go:107`. The ride service, the activation service (`internal/service/service.go:182`), and the notification queue workers (`cmd/api/main.go:320`) all share it.
+
+### Writes are not transactional
+
+Recorder writes are not part of the ride's transaction:
+
+- The recorder inserts on its own connection, after the `Record` call returns. A successful ride change can end up with no event if the buffer is full, the insert fails, or the process stops.
+- Some events are recorded before the state change they describe, so they can exist even when the change fails. Examples: `pickup_route_calculated`, `merchant_selected`, and `payment_intent_created` during accept; `payment_canceled` before the cancel write; `payment_confirmed` before the complete write; and `activation_tier_reached` before the notification is enqueued.
+- `created_at` is the insert time. Under load it can lag the real event, and `elapsed_since_previous_ms` inherits that lag.
+
+The one transactional write is `message_sent`. The `InsertMessageTimeline` query (`internal/data/repository/queries/messaging.sql:49`) runs inside the same transaction as the message insert in `AppendMessage` (`internal/data/repository/messaging.go:55`). It is written as raw SQL with the literal string `'message_sent'` and does not use the recorder.
+
+### Shutdown
+
+`main.go` calls `EventRecorder.Stop()` (`cmd/api/main.go:521`), which closes the channel and returns right away. It does not wait for the insert goroutine to drain. The goroutine also inserts with the root `ctx` passed to `Start`, and that context is already canceled at shutdown. Buffered events are likely lost on every deploy.
+
+## Event types
+
+`internal/models/ride_event.go:11` defines 33 event types. The tables below list each call site that records them. **Status** shows `old_status → new_status`. A dash means the column is null.
+
+Common metadata keys:
+
+- `pickup_name`, `dest_name`, and `destination_name` are the display names of the pickup and destination.
+- `distance` is the ride's route distance.
+- `elapsed_since_*_ms` values are measured with `time.Since` when the event is recorded.
+
+<AccordionGroup>
+<Accordion title="Request and pricing">
+
+| Event type | Recorded when | Source | Actor | Status | Metadata |
+| --- | --- | --- | --- | --- | --- |
+| `price_calculated` | Vehicle prices are computed while a ride is created, before `ride_requested` | `internal/service/ride/rider.go:1281` (`buildVehicleOptions`), `rider.go:1579` (`buildVehicleOptionsV2`), helper `events.go:527` | `system` | — | `cache_hit`, `distance_meters`, `duration_seconds`, `surge_multiplier`, `price_params`, `vehicle_prices`, `community_id`, `used_default_pricing`, optional `price_breakdowns`, `discount_id`, `discount_rate` |
+| `ride_requested` | `CreateRide` or `CreateRideV2` inserts the ride row | `internal/service/ride/rider.go:104` (V1), `rider.go:1445` (V2) | `rider`, with `actor_id` set to the rider | — → `requested` | `distance`, `duration`, `pickup_name`, `destination_name`, `community_id`, `pickup_lat`, `pickup_lng`, `destination_lat`, `destination_lng`, `is_public_pickup`, `is_public_destination`. V2 also adds `quoted_prices`, an array of `fleet_id`, `vehicle_type`, `price`, `discounted_price`, and `is_discounted`. |
+| `surge_pricing_applied` | Right after `ride_requested`, when the community surge multiplier is above 1.0 and not expired | `internal/service/ride/rider.go:126` (V1), `rider.go:1455` (V2), helper `events.go:462` | `system` | — | `surge_multiplier`, `community_id` (from the rider's user record, `prep.user.CommunityID`) |
+| `ride_confirmed` | `finalizeConfirmRide` after `Ride.Confirm` succeeds | `internal/service/ride/rider.go:395` | `rider`, with `actor_id` set to the requesting user | `requested` → `confirmed` | `price`, `actual_price`, `display_price`, `vehicle_type`, `discount_id`, `discounted_price`, `payment_method_brand`, `fleet_id`, `confirm_code` |
+
+</Accordion>
+<Accordion title="Matching and dispatch">
+
+| Event type | Recorded when | Source | Actor | Status | Metadata |
+| --- | --- | --- | --- | --- | --- |
+| `ride_board_added` | The ride is added to the community ride board after confirm, or before a direct request is sent | `internal/service/ride/rider.go:430` (`addToRideBoardAndNotify`), `rider.go:469` (`directAssignDriver`), helper `events.go:355` | `system` | — | `community_id` |
+| `notification_dispatched` (T0) | The immediate ride-available push to fleet and founding drivers is enqueued | `internal/service/ride/rider.go:2171` (`notifyDriversAboutNewRide`) | `system` | — | `tier` (always `0`), `num_drivers`, `drivers` (array of `id` and `name`), `elapsed_since_confirm_ms`, `community_id`, `fleet_id` |
+| `notification_dispatched` (direct request) | A rider-chosen driver's request push is enqueued | `internal/service/ride/rider.go:488` (`directAssignDriver`) | `system` | — | `driver_id`, `direct_request` (`true`), `response_window_seconds` (`30`) |
+| `direct_assign_fallback` | A direct request can't be offered, and the ride falls back to normal matching | `internal/service/ride/rider.go:572` (`directAssignFallback`) | `system` | — | `driver_id`, `fallback_reason`: `driver_unavailable`, `driver_offline`, `no_active_session`, `session_changed`, `vehicle_changed`, `eta_unavailable`, `eta_too_long`, `board_unavailable`, or `notification_failed` |
+| `activation_tier_reached` | The activation sweep reaches a new tier for an unmatched ride. It is recorded even when there are zero candidates. | `internal/service/activation/activation.go:456` (`activateForConfigTier`) | `system` | — | `tier`, `drivers_notified`, `driver_ids`, `driver_names`, `elapsed_since_confirm_ms`, `community_id`, `search_radius_km`, `target_drivers`, `ignore_already_notified` |
+| `rescue_alert_sent` | A Slack rescue alert is sent because the ride is still unmatched past the last tier delay plus the rescue grace period. It fires once per ride (`TrySetRescueSent`). | `internal/service/activation/activation.go:775` (`checkRescue`) | `system` | — | `elapsed_minutes`, `drivers_notified` (null if the Redis read failed), `tiers_count`, `community_id` |
+| `ride_declined` | A driver declines a ride offer | `internal/service/ride/driver.go:408` (`DeclineRide`) | `driver`, with `actor_id` set to the driver | — | `reason`, `driver_id`, `total_declined_drivers`, `num_previously_declined`, `pickup_name`, `dest_name`, `distance`, optional `vehicle_type`, `elapsed_since_confirm_ms` |
+| `pickup_route_calculated` | During `AcceptRide`, after the driver-to-pickup route is computed and before payment or the accept write | `internal/service/ride/driver.go:77`, helper `events.go:333` | `system` | — | `pickup_distance`, `pickup_duration`, `driver_id` |
+| `ride_accepted` | `AcceptRide` after `Ride.Accept` commits | `internal/service/ride/driver.go:108`, helper `events.go:31` | `driver`, with `actor_id` set to the driver | `confirmed` → `driver_en_route`, or `queued` if the driver's `QueueLength` was above 0 | `pickup_distance`, `pickup_duration`, `vehicle_id`, `fleet_id`, `queue_position`, `auto_queued` (always `false`), `driver_name` |
+| `ride_board_removed` | The ride leaves the board on accept (`reason: accepted`) or on cancel (`reason: canceled`) | `internal/service/ride/driver.go:118`, `internal/service/ride/ride.go:139`, helper `events.go:370` | `system` | — | `reason`, `community_id` |
+| `ride_auto_queued` | The activation service auto-assigns a ride into an online driver's queue (`AutoAssignRide`) | `internal/service/ride/driver.go:157` | `system` (no `actor_id`) | `confirmed` → `queued` | `driver_id` |
+| `queue_promoted` | A queued ride becomes the driver's active ride after the previous ride completes or is canceled | `internal/service/ride/driver.go:1290` (`notifyQueuePromotion`), helper `events.go:302` | `system` | `queued` → `driver_en_route` | `previous_ride_id`, `pickup_name`, `dest_name`, optional `wait_in_queue_ms` (measured from `match_time`), `driver_id` |
+| `notification_dispatched` (queue promotion) | During queue promotion, when the rider has a push token | `internal/service/ride/driver.go:1279` | `system` | — | `recipient` (`rider`), `notification_type` (`queue_promoted`), `sender_id` |
+| `no_drivers_available` | The operational sweep, every 30 s (`cmd/api/main.go:559`), expires confirmed rides that are still unassigned | `internal/service/ride/ride.go:711` (`CancelUnmatchedRides`) | `system` | `confirmed` → `complete` | `community_id` |
+| `direct_assigned` | Never written. See [Defined but never written](#defined-but-never-written). | helper only: `internal/service/ride/events.go:386` | `system` | `confirmed` → `queued` | `driver_id`, `vehicle_id`, `fleet_id` |
+
+</Accordion>
+<Accordion title="Trip">
+
+| Event type | Recorded when | Source | Actor | Status | Metadata |
+| --- | --- | --- | --- | --- | --- |
+| `driver_at_pickup` | `AtPickup` after `Ride.AtPickup` commits | `internal/service/ride/driver.go:448`, helper `events.go:215` | `driver` | `driver_en_route` → `driver_waiting` | `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_match_ms`, `elapsed_since_confirm_ms` |
+| `rider_picked_up` | `Pickup` after the confirm code check and `Ride.Pickup` commit | `internal/service/ride/driver.go:506`, helper `events.go:247` | `driver` | `driver_waiting` → `in_progress` | `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_match_ms`, `wait_at_pickup_ms`, `elapsed_since_confirm_ms` |
+| `ride_completed` | `Complete` after `Ride.Complete` commits | `internal/service/ride/driver.go:597`, helper `events.go:66` | `driver` | `in_progress` → `pending_rider_rating` | `distance`, `price`, `pickup_name`, `dest_name`. Adds `tip_pending` (`true`) when tips are enabled, otherwise `driver_payout`. Optional `elapsed_since_confirm_ms`, `ride_duration_ms`. |
+| `ride_rated` | `Rate` after the rating is saved, for either party | `internal/service/ride/ride.go:280`, helper `events.go:478` | `rider` or `driver`, based on who rated | — | `rating`, `feedback`, `rated_by`, `pickup_name`, `dest_name`, `distance`, `price`, optional `elapsed_since_complete_ms`. Adds `tips_enabled` and `tip_amount` when tips are on. |
+| `message_sent` | A rider or driver sends an in-ride chat message (`SendMessage`, `messaging_sync.go`). Written in the same transaction as the message. | `internal/data/repository/queries/messaging.sql:49` via `internal/data/repository/messaging.go:55` | `rider` or `driver`, with `actor_id` set to the sender | — | `content` (full message text), `message_length` (bytes), `sender_type` |
+
+</Accordion>
+<Accordion title="Cancellation and requeue">
+
+| Event type | Recorded when | Source | Actor | Status | Metadata |
+| --- | --- | --- | --- | --- | --- |
+| `payment_canceled` | `Cancel` after `handleCancellationPayment`, before the cancel write. Only when the ride has a payment intent. | `internal/service/ride/ride.go:122`, helper `events.go:105` | `system` | — | `payment_intent_id`, `cancellation_fee`, `original_amount`, `cancel_phase` |
+| `ride_canceled` (user) | `Cancel` after `Ride.Cancel` commits, for a rider cancel or a non-requeue driver cancel | `internal/service/ride/ride.go:133`, helper `events.go:123` | `rider` or `driver`, with `actor_id` set to the canceler | the prior status → `complete` | `cancel_reason`, `cancel_phase`, `cancellation_fee`, `canceled_by`, `had_driver`, `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_confirm_ms` |
+| `ride_canceled` (superseded) | A rider creates a new ride while an older open request exists. `CancelOpenRequest` closes the old ride, and the event is written against the old ride's ID. | `internal/service/ride/rider.go:77` (V1), `rider.go:1384` (V2), helper `events.go:283` | `system`, with `actor_id` set to the rider | — → `complete` | `cancel_reason` (`superseded`), `triggered_by` (`new_ride_request`) |
+| `auto_requeued` | A driver cancels in `queued`, `driver_en_route`, or `driver_waiting`. The ride returns to `confirmed` instead of ending. It is recorded last in `requeueAfterDriverCancel`. | `internal/service/ride/ride.go:1118`, helper `events.go:164` | `driver`, with `actor_id` set to the canceling driver | the prior status → `confirmed` | `ride_id`, `rider_id`, `canceled_driver_id`, `cancel_reason`, `cancel_comment`, `cancel_phase`, `price`, `actual_price`, `pickup_name`, `destination_name`, `community_id`, optional `vehicle_type`, `original_confirm_time`, `time_since_confirm_seconds`, `original_match_time` |
+
+The payment-failure paths during accept also call `Cancel` (`internal/service/ride/driver.go:974` and `driver.go:1058`). Those cancels produce the usual `payment_canceled` and `ride_canceled` rows after `payment_processing_failed`.
+
+</Accordion>
+<Accordion title="Payment and tips">
+
+| Event type | Recorded when | Source | Actor | Status | Metadata |
+| --- | --- | --- | --- | --- | --- |
+| `merchant_selected` | The Stripe merchant is chosen during accept (skipped when an existing authorization is reused) and again at complete | `internal/service/ride/driver.go:843` (`processRidePayment`), `driver.go:567` (`Complete`), helper `events.go:413` | `system` | — | `merchant_id`, `merchant_type`, `driver_id` |
+| `payment_processing_failed` | A step of the accept-time payment flow fails | `internal/service/ride/driver.go:969`, `driver.go:984` (`operation: clone_payment_method`), `driver.go:1056`, `1068`, `1081`, `1094` (`create_payment_intent`), `driver.go:1124` (`persist_payment_intent`), helper `events.go:436` | `system` | — | `operation`, `error`, plus `merchant_id` and `rider_id` (clone); `merchant_id`, `rider_id`, `driver_id`, and `amount` (create); or `payment_intent_id` (persist) |
+| `payment_intent_created` | A new authorization is created and persisted during accept | `internal/service/ride/driver.go:873` (`processRidePayment`) | `system` | — | `payment_intent_id`, `amount`, `auth_amount` (fare plus `TipBuffer` when tips are enabled), `merchant_id`, `rider_id`, `driver_id` |
+| `payment_confirmed` | The fare is captured. This happens at complete when tips are off, or at rating time when tips are on (`captureTipWithinBuffer`, `captureFareOnly`). Only when a payment intent exists. | `internal/service/ride/driver.go:583`, `internal/service/ride/tip_charge.go:84`, `tip_charge.go:100`, helper `events.go:50` | `system` | — | `payment_intent_id`, `amount` |
+| `tip_captured` | A tip is captured inside the existing authorization, by a separate tip charge that succeeds right away, or by `ConfirmTip` after the rider completes an on-session confirmation | `internal/service/ride/tip_charge.go:85`, `tip_charge.go:174`, `tip_charge.go:231`, helper `tip_charge.go:290` | `rider`, with `actor_id` set to the rider | — | `tip_amount`, `fare`, `total_capture`, `driver_payout` |
+| `tip_window_expired` | `AutoCaptureTipWindowExpired` captures the fare only, after the 24-hour tip window, and wins the `CompleteTip` race | `internal/service/ride/tip_capture.go:77` | `system` | — (no status recorded, although the ride moves `pending_rider_rating` → `complete`) | `fare`, `tip_amount` (`0`), `driver_payout` |
+
+</Accordion>
+<Accordion title="Notification pipeline">
+
+The River notification workers in `internal/notify/queue` write these rows for any notification emitted with `notify.WithRideID`. That covers every ride-scoped push in `internal/service/notifications/notification.go`, including silent `ride_status_changed` pings. Test notifications (`IsTest`) are skipped.
+
+| Event type | Recorded when | Source | Actor | Status | Metadata |
+| --- | --- | --- | --- | --- | --- |
+| `notification_dispatched` (orchestrator) | The orchestrate worker resolves recipients and stores the `Notifications` row. It is not recorded when the `event_key` dedupes. | `internal/notify/queue/orchestrate.go:140` (`recordOrchestrationOutcome`) | `system` | — | `notification_id`, `template_code`, `recipient_count`, `suppressed_count`, `targeted_count`, `status` (`queued` or `not_sent`), `reason` (empty, `no_reachable_recipients`, `all_recipients_suppressed`, or a single suppression reason), `cohorts` |
+| `notification_sent` | After the send worker's finalize transaction commits. One row per delivery that Expo accepted with a ticket. | `internal/notify/queue/send.go:339` (`finalizeChunk`) | `system` | — | `notification_id`, `notification_delivery_id`, `template_code`, `recipient_id`, `expo_ticket_id` |
+| `notification_delivered` | The receipt worker recomputes counts and no delivery is still pending a receipt. Written at most once per notification. | `internal/notify/queue/maintenance.go:70` | `system` | — | `notification_id`, `delivered_count`, `failed_count` |
+
+`notification_delivered` fires at most once because of `"Notifications".delivery_event_recorded_at`, added in `migrations/000250_notification_cohorts_policies.up.sql:76`. `RecomputeCounts` (`internal/notify/repository/pipeline.go:203`) sets that column in the same `UPDATE` that returns `record_ride_event = true`. Only notifications with a `ride_id`, a null `delivery_event_recorded_at`, and `receipt_pending = 0` qualify. The event is still written through the async recorder, so a dropped insert is never retried.
+
+</Accordion>
+</AccordionGroup>
+
+### Defined but never written
+
+- `direct_assigned` (`RideEventDirectAssigned`) has a helper, `recordDirectAssignedEvent` (`internal/service/ride/events.go:386`), that is only called from `events_test.go`. Direct requests now leave the ride unmatched until the driver accepts (`internal/service/ride/rider.go:449`), so a direct match shows up as `notification_dispatched` with `direct_request: true`, followed by `ride_accepted`. The dashboard summary still treats `direct_assigned` as a match (`internal/service/dashboard/rides.go:107`).
+
+### Written as a raw string
+
+- `message_sent` is inserted by SQL with the literal `'message_sent'` (`internal/data/repository/queries/messaging.sql:51`). The `RideEventMessageSent` constant is only referenced by the dashboard summary switch.
+
+All other event types are written through `models.RideEvent*` constants.
+
+## Reading events
+
+### Dashboard endpoint
+
+`GET /dashboard/rides/{id}/events` returns one ride's timeline. It is registered in `internal/server/http/dashboard/rides/rides_routes.go:25` under the `/dashboard/rides` group (`internal/server/http/router.go:552`), with operation ID `dashboard.GetRideEvents`.
+
+- **Auth:** A Clerk dashboard session with role `admin` (`rides_handler.go:130`). Other roles get `403 admin access required`.
+- **Errors:** A path ID that isn't a UUID returns `400 invalid ride ID`. An unknown ride returns `200` with an empty `events` array.
+- **Query:** `ListRideEventsByRideID` (`internal/data/repository/queries/engagement.sql:544`) left-joins `"Users"` on `actor_id` to build `actor_name` and orders by `created_at ASC, id ASC`.
+
+The response is wrapped in the standard envelope, with `success`, `data`, and `metadata` fields:
+
+```json
+{
+  "success": true,
+  "data": {
+    "events": [
+      {
+        "id": 1234,
+        "ride_id": "2f6c…",
+        "event_type": "ride_accepted",
+        "actor_id": "9a1e…",
+        "actor_type": "driver",
+        "actor_name": "Jordan Lee",
+        "old_status": "confirmed",
+        "new_status": "driver_en_route",
+        "metadata": { "pickup_distance": 1830, "queue_position": 0 },
+        "created_at": "2026-09-20T02:14:07.512Z",
+        "elapsed_since_previous_ms": 41250
+      }
+    ],
+    "summary": {
+      "time_to_match_ms": 41250,
+      "time_to_pickup_ms": 312000,
+      "ride_duration_ms": 604000,
+      "total_events": 18,
+      "total_declines": 1
+    }
+  }
+}
+```
+
+`GetRideEvents` in `internal/service/dashboard/rides.go:70` computes the derived fields:
+
+| Field | How it's computed |
+| --- | --- |
+| `elapsed_since_previous_ms` | `created_at` minus the previous row's `created_at`. Null on the first row. |
+| `time_to_match_ms` | The last `ride_accepted`, `ride_auto_queued`, or `direct_assigned` time minus the last `ride_confirmed` time. `queue_promoted` does not count. |
+| `time_to_pickup_ms` | The first `driver_at_pickup` in the list minus the last match time |
+| `ride_duration_ms` | `ride_completed` time minus the last `rider_picked_up` time |
+| `total_events` | Row count |
+| `total_declines` | Count of `ride_declined` rows |
+
+### Dashboard UI
+
+In `yelo-web`, `useRideEvents` (`src/hooks/useRideEvents.ts`) calls the generated `dashboardGetRideEvents`. `RideEventsTimeline` (`src/sites/dashboard/components/RideEventsTimeline.tsx`) renders the timeline inside `RideDetailSheet` (`src/components/rides/RideDetailSheet.tsx`). The sheet opens from the Rides trips table, the Issues tab, supply-demand tables, and recent pricing activity.
+
+- Badge colors cover 19 event types (`RideEventsTimeline.tsx:11`). Other types use the default zinc badge.
+- `notification_dispatched` rows get a bell icon. They are meant to expand into notification details through `dashboardGetNotificationDetail`, which reads `metadata.notification_log_id`. The API never writes that key, so the row falls back to showing raw metadata JSON.
+
+### Other consumers
+
+There is no rider or driver API for ride events. The mobile app (`yelo-frontend`) does not read them. The only other code that touches the table is the E2E fixture cleanup, which runs `DELETE FROM "RideEvents"` before deleting fixture rides (`internal/server/http/e2econtrol/ride_fixture.go:65`).
+
+## Query a ride's history in SQL
+
+Run these read-only queries against the API database. Replace the UUIDs with real values.
+
+Get the full timeline for a ride, in the dashboard's order, with actor names:
+
+```sql
+SELECT e.id,
+       e.created_at,
+       e.event_type,
+       e.actor_type,
+       COALESCE(u.first_name || ' ' || u.last_name, '') AS actor_name,
+       e.old_status,
+       e.new_status,
+       e.created_at - LAG(e.created_at) OVER (ORDER BY e.created_at, e.id) AS since_previous,
+       e.metadata
+FROM "RideEvents" AS e
+LEFT JOIN "Users" AS u ON u.id = e.actor_id
+WHERE e.ride_id = '00000000-0000-0000-0000-000000000000'
+ORDER BY e.created_at, e.id;
+```
+
+Show only status transitions:
+
+```sql
+SELECT created_at, event_type, old_status, new_status, actor_type
+FROM "RideEvents"
+WHERE ride_id = '00000000-0000-0000-0000-000000000000'
+  AND new_status IS NOT NULL
+ORDER BY created_at, id;
+```
+
+List decline reasons for a ride:
+
+```sql
+SELECT created_at,
+       metadata->>'driver_id'                AS driver_id,
+       metadata->>'reason'                   AS reason,
+       (metadata->>'elapsed_since_confirm_ms')::bigint AS ms_since_confirm
+FROM "RideEvents"
+WHERE ride_id = '00000000-0000-0000-0000-000000000000'
+  AND event_type = 'ride_declined'
+ORDER BY created_at;
+```
+
+Trace activation and notifications for an unmatched ride:
+
+```sql
+SELECT created_at,
+       event_type,
+       metadata->>'tier'             AS tier,
+       metadata->>'drivers_notified' AS drivers_notified,
+       metadata->>'template_code'    AS template_code,
+       metadata->>'recipient_count'  AS recipient_count,
+       metadata->>'status'           AS dispatch_status
+FROM "RideEvents"
+WHERE ride_id = '00000000-0000-0000-0000-000000000000'
+  AND event_type IN ('notification_dispatched', 'activation_tier_reached',
+                     'rescue_alert_sent', 'no_drivers_available')
+ORDER BY created_at, id;
+```
+
+Count event types over the last 7 days. This query uses `idx_ride_events_type`:
+
+```sql
+SELECT event_type, COUNT(*) AS events
+FROM "RideEvents"
+WHERE created_at >= now() - interval '7 days'
+GROUP BY event_type
+ORDER BY events DESC;
+```
+
+Find payment failures by operation in one community:
+
+```sql
+SELECT e.created_at,
+       e.ride_id,
+       e.metadata->>'operation' AS operation,
+       e.metadata->>'error'     AS error
+FROM "RideEvents" AS e
+JOIN "Rides" AS r ON r.id = e.ride_id
+WHERE e.event_type = 'payment_processing_failed'
+  AND r.community_id = '00000000-0000-0000-0000-000000000000'
+ORDER BY e.created_at DESC
+LIMIT 100;
+```
+
+Find confirmed rides that have no `ride_confirmed` event, which points to dropped events:
+
+```sql
+SELECT r.id, r.status, r.confirm_time
+FROM "Rides" AS r
+WHERE r.confirm_time >= now() - interval '1 day'
+  AND NOT EXISTS (
+    SELECT 1 FROM "RideEvents" AS e
+    WHERE e.ride_id = r.id AND e.event_type = 'ride_confirmed'
+  )
+ORDER BY r.confirm_time DESC;
+```
+
+<Tip>
+`metadata` is `JSONB`, so use `->>` for text and cast numbers explicitly. Key names vary by event. For example, `ride_requested` uses `destination_name`, while most trip events use `dest_name`. Check the tables above before filtering.
+</Tip>
+
+## Add a new event type
+
+1. Add a `RideEvent*` constant in `internal/models/ride_event.go`. No migration is needed because `event_type` is unconstrained `TEXT`.
+2. Add a `record*Event` helper in `internal/service/ride/events.go`. Record after the state change commits and set `OldStatus` and `NewStatus` when the event is a transition.
+3. Add the constant to the `applyEventToTimings` switch in `internal/service/dashboard/rides.go:104`. The switch is exhaustive, and the linter flags missing cases.
+4. Optionally, add a badge color in `yelo-web/src/sites/dashboard/components/RideEventsTimeline.tsx`.

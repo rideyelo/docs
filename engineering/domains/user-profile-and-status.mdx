@@ -1,0 +1,284 @@
+---
+title: "User profile, status, and account lifecycle"
+description: "How the /user endpoints read and update the profile, what the /user/status poll computes and from which queries, the ride-state snapshot, shared user requirements, profile photos, history, drive fee repair, and account deletion."
+---
+
+The `user` HTTP package serves the signed-in mobile user: their profile, the status poll that drives the app's home screen, ride and drive history, profile photos, and account deletion. Sign-in, tokens, and identity linking live elsewhere. See [Identity overview](/engineering/identity/overview) and [Tokens and sessions](/engineering/identity/tokens-and-sessions).
+
+The social half of the same package (contacts, friends, likes, and recent locations) is on [User social graph and saved places](/engineering/domains/user-social-graph).
+
+## Data touched
+
+| Store | Keys or tables | Used for |
+| --- | --- | --- |
+| Postgres | `Users` | Profile columns, `is_online_driver`, `last_pinged_driver`, `ride_state_revision`, `active_experiments`, `share_location_with_friends`, soft-delete flags |
+| Postgres | `Rides`, `FleetDrivers`, `DriverApplications`, `Schools` | Status poll, profile aggregates, history |
+| Redis | `user:profile:{userID}` | Full `models.User` JSON, 5-minute TTL (`userProfileCacheTTL`) |
+| Redis | `driver:earnings:all_time:{userID}` | All-time earnings, 60-second TTL (`driverEarningsCacheTTL`) |
+| Redis | `driver:queue_summary:{userID}` | Hash read by the status poll for `queue_summary` |
+| Redis | Auth cache | Invalidated on community switch and deletion |
+| Supabase Storage | Public bucket, `profile_pictures/{userID}/{uuid}{ext}` and `..._thumb.jpg` | Rider profile photo and 512 px thumbnail |
+| Stripe | Customer object, connected-account balance transactions | Deleted on account deletion. Read by drive fee repair |
+| River | `stripe` queue | `stripe_drive_fee_scan`, `stripe_drive_fee_repair` |
+
+## Endpoints
+
+All routes are registered in `internal/server/http/user/user_routes.go` under the `/user` group in `internal/server/http/router.go`. Every route uses `getValidateJWTMiddleware` followed by `getRequireRoleMiddleware([]string{"user"})`. `RegisterUnauthenticatedRoutes` is empty.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| GET | `/user/current-user` | User JWT | `GetCurrentUser`: cached profile plus `signup_status` |
+| GET | `/user/status` | User JWT | `GetUserStatus`: the polling endpoint. Optionally merges the ride-state snapshot |
+| GET | `/user/ride-state` | User JWT | `GetRideStateSnapshot`: committed ride snapshot. Query `minimum_session_revision` |
+| POST | `/user/location` | User JWT | `UpdateLocation`: position write plus the `stop_sharing` kill switch. See [Driver location tracking](/engineering/location/driver-location-tracking) |
+| GET | `/user/ride-history` | User JWT | `GetRideHistory`: last 200 rides as rider |
+| GET | `/user/drive-history` | User JWT | `GetDriveHistory`: last 200 rides as driver |
+| PUT | `/user/name` | User JWT | `UpdateName` |
+| PUT | `/user/profile-picture` | User JWT | `UpdateProfilePicture`: multipart field `profile_picture` |
+| GET | `/user/profile-picture/thumbnail` | User JWT | `GetProfilePictureThumbnail`: generates the thumbnail lazily |
+| PUT | `/user/community` | User JWT | `UpdateActiveCommunity`: validated switch, returns a new JWT |
+| DELETE | `/user/i/{id}` | User JWT | `Delete`: deletes the caller's account |
+| PUT | `/user/app-version` | User JWT | `UpdateAppVersion`: `app_version` and `expo_update_id` |
+| PUT | `/user/allow-notifications` | User JWT | `SetAllowNotifications` |
+| PUT | `/user/experiments` | User JWT | `SetActiveExperiments`: replaces the whole list |
+| PUT | `/user/location-sharing` | User JWT | `UpdateLocationSharing`: friends ghost-mode toggle |
+
+## The status poll
+
+`GET /user/status` is the hot path. The app polls it from several hooks. `UserService.GetUserStatus` calls `sqlUserRepository.GetStatus` in `internal/data/repository/user_driver.go`, which runs one pool query with no explicit transaction: `GetUserDriverStatus` in `queries/user_driver.sql`.
+
+### Response fields
+
+| Field | Source |
+| --- | --- |
+| `user_status` | `home`, `riding`, or `driving`, computed in SQL (see below). `waitlisted` exists in the enum but this query never returns it |
+| `driver_is_online` | `Users.is_online_driver` |
+| `driver_active_fleet` | `FleetDrivers.fleet_id` where `is_active = TRUE` (plain `LEFT JOIN`, then `LIMIT 1`) |
+| `current_ride_id`, `current_ride_status` | From `current_ride` when riding, from `current_drive` when driving, else null |
+| `potential_ride_id` | Newest `Rides.id` by `confirm_time` where `potential_driver` is the user, `driver_id IS NULL`, and status is not `complete` |
+| `queued_rides` | IDs of the user's rides as driver with status `queued` |
+| `driver_earnings.daily_earnings` | Sum of `driver_payout` for `complete` or `pending_rider_rating` drives with `request_time` in the last day. Null when there are none |
+| `driver_earnings.weekly_earnings` | Same over the last week |
+| `driver_earnings.all_time_earnings` | `DriverEarningsCache` (60 s) with loader `GetDriverAllTimeEarnings` |
+| `queue_summary` | Redis `driver:queue_summary:{userID}`, only when `queued_rides` is non-empty |
+| `waitlist_position` | Never populated by this path |
+| `ride_state` | Only when the client opts into the snapshot protocol |
+
+### How `user_status` is computed
+
+The query builds `recent_rides`: all non-`complete` rides where the user is rider or driver, ordered by `COALESCE(match_time, request_time) ASC`.
+
+<Steps>
+  <Step title="Pick the rider ride">
+    `current_ride` is the first row of `recent_rides` where the user is the rider (`LIMIT 1`).
+  </Step>
+  <Step title="Pick the driver trip">
+    `current_drive` is the first row where the user is the driver and status is `driver_en_route`, `driver_waiting`, or `in_progress`.
+  </Step>
+  <Step title="Classify">
+    `riding` if `current_ride` status is one of `queued`, `confirmed`, `driver_en_route`, `driver_waiting`, `in_progress`, `pending_rider_rating`. Otherwise `driving` if the user drives `current_drive` or `is_online_driver` is true. Otherwise `home`.
+  </Step>
+</Steps>
+
+Riding wins over driving. A user with a live booking who is also online as a driver reports `riding`.
+
+### Earnings example
+
+A driver has three drives in `complete`: $12.50 six hours ago, $8.00 twenty hours ago, and $20.00 three days ago. The poll returns `daily_earnings` 20.50 and `weekly_earnings` 40.50. `all_time_earnings` comes from Redis and may lag by up to 60 seconds.
+
+### Side effects of polling
+
+When `user_status` is `driving` and `last_pinged_driver` is older than 5 seconds (`driverPingFreshness`), `GetStatus` calls `pingDriverAsync`. That goroutine refreshes `last_pinged_driver` on a dedicated pool connection with a detached context. This is how an online driver stays DB-online. See [Heartbeat and presence](/engineering/location/heartbeat-and-presence) for the 30-minute expiry sweep that consumes it.
+
+### Queue summary merge
+
+`UserService.GetUserStatus` reads `GetQueueSummary` only when `queued_rides` is non-empty. It then:
+
+- Skips the summary when Redis errors or `ride_count` is 0.
+- Skips it and logs a warning when `ride_count` differs from `len(queued_rides)`. Nothing is deleted, because the driver's queue-detail poll rebuilds the cache.
+- Otherwise sets `queue_summary` with `total_fare = total_fare_cents / 100`. A cached 2350 becomes `23.50`.
+
+## Ride-state snapshot
+
+The snapshot protocol is gated by `RIDE_STATE_SNAPSHOT_ENABLED` (default false). For how revisions are written, see [Rides implementation](/engineering/api/rides-implementation).
+
+| Entry point | Behavior |
+| --- | --- |
+| `GET /user/ride-state` | Always calls `GetRideStateSnapshot`. Returns 503 `RideStateUnavailableError` when the flag is off |
+| `GET /user/status` with `X-Ride-State-Protocol: 1` | When the flag is on, parses `X-Ride-State-Minimum-Revision`, loads the snapshot, and calls `status.ApplyRideState`. Any snapshot error fails the whole poll. When the flag is off, the header is ignored and the legacy response is returned |
+
+`parseMinimumSessionRevision` accepts only ASCII digits. An empty value means 0. Non-digits and values outside `int64` return 400 **Invalid Revision**.
+
+`sqlUserRepository.GetRideStateSnapshot` in `internal/data/repository/ride_snapshot.go` runs in a `REPEATABLE READ`, read-only transaction:
+
+<Steps>
+  <Step title="Check the revision">
+    `GetRideSnapshotUser` reads `ride_state_revision` and `is_online_driver`. If the stored revision is less than the requested minimum, it returns 503 **minimum session revision not available**.
+  </Step>
+  <Step title="Load rides">
+    `GetRideSnapshotRows` returns the user's rides, excluding `requested` and `no_drivers_available`. It keeps `complete` rides only when they were picked up, not cancelled, and still await this user's review. Rows are ordered by `COALESCE(match_time, request_time), id`.
+  </Step>
+  <Step title="Bucket rows">
+    `appendSnapshotRide` puts a non-complete rider row in `rider_booking`, a driver row in `queued` into `driver_queue`, and a driver row in `driver_en_route`, `driver_waiting`, or `in_progress` into `driver_current`. Review-pending rows go to `rider_reviews` or `driver_reviews`.
+  </Step>
+  <Step title="Derive status">
+    `driving` if `driver_current` is set or the driver is online. Then `riding` overrides it if `rider_booking` status is `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress`, or `pending_rider_rating`.
+  </Step>
+</Steps>
+
+Rules inside the snapshot:
+
+- A second non-complete rider booking or a second current driver trip returns 503 **multiple ... require reconciliation** instead of guessing.
+- `confirm_code` is included only on rows where the caller is the rider.
+- `queue_position` is 1-based: the count of the driver's queued rides whose `(COALESCE(match_time, request_time), id)` is at or before this ride's.
+- Revisions (`session_revision`, `ride_revision`, `assignment_generation`) are decimal strings, because JavaScript numbers can't hold every bigint.
+
+`ApplyRideState` in `internal/models/ride_snapshot.go` overwrites `queued_rides`, `user_status`, `driver_is_online`, `current_ride_id`, and `current_ride_status` from the snapshot. It clears `queue_summary` when the snapshot queue differs from the legacy `queued_rides`.
+
+## Profile reads and writes
+
+`GET /user/current-user` returns `{ user, signup_status }`. `user` comes from `UserProfileCache.Get`, which falls back to `sqlUserRepository.GetByID` (`GetUserProfileByID`). That query adds `school_name`, average rider and driver ratings, `drive_count` and `ride_count` (completed, not cancelled), `driver_application_status` (`complete` when `DriverApplications.is_active`), `queue_length`, `next_available_latitude`/`longitude`, and `active_fleet_id`.
+
+`signup_status` is read directly from Postgres by `GetUserSignupStatus`, not from the cache:
+
+| Flag | Rule |
+| --- | --- |
+| `phone_verified` | `phone_number` is non-null and non-empty |
+| `profile_init` | `first_name`, `last_name`, `gender`, and `photo_url` are all non-empty |
+
+### Update rules
+
+| Endpoint | Validation | Write | Cache and side effects |
+| --- | --- | --- | --- |
+| `PUT /user/name` | Each trimmed name at least 2 bytes (`UpdateNameRequest.Validate`) | `SetUserName` stores the untrimmed values | Profile cache invalidated. `RefreshShareCardAsync` re-upserts the Dub share link |
+| `PUT /user/app-version` | Non-empty and matches `^(\d+)\.(\d+)\.(\d+)$` | `SetUserAppVersion` also sets `expo_update_id`, null when omitted | Profile cache invalidated |
+| `PUT /user/allow-notifications` | None | `SetUserAllowNotifications` | Profile cache invalidated |
+| `PUT /user/experiments` | None | `SetUserActiveExperiments` replaces the array | Profile cache invalidated |
+| `PUT /user/location-sharing` | None | `SetUserShareLocationWithFriends` | Profile cache invalidated. `mapChanges.SocialChanged` notifies the user and their friends |
+| `PUT /user/community` | `community_id` not nil | `SetUserActiveCommunityValidated` | Profile and auth caches invalidated. Returns a new token |
+
+### Community switch
+
+`SetUserActiveCommunityValidated` updates `Users.community_id` only when all of these hold:
+
+- The community is active.
+- It is not the reserved Yelo community (`87794dc9-7ef8-438c-b2e8-ba6fd77e66aa`).
+- It is neither test nor hidden, unless the user is a test user.
+- The user is not deleted or banned.
+
+Zero rows returns 400 **community is unavailable for this user**. On success, the handler mints a token with `jwt.GetJWToken(userID, ["user"], communityID, config.DefaultJwtDuration)`, which is 6,360 hours. For how automatic resolution can later move the user, see [Community assignment](/engineering/location/community-assignment).
+
+## Profile photos
+
+`PUT /user/profile-picture` parses the multipart form with a 100 MiB limit (`helpers.MaxMultipartFormSize`). It reads the `profile_picture` file and takes the extension from the last `.` in the filename. `models.Photo.Validate` requires only non-empty bytes and a non-empty extension.
+
+<Steps>
+  <Step title="Upload the original">
+    `SupabaseStorage.UploadProfilePicture` writes `profile_pictures/{userID}/{newUUID}{ext}` to the public bucket and returns the public URL.
+  </Step>
+  <Step title="Save the URL">
+    `SetUserProfilePicture` sets `photo_url` and clears `photo_thumbnail_url` to an empty string.
+  </Step>
+  <Step title="Best-effort thumbnail">
+    `image.Processor.GenerateThumbnail` decodes JPEG, PNG, GIF, BMP, or TIFF. If either side exceeds 512 px (`thumbnailMaxSize`), it scales with CatmullRom to fit, then encodes JPEG at quality 80. `UploadProfilePictureThumbnail` upserts `{original path without ext}_thumb.jpg`. `SetUserProfilePictureThumbnail` saves the URL. Each failure is logged, not returned.
+  </Step>
+  <Step title="Refresh caches">
+    The profile cache is invalidated, then the share card is refreshed. The refresh runs last because the card embeds the thumbnail URL.
+  </Step>
+</Steps>
+
+A 1200 × 800 upload scales by `min(512/1200, 512/800) = 0.4267` to 512 × 341. A 400 × 300 upload is re-encoded at its original size.
+
+`GET /user/profile-picture/thumbnail` returns the stored `photo_thumbnail_url` when present. If only `photo_url` is set, it downloads the original with a plain HTTP GET (30-second client timeout), generates and uploads the thumbnail, saves it, and invalidates the profile cache. If `photo_url` is empty, the handler returns 404 **no profile picture found**. The download bypasses the storage SDK on purpose, because stored URLs point at several historical Supabase projects.
+
+## History
+
+`GET /user/ride-history` and `GET /user/drive-history` call `GetRideHistoryByRiderID` and `GetRideHistoryByDriverID` in `queries/ride_history.sql`. Both return at most 200 rows with status `complete` or `pending_rider_rating`, newest `request_time` first. Neither filters on `cancel_phase`, so cancelled rides that ended in `complete` appear. Each record carries `stripe_fee_cents` as `FeeCents`, which the drive fee jobs backfill. Empty results serialize as `[]`.
+
+### Drive fee repair jobs
+
+`internal/service/user/drive_fee_jobs.go` registers two River workers on the `stripe` queue. The periodic scan runs every 10 minutes with `RunOnStart` (`internal/notify/queue/queue.go`). Timing and page limits are documented in [Payouts and earnings](/engineering/payments/payouts-and-earnings). The key rules:
+
+- `GetDriversWithMissingStripeFees` selects up to 100 (driver, merchant) pairs with a `payment_intent_id`, null `stripe_fee_cents`, and a due `stripe_fee_repair_after`.
+- Each repair job lists balance transactions with `created >= oldest missing request_time - 8 days` (`driveFeeCaptureCushion`), 100 per page.
+- After each page it calls `PersistStripeFees`, then stops as soon as `HasMissingStripeFees` is false.
+- When Stripe has no more pages, `DeferMissingStripeFeeRepair` pushes the unresolved rides 24 hours out.
+- After 10 pages it enqueues a continuation with the cursor, 1 second later, `MaxAttempts` 25.
+- Jobs are unique by args across available, pending, running, retryable, and scheduled states.
+
+## Shared user requirements
+
+`internal/service/userrequirements/user.go` holds the rules other services use to block a user. It has no routes.
+
+| Function | Rule | Error | Callers |
+| --- | --- | --- | --- |
+| `HasVerifiedPhone` | Non-nil user with a non-blank `phone_number` | None | Driver signup status (`PhoneVerified`) |
+| `RequireVerifiedPhone` | Same | 409 `ErrorTypePhoneRequired`, **Phone Number Required** | Driver going online, driver photo and license uploads, activation and activation reconcile, vehicle create, Stripe onboarding link. Every caller gates it on `DRIVER_VERIFIED_PHONE_REQUIRED` (default false) |
+| `RequireCompletedProfile` | Non-blank `first_name` and `last_name` | 409 `ErrorTypeProfileRequired`, **Finish Your Profile** | `StripeAccountService.validateExpressAccountUser`, always enforced |
+| `CanReceiveSMS` | Verified phone and `sms_opted_out_at` is null | None | Friend bump SMS in `internal/service/notifications/bump.go`. See [SMS and friend bumps](/engineering/notifications/sms-and-friend-bumps) |
+
+A phone number counts as verified because only OTP flows write it. See [Phone OTP and rate limits](/engineering/identity/phone-otp-and-rate-limits).
+
+## Account deletion
+
+`DELETE /user/i/{id}` calls `UserService.Delete` with the caller's ID from the token. Steps run in order, and any error stops the rest:
+
+<Steps>
+  <Step title="Load the user">
+    `GetByID` reads the uncached profile.
+  </Step>
+  <Step title="Delete the Stripe customer">
+    If `stripe_customer_id` is set, `PaymentClient.DeleteCustomer` runs.
+  </Step>
+  <Step title="Delete the photo">
+    If `photo_url` is set, `StorageClient.DeleteFile` is called with `["profile_pictures", userID, lastURLSegment]`.
+  </Step>
+  <Step title="Run the identity lifecycle">
+    `authv3.IdentityLifecycle.PrepareUserDeletion` revokes Apple refresh tokens, then `DeleteIdentitiesAndScrubUser` removes auth-v3 identities and soft-deletes the user. When this succeeds, the auth and profile caches are invalidated immediately. `SocialChanged` is deferred so friends refresh even if later steps fail.
+  </Step>
+  <Step title="Scrub the legacy row">
+    `ScrubUserPersonalDetails` blanks `first_name`, `last_name`, `email`, `phone_number`, all four photo URL columns, and sets `is_deleted = TRUE` and `deleted_at`.
+  </Step>
+  <Step title="Revoke web sessions">
+    `AuthV3.RevokeAllWebSessionsForUser` runs best-effort. Mobile JWTs can't be revoked. The auth cache marks them deleted.
+  </Step>
+</Steps>
+
+Database triggers finish the cleanup. `clear_recent_locations_on_user_deletion` deletes the user's `RecentLocations` when `is_deleted` becomes true. `Friendships` and `UserContacts` rows remain, but friend lists filter out deleted users. For which identity tables survive deletion, see [Identity overview](/engineering/identity/overview).
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Route registration | `internal/server/http/user/user_routes.go` | `RegisterAuthenticatedRoutes` |
+| Middleware mount | `internal/server/http/router.go` | `userAuthGroup` |
+| Handlers | `internal/server/http/user/user_handler.go` | `GetUserStatus`, `UpdateProfilePicture`, `UpdateActiveCommunity`, `Delete` |
+| Snapshot handler | `internal/server/http/user/ride_snapshot.go` | `GetRideStateSnapshot`, `parseMinimumSessionRevision` |
+| Request validation | `internal/server/http/user/requests/*.go` | `UpdateNameRequest`, `AppVersionRequest`, `UpdateCommunityRequest` |
+| Service | `internal/service/user/user.go` | `UserService`, `GetUserStatus`, `Delete`, `UpdateProfilePicture` |
+| Status query | `internal/data/repository/queries/user_driver.sql` | `GetUserDriverStatus`, `GetDriverAllTimeEarnings` |
+| Status repository | `internal/data/repository/user_driver.go` | `GetStatus`, `pingDriverAsync`, `driverPingFreshness` |
+| Snapshot repository | `internal/data/repository/ride_snapshot.go`, `queries/ride_snapshot.sql` | `GetRideStateSnapshot`, `appendSnapshotRide` |
+| Snapshot model | `internal/models/ride_snapshot.go` | `RideStateSnapshot`, `ApplyRideState` |
+| Profile queries | `internal/data/repository/queries/user_profile.sql` | `GetUserProfileByID`, `GetUserSignupStatus`, `SetUserActiveCommunityValidated`, `ScrubUserPersonalDetails` |
+| Profile cache | `internal/data/redis/user_profile_cache.go` | `UserProfileCache` |
+| Requirements | `internal/service/userrequirements/user.go` | `RequireVerifiedPhone`, `RequireCompletedProfile`, `CanReceiveSMS` |
+| Thumbnails | `internal/service/image/processor.go` | `GenerateThumbnail`, `fitDimensions` |
+| Storage | `internal/data/supabasestorage/storage.go` | `UploadProfilePicture`, `DownloadProfilePicture`, `deriveThumbPath` |
+| Drive fee jobs | `internal/service/user/drive_fee_jobs.go` | `driveFeeScanWorker`, `driveFeeRepairWorker` |
+| Models | `internal/models/user.go`, `photo.go` | `User`, `UserStatusDetails`, `SignupStatus`, `Photo` |
+
+## Gotchas and edge cases
+
+- `DELETE /user/i/{id}` ignores `{id}`. The handler always deletes the token's user, so the path value is decorative.
+- Photo deletion on account delete doesn't remove the file. `RemoveFile` in storage-go treats each array element as a full object path, so it receives three paths (`profile_pictures`, the user ID, and the bare filename) instead of one joined path. The thumbnail is never targeted either.
+- Stripe customer deletion runs before the identity lifecycle. If Apple revocation fails with 503, the user keeps their account but has lost their Stripe customer. A retry calls `DeleteCustomer` again on the same ID.
+- The legacy `current_ride` picks the oldest non-complete rider ride, including `requested` and `no_drivers_available` rows. If a stale row of that kind is older than a live booking, `user_status` reports `home`. The snapshot query excludes those statuses for exactly this reason.
+- `/user/status` reports `pending_rider_rating` as `riding` in both the legacy and snapshot paths.
+- Content types are built as `"image/" + extension`, and the extension includes the dot, so originals upload as `image/.jpg`. Thumbnails correctly use `image/jpeg`.
+- The extension comes from the client filename with no allow-list. A HEIC or WebP upload succeeds, but thumbnail decoding fails. Every later `GET /user/profile-picture/thumbnail` then retries the download and fails with 500.
+- Uploading a new photo doesn't delete the previous original or thumbnail from storage.
+- `PUT /user/name` validates trimmed length but stores untrimmed input, so leading and trailing spaces persist.
+- `GET /user/current-user` tolerates an `ErrorTypeMissingFields` error from the profile read and can return `user: null` with a valid `signup_status`.
+- The profile cache TTL is 5 minutes. Writers that skip `invalidateProfileCache` serve stale profiles until then.
+- `ScrubUserPersonalDetails` leaves `referral_code`, `stripe_merchant_id`, `push_notification_token`, and last location in place.

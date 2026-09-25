@@ -1,0 +1,171 @@
+---
+title: "Fleet Stripe accounts and lifecycle operations"
+description: "How fleets are created, cloned, updated, deleted, and unlinked from Stripe, how fleet Stripe status and activation are driven by webhooks and reconciliation, and what each operation cascades to."
+---
+
+This page follows a fleet from creation to deletion, with the Stripe side of each step. For payout routing on rides, see [Membership and payout routing](/engineering/fleets/membership-and-payout-routing). For the admin UI, see [Fleets](/dashboard/fleets).
+
+## State model
+
+A fleet-merchant fleet moves through these combinations of `is_active`, `stripe_status`, and `deleted_at`. Owner-operator fleets are created as `is_active = TRUE`, `stripe_status = 'not_required'`, and only leave that state on delete.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending: create, new Stripe account
+  [*] --> Cloned: create, clone source account
+  Cloned --> Ready: source status complete
+  Cloned --> Pending: source status pending or restricted
+  Pending --> Ready: account.updated -> complete (ActivateFleet)
+  Pending --> Restricted: account.updated -> restricted
+  Restricted --> Ready: account.updated -> complete
+  Ready --> Restricted: account.updated -> restricted (is_active stays TRUE)
+  Ready --> Pending: unlink (new account, is_active FALSE)
+  Restricted --> Pending: unlink
+  Pending --> Deleted: delete
+  Ready --> Deleted: delete
+  Restricted --> Deleted: delete
+  Deleted --> [*]
+```
+
+| State | `is_active` | `stripe_status` | Payout-ready |
+| --- | --- | --- | --- |
+| Pending | `FALSE` | `pending` | No |
+| Ready | `TRUE` | `complete` | Yes, if `has_custom_payouts` |
+| Restricted | Unchanged, usually `TRUE` | `restricted` | No |
+| Deleted | `FALSE` | Unchanged | No |
+
+The dashboard list derives its badge in `StatusBadge` (`yelo-web/src/sites/dashboard/pages/ManageFleetsPage.tsx`) in this priority: deleted, `restricted`, `pending`, `is_active`, otherwise inactive.
+
+## Create
+
+`POST /dashboard/communities/{id}/fleets` is admin only. `CreateFleetAPIRequest.Validate` requires a name, a valid `payment_model`, and at least one supported type. `DashboardService.CreateFleet` in `internal/service/dashboard/fleet.go` then:
+
+<Steps>
+  <Step title="Validate vehicle types">
+    `validateVehicleTypes`: every type is valid and the primary type is in the supported list.
+  </Step>
+  <Step title="Resolve the clone source">
+    With `source_fleet_id`, loads the source (`GetFleetByID`, which returns deleted fleets) and rejects it if `deleted_at` is set.
+  </Step>
+  <Step title="Set up Stripe">
+    `setupStripeForCloneOrNew`:
+    - Owner-operator: `stripe_status = 'not_required'`, `is_active = TRUE`, no Stripe call.
+    - Fleet-merchant cloning a source that has an account: copies `stripe_merchant_id` and `stripe_status`, sets `is_active` to whether the source is `complete`, and stores no onboarding URL.
+    - Otherwise: `CreateFleetExpressAccount` (Express, US, `card_payments` and `transfers` requested, business type `company`), then an Account Link with `collection_options.fields = eventually_due`. The refresh URL is `cfg.Stripe.ReturnUrl + "?fleet=<id>"`. The fleet starts as `pending` and inactive. If the link fails, the new account is deleted.
+  </Step>
+  <Step title="Insert">
+    `sqlDashboardRepository.CreateFleet` locks the community (`archived_at IS NULL`), inserts the fleet, and inserts a `fleet_creation` service row for the home community in one transaction. If the insert fails, the new Stripe account is deleted.
+  </Step>
+  <Step title="Seed pricing">
+    Outside that transaction. With a source and `copy_pricing_from_source` not `false`, `copyPricingFromSourceFleet` copies the source fleet's first open price per supported type from the source's home community into the new fleet's home community, falling back to community pricing per type. Otherwise `copyPricingToFleet` copies, for each supported type, the first open row of that type from any other fleet in the community.
+  </Step>
+</Steps>
+
+`has_owner_operators` is set to `payment_model == owner_operator`, and `requires_confirmation_code` defaults to `TRUE`.
+
+## Update
+
+`PATCH /dashboard/communities/{id}/fleets/{fleet_id}` is allowed for admins and the fleet's own managers. See [Manager authorization](/engineering/fleets/dashboard-authorization). The path community must be the home community.
+
+`UpdateDashboardFleet` is a `COALESCE` partial update over `name`, `logo_url`, `primary_vehicle_type`, `supported_vehicle_types`, `has_custom_payouts`, `requires_confirmation_code`, `is_student_only`, and `has_owner_operators`. `payment_model`, `community_id`, and the Stripe columns can't be changed here.
+
+When `supported_vehicle_types` changes, `applyVehicleTypeUpdates` runs **before** the fleet row is written:
+
+- Added types go through `copyPricingToFleet` into the home community.
+- Removed types go through `expirePricingForFleet`, which ends the fleet's first open price row of each removed type in the home community.
+
+Price changes only touch the home community. Prices in other service communities are left open for removed types.
+
+Effects of the toggles:
+
+| Field | Immediate effect |
+| --- | --- |
+| `has_custom_payouts` | Changes payout readiness, joinability, and routing for the next authorization. Turning it off on a fleet-merchant fleet makes its fleet-managed drivers read as `pending` and blocks them from going online. Turning it on for an owner-operator fleet disables invitations. |
+| `requires_confirmation_code` | Applies to rides confirmed afterwards. Existing rides keep their code. |
+| `is_student_only` | Applies to the next rider options request. |
+| `name` | Changes derived `Fleet: <name>` tags immediately. Renaming the `Yelo` fleet changes badges and T0 targeting. |
+
+## Stripe status sources
+
+| Source | Code | Effect |
+| --- | --- | --- |
+| `account.updated` webhook | `PaymentService.AccountUpdated` → `handleFleetAccountUpdated` in `internal/service/payment/payment.go` | Matches every non-deleted fleet with this `stripe_merchant_id`. Past-due or currently-due requirements set `restricted`. Payouts disabled sets `pending`. Otherwise `complete`. |
+| Daily reconciliation | `reconciliation_jobs.go`, `queries/stripe_reconciliation.sql` | Discovers every non-deleted fleet account and re-runs `AccountUpdated` about every 24 hours per account. |
+| Refresh link | `RefreshStripeOnboardingLink` | Mints a new Account Link and stores it, keeping the current status. Admin only. |
+| Unlink | `UnlinkStripe` | Sets `pending` with a new account. |
+
+On `complete`, `handleFleetAccountUpdated` also:
+
+1. Calls `ActivateFleet` (`is_active = TRUE` where not deleted).
+2. Lists `ListEligibleFleetJoinDrivers`: inactive applications whose `payout_fleet_id` is this fleet, with approved profile photo and license and at least one approved available vehicle.
+3. Calls `ReconcileDriverActivation` for each, in UUID order. The first error aborts the loop and the remaining fleets.
+
+Non-`complete` statuses never deactivate the fleet. Readiness still fails because it requires `stripe_status = 'complete'`.
+
+If a connected account matches any fleet, the webhook takes the fleet branch and skips the driver branch, even if a user has the same account ID.
+
+### Stripe status for the dashboard
+
+`GetFleetStripeStatus` calls Stripe on every request. It returns `connected: false` if there is no account ID. Otherwise it returns `payouts_enabled`, `charges_enabled`, `disabled_reason`, currently due, past due, and error reasons. It mints an Express login link only when `details_submitted`, and a link failure degrades to no link.
+
+## Unlink
+
+`POST .../stripe/unlink` is allowed for admins and the fleet's managers, for fleet-merchant fleets only. `DashboardService.UnlinkStripe`:
+
+1. `cleanupOrphanedStripeAccount`: if exactly one non-deleted fleet (this one) uses the current account, deletes the account at Stripe. A delete failure is logged and ignored. Shared accounts are never deleted.
+2. Creates a new Express account and an Account Link. If the link fails, deletes the new account.
+3. `SetDashboardFleetStripeMerchantID`: new account ID, `is_active = FALSE`.
+4. `UpdateFleetStripeStatus`: `pending` with the new onboarding URL.
+
+None of these steps are in a database transaction.
+
+## Delete
+
+`DELETE /dashboard/communities/{id}/fleets/{fleet_id}` is allowed for admins and the fleet's managers. `DeactivateDashboardFleet` runs one statement:
+
+```sql
+UPDATE "Fleets" SET is_active = FALSE, deleted_at = NOW(),
+    stripe_merchant_id = NULL, updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL;
+```
+
+What happens to everything else:
+
+| Object | After delete |
+| --- | --- |
+| Stripe account | Not deleted. Only the reference is cleared. |
+| `FleetDrivers` | Unchanged, including `is_active = TRUE`. Members' `ActiveFleetId` still points here. |
+| `DriverApplications.payout_fleet_id` | Unchanged. Fleet-managed members read as `pending` and can't go online. |
+| Open `RidePriceParameters` | Unchanged. The trigger blocks new open rows for the fleet. |
+| `FleetCommunityServices` | Unchanged and still enabled, hidden by the view. |
+| `CalendarConnections` | Unchanged. Sync stops because the service isn't active. |
+| `FleetVehicles` | Unchanged. The inventory disappears from `AvailableDriverVehicles`. Admin writes fail with **fleet not found**. |
+| `driver_join_code` | Unchanged. Preview returns `available: false`. |
+| `QrPaymentConfigs` | Unchanged. `DeactivateConfig` skips the Stripe call because the account ID is now `NULL`. |
+| Rides in progress | Continue. Completion recomputes the Stripe account and falls back to the driver's account because `stripe_merchant_id` is `NULL`. |
+| `Communities.primary_fleet_id` | Unchanged. The community keeps a deleted primary fleet. |
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Lifecycle service | `yelo-api/internal/service/dashboard/fleet.go` |
+| Lifecycle SQL | `CreateDashboardFleet`, `UpdateDashboardFleet`, `DeactivateDashboardFleet`, `SetDashboardFleetStripeStatus`, `ActivateDashboardFleet`, `SetDashboardFleetStripeMerchantID` in `yelo-api/internal/data/repository/queries/driver_fleet_primitives.sql` |
+| Repository | `yelo-api/internal/data/repository/dashboard.go` |
+| Handlers | `yelo-api/internal/server/http/community/community_handler.go`; routes in `community_router.go` (`registerFleetRoutes`) |
+| Request validation | `yelo-api/internal/server/http/community/requests/fleet.go` |
+| Stripe client | `CreateFleetExpressAccount`, `GetExpressAccountOnboardingLink` in `yelo-api/internal/data/stripe/account.go` |
+| Webhook and reconciliation | `yelo-api/internal/service/payment/payment.go`, `reconciliation_jobs.go` |
+| Dashboard status badge | `yelo-web/src/sites/dashboard/pages/ManageFleetsPage.tsx` |
+
+## Gotchas and edge cases
+
+- **Unlink deletes before it creates.** If `CreateFleetExpressAccount` or the database update fails after `cleanupOrphanedStripeAccount` deleted the old account, the fleet keeps pointing at a deleted account.
+- **Unlink during a ride breaks capture.** Completion recomputes the account from the fleet, so a ride authorized on the old account is captured against the new one.
+- **Cloned fleets share one account.** Webhooks update every fleet on the account at once. Unlinking one clone gives it a new account and leaves the shared one in place. A clone stores no onboarding URL, so **Refresh Link** mints one for the shared account.
+- **Creation isn't atomic.** Pricing is seeded after the fleet commits. A pricing failure returns an error, but the fleet, its service row, and possibly its Stripe account exist.
+- **Price copy and expiry only see active coverage.** `copyPricingToFleet`, `copyPricingFromSourceFleet`, and `expirePricingForFleet` read `GetAllRidePriceParameters`, which joins `ActiveFleetCommunityServices`. A source fleet that is inactive or pending Stripe contributes nothing, and removing a vehicle type from an inactive fleet doesn't end its price row.
+- **Pricing tie-breaks are alphabetical.** `copyPricingToFleet` takes the first matching row from `ListDashboardRidePriceParameters`, ordered by fleet name, then vehicle type, then newest start time. A new fleet inherits prices from the alphabetically first fleet that prices the type.
+- **Fleet-merchant fleets without custom payouts are never ready.** Creating one with `has_custom_payouts = false` still creates a Stripe account, and the webhook will activate the fleet, but it can't accept joins and its drivers can't use fleet-managed payouts.
+- **The Deleted badge is unreachable.** `ListDashboardFleets` filters `deleted_at IS NULL`, so the list never contains a deleted fleet.
+- **Delete isn't reversible through the API.** Every write query filters `deleted_at IS NULL`, and there is no restore endpoint.

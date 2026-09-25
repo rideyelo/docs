@@ -1,0 +1,91 @@
+---
+title: "E2E environment reset"
+description: "Clean up leaked E2E fixtures, reclaim simulator leases and suite locks, and re-converge the isolated E2E API and database with production"
+---
+
+Mobile E2E has three parts that can get stuck: fixtures on the isolated API, the simulator pool on the Mac, and the E2E API deployment itself. Reset only the part that's broken. See [Mobile E2E](/engineering/testing#mobile-e2e) and `yelo-frontend/E2E.md`.
+
+<Warning>
+Everything here targets the isolated E2E environment: the `yelo-api-e2e` service, the `yelo_e2e` database, a nonzero Redis database, and Stripe test keys. Never point these tools at production, and never create or delete fixtures by hand in Supabase.
+</Warning>
+
+## Symptoms
+
+- A run fails creating a fixture, or `GET /internal/e2e/runs/{id}` shows a run that's still `active` after the test ended.
+- `make e2e-suite-local` refuses to start because another scheduler holds the worktree lock.
+- Simulators are held by a worktree that no longer exists.
+- Fixture creation fails with 401, 404, or a schema error after a production release.
+
+## Diagnose
+
+<Steps>
+  <Step title="Check the simulator pool">
+    ```bash
+    make pool-status
+    ```
+
+    It lists each pool device and which worktree holds it.
+  </Step>
+  <Step title="Check fixture runs">
+    The runner prints the fixture run ID. Read it with the E2E key:
+
+    ```bash
+    curl -sS -H "X-E2e-Key: $E2E_CONTROL_API_KEY" \
+      "$E2E_API_URL/internal/e2e/runs/<run-id>"
+    ```
+
+    The response includes `status`, `expires_at`, `cleaned_at`, the actors, and the fixtures. `make e2e-local` resolves the key from Secret Manager secret `yelo-e2e-control-api-key` in `prod-yelo`.
+  </Step>
+  <Step title="Check API convergence">
+    Open the latest `release-e2e.yml` run in `yelo-api`. It compares the E2E service's commit, image digest, and migration version with the production revision serving 100% of traffic, and redeploys when they drift. It only runs when the repository variable `E2E_RELEASE_ENABLED` is `true`.
+  </Step>
+</Steps>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Clean up a leaked fixture">
+    Delete the run. Cleanup is idempotent and only removes rows the run owns:
+
+    ```bash
+    curl -sS -X DELETE -H "X-E2e-Key: $E2E_CONTROL_API_KEY" \
+      "$E2E_API_URL/internal/e2e/runs/<run-id>"
+    ```
+
+    You rarely need to. Every `POST /internal/e2e/runs` first sweeps up to 100 `active` runs whose `expires_at` has passed and cleans them with status `expired`. Runs expire after `E2E_FIXTURE_TTL`, 30 minutes by default.
+  </Accordion>
+  <Accordion title="Option 2: Reclaim simulators and locks">
+    - `make pool-clean` reclaims device leases and port claims whose worktree no longer exists.
+    - `make pool-reset` shuts down every pool device and releases every lease on the machine. Use it only when you mean to reset the whole pool.
+    - If a scheduler was killed, confirm that the PID in `.expo/e2e-suite.lock` isn't running, then delete the lock file.
+    - For a stuck GitHub run, confirm that the self-hosted runner with labels `self-hosted`, `macOS`, `ARM64`, and `yelo-e2e` is online, and that only one runner process exists.
+  </Accordion>
+  <Accordion title="Option 3: Re-converge the E2E API">
+    Dispatch the workflow:
+
+    ```bash
+    gh workflow run release-e2e.yml --repo rideyelo/yelo-api --ref main
+    ```
+
+    When it detects drift, it runs `cloudbuild.e2e.yaml`. That migrates `yelo_e2e` with the `yelo-api-e2e-migrate` job and deploys the exact production image digest with E2E-only secrets. It never rebuilds the API. The build refuses any database other than `yelo_e2e` and any project ref equal to production.
+
+    After a production rollback across a migration, convergence fails until production is back on the newest migration version.
+  </Accordion>
+  <Accordion title="Option 4: Rebuild the E2E app">
+    If the preflight rejects the app, because of a wrong bundle ID or a missing API URL in the bundle, rebuild with `make e2e-build-local`. Clean builds are cached by Git SHA under `~/.cache/yelo-e2e-builds`.
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- `make pool-status` shows no stale leases.
+- `GET /internal/e2e/runs/<run-id>` shows `cleaned_at` set.
+- The latest `release-e2e.yml` run succeeded, or skipped because nothing drifted.
+- `make e2e-local FLOW=e2e/flows/auth-existing-actor.ad` passes.
+
+## Root causes seen in code
+
+- **Interrupted runs** skip the scheduler's `DELETE`. The TTL sweep only happens on the next fixture creation.
+- **Scenario constraints.** A new scenario needs a migration that extends the `E2ERuns` scenario check. An API that hasn't converged rejects it.
+- **Background jobs are off** in E2E mode. Flows that need River or the tickers can't pass on the shared E2E API.
+- **Convergence follows production**, including rollbacks, so an E2E failure right after a production incident can be expected.

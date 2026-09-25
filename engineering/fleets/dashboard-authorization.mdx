@@ -1,0 +1,103 @@
+---
+title: "Fleet manager authorization"
+description: "How the API turns Clerk fleet assignments into fleet scope, the path-based scope middleware, per-handler checks, and the resulting route matrix for fleet managers."
+---
+
+Fleet managers (`role: fleet`) reach the dashboard API through two layers. A path-based middleware decides which URL shapes a manager may call at all. Each handler then checks the specific fleet and community. This page documents both layers and the resulting behavior per route. For the product-level role description, see [Dashboard roles and access](/administration/dashboard-roles).
+
+## Claims
+
+`getClerkAuthMiddleware` in `internal/server/http/clerk_middleware.go` reads Clerk public metadata into `customContext.ClerkUserContext`:
+
+| Metadata | Result |
+| --- | --- |
+| `fleet_assignments: [{fleet_id, community_id}, ...]` | `FleetAssignments` as given. `FleetID` and `CommunityID` are set from the first entry. |
+| Legacy `fleet_id` and `community_id` | Wrapped into a one-entry `FleetAssignments`. |
+| Only `community_id` | Intern shape. No assignments. |
+
+`DashboardService.InviteUser` writes these claims. For the `fleet` role, `inviteOrUpdateFleetUser` merges new assignments into an existing Clerk user instead of sending a second invitation.
+
+### Helper methods
+
+| Method | Checks |
+| --- | --- |
+| `HasFleetAccess(fleetID)` | Any assignment has this fleet, in any community. |
+| `HasFleetCommunityAccess(fleetID, communityID)` | One assignment has both. |
+| `ResolveDashboardCommunity(requested)` | For `fleet`, an empty value falls back to the legacy `CommunityID`. The community must appear in an assignment with a valid, non-nil fleet ID. Otherwise 403 **community access denied**. |
+| `GetFleetIDsForCommunity(communityID)` | Fleets assigned in that community. Used by dashboard rides. |
+
+`models.FleetScope` in `internal/models/fleet.go` is the service-level form of the same decision. Its zero value permits nothing, and admin scope must be requested explicitly with `AllFleets()`. QR payments use it.
+
+## Layer 1: scope middleware
+
+`getDashboardScopeMiddleware` runs on the whole `/dashboard` group after Clerk authentication. It writes a **401 with no error payload** when `dashboardScopeAllows` is false.
+
+For `fleet`, `dashboardScopeAllows` first requires at least one assignment where both IDs parse as non-nil UUIDs. `fleetDashboardScopeAllows` then matches on the path segment after `/dashboard`:
+
+| Segment | Allowed for `fleet` |
+| --- | --- |
+| `rides` | Exactly `GET /dashboard/rides` |
+| `qr`, `calendar-owner` | Everything. The handlers scope themselves. |
+| `fleet` | `GET /dashboard/fleet/{fleet_id}/{kpis,histogram}` with `HasFleetAccess`. `GET /dashboard/fleet/{fleet_id}/drivers?community_id=` with `HasFleetCommunityAccess`. |
+| `fleets` | `/dashboard/fleets/driver-join-link/{fleet_id}...` with `HasFleetAccess`, and `/dashboard/fleets/{fleet_id}/communities/{community_id}/calendar...` with `HasFleetCommunityAccess`. Any method. |
+| `communities` | `/dashboard/communities/{c}/fleets/{f}...` with `HasFleetCommunityAccess(f, c)`, any method. `/dashboard/communities/{c}/price-parameters...` when `ResolveDashboardCommunity(c)` succeeds, any method. |
+| Anything else | Only `GET /dashboard/{community}/fleets` when the community resolves. |
+
+Everything else, including `/dashboard/fleets` (the global list), `/dashboard/fleets/services/...`, `/dashboard/vehicles`, and `/dashboard/users/...`, is rejected for fleet managers at this layer.
+
+## Layer 2: handler checks
+
+The middleware only proves the manager has some claim on the IDs in the path. Handlers decide what the manager can do.
+
+| Route | Handler gate | Service scoping |
+| --- | --- | --- |
+| `GET /dashboard/{community}/fleets` | `resolveCommunityID`, then filters to `HasFleetCommunityAccess` | Active service in the community only |
+| `POST /dashboard/communities/{id}/fleets` | `assertAdmin` | Not applicable |
+| `GET /dashboard/communities/{id}/fleets/{fleet_id}` | `assertFleetAccess` | Path community must equal the fleet's home community, otherwise 404 |
+| `PATCH` same path | `assertFleetAccess` | Same. All `FleetUpdate` fields, including `has_custom_payouts`, `is_student_only`, and `requires_confirmation_code` |
+| `DELETE` same path | `assertFleetAccess` | Same. Soft delete |
+| `POST .../stripe/refresh-link` | `assertAdmin`, because the link is a bearer credential for a possibly shared account | Home community match |
+| `POST .../stripe/unlink` | `assertFleetAccess` | Home community match, fleet-merchant only |
+| `GET .../stripe/status` | Admin or `HasFleetAccess` | Home community match |
+| `GET`, `POST .../whitelist`, `PUT .../whitelist/{entry_id}` | Admin or `HasFleetAccess` | `assertFleetInCommunity` for create, `assertWhitelistEntryInFleet` for update |
+| `GET /dashboard/communities/{id}/price-parameters` and `/history` | `resolveCommunityID` | Result filtered to `HasFleetAccess` rows |
+| `POST .../price-parameters` | Admin only | Not applicable |
+| `PATCH .../price-parameters/{param_id}` | Admin, or `fleet` with `HasFleetAccess(param.FleetID)` | Param's community must equal the path |
+| `DELETE .../price-parameters/{param_id}` | Admin only | Not applicable |
+| `GET /dashboard/fleet/{fleet_id}/kpis`, `/histogram` | Admin or `HasFleetAccess` | All communities |
+| `GET /dashboard/fleet/{fleet_id}/drivers` | Admin, or `HasFleetAccess` plus an exact assignment for `community_id` | Drivers in that community |
+| `POST /dashboard/fleet/{fleet_id}/drivers` | Admin or `HasFleetAccess` | Middleware blocks non-`GET` for managers, so admin only in practice |
+| Join link routes | `authorizeFleet`: admin, or `fleet` with `HasFleetAccess` | Not applicable |
+| Calendar routes | `CalendarAccess`: admin, or `fleet` or `operator` with a claim for the fleet and community (empty community in the claim matches any). Attach and prefix rename are admin only. | 404 to unauthorized non-admins |
+| `GET /dashboard/rides` | `fleet` needs at least one fleet in the requested community (`GetFleetIDsForCommunity`) | Rides filtered to those fleets |
+| QR config reads and mutations | Admin gets `AllFleets()`. Managers get `FleetsScope(assigned)`. Mutations load the config and 404 if its fleet isn't assigned. Creation is admin only. | Service rechecks `scope.Permits` |
+| `/dashboard/fleets/services/...` | `serviceAdmin` and `fleetServiceAdmin` | Admin only |
+| `/dashboard/vehicles...` | `Handler.authorize`: admin only | Not applicable |
+| `PUT /dashboard/users/detail/{id}/fleet` | `/users` group middleware: admin only | Not applicable |
+
+## Web dashboard
+
+The web app hides pages by role (see [Dashboard roles and access](/administration/dashboard-roles)), but the API is the enforcement boundary. Any route in the table above that a manager passes is callable with a manager's Clerk token, whether or not the manager UI exposes it. The manager-facing page is `yelo-web/src/sites/dashboard/pages/FleetsPage.tsx`. The fleet editor is `ManageFleetsPage.tsx`.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Claims parsing | `yelo-api/internal/server/http/clerk_middleware.go` |
+| Claim helpers | `yelo-api/internal/utilities/context/context.go` |
+| Scope middleware | `yelo-api/internal/server/http/dashboard_scope.go` |
+| Group wiring | `yelo-api/internal/server/http/router.go` (`dashboardGroup`, `dashboardUsersGroup`) |
+| Fleet CRUD, Stripe, whitelist, price handlers | `yelo-api/internal/server/http/community/community_handler.go` (`assertFleetAccess`, `assertAdmin`, `resolveCommunityID`, `scopedPriceParameters`) |
+| Join link handlers | `authorizeFleet` in `yelo-api/internal/server/http/fleetjoin/handler.go` |
+| Calendar access | `CalendarAccess` in `yelo-api/internal/service/operatinghours/dashboard.go` |
+| QR scope | `yelo-api/internal/server/http/dashboard/qrpayment/handler.go`, `models.FleetScope` |
+| Authorization tests | `yelo-api/internal/server/http/community/community_authz_test.go`, `internal/server/http/dashboard/fleet/gate_enumeration_test.go` |
+
+## Gotchas and edge cases
+
+- **Managers can edit, delete, and unlink their own fleet through the API.** `UpdateFleet`, `DeleteFleet`, and `UnlinkStripe` use `assertFleetAccess`, and `community_authz_test.go` asserts this admin-or-own-fleet rule. Only the path community must be the fleet's home community. A manager can toggle `has_custom_payouts`, which changes where fares are paid, or soft-delete the fleet.
+- **`HasFleetAccess` ignores community.** A manager with assignments (fleet A, community X) and (fleet B, community Y) passes the middleware for `/communities/Y/price-parameters/...` and can then `PATCH` a fleet A price row in community Y, because the handler checks only the fleet.
+- **Rejections at layer 1 return 401, not 403.** The payload-less 401 from the middleware is easy to confuse with an expired token.
+- **Legacy single-fleet claims still work everywhere.** They are converted into one assignment. `CalendarAccess` also falls back to the legacy fields if `FleetAssignments` is empty.
+- **`operator` is dead code in calendar access.** `CalendarAccess` accepts an `operator` role, but `dashboardScopeAllows` rejects every role other than `admin`, `intern`, and `fleet`, so an `operator` request never reaches the calendar handlers.
+- **Stripe status for managers calls Stripe.** `GET .../stripe/status` fetches the live account and mints an Express login link on each request when details are submitted.
