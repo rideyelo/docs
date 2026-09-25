@@ -1,0 +1,94 @@
+---
+title: "QR payments"
+description: "Create QR payment links for a fleet, set fixed or custom pricing, deactivate links, and review QR payment history in the Yelo dashboard."
+---
+
+QR payment links let riders pay a fleet directly, for example by scanning a QR code in a vehicle. Each link is a QR config: a short URL tied to one fleet, with either a fixed price or a price range the rider chooses from. You manage QR configs and see payment history on the **Payments** tab of the **Fleet** page.
+
+The old `/qr-payments` URL redirects to the **Fleet** page.
+
+## Prerequisites
+
+- An `admin` or `fleet` dashboard role. Fleet managers see and edit only QR configs and payments for their assigned fleets. See [Dashboard roles and access](/administration/dashboard-roles).
+- An `admin` role to create a QR config.
+- A fleet with a connected Stripe account. Yelo creates the payment objects on the fleet's Stripe account, and rejects the config if the fleet has none. See [Fleets](/dashboard/fleets#operations).
+
+## Open QR payments
+
+1. Open **Fleet** in the **Community** group of the sidebar.
+2. Select the **Payments** tab.
+
+The **QR Payments** section shows a card for each QR config, followed by **QR Payment History**.
+
+Each card shows:
+
+- The short link, such as `pay.yelo.link/campus-carts`, as the card title.
+- The fleet name.
+- The pricing, such as `Fixed: $5.00` or `Custom: $3.00 - $20.00 (preset $5.00)`.
+- An **Active** or **Inactive** badge.
+
+## Create a QR config
+
+<Steps>
+  <Step title="Open the form">
+    Select **Create New** on the **Add a new QR config** card.
+  </Step>
+  <Step title="Choose the fleet">
+    Pick the **Fleet**. The list shows each fleet with its community.
+  </Step>
+  <Step title="Set the slug">
+    Enter a **Slug**. It becomes the link path, `pay.yelo.link/{slug}`. Use lowercase letters, numbers, and hyphens, and start with a letter or number. The form strips other characters as you type.
+  </Step>
+  <Step title="Name the product">
+    Enter a **Product Name**. Riders see it at checkout.
+  </Step>
+  <Step title="Choose pricing">
+    Pick a **Pricing Mode** and enter the amounts in dollars. See [Pricing modes](#pricing-modes).
+  </Step>
+  <Step title="Save">
+    Select **Create Config**.
+  </Step>
+</Steps>
+
+Yelo creates a Stripe product, price, and payment link on the fleet's Stripe account. It then creates the `pay.yelo.link` short link, which points to the rider tip page for that slug. If the short link can't be created, Yelo still saves the config without it.
+
+### Pricing modes
+
+| Mode | Fields | Rider experience |
+| --- | --- | --- |
+| **Fixed** | **Amount (dollars)** | The rider pays the set amount. |
+| **Custom** | **Minimum (dollars)**, **Maximum (dollars)**, **Preset Amount (dollars)** | The rider picks an amount between the minimum and maximum. The preset is the suggested amount. |
+
+## Change pricing
+
+1. Select **Edit Pricing** on the config's card.
+2. Choose **Fixed** or **Custom** and enter the new amounts.
+3. Select **Save Pricing**.
+
+Changing pricing creates a new Stripe price and payment link, and then deactivates the old payment link. The short link keeps the same slug, so QR codes you've already printed keep working.
+
+## Deactivate a QR config
+
+Select **Deactivate** on an active config's card. Yelo deactivates the Stripe payment link, and the card shows **Inactive**. Riders can no longer pay through that link.
+
+## Review payment history
+
+**QR Payment History** lists payments made through your QR configs.
+
+| Column | Description |
+| --- | --- |
+| **Customer Name** | The payer's name. |
+| **Email** | The payer's email. |
+| **Phone** | The payer's phone number. |
+| **Amount** | The amount paid. |
+| **Fleet** | The fleet that received the payment. Admins only. |
+| **Date / Time** | When the payment happened. Hover to see the exact time. |
+
+To narrow the list:
+
+- Search by name or email with **Search name or email...**.
+- Pick a start and end date with the date fields.
+
+Use **Rows per page** and the page controls to move through long histories. The **QR Payments** KPI on the **Overview** tab summarizes the same payments for the selected time range.
+
+For how QR payments fit into fleet payouts, see [Payments and payouts](/concepts/payments-and-payouts) and [Events and the community feed](/concepts/events-and-feed).

@@ -1,0 +1,192 @@
+---
+title: "Data layer"
+description: "How yelo-api stores data: Postgres through pgx and sqlc repositories, the migration workflow and policy, connection pools, Redis with its circuit breaker, and the typed caches."
+---
+
+The data layer lives in `internal/data`. Postgres (hosted on Supabase) is the source of truth. Redis (Memorystore Valkey in production) holds caches, the ride board, and presence. Services reach both through the `RepositoryLayer` built at startup.
+
+## Repository layer
+
+`repository.NewRepositoryLayer` in `internal/data/repository/storage.go` opens the API Postgres pool and the Redis client, then constructs every repository:
+
+```go
+type RepositoryLayer struct {
+	RedisClient *redis.Client
+	User        UserRepository
+	Ride        RideRepository
+	Community   CommunityRepository
+	// ... about 45 more repositories
+}
+```
+
+- Repository interfaces live in `internal/data/repository/interfaces.go`. Mockery generates mocks for them in `internal/data/repository/mocks`.
+- Implementations are unexported structs such as `sqlRideRepository`, constructed with `NewXRepository(postgresDb, logger)`.
+- Repositories accept a `DBTX`, an interface satisfied by both `*pgxpool.Pool` and `pgx.Tx`. Production passes the pool. Integration tests can pass a transaction.
+- `RepositoryLayer.Pool()` exposes the raw pool for stores and River emitters that need it.
+
+### Writing queries with sqlc
+
+Most repository methods call generated sqlc code. Queries live in `internal/data/repository/queries/*.sql`, and sqlc generates Go into `internal/data/sqlc`.
+
+```sql
+-- name: MarkRideAtPickup :exec
+UPDATE "Rides" SET status = 'driver_waiting', at_pickup_time = sqlc.arg(at_pickup_time)::timestamp
+WHERE id = sqlc.arg(ride_id)::uuid;
+```
+
+```go
+func (r *sqlUserRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.User, errors.Error) {
+	queries := datasqlc.New(r.postgresDb)
+
+	row, err := queries.GetUserProfileByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errors.NewNotFoundError("user not found")
+		}
+
+		return nil, errors.NewServerErrorFromError(err)
+	}
+	// map row to models.User ...
+}
+```
+
+Conventions:
+
+- Name parameters explicitly with `sqlc.arg(name)` and `sqlc.narg(name)` and cast them (`::uuid`, `::timestamptz`), so the generated structs are readable.
+- Map `pgx.ErrNoRows` to `NotFoundError`. Map everything else with `errors.NewServerErrorFromError`.
+- Coerce nil slices in the mapping so JSON responses serialize `[]`, not `null`.
+- Add a `*_sqlc_contract_test.go` next to the repository when you add a query file. These tests pin the generated query shape.
+
+`sqlc.yaml` configures the generator:
+
+| Setting | Value |
+| --- | --- |
+| Schema | `internal/data/sqlc/schema.sql`, generated from `migrations/*.up.sql` by `scripts/sqlc/generate-schema.sh` |
+| Driver | `pgx/v5` |
+| Options | `emit_empty_slices`, `emit_pointers_for_null_types` |
+| Type overrides | `uuid` to `gofrs/uuid.UUID`, `numeric` and `float4` to `float64`, `timestamptz` to `time.Time`, nullable variants to pointers, `RidePriceParameters.adjustment` to `models.PricingAdjustment` |
+
+Run `make sqlc-generate` after changing queries or migrations, and commit the output. `make sqlc-check` regenerates into a temp copy and fails on any diff, and fails if new generated files are not staged.
+
+A few newer stores (`contact_sync.go`, `driver_leads.go`, `fleet_vehicle.go`, `marketing_segments.go`, `pricing_jitter.go`, `vehicle_catalog.go`) run hand-written SQL through pgx directly. Prefer sqlc for new code.
+
+### Transactions
+
+Open a transaction with `postgresDb.Begin` or `BeginTx`, run sqlc queries with `datasqlc.New(tx)`, and always defer a rollback that ignores `pgx.ErrTxClosed`:
+
+```go
+defer func() {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+
+	if err := tx.Rollback(rollbackCtx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		r.logger.NativeErrorC(err, ctx)
+	}
+}()
+```
+
+The rollback uses a detached context so it still runs when the request is cancelled. Ride commands add participant locking on top of this. See [Rides implementation](/engineering/api/rides-implementation#locking-and-command-transactions).
+
+## Connection pools
+
+`openPostgresDb` configures each pool:
+
+| Setting | Value |
+| --- | --- |
+| Query exec mode | `pgx.QueryExecModeExec` (no prepared statements, compatible with poolers) |
+| `MinConns` | 1 |
+| `MaxConnLifetime` | 1 hour |
+| `MaxConnIdleTime` | 30 minutes |
+| `HealthCheckPeriod` | 1 minute |
+| Dial | Prefers IPv4, 5-second dial timeout |
+| `application_name` | `yelo-api-<role>-<K_REVISION or local host and pid>`, truncated to 63 characters |
+| Startup | Retries pool creation and a 30-second ping with the network retrier |
+
+Because exec mode skips parameter type discovery, `registerPgxTypes` registers the gofrs UUID codec and the `_uuid` array type on every connection.
+
+| Pool | Max connections | Purpose |
+| --- | --- | --- |
+| `api` | 10 | HTTP requests and in-process tickers |
+| `river` | 12 | River job queue and notification repositories |
+| `cli` | 2 | One-shot operator tools in `cmd/` |
+
+The production database allows 90 connections with 3 reserved. Two serving instances plus one rollout candidate must fit, which is why each instance uses 22 connections. If you raise a pool size, recheck that budget.
+
+<Note>
+The River pool has no leak monitor and no slow-query warnings, because River holds connections for the whole job transaction and polls constantly. The API pool logs utilization every `POSTGRES_POOL_LOG_INTERVAL` and warns above 80% utilization or when a connection is held longer than 5 minutes.
+</Note>
+
+Queries are traced through an OTel pgx tracer. Queries slower than `SLOW_QUERY_THRESHOLD_MS` (default 50) log a warning unless `DISABLE_SLOW_QUERY_WARNINGS` is true. See [Observability](/engineering/observability).
+
+## Migrations
+
+Schema changes are SQL files in `migrations/` at the repo root, managed by [golang-migrate](https://github.com/golang-migrate/migrate).
+
+<Steps>
+  <Step title="Create a numbered pair">
+    Add `NNNNNN_description.up.sql` and `NNNNNN_description.down.sql` with the next six-digit version. Both files must be non-empty.
+  </Step>
+  <Step title="Regenerate sqlc">
+    Run `make sqlc-generate`. The sqlc schema is built from the up migrations, so new columns become visible to queries.
+  </Step>
+  <Step title="Check the policy">
+    Run `make migration-check` and `make check-migration-policy`. The checks validate filenames, one up and one down per version, and even file counts. They also compare against `origin/main` (or `BASE_REF`) and fail if an already-merged migration changed.
+  </Step>
+  <Step title="Apply locally">
+    Run `make migrate`. It reads `DSN` from `.env`, prints the current version and pending files without printing the DSN, and asks for confirmation. `make migrate-down` reverts one version after confirmation.
+  </Step>
+</Steps>
+
+<Warning>
+Applied migrations are immutable. Fix a mistake with a new migration. Releases apply migrations before routing traffic to the new revision, and rollback never runs down migrations automatically, so every migration must be compatible with the previous binary. See [Deployment](/engineering/deployment).
+</Warning>
+
+Integration tests start a `postgres:15-alpine` container with testcontainers and apply every migration through golang-migrate. `internal/data/migrationprep` rewrites Supabase-specific statements so they run on plain Postgres. See [Testing](/engineering/testing).
+
+## Redis
+
+`internal/data/redis/client.go` wraps `go-redis/v9`.
+
+### Startup and fallback
+
+- `REDIS_ENABLED=false` or an empty `REDIS_URL` returns a disabled client. Every cache then falls back to Postgres or in-memory behavior, and the ride board uses its in-memory implementation.
+- Otherwise the client pings with exponential backoff (500 ms up to 5 seconds) for `REDIS_STARTUP_TIMEOUT_SECONDS` (default 180). If Redis never answers, startup fails.
+- Pool settings: 50 connections, 10 minimum idle, 3 retries, 5-second dial, 3-second read and write, 4-second pool timeout.
+
+### Circuit breaker
+
+Every Redis command runs through a `sony/gobreaker` breaker named `redis`:
+
+| Setting | Value |
+| --- | --- |
+| Trip condition | At least 50 requests and a failure ratio of 80% or more in the window |
+| Window (`Interval`) | 120 seconds |
+| Open duration (`Timeout`) | 60 seconds |
+| Half-open probes (`MaxRequests`) | 10 |
+
+State changes are logged and recorded as metrics. While the breaker is open, commands fail fast and callers fall back. A `GET` on a disabled client returns `NotFoundError`, and a `SET` returns an error that callers log and ignore.
+
+Provider clients use a different breaker profile from `internal/utilities/circuitbreaker`. See [Integrations](/engineering/api/integrations#resilience).
+
+### Caches
+
+Caches are constructed in `service.NewService` and share the Redis client. All of them tolerate Redis being unavailable.
+
+| Cache | TTL | Contents |
+| --- | --- | --- |
+| `AuthCache` | 15 minutes | Deleted flag, banned flag, and community per user, read by JWT middleware |
+| `UserProfileCache` | 5 minutes | User profiles |
+| `CommunityCache` | 60 seconds | All communities |
+| `CommunityDetailCache` | 60 seconds | Community by ID |
+| `PresenceCache` | 120-second presence window | Online driver presence, sorted by last heartbeat |
+| `ActivationCache` | Driver locations 2 hours, config 5 minutes, notified sets 30 minutes | Activation state per ride and driver |
+| `QueueCache` | Summaries 30 minutes, auto-queue attempted 1 hour, offline grace 5 minutes | Driver queue summaries and flags |
+| `RouteCache` | Routes 5 minutes, live ride ETA 15 seconds | Distance and route lookups shared by Mapbox and Google |
+| `PriceCache` | 5 minutes | Vehicle prices for a ride request |
+| `PlaceCache` | Suggestions 10 minutes, details 7 days, resolve 30 days | Place search and details |
+| `DriverEarningsCache` | 60 seconds | All-time driver earnings for status responses |
+| `SchoolSignupStatsCache` | 60 seconds | School signup stats |
+
+When you change data behind a cache, invalidate it. For example, account changes call both `userProfileCache.Invalidate` and `authCache.Invalidate`.
+
+For local Redis access to a shared environment, `make gcp-tunnel` opens an IAP tunnel to port 6379. See [Local development](/engineering/local-development).

@@ -1,0 +1,147 @@
+---
+title: "Growth features"
+description: "How referrals, Dub share links, attribution, the World Cup campus race, ride discounts, coupons, promo bars, and ads work in Yelo."
+---
+
+Yelo grows mostly through students inviting students. This page covers the features that support that: referral codes and share links, sign-up attribution, the World Cup campus race, and the promotional surfaces (discounts, coupons, promo bars, and ads).
+
+For events, The Spot, the community feed, and QR payments, see [Events and the community feed](/concepts/events-and-feed).
+
+<Note>
+  Several of these features have no dashboard editor today. Coupons, promo bars, ads, discounts, and referral rewards can only be changed in the database. The sections below call this out.
+</Note>
+
+## Referrals
+
+Every user with a finished profile has a referral code and a share link. When a new user signs up with a code, Yelo records the inviter as their referrer.
+
+### Referral codes
+
+Codes use the format `INITIALS-XXXXX`: the first-name initial, the last-name initial, a hyphen, and five characters from `23456789ABCDEFGHJKMNPQRSTUVWXYZ`. A missing initial becomes `X`. Yelo generates the code when the user finishes their profile (`internal/utilities/referral/generate.go`).
+
+Users with an older code that has no hyphen get a new code the first time they request a share link.
+
+### Share links
+
+`GET /referral/link` returns the user's code and a share link in this format:
+
+```text
+https://join.yelo.link/<code>?v=3
+```
+
+The link is a Dub short link. Yelo creates or updates it with:
+
+- Title "Join *First name* on Yelo" and a description inviting the friend to ride together.
+- A preview image rendered by the `yelo-og` Cloudflare Worker from the user's name and photo. Yelo refreshes the link after a name or photo change.
+- Conversion tracking turned on.
+
+The `v` query value is bumped to force iMessage to refresh link previews. The link points at the invite landing site (`yelo-web/src/sites/invite`), which shows the inviter from `GET /referral/invite/{code}`. On Apple devices without the app, the site sends users to the App Store with the code as the campaign token.
+
+In the app, the referral hub (`components/ReferralHub.tsx`) shows **Your referral link**, a QR code, and a share message.
+
+### Applying a code at sign-up
+
+The **Finish profile** screen accepts a referral code. See [Accounts and sign-in](/concepts/accounts-and-sign-in).
+
+- If the user arrived through an invite link, the code is bound to their sign-in. A different code is rejected with "referral code is already bound to this sign-in".
+- An unknown code, or the user's own code, fails with "referral code is invalid".
+- Each user can have only one referrer. The first referrer keeps the credit (`UNIQUE (referee_id)` on `Referrals`).
+
+### Rewards
+
+Referral rewards are set per community in `ReferralRewards`, with a `rider_value` and a `driver_value` and a time window. The reward that applies is the one in effect at the referral time.
+
+- A referee counts once they complete a ride.
+- If the referee has driven, the referrer earns the driver value. If they have only ridden, the referrer earns the rider value.
+- The outstanding balance is the total earned minus rows in `ReferralPayouts`.
+
+The dashboard doesn't have a referral rewards page. The **Drivers** page shows **Referral credit** on driver leads, and admins or interns can set a lead's referrer there. Leads with a completed ride and a referrer land in the `pending_referral_payout` stage. See [Driver leads](/dashboard/driver-leads).
+
+## Sign-up attribution
+
+Auth v3 records where each sign-up came from. Each visit to the hosted sign-in page stores an attribution touch with UTM parameters, referrer host and path, landing surface, Dub click ID, and referral code. Yelo keeps the first and last touch per user and marks three conversions: `authenticated`, `profile_completed`, and `first_ride` (`AuthV3UserAttribution` in `internal/models/authv3.go`).
+
+Separately, each user has an `acquisition_source`: `app_organic`, `app_referral`, `qr_payment`, `event_link`, `csv_import`, `guest`, `driver_guest`, or `other`. Contact sync segments can filter on it as `yelo_acquisition_source`. See [Contact sync](/administration/contact-sync).
+
+## Dub links in use
+
+| Domain | Used for | Created by |
+| --- | --- | --- |
+| `join.yelo.link` | Referral share links | `internal/service/referral` |
+| `yelo.link` | Fleet driver join links (`yelo.link/fleet-<code>`) | `internal/service/fleetjoin` |
+| `pay.yelo.link` | QR payment links | `internal/service/qrpayment` |
+
+The API also has its own path shortener at `POST /link/encode` and `GET /link/decode`, with 8-character codes. No current client calls it.
+
+## World Cup campus race
+
+The World Cup is a race between campuses. Students claim their `.edu` email on the World Cup site. The first 25 schools to reach 500 sign-ups unlock a Yelo pass for their campus.
+
+| Constant | Value |
+| --- | --- |
+| `WorldCupCampaignKey` | `world_cup` |
+| `WorldCupThreshold` | 500 |
+| `WorldCupWinnerSlots` | 25 |
+| Counting starts | 2025-01-01 UTC |
+
+How it works:
+
+1. A student submits a `.edu` email on the World Cup site (`yelo-web/src/sites/world-cup`). Yelo matches the school by email domain and stores a claim with status `pending`. Claims can also be `verified` or `superseded`.
+2. A school's count is its pending and verified claims since the start date, plus verified `.edu` users at the school who have no claim.
+3. When a school reaches 500 and fewer than 25 winners exist, it becomes a winner.
+4. The next time the student opens the app, it prompts them to verify the email. That proves inbox ownership and makes them a student account. They can choose **Verify later**.
+
+The public routes are `GET /world-cup/standings` and `GET /world-cup/activity`. Claim routes accept a pre-signup or full token. Admins can list and rematch unmatched claims at `/dashboard/education-claims/unmatched` and `/dashboard/education-claims/rematch`.
+
+## Ride discounts
+
+Ride discounts lower the fare for rides to a specific destination. They apply automatically. There is no promo code to enter.
+
+- A discount (`internal/models/discount.go`) has a `target_address`, a `discount_rate` (a fraction), a start and end time, and an optional sponsor.
+- When a ride's destination address exactly matches a discount's target address during its window, the ride gets the discount. If several match, the highest rate wins.
+- The discounted price is `max(price × (1 − discount_rate), 0)`. The ride records `is_discounted`, `discounted_price`, and `discount_id`.
+
+Discounts have no dashboard editor. For the rest of the fare math, see [Pricing](/concepts/pricing).
+
+## Coupons
+
+Coupons are limited-quantity deals from local venues, not ride discounts. A coupon has a title, description, photo, venue, community, total and available counts, and preview, release, and expiry times.
+
+- Users claim a coupon with `POST /coupon/i/{couponId}/claim`. Each claim gets a unique code.
+- A user can claim a coupon once. Claims stop when the coupon is out of stock.
+- The API doesn't check the release or expiry times, and has no redeem endpoint.
+
+The app has deals components (`components/feed/Deals.tsx`), but no current screen shows them. Coupons have no dashboard editor.
+
+## Promo bars
+
+A promo bar is a banner for a community with optional text, text color, link, background image, and background color. `GET /promobar/` returns every promo bar for the caller's community. There is no schedule or active flag, no dashboard editor, and the current app doesn't call the endpoint.
+
+## Ads
+
+Ads are sponsored media shown in the app.
+
+- An ad has a media type (`image`, `video`, or `lottie`), size (`small`, `medium`, or `large`), shape (`horizontal_rectangle`, `vertical_rectangle`, or `square`), tier, target communities, and start and end times.
+- `GET /ad/` returns one random active ad for the caller's community that matches the requested size and shape and meets the tier.
+- The app reports views and clicks with `POST /ad/impression`.
+- The community feed places one ad after each group of rides and bumps. See [Events and the community feed](/concepts/events-and-feed#community-feed).
+
+<Warning>
+  The ride-matching screen requests ads with shape `rectangle`, which isn't a valid shape, so it likely never gets an ad. Ads also have no dashboard editor.
+</Warning>
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Referrals and share links | `yelo-api/internal/service/referral/` (`referral.go`, `card.go`), `internal/utilities/referral/generate.go` |
+| Referral at sign-up | `yelo-api/internal/data/repository/authv3.go` (`applyAuthV3Referral`) |
+| Dub client | `yelo-api/internal/data/dub/dub.go` |
+| Attribution | `yelo-api/internal/models/authv3.go`, `yelo-web/src/sites/signup/auth-v3/attribution.ts` |
+| World Cup | `yelo-api/internal/service/worldcup/`, `internal/models/world_cup.go`, `yelo-web/src/sites/world-cup/` |
+| Discounts | `yelo-api/internal/models/discount.go`, `internal/utilities/pricing/pricing.go` |
+| Coupons | `yelo-api/internal/service/coupon/`, `internal/models/coupon.go` |
+| Promo bars | `yelo-api/internal/service/promobar/` |
+| Ads | `yelo-api/internal/service/ad/`, `internal/models/ad.go`, `yelo-frontend/components/feed/Ad.tsx` |
+| Invite landing site | `yelo-web/src/sites/invite/` |
+| Mobile referral hub | `yelo-frontend/components/ReferralHub.tsx`, `hooks/useReferralLink.ts` |

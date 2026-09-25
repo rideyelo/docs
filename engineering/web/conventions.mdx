@@ -1,0 +1,161 @@
+---
+title: "Web conventions"
+description: "Directory layout, code style, lint and type rules, tests, and environment variables for yelo-web"
+---
+
+This page collects the rules that `yelo-web` enforces through tooling, plus the conventions the codebase follows. When the tooling disagrees with this page, the tooling wins. Check `package.json`, `.oxlintrc.json`, `eslint.config.js`, and `tsconfig.app.json`.
+
+## Toolchain
+
+| Tool | Version or setting |
+| --- | --- |
+| Node.js | `>=22.12.0` (`engines`); CI uses Node 22 |
+| Package manager | pnpm, pinned in `packageManager` (`pnpm@11.5.2`). Install with `pnpm install`. |
+| Build | Vite 8, orchestrated per site by Nx 23 |
+| Language | TypeScript 6, strict |
+| UI | React 19, Tailwind CSS v4, shadcn/ui (New York) |
+| Format | `oxfmt` |
+| Lint | `oxlint` plus a focused ESLint config for React hooks and import restrictions |
+| Tests | Vitest 5 with jsdom and Testing Library; `node --test` for pure TypeScript modules |
+
+## Directory layout
+
+```text
+yelo-web/
+├─ sites.config.json        # registry of sites
+├─ vite.config.ts           # re-exports tools/vite/base/config.ts
+├─ orval.config.ts          # per-consumer API client generation
+├─ docs/openapi.json        # pinned API contract (+ openapi.lock.json)
+├─ scripts/                 # site generator, Firebase config, OpenAPI sync
+├─ tools/vite/              # Vite config and site-specific build plugins
+├─ workers/                 # Cloudflare Workers (og, world-cup-router, experience-router)
+├─ public/                  # shared static assets and .well-known files
+└─ src/
+   ├─ sites/<site>/         # code owned by exactly one site
+   ├─ shared/bootstrap/     # renderSite, ClerkAuth
+   ├─ shared/signup/        # signup steps shared by signup flows
+   ├─ shared/theme/         # Tailwind theme and tokens
+   ├─ components/           # shared components; ui/ holds shadcn primitives
+   ├─ contexts/             # CommunityProvider, ThemeProvider
+   ├─ hooks/                # data and role hooks (useRole, useAccess, ...)
+   ├─ lib/                  # api-client, api-error, table, telemetry, utils
+   ├─ generated/            # Orval output: dashboard, event, signup, auth-v3
+   ├─ assets/  utils/
+```
+
+Rules of thumb:
+
+- Code under `src/sites/<site>/` belongs to that site only. Do not import one site's code from another. The one exception is `maestro`, which reuses the signup Auth v3 page.
+- Everything else under `src/` is a shared library, imported through the `@/` alias, for example `@/components/ui/button`. Do not put site-specific code in shared directories.
+- Dashboard-only components can live in `src/sites/dashboard/components/`. Components reused across pages or sites go in `src/components/`, grouped by domain folder such as `kpi/`, `leads/`, or `notifications/`.
+- Pages live in `src/sites/dashboard/pages/`, one component per file, as a named export that matches the file name.
+- Never edit `src/generated/`. Regenerate it with `make orval`. Lint and format both ignore it.
+
+## Code style
+
+`oxfmt` formats the repo using `.oxfmtrc.json`:
+
+- single quotes in TypeScript, double quotes in JSX attributes;
+- semicolons, trailing commas everywhere, and `arrowParens: always`;
+- 2-space indentation and a 120-character print width;
+- LF line endings.
+
+Run `pnpm format` to write changes, or `pnpm format:check` to verify.
+
+TypeScript settings that shape how you write code:
+
+- `strict`, `noUnusedLocals`, `noUnusedParameters`, and `noFallthroughCasesInSwitch`.
+- `verbatimModuleSyntax`: use `import type` for type-only imports.
+- `erasableSyntaxOnly`: no `enum`, `namespace`, or parameter properties. Use union types and `as const` objects instead.
+- `allowImportingTsExtensions`: entry files import `./App.tsx` with the extension.
+
+Other conventions visible across the codebase:
+
+- Prefer named exports for components and hooks. A few modules, such as site `App.tsx` files and `CommunitiesPage`, use default exports. `lazyDashboardRoute` accepts either through its `select` callback.
+- Use `cn()` from `@/lib/utils` to merge Tailwind classes.
+- Use sonner `toast` for user feedback, and `getApiErrorMessage()` from `@/lib/api-error` for API error text.
+- Write comments that explain why, not what. Many files carry a short rationale above a non-obvious decision.
+
+## Lint rules
+
+`pnpm lint` runs `oxlint --deny-warnings .` and then `eslint .`. `pnpm lint:type-aware` runs oxlint with type information from `.oxlintrc.typeaware.json`.
+
+Oxlint enables the `correctness`, `suspicious`, and `perf` categories as errors, with the `react`, `typescript`, `unicorn`, `jsx-a11y`, `import`, `promise`, and `node` plugins. Notable rules:
+
+| Rule | Effect |
+| --- | --- |
+| `typescript/no-explicit-any` | `any` is an error. Use `unknown` and narrow. |
+| `eslint/eqeqeq` | Use `===`, except `== null`. |
+| `eslint/no-duplicate-imports` | Use one import statement per module. |
+| `unicorn/prefer-string-slice` | Use `slice` over `substring` and `substr`. |
+
+ESLint adds:
+
+| Rule | Scope | Effect |
+| --- | --- | --- |
+| `react-hooks/rules-of-hooks`, `exhaustive-deps`, `purity`, `static-components`, `use-memo`, `preserve-manual-memoization` | All TypeScript | Errors. `set-state-in-effect`, `refs`, `immutability`, and `incompatible-library` are off. |
+| `no-restricted-imports` on `@/lib/api-client` | `src/**` (except the client, the interceptor, and a few signup files) | Call a generated operation instead of the raw axios transport. |
+| `no-restricted-syntax` on `fetch()` | `src/components`, `src/hooks`, `src/sites/dashboard` | Raw `fetch` is blocked. `JobsPage.tsx` and `TopLocationsManager.tsx` are exempt. |
+
+## Tests
+
+| Kind | Location | Runner |
+| --- | --- | --- |
+| React component and page tests | `*.test.tsx` beside the source, with `// @vitest-environment jsdom` | `pnpm test:components` (Vitest) |
+| Pure logic in some areas | `*.test.ts` | `node --experimental-strip-types --test`, through scripts such as `test:schools`, `test:auth-v3`, and `test:invite` |
+| Workers | `workers/*/src/*.test.ts`, `workers/og` Vitest config | `pnpm test:og`, `test:experience-router`, `test:world-cup-router` |
+| Everything | | `pnpm test` |
+
+<Warning>
+`test:components` lists every Vitest file explicitly in `package.json`. A new test file does not run in CI until you add it to that list, or to the matching `node --test` script.
+</Warning>
+
+Mock Clerk, `useRole`, and heavy layout components with `vi.mock`, as `src/sites/dashboard/App.test.tsx` does. Cross-repo testing strategy is in [Testing](/engineering/testing).
+
+## Pre-merge checks
+
+Run these before you open a PR:
+
+```bash
+pnpm check    # format:check, lint, lint:type-aware, typecheck
+pnpm test
+make api-check   # only if you touched the API contract or generated client
+```
+
+CI runs `nx run workspace-quality:ci`, which runs `api-contract`, `format`, `lint`, `lint-types`, `typecheck`, `test`, and `firebase-config`. It then builds every affected site. See [Deployment](/engineering/deployment).
+
+Commit subjects and PR titles use a lowercase area prefix, such as `dashboard: …`, `pricing: …`, `auth: …`, or `hosting: …`.
+
+## Environment variables
+
+Vite inlines `VITE_*` variables at build time, so each value is baked into the site that references it. Every site reads the single `.env` at the repo root (`envDir`). `.env.example` documents the local setup. In CI, the values come from GitHub repository variables listed in the `env` block of both workflows, and each site's `project.json` declares which ones are required.
+
+<Note>
+This table lists names only. Get values from the team's secret store or the GitHub repository variables. Never commit a filled-in `.env`.
+</Note>
+
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| `SITE` | Vite config, Makefile | Which site to serve or build. Defaults to `dashboard`. |
+| `VITE_API_URL` | All API-backed sites | API base URL. Defaults to `/api` in dev; a relative value falls back to the production API in builds. |
+| `VITE_API_PROXY_TARGET` | Dev server | Target for the `/api`, `/riverui`, and `/world-cup/api` proxies |
+| `VITE_USE_PROD_DOMAIN` | Dev server | Serves on `dev.dash.rideyelo.com:443` over HTTPS for production Clerk keys |
+| `VITE_ALLOWED_HOST` | Dev server | Comma-separated extra allowed hosts |
+| `VITE_CLERK_PUBLISHABLE_KEY` | dashboard | Clerk publishable key (required) |
+| `VITE_SENTRY_DSN` | dashboard | Enables Sentry when set |
+| `VITE_MAPBOX_API_KEY` | dashboard, event | Mapbox GL and static maps |
+| `VITE_GOOGLE_WEB_CLIENT_ID` | signup | Google web OAuth client |
+| `VITE_APPLE_SERVICES_ID` | signup | Sign in with Apple Services ID |
+| `VITE_APPLE_REDIRECT_URI` | signup | Optional Apple return URL |
+| `VITE_AUTH_V3_APP_SCHEME` | signup, maestro | App URL scheme for Auth v3 callbacks |
+| `VITE_AUTH_V3_DEVICE_TEST` | signup (dev only) | Enables the mock Auth v3 device-test server |
+| `VITE_APP_ENV` | signup | Gates Auth v3 analytics. Only `production` captures events, and it excludes emulator, test, and `@rideyelo.com` traffic. |
+| `VITE_POSTHOG_KEY`, `VITE_POSTHOG_HOST` | signup | PostHog for Auth v3 analytics |
+| `VITE_SUPABASE_URL` | maestro | Supabase Storage base for E2E artifacts |
+| `VITE_E2E_API_URL` | maestro | API used by the maestro Auth v3 entry |
+| `VITE_E2E_ARTIFACT_BASE_URL` | maestro | Optional override for the artifact base URL |
+| `VITE_SIGNUP_URL` | world-cup | Claim link target |
+| `VITE_CURVED_BAND_FIT` | home | Development toggle for a landing animation |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Makefile | Service account for manual `firebase deploy`, loaded from `.env` |
+
+The Workers have their own variables and secrets in `wrangler.jsonc` and `.dev.vars`. See [Local development](/engineering/local-development).

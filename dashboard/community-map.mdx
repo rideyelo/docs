@@ -1,0 +1,176 @@
+---
+title: "Community map"
+description: "View a community's service area, zones, places, demand, and transit feeds on one map, and manage zones, locations, and mobility feeds in the Yelo dashboard."
+---
+
+The **Map** page shows one community's geography in a single view: its bounding box, zones, places, recent ride demand, and live transit. Use it to add or import the places riders see, draw pricing zones, and connect mobility feeds.
+
+The old **Zones** and **Locations** URLs, `/zones` and `/locations`, redirect to this page.
+
+## Prerequisites
+
+- An `admin` or `intern` dashboard role. Interns only see their assigned community and can't edit zones or mobility feeds. See [Dashboard roles and access](/administration/dashboard-roles).
+- A community with a bounding box. Without one, the page shows "This community has no bounding box set. Set one to use the map." See [Communities](/dashboard/communities#geography).
+
+## Open the map
+
+1. Open **Map** in the **Community** group of the sidebar.
+2. Pick a community in the top bar.
+
+Admins also see this map at the bottom of the **Fleet** page, without the mobility feeds layer.
+
+## Choose map layers
+
+Open the layer panel on the map to turn layers on and off.
+
+| Layer | Default | Who sees it | What it shows |
+| --- | --- | --- | --- |
+| **Locations** | On | Everyone | Places with **Show on map** turned on. Click a pin to edit the place. |
+| **Zones** | On | Everyone | The community's zones. |
+| **Bounding box** | On | Everyone | The community's service area. |
+| **Ride routes** | On | Everyone | Quoted routes from recent ride requests. |
+| **Users** | Off | Admins | Last known user locations. These can be out of date. |
+| **Ride destinations** | Off | Admins | Destinations of unpaid **Quote** rides and **Confirmed** rides. |
+| **Community content** | Off | Everyone | A preview of the rider app's community map. |
+| **Mobility feeds** | Off | Admins | Live vehicles plus transit routes and stops. |
+
+### Ride routes
+
+When **Ride routes** is on, pick a window of **7d**, **14d**, **30d**, or **60d**. Blue lines are a **Requested route**. Red lines are a **Pricing decline**, where a driver declined because of the fare. The panel shows how many routes are on the map. Windows with more than 2,000 routes show only the newest 2,000.
+
+To compare routes with pricing zones while you edit fares, see [Ride pricing](/dashboard/ride-pricing#work-with-pricing-geography).
+
+### Community content
+
+**Community content** shows what riders see on the app's community map:
+
+- **Places**: the community's top locations. See [Community top locations](/guides/community-top-locations).
+- **Events**: the community's events. See [Events and The Spot](/dashboard/feed-and-events).
+- **Heading to**: anonymized recent trips. The community's **Map activity window** controls how far back these go.
+- **Presence**: a heatmap of recent activity.
+
+The panel counts each item type. The preview only loads when you turn the layer on.
+
+### Mobility feeds
+
+**Mobility feeds** shows **Routes**, **Stops**, and **Vehicles** from the community's enabled feeds. The panel counts routes, stops, and vehicles, and the layer refreshes every minute. See [Manage mobility feeds](#manage-mobility-feeds).
+
+## Manage zones
+
+Zones are polygons inside a community. Active zones count for pricing, and visible zones appear on the rider map. For how zones affect fares, see [Pricing](/concepts/pricing).
+
+Only admins can edit zones. Interns see "Zone editing requires administrator access." under the map.
+
+<Steps>
+  <Step title="Draw the zone">
+    Turn on **Zones**, then use the polygon tool on the map to draw the zone's outline.
+  </Step>
+  <Step title="Enter the details">
+    Fill in the **New zone** dialog. See the fields below.
+  </Step>
+  <Step title="Save">
+    Select **Save**.
+  </Step>
+</Steps>
+
+| Field | Description |
+| --- | --- |
+| **Name** | The zone name. Required. |
+| **Description** | Rider-facing info shown in the zone tooltip. |
+| **Color** | The zone's color on the map. |
+| **Priority** | A whole number, zero or greater. Higher priority wins where zones overlap. On a tie, the smaller zone wins. |
+| **Active (counts for pricing)** | Whether pricing uses the zone. |
+| **Show on map (riders see it)** | Whether riders see the zone on the app map. |
+
+The **Zones** list under the map shows each zone with an icon for whether it's visible on the map. Use the edit icon to open the **Edit zone** dialog, or the delete icon to remove the zone.
+
+<Warning>
+  Deleting a zone takes effect right away. The dashboard doesn't ask you to confirm.
+</Warning>
+
+## Manage locations
+
+Locations are the named places Yelo knows about in a community, such as a student center or a stadium. Riders see them as pins on the app map when **Show on map** is on. You can also feature them in rider search. See [Community top locations](/guides/community-top-locations).
+
+The **Locations** list under the map shows **Name**, **Address**, **Categories**, **Map**, and **Created**. Places on the rider map show an **On map** badge. The list shows up to 500 locations.
+
+### Add a location
+
+<Steps>
+  <Step title="Open the form">
+    Select **Add Location** above the map.
+  </Step>
+  <Step title="Enter the details">
+    Fill in the fields below.
+  </Step>
+  <Step title="Save">
+    Select **Add Location**.
+  </Step>
+</Steps>
+
+| Field | Required | Description |
+| --- | --- | --- |
+| **Name** | Yes | The place name. |
+| **Address** | Yes | The street address. |
+| **Categories** | No | A comma-separated list, such as `dining, study`. |
+| **Latitude** and **Longitude** | No | The place's coordinates. |
+| **Description** | No | A short description. |
+| **Image URL** | No | A link to an image of the place. |
+| **Show on map** | No | Shows the place as a pinned point of interest on the app map. The first category sets its icon. |
+
+To edit a location, click its pin on the map or select the edit icon in the list. To delete it, select the delete icon. Deletion happens right away.
+
+### Import locations and zones
+
+Select **Import** above the map and choose a `.kml` or `.csv` file. When the import finishes, a message summarizes how many locations and zones were added and how many failed.
+
+<Tabs>
+  <Tab title="CSV">
+    A CSV file imports locations only. The first row must be a header row with a `name` column. Yelo also reads these optional columns: `address`, `latitude`, `longitude`, `description`, `image_url`, and `categories`.
+
+    Each row needs a name plus either an address or both coordinates. Yelo skips other rows. It looks up coordinates for rows that only have an address.
+
+    ```csv
+    name,address,categories
+    Student Center,123 University Ave,"dining, study"
+    ```
+  </Tab>
+  <Tab title="KML">
+    A KML file, such as a Google My Maps export, can import both locations and zones.
+
+    - Each point placemark becomes a location. The name of its folder becomes the location's category, in singular form. For example, a folder named `Restaurants` becomes the category `restaurant`.
+    - Each polygon placemark becomes a zone with priority `0` and a color from a fixed palette. Yelo skips a polygon when the community already has a zone with the same name.
+  </Tab>
+</Tabs>
+
+## Manage mobility feeds
+
+Admins see a **Mobility feeds** panel below the map. It manages live vehicle feeds and static transit route and stop archives for the community.
+
+| Column | Description |
+| --- | --- |
+| **Status** | **Active** or **Inactive**. Toggle it to turn the feed on or off. |
+| **Name** | The feed name. |
+| **Source** | **GBFS**, **GTFS Schedule**, or **GTFS Realtime**. |
+| **Vehicle type** | The vehicle type for the feed's vehicles. GTFS Schedule feeds show **Derived from routes**. |
+| **URL** | The feed URL. |
+| **Created** | When the feed was added. |
+
+### Add a feed
+
+1. Select **Add feed**.
+2. Enter a **Name** and choose a **Source**.
+3. Choose a **Vehicle type**, if the source needs one.
+4. Paste the **Feed URL**:
+   - **GBFS**: a GBFS auto-discovery URL, or a direct `vehicle_status` or `free_bike_status` URL. Station-only systems without individual vehicle positions aren't supported.
+   - **GTFS Schedule**: a direct GTFS ZIP URL, or a Mobility Database GTFS Schedule page. Yelo resolves catalog pages to their latest ZIP archive.
+   - **GTFS Realtime**: a URL that returns a GTFS-Realtime VehiclePositions protobuf feed.
+5. Select **Add feed**.
+
+The **Relevant Mobility Database feeds** section suggests active public feeds whose service area overlaps the community's bounding box. Suggestions can carry **Official** or **Enabled** badges. Review the catalog entry, then select **Add feed** to add one.
+
+You can edit a feed's name, vehicle type, and URL later. You can't change its source.
+
+<Note>
+  Yelo caches GTFS Schedule ZIPs for a day. Disabling or deleting a feed removes its routes and stops from the map on the next refresh.
+</Note>

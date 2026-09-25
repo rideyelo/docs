@@ -1,0 +1,146 @@
+---
+title: "Background jobs"
+description: "Every in-process ticker, sweeper, and River periodic job that yelo-api runs, with intervals, what each does, and how to disable them."
+---
+
+The API runs background work in two ways:
+
+- **In-process tickers** started from `cmd/api/main.go`. They run on every instance and hold no durable state between ticks.
+- **River jobs** on the Postgres-backed queue built in `internal/notify/queue`. Jobs are durable, retried with backoff, and deduplicated across instances.
+
+Both run inside the API process on Cloud Run. There is no separate worker service. See [Deployment](/engineering/deployment) for how instances are scaled.
+
+## In-process ticker loops
+
+`startBackgroundTasks` in `cmd/api/main.go` starts these groups through `backgroundCleanup` (in `cmd/api/background_cleanup.go`):
+
+| Group | Interval | Tasks | Purpose |
+| --- | --- | --- | --- |
+| `AuthV3Runtime` | 5 minutes | `RuntimeCleanupService.Run` | Deletes expired Auth v3 transactions, handoffs, phone attempts, and rate counters. Only when Auth v3 is enabled |
+| `AuthV3OtpFallback` | `TWILIO_OTP_SWEEP_INTERVAL` (default 15 seconds) | `PhoneFallbackService.Run` | Re-sends OTPs that Twilio Verify never confirmed delivered, after `TWILIO_OTP_FALLBACK_DELAY` (default 60 seconds). Only when Auth v3 is enabled |
+| `Operational` | 30 seconds | `UserService.PurgeOfflineDrivers`, `RideService.CancelUnmatchedRides`, `ActivationService.ProcessUnmatchedRides` | Offline sweep and renew reminders, ride request expiry, driver activation and auto-queue |
+| `Refresh` | 2 minutes | `CommunityService.RefreshFeed` | Rebuilds each community's cached feed |
+| `Notifications` | 1 minute | `DashboardService.ProcessScheduledNotifications` | Sends dashboard notifications whose scheduled time has passed |
+| `QueueRefresh` | 3 minutes | `ActivationService.RefreshQueueSummaries` | Recovers idle driver queues and rewrites queue summary caches |
+| `TipCapture` | 5 minutes | `RideService.AutoCaptureTipWindowExpired` | Captures fare and tip for up to 50 rides whose tip window closed |
+| `MapHeat` | 5 minutes, runs immediately on start | `MapLayerService.RefreshHeatmaps`, `MapLayerService.PurgeExpiredBumps` | Recomputes community heatmaps. Deletes bumps expired more than 7 days ago |
+| `Mobility` | 1 minute | `MapLayerService.RefreshMobilityFeeds` | Polls GBFS and GTFS-RT feeds into the map vehicles layer. Skipped when Redis is disabled |
+
+For what the ride-related tasks do, see [Rides implementation](/engineering/api/rides-implementation#activation-and-auto-queue).
+
+### How the loop behaves
+
+`backgroundCleanupLoop` runs each task in its own goroutine on every tick.
+
+- **Timeout.** Each run gets a context with a 2-minute timeout (`backgroundTaskTimeout`).
+- **No overlap.** A task that is still running when the next tick fires is skipped, with a warning.
+- **Stuck runs.** A running entry older than 5 minutes (`staleTaskTimeout`) is evicted and logged as an error, and the task runs again.
+- **Errors.** Failures are logged with the group, task name, and duration. They never stop the loop.
+- **Names.** Task names in logs come from the function name via reflection, for example `PurgeOfflineDrivers`.
+
+<Note>
+Tickers run on every instance. Tasks must be safe to run concurrently on several instances. They rely on database conditions, row locks, and idempotent writes, not on leader election. For example, `RefreshHeatmaps` does an idempotent Redis `SET`, and `CancelUnmatchedConfirmedRides` only updates rows still matching its `WHERE` clause.
+</Note>
+
+### Other goroutines
+
+| Goroutine | Interval | Where | Purpose |
+| --- | --- | --- | --- |
+| Vehicle type refresh | 5 minutes | `main.go` | Reloads the vehicle type registry so dashboard edits reach every instance |
+| Pool stats | `POOL_STATS_INTERVAL_S` (default 15 seconds) | `main.go` | Publishes Postgres and Redis pool gauges |
+| Postgres pool monitor | `POSTGRES_POOL_LOG_INTERVAL` (default 30 seconds) | `repository/storage.go` | Logs pool utilization and connection leak warnings for the API pool |
+| Rate limiter janitor | 1 minute | `middleware.go` | Evicts IPs idle for 3 minutes |
+| Ride event recorder | Continuous | `rideevents` | Drains the ride event channel into Postgres |
+| Location sync | Continuous | `UserService`, `HeartbeatService` | Writes driver locations to Postgres from a 100-item channel |
+| Search analytics | Continuous | `MappingService` | Four workers drain a 1024-item search analytics queue |
+| Contact sync lease renewal | 30 seconds | `contactsync` | Renews a running sync's lease while it works |
+
+## River jobs
+
+River is a Postgres-backed job queue. `notifyqueue.New` registers workers and periodic jobs, and `main.go` starts the client.
+
+- River uses its own pool (`riverPoolMaxConns` = 12 connections) so long-lived job transactions don't consume the API pool. See [Data layer](/engineering/api/data-layer#connection-pools).
+- Before starting, `CancelStaleOrchestrationJobs` cancels time-sensitive notification jobs that expired during an outage, so exponential backoff cannot deliver them days later.
+- The River UI is served at `/riverui/` for dashboard admins. The dashboard exposes it on the **Jobs** page.
+- On shutdown, `notifyClient.Stop` runs within the 8-second shutdown budget.
+
+### Queues
+
+| Queue | Max workers |
+| --- | --- |
+| `default` | 10 |
+| Calendar sync | 2 |
+| Top locations | 2 |
+| `stripe` | 2 |
+| Quo, Quo control | 1 each |
+| `gtm` | 1 |
+| Stripe reconciliation | 1 |
+| Contact sync queues | Added by `contactsync.Service.Queues()` for configured destinations |
+
+A replica consumes contact sync queues only for destinations it has credentials for, which keeps a rolling deploy with different settings safe.
+
+### Periodic jobs
+
+All periodic jobs use `RunOnStart: true`. River's leader election ensures only one instance enqueues each periodic job, and unique options prevent duplicates.
+
+| Kind | Interval | Purpose | Condition |
+| --- | --- | --- | --- |
+| `top_locations_dispatch` | 5 minutes | Dispatches top-location refreshes | Top locations service present |
+| `top_locations_verify_legacy` | 1 hour | Verifies legacy top-location data | Top locations service present |
+| `place_identity_backfill` | 1 minute | Backfills place identities in batches | Always |
+| `contact_sync_dispatch` | 5 seconds | Dispatches per-user contact sync work | Contact sync configured |
+| `contact_sync_scan` | 1 minute | Scans for contacts that need syncing | Contact sync configured |
+| `calendar_sync_dispatch` | 15 seconds | Dispatches Google Calendar syncs | Calendar sync configured |
+| `community_geography_maintenance` | 15 seconds | Cleans expired calendar OAuth flows, reconciles community time zones, applies community cache invalidations | Always (sub-steps gated by config) |
+| `google_play_release_check` | 5 minutes | Checks Google Play tracks and posts release changes to Slack | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` |
+| `gtm_refresh` | 5 minutes | Rebuilds the cached go-to-market prospect snapshot | GTM service present |
+| `stripe_reconciliation_dispatch` | 1 minute | Dispatches per-account Stripe reconciliation | `STRIPE_RECONCILIATION_ENABLED` (default true) |
+| `quo_sync_outbox` | 5 seconds | Drains the Quo contact outbox | Always |
+| `quo_sync_batch` (`backfill`) | 1 minute | Backfills Quo contacts | Always |
+| `quo_sync_batch` (`reconcile`) | 1 minute | Reconciles Quo contacts | Always |
+| `stripe_drive_fee_scan` | 10 minutes | Scans and repairs drive fee history | Always |
+| `notify_receipt_check` | 5 minutes | Polls Expo receipts, finalizes deliveries, clears dead push tokens | Always |
+| `notify_recovery` | 5 minutes | Requeues deliveries stuck in `sending` longer than the 10-minute lease | Always |
+
+### On-demand jobs
+
+These kinds are enqueued by application code rather than a schedule:
+
+| Kind | Enqueued by | Purpose |
+| --- | --- | --- |
+| `notify_orchestrate` | `notify.Emit` inside a business transaction | Resolves template, variant, and recipients, writes notification and delivery rows, enqueues the send |
+| `notify_send` | Orchestrator and recovery | Sends deliveries to Expo in batches of 100 |
+| `notify_bump_sms` | Friend bumps | Sends one bump text through Photon or Twilio, with a 5-minute per-recipient cooldown and 15-minute freshness |
+| `signup_slack_alert` | Signups | Posts a signup alert to Slack |
+| `top_locations_refresh` | Top locations dispatch and `TopLocations.Enqueue` | Refreshes one community's top locations |
+| `calendar_sync` | Calendar dispatch | Syncs one calendar |
+| `contact_sync_user`, `contact_sync_segments` | Contact sync | Syncs one user or segment to Resend or Quo |
+| `quo_sync_user` | Quo service | Syncs one user to Quo |
+| `stripe_reconcile_account` | Reconciliation dispatch | Reconciles one Stripe connected account |
+| `stripe_drive_fee_repair` | Drive fee scan | Repairs one drive fee history record |
+
+<Tip>
+Use `notify.Emit(ctx, tx, code, vars, opts...)` inside the same transaction as the state change that triggers a notification. The orchestrate job then commits or rolls back with that change. This is the transactional outbox the ride state protocol relies on.
+</Tip>
+
+Time-sensitive notification codes expire after 15 minutes (`orchestrateFreshness`). Durable codes, such as payouts and account state, never expire.
+
+## Disabling background work
+
+| Setting | Effect |
+| --- | --- |
+| `BACKGROUND_TASKS_ENABLED=false` | Every `backgroundCleanup` loop logs that it is disabled and returns. River and the other goroutines still run |
+| `E2E_ENABLED=true` with `E2E_BACKGROUND_JOBS_ENABLED` false | Skips River workers, River UI, and `startBackgroundTasks` entirely |
+| `ACTIVATION_ENABLED=false` | `ProcessUnmatchedRides` returns immediately |
+| `STRIPE_RECONCILIATION_ENABLED=false` | Stops the reconciliation dispatch |
+
+<Warning>
+With `BACKGROUND_TASKS_ENABLED=false`, rides never expire, drivers are never set offline, and tip windows never capture. Use it only for local debugging.
+</Warning>
+
+## Adding a job
+
+- **Short, idempotent sweep that every instance can run**: add a method that matches `func(ctx context.Context) errors.Error` and pass it to `backgroundCleanup` in `startBackgroundTasks`, either in an existing group or a new one.
+- **Work that must survive restarts, retry, or run once across instances**: add a River `JobArgs` type with a `Kind()`, a worker, and register it in `notifyqueue.New`. Add a `river.NewPeriodicJob` entry with `UniqueOpts` if it runs on a schedule.
+
+Monitor job health in the River UI and in the logs described in [Observability](/engineering/observability).

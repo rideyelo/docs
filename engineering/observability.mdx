@@ -1,0 +1,111 @@
+---
+title: "Observability"
+description: "Logging, tracing, metrics, error tracking, and product analytics across the Yelo API, web sites, and mobile app"
+---
+
+Each signal has one home. Use this table to decide where to look and where to add instrumentation.
+
+| Signal | API | Web | Mobile |
+| --- | --- | --- | --- |
+| Logs | zerolog, JSON to Cloud Logging | Browser console | `react-native-logs`, console plus rotated files |
+| Traces | OpenTelemetry, OTLP gRPC export | Sentry browser tracing (dashboard) | Sentry, 20% sampling |
+| Metrics | OpenTelemetry with a Prometheus exporter at `/metrics` | None | Device telemetry posted to the API |
+| Errors | Sentry | Sentry (dashboard) | Sentry |
+| Product analytics | PostHog business events | PostHog (signup Auth v3 only) | PostHog events and session replay |
+
+## API
+
+### Logging
+
+`internal/utilities/logger` wraps zerolog. The format depends on `ENVIRONMENT`:
+
+- **`dev`**: human-readable console output at `debug` level.
+- **Any other value**: JSON on stderr at `info` level, with the level written as a Cloud Logging `severity` field (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, `ALERT`).
+
+Set `LOG_LEVEL` to override the level.
+
+Request-scoped loggers from `WithCtx(ctx)` add `request_id`, `method`, `path`, `user_id`, and `community_id`. When a span is active, they also add `logging.googleapis.com/trace` and `logging.googleapis.com/spanId`, so Cloud Logging links log lines to traces. Use the context-aware helpers (`InfoC`, `WarnC`, `ErrorC`) inside request and job code.
+
+<Note>
+`ErrorC` logs the error with its stack trace, records the `error.count` metric, and sends it to Sentry. If the context was canceled because the client disconnected or the server is shutting down, it downgrades to a warning and skips Sentry. Deadline errors still escalate.
+</Note>
+
+golangci-lint enforces structured logging. Use typed zerolog fields instead of formatted strings.
+
+### Tracing
+
+`internal/utilities/otel` initializes OpenTelemetry at startup when `OTEL_ENABLED=true`, which is the default.
+
+- **Export.** Traces go to `OTEL_OTLP_ENDPOINT` over OTLP gRPC. Setting `OTEL_OTLP_AUTH_HEADER` or `ENVIRONMENT=prod` enables TLS, and the auth header is sent as HTTP basic auth, which is the format Grafana Cloud expects. Tracing is off when the endpoint is empty.
+- **Sampling.** `OTEL_TRACE_SAMPLING_RATIO` sets the ratio from `0.0` to `1.0`. `.env.example` uses `1.0` for development and recommends `0.01` to `0.25` in production.
+- **Resource.** `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, and `ENVIRONMENT` as `deployment.environment`.
+- **Propagation.** W3C Trace Context and Baggage.
+
+Instrumentation comes from four places:
+
+1. HTTP middleware wraps every request with `otelhttp` and flags requests slower than `SLOW_REQUEST_THRESHOLD_MS`.
+2. `PgxTracer` creates a span per query with sanitized SQL and warns about queries slower than `SLOW_QUERY_THRESHOLD_MS`. `DISABLE_SLOW_QUERY_WARNINGS` turns the warnings off.
+3. `NewInstrumentedHTTPClient` traces outbound provider calls.
+4. Service methods open spans with `otel.CustomSpan(ctx, "<domain>", "<Method>")` and defer the returned function, which records the error automatically. Use the `AttrKey*` constants in `helpers.go` (`ride.id`, `community.id`, `fleet.id`, and so on) for business attributes.
+
+Sentry on the API runs with `TracesSampleRate: 0`. OpenTelemetry owns tracing.
+
+### Metrics
+
+When OpenTelemetry is enabled, the API registers a `MultiMetricsProvider` that fans out to two backends:
+
+- **OpenTelemetry**, exported in Prometheus format at `GET /metrics`. This covers HTTP requests, durations, sizes, and in-flight counts, database query counts and durations, connection pool stats, Redis operations and cache hit rate, circuit breaker state, rate limiter rejections, external call latency, notification delivery, and OTP delivery status. Go runtime metrics are included.
+- **PostHog**, which receives only business counters. Any metric whose name starts with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` is dropped. Events without an authenticated user use the distinct ID `yelo-api` and do not create a person profile.
+
+`/metrics` requires a bearer token when `METRICS_AUTH_TOKEN` is set. `PPROF_ENABLED=true` also mounts `/debug/pprof/` behind the same check, with `PPROF_BLOCK_RATE` and `PPROF_MUTEX_RATE` controlling profiling rates.
+
+### Health and job visibility
+
+- `GET /healthcheck` is the liveness check. `GET /healthcheck/deep` also checks dependencies. The release pipeline smoke-tests both before it promotes a revision.
+- River UI is embedded under `/riverui` for admins. The dashboard exchanges its Clerk token for a short-lived cookie through `POST /riverui/session`. See [background jobs](/engineering/api/background-jobs).
+- The API posts operational alerts, signups, and driver application updates to Slack. Release pipelines post deploy results separately. `SLACK_WEBHOOK_URL`, `SLACK_USER_UPDATES_WEBHOOK_URL`, and `SLACK_DRIVER_UPDATES_WEBHOOK_URL` route them to separate channels.
+
+### Local observability stack
+
+`docker-compose.yml` runs the API with Prometheus, Grafana, and Jaeger:
+
+```bash
+make rund
+```
+
+| Service | URL | Notes |
+| --- | --- | --- |
+| Prometheus | `http://localhost:9090` | Scrapes `host.docker.internal:8080` every 15 seconds and loads `monitoring/prometheus/alert-rules.yml` |
+| Grafana | `http://localhost:3000` | Provisioned dashboards: API performance, database health, external dependencies, Redis caching, request deep dive, system health |
+| Jaeger | `http://localhost:16686` | OTLP gRPC on port 4317 |
+
+To send traces to Jaeger from `make run`, set `OTEL_OTLP_ENDPOINT=localhost:4317` in `.env`. The alert rules (high error rate, API down, pool exhaustion, open circuit breaker, slow queries, and more) are a reference for local testing.
+
+## Web
+
+- **Sentry.** The dashboard's `main.tsx` initializes `@sentry/react` when `VITE_SENTRY_DSN` is set, with browser tracing at a 100% sample rate and session replay at 10%, rising to 100% for sessions with an error. `src/components/RouteBoundary.tsx` wraps routes in a Sentry error boundary. Public sites do not initialize Sentry.
+- **PostHog.** Only the signup site's Auth v3 flow uses `posthog-js` (`src/sites/signup/auth-v3/analytics.ts`). It initializes only when `VITE_POSTHOG_KEY` is set and `VITE_APP_ENV` permits capture, disables autocapture and pageviews, masks inputs and error text in session replay, and strips email from event context.
+- **Mobile telemetry.** The dashboard's telemetry page charts the device telemetry the mobile app reports to the API.
+
+## Mobile
+
+- **Logging.** Import `log` from `@/lib/observability/logger`. It uses `react-native-logs` at `debug` level in development. When `EXPO_PUBLIC_IS_PRODUCTION=true`, it logs at `info` level to the console and to daily files in the cache directory. Files rotate at 2 MB with up to seven archives, and files older than seven days are deleted. Lint bans `console.*`. Use dotted event names and pass errors through `serializeError(error)`.
+- **Sentry.** `app/_layout.tsx` initializes `@sentry/react-native` with `EXPO_PUBLIC_SENTRY_DSN`, a 0.2 trace sample rate, and the React Navigation integration. It is disabled in development (`__DEV__`) and in E2E builds. Surface user-facing failures through error boundaries instead of silent catches.
+- **PostHog.** `PostHogProvider` in `app/_layout.tsx` is disabled in E2E builds and when `EXPO_PUBLIC_POSTHOG_API_KEY` is missing. Session replay is armed after boot by `SessionReplayObserver`. Define every event in `lib/analytics/events/` and capture it through the typed `useXxxAnalytics` hooks, never with inline strings.
+- **Device telemetry.** `lib/observability/TelemetryService.ts` posts device, OS, permission, locale, and update information to the API's telemetry endpoint, throttled to once every five minutes.
+
+<Warning>
+Never log or capture secrets, tokens, OTPs, or full contact details. The Auth v3 transaction secret, PKCE values, and phone numbers must stay out of logs, Sentry breadcrumbs, and PostHog properties on every platform.
+</Warning>
+
+## Where to add instrumentation
+
+| You want to | Do this |
+| --- | --- |
+| Trace a new service method | Start it with `otel.CustomSpan` and defer the end function |
+| Count a technical event | Add a method to the metrics provider interface and register the instrument in `metrics/otel.go` |
+| Track a business outcome | Call `IncrementCounter` with a domain-prefixed name such as `ride.` or `payment.`. It reaches PostHog automatically |
+| Report an unexpected API error | Return a wrapped `errors.Error` and let `ErrorC` log it and send it to Sentry |
+| Track a mobile user action | Add the event to `lib/analytics/events/` and expose it through the domain hook |
+
+See [request lifecycle](/engineering/api/request-lifecycle) for where the middleware sits in the request path.

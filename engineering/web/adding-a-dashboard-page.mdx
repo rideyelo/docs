@@ -1,0 +1,213 @@
+---
+title: "Add a dashboard page"
+description: "A step-by-step recipe for adding a new role-gated page to the yelo-web dashboard, from the API hook to the sidebar entry and docs"
+---
+
+This recipe adds a new top-level page to the dashboard. It touches the files listed below, in this order. Read [Dashboard architecture](/engineering/web/dashboard-architecture) first if you have not worked in the dashboard before.
+
+The examples use a hypothetical **Widgets** page at `/widgets`, backed by a hypothetical `GET /dashboard/widgets` endpoint. Replace the names with your own.
+
+| Step | File |
+| --- | --- |
+| API contract and client | `docs/openapi.json`, `src/generated/dashboard/` |
+| Data hook (optional) | `src/hooks/useWidgets.ts` |
+| Page component | `src/sites/dashboard/pages/WidgetsPage.tsx` |
+| Lazy import registry | `src/sites/dashboard/routeModules.ts` |
+| Route and roles | `src/sites/dashboard/App.tsx` |
+| Sidebar entry | `src/components/Sidebar.tsx` |
+| Browser tab title | `src/sites/dashboard/DashboardTitle.tsx` |
+| Tests | `src/sites/dashboard/App.test.tsx`, `package.json` |
+| Docs | This docs site: `/dashboard/*` and `/administration/dashboard-roles` |
+
+<Steps>
+  <Step title="Make sure the API exposes the data">
+    The dashboard reads data only through the generated client, and lint rules block raw `fetch` and direct `api-client` imports. If the endpoint does not exist in `docs/openapi.json` yet, land the `yelo-api` change first. Dashboard endpoints should sit behind the Clerk middleware and enforce the same roles you plan to allow in the UI.
+
+    Then sync and regenerate the client:
+
+    ```bash
+    make openapi      # sync docs/openapi.json from the paired yelo-api checkout
+    make orval        # regenerate src/generated/*
+    make api-check    # verify the lock and generated output are current
+    ```
+
+    Commit the regenerated files. The full pipeline is in [OpenAPI and clients](/engineering/openapi-and-clients).
+  </Step>
+
+  <Step title="Pick or write a data hook">
+    For a simple read, call the generated hook directly in the page:
+
+    ```tsx
+    import { useDashboardListWidgets } from '@/generated/dashboard/endpoints/dashboard/dashboard';
+    ```
+
+    Write a wrapper in `src/hooks/` when you need stable query keys for invalidation after a mutation, a narrower response type, or a different operation than the generated hook uses. Follow the key-factory pattern from `useAccess.ts` and `useZones.ts`:
+
+    ```ts src/hooks/useWidgets.ts
+    import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+    import {
+      dashboardListWidgets,
+      dashboardUpdateWidget,
+    } from '@/generated/dashboard/endpoints/dashboard/dashboard';
+
+    export const widgetKeys = {
+      all: ['dashboard-widgets'] as const,
+      list: (communityId: string) => ['dashboard-widgets', communityId] as const,
+    };
+
+    export function useWidgets(communityId: string | null) {
+      return useQuery({
+        queryKey: widgetKeys.list(communityId ?? ''),
+        queryFn: () => dashboardListWidgets({ community_id: communityId! }),
+        enabled: !!communityId,
+      });
+    }
+
+    export function useUpdateWidget() {
+      const queryClient = useQueryClient();
+      return useMutation({
+        mutationFn: dashboardUpdateWidget,
+        onSuccess: () => queryClient.invalidateQueries({ queryKey: widgetKeys.all }),
+      });
+    }
+    ```
+
+    The default `staleTime` is 5 minutes. Set `refetchInterval` only if the page must stay live, and pair it with `refetchIntervalInBackground: false`.
+  </Step>
+
+  <Step title="Create the page component">
+    Add `src/sites/dashboard/pages/WidgetsPage.tsx` with a named export whose name matches the file name. The search index looks for a component with that name. Use shadcn primitives from `@/components/ui/*`.
+
+    ```tsx src/sites/dashboard/pages/WidgetsPage.tsx
+    import { toast } from 'sonner';
+    import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+    import { useCommunity } from '@/contexts/CommunityContext';
+    import { useUpdateWidget, useWidgets } from '@/hooks/useWidgets';
+    import { getApiErrorMessage } from '@/lib/api-error';
+
+    export function WidgetsPage() {
+      const { selectedCommunityId } = useCommunity();
+      const query = useWidgets(selectedCommunityId);
+      const update = useUpdateWidget();
+      const widgets = query.data?.success ? query.data.data : [];
+
+      const rename = (id: string, name: string) =>
+        update.mutate(
+          { id, data: { name } },
+          {
+            onSuccess: () => toast.success('Widget updated'),
+            onError: (error) => toast.error(getApiErrorMessage(error, 'Failed to update widget')),
+          },
+        );
+
+      return (
+        <div className="space-y-6">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">Widgets</h1>
+            <p className="mt-1 text-sm text-muted-foreground">Configure widgets for the selected community.</p>
+          </div>
+          {(query.isError || (query.data && !query.data.success)) && (
+            <div role="alert" className="rounded-lg border border-destructive/40 p-4 text-sm">
+              Could not load widgets.
+            </div>
+          )}
+          <Card>
+            <CardHeader>
+              <CardTitle>Active widgets</CardTitle>
+            </CardHeader>
+            <CardContent>{/* table, chart, or form */}</CardContent>
+          </Card>
+        </div>
+      );
+    }
+    ```
+
+    Keep these conventions:
+
+    - **Community scope.** Community-scoped pages read `useCommunity()`. Pages that aggregate across communities use `useGlobalCommunityFilter()` with `CommunityFilterDropdown`.
+    - **Errors.** Query errors do not reach error boundaries, so render them inline. Show mutation errors with `getApiErrorMessage`.
+    - **Search indexing.** The search index uses the first `<h1>` in the page's final `return` as the result title, and a single sibling `<p>` as its description. Each static `<h2>`–`<h6>` or `CardTitle` outside tabs, sheets, and dialogs becomes a section result. Keep those strings static, and add an `id` or `data-search-section` attribute that matches the section slug if you want deep links to scroll to the right place.
+    - **Tables, charts, and maps.** Use `appTableFeatures` from `@/lib/table`, `ChartContainer` from `@/components/ui/chart`, and existing Mapbox components rather than new libraries.
+  </Step>
+
+  <Step title="Register the lazy import">
+    Add the module to `routeImporters` in `src/sites/dashboard/routeModules.ts`:
+
+    ```ts
+    '/widgets': () => import('./pages/WidgetsPage'),
+    ```
+
+    This enables sidebar prefetching and chunk-load retries, and makes the search index pick up the page.
+  </Step>
+
+  <Step title="Add the route and roles">
+    In `src/sites/dashboard/App.tsx`, declare the lazy component and add a route wrapped in `ProtectedRoute`:
+
+    ```tsx
+    const WidgetsPage = lazy(
+      lazyDashboardRoute('/widgets', (m: typeof import('./pages/WidgetsPage')) => m.WidgetsPage),
+    );
+
+    <Route
+      path="/widgets"
+      element={
+        <ProtectedRoute allowedRoles={['admin']}>
+          <WidgetsPage />
+        </ProtectedRoute>
+      }
+    />
+    ```
+
+    Write `allowedRoles` as an inline array literal. The search index parses it statically, and the build fails with `route /widgets has no access policy` if it cannot find one. If you rename an existing path, keep the old path as a redirect so bookmarks keep working. The `LegacyRoute` helper preserves the query string and hash.
+  </Step>
+
+  <Step title="Add the sidebar entry">
+    Add an item to the right group in `navGroups` in `src/components/Sidebar.tsx`, with a `lucide-react` icon:
+
+    ```tsx
+    { title: 'Widgets', url: '/widgets', icon: Puzzle },
+    ```
+
+    If interns or fleet managers can open the page, also add the URL to the matching list in `isAccessible()` and in the idle-prefetch filter in the same file. Otherwise the item renders dimmed for them even though the route allows it.
+  </Step>
+
+  <Step title="Set the tab title">
+    Add `'/widgets': 'Widgets'` to `pageTitles` in `src/sites/dashboard/DashboardTitle.tsx`. Without it, the browser tab reads "Dashboard".
+  </Step>
+
+  <Step title="Add tests">
+    - Add the path and its allowed roles to the `pages` map in `src/sites/dashboard/App.test.tsx`. The test renders every route as each role and checks where it lands.
+    - Put component tests next to the page as `WidgetsPage.test.tsx`, with `// @vitest-environment jsdom` at the top.
+    - Add each new test file to the explicit file list in the `test:components` script in `package.json`. The test runner does not discover files on its own.
+
+    See [Testing](/engineering/testing) for mocking patterns.
+  </Step>
+
+  <Step title="Verify locally">
+    ```bash
+    pnpm check                        # format, lint, type-aware lint, typecheck
+    pnpm test:components
+    make dev                          # sign in as each role you allowed
+    make build-site SITE=dashboard    # confirms the search index builds
+    ```
+
+    Test with an admin account and with an intern or fleet account if you allowed those roles. Confirm the community dropdown drives the data you expect.
+  </Step>
+
+  <Step title="Document the page">
+    Add a user-facing guide under `/dashboard/` in this docs site that covers what the page shows and how operators use it. If the page changes who can access what, update [Dashboard roles](/administration/dashboard-roles). Add both pages to `docs.json`.
+  </Step>
+</Steps>
+
+## Checklist
+
+- The endpoint exists in the pinned contract, and `make api-check` passes.
+- The page uses generated operations only: no raw `fetch` and no direct `api-client` import.
+- `routeImporters`, `App.tsx`, `Sidebar.tsx`, and `DashboardTitle.tsx` all include the new path.
+- `allowedRoles` and the sidebar's `isAccessible()` agree with each other and with the API's authorization.
+- `App.test.tsx` covers the new route, and new tests are listed in `test:components`.
+- User-facing docs are written or updated.
+
+<Note>
+Merging to `main` deploys the dashboard automatically when its Nx project is affected. See [Deployment](/engineering/deployment).
+</Note>

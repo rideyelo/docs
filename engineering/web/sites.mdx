@@ -1,0 +1,125 @@
+---
+title: "Sites"
+description: "Every site that yelo-web builds: purpose, audience, auth model, API usage, and Firebase Hosting target"
+---
+
+`sites.config.json` registers seven sites. Each one lives in `src/sites/<site>/`, builds to `dist/<site>/`, and deploys to its own Firebase Hosting site in the `yelo-dashboard-v2` project. For how the build works, see [Multisite build](/engineering/web/multisite).
+
+<Warning>
+There are no `pay` or `drive` sites. Older notes, including `CODEBASE_CONTEXT.md` and `/Users/cj/Code/yelo/CLAUDE.md`, describe them as Clerk-authenticated stubs, and the `Makefile` help text still uses `deploy-pay` as an example. Both folders were removed from `yelo-web`. Rider tipping, the only web payment flow, now lives in the `signup` site at `/tip/<slug>`, and the `experience-router` Cloudflare Worker serves it at `joinyelo.com/pay/tip`.
+</Warning>
+
+## At a glance
+
+| Site | Audience | Auth | Bootstrap | API client | Hosting site ID | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `dashboard` | Admins, interns, fleet managers | Clerk | Bespoke `main.tsx` | `@/generated/dashboard` | `yelo-dashboard-v2` | Live |
+| `signup` | Riders and drivers signing up, tipping, or deleting accounts | Auth v3 and phone OTP, no Clerk | `renderSite` | `@/generated/signup`, `@/generated/auth-v3` | `yelo-signup` | Live |
+| `event` | Anyone with a shared event link | Public | `renderSite` | `@/generated/event` | `yelo-event` | Live |
+| `home` | Marketing visitors | Public | Plain `createRoot` | None | `yelo-home` | Live |
+| `maestro` | Engineers reviewing E2E runs | Public viewer | `renderSite` | Supabase Storage JSON | `yelo-maestro` | Internal |
+| `invite` | Recipients of referral and fleet invite links | Public | `renderSite` | `@/generated/dashboard` (two public hooks) | `yelo-invite` | Live |
+| `world-cup` | Students in the World Cup campus race | Public | `renderSite` | `@/generated/dashboard` (world-cup functions) | `yelo-world-cup` | Live |
+
+The Hosting site IDs come from `.firebaserc`. Each Hosting target has the same name as its site.
+
+## dashboard
+
+The internal operations app for Yelo staff and fleet partners. It is the only site with Clerk authentication and role-based access control.
+
+- **Audience:** `admin`, `intern`, and `fleet` roles. See [Dashboard roles](/administration/dashboard-roles) for what each role can do.
+- **Auth:** `ClerkProvider` in `src/sites/dashboard/main.tsx`. Signed-out users see Clerk's `SignIn` with hash routing. `ClerkAxiosInterceptor` adds `Authorization: Bearer <token>` to every request from the shared axios instance.
+- **API:** The tag-split React Query client in `src/generated/dashboard/endpoints/`, plus wrapper hooks in `src/hooks/`. The Jobs page embeds River UI in an iframe after minting a cookie through `POST /riverui/session`.
+- **Required build variables:** `VITE_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_MAPBOX_API_KEY`. `VITE_SENTRY_DSN` is optional.
+- **Hosting:** Every path rewrites to `/index.html`. HTML is served `no-cache, no-store`, and `/assets/**` is served immutable for one year.
+
+Implementation details are in [Dashboard architecture](/engineering/web/dashboard-architecture). User-facing page guides live under the Dashboard section of these docs, for example [Ride metrics](/dashboard/ride-metrics).
+
+## signup
+
+The public web entry point for account creation and several one-off flows. It has two HTML entries: `index.html` for the main bundle, and `auth/v3/index.html` for Auth v3, so the sign-in page ships without the guest signup bundle.
+
+`src/sites/signup/App.tsx` chooses a flow from the URL path rather than route definitions:
+
+| Path | Flow |
+| --- | --- |
+| `/auth/v3`, `/auth/v3/callback` | Auth v3 sign-in page (`auth-v3/AuthV3Page`). Normally served by the dedicated entry; the main bundle lazy-loads it as a fallback. |
+| `/delete-account` | Account deletion: phone OTP, then confirmation with the word `DELETE`. |
+| `.../tip/<slug>` | Rider tip for a driver or fleet (`TipStep`). If the tip API returns unauthorized, it redirects to Auth v3 with `intent=tip`. `?status=success` shows the confirmation screen. |
+| `.../world-cup`, `.../world-cup/claim`, or `?intent=world-cup` | World Cup claim: Auth v3 sign-in, then `.edu` email verification (`EduClaimStep`). |
+| Anything else | Redirects into the Auth v3 web flow. |
+
+- **Auth:** No Clerk. Auth v3 uses its own fetch client and a request secret that `captureAuthV3RequestSecret()` strips from the URL before React mounts. Older steps use the Auth v2 phone OTP endpoints.
+- **API:** `@/generated/signup` for `authv2`, `tips`, and `user`; `@/generated/auth-v3` for Auth v3; and `worldCupClaimEducationEmail` from the dashboard client.
+- **Required build variables:** `VITE_API_URL`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`. `VITE_APPLE_REDIRECT_URI`, `VITE_AUTH_V3_APP_SCHEME`, `VITE_APP_ENV`, `VITE_POSTHOG_KEY`, and `VITE_POSTHOG_HOST` are optional.
+- **Hosting:** Strict security headers and a Content Security Policy on `/auth/v3`, `no-store` on `/delete-account`, and `.well-known` app-association files. The `experience-router` Worker proxies `joinyelo.com/auth/v3*`, `/pay/tip*`, and `/world-cup/claim*` to this site so users see canonical `joinyelo.com` URLs.
+
+<Tip>
+In dev, open `/?preview=all` on the signup site to see every step stacked on one page, or `/?preview=<step>` for a single step. For iPhone keyboard testing of Auth v3, run `pnpm dev:signup-device`. See [Local development](/engineering/local-development).
+</Tip>
+
+## event
+
+A public landing page for a single event, reached from shared links.
+
+- **Routes:** `/:slug` renders `EventPage`; anything else shows "Event not found".
+- **API:** `usePublicEventGetBySlug` from `@/generated/event`, a client generated only from the public events tags.
+- **Features:** A Mapbox static map and directions link, an "open in app" handoff that falls back to `https://yelo.link`, and an embedded Posh checkout (`CheckoutModal`) when the event's ticket URL is a `posh.vip` link.
+- **Required build variables:** `VITE_API_URL`, `VITE_MAPBOX_API_KEY`.
+
+## home
+
+The marketing site. It intentionally does not follow the shared conventions: it uses no Tailwind, no `renderSite`, and no router library. `main.tsx` calls `createRoot` directly and switches pages on `window.location.pathname`.
+
+- **Pages:** rider landing (`/`), `/drivers`, `/partner`, `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, and `/terms`. Each non-root page has a Hosting rewrite to its own `index.html`.
+- **Assets:** A site-local `public/`. Images in `public/img/` are generated from `assets-src/` by `tools/vite/home/gen-home-images.ts` at build start, and are not committed.
+- **Link previews:** The build target also runs `scripts/emit-partner-html.mjs`, which writes static HTML documents with page-specific Open Graph tags because link-preview crawlers do not run JavaScript.
+- **API:** None.
+- **Previews:** Pull requests that affect `home` get a Firebase preview channel, and CI comments the URL on the PR.
+
+Read `src/sites/home/README.md` before you change this site.
+
+## maestro
+
+An internal viewer for Maestro end-to-end test runs, with video, screenshots, and a synchronized timeline.
+
+- **Data:** Reads a run index and per-run artifacts as JSON from Supabase Storage, at `VITE_SUPABASE_URL` + `/storage/v1/object/public/e2e`, or from `VITE_E2E_ARTIFACT_BASE_URL` if set. It does not call the Yelo API for reports.
+- **Auth:** None in the viewer. It stores pinned runs and the theme in `localStorage`.
+- **Second entry:** `auth/v3/index.html` mounts the signup `AuthV3Page`. The build points `VITE_API_URL` at `VITE_E2E_API_URL` and sets the app scheme to `com.rideyelo.e2e`, so E2E app builds can run the web sign-in flow against the E2E API.
+- **Required build variables:** `VITE_SUPABASE_URL`, `VITE_E2E_API_URL`.
+
+## invite
+
+Handles shared referral and fleet invite links, then hands users off to the app or the store.
+
+- **Routes:** `/fleet/:code` renders `FleetInvitePage`; `/:code` renders `InvitePage`. The root path redirects (302) to `https://signup.yelo.link/`.
+- **API:** `useReferralGetInvitePreview` and `useFleetJoinGetPreview`, both public hooks from the dashboard client.
+- **Behavior:** Shows the inviter's first name and avatar, then redirects based on the user agent. The signup link points at `https://joinyelo.com/auth/v3?code=<code>`.
+- **App links:** The Vite config emits an `apple-app-site-association` file with invite-specific path components so invite paths open the app.
+- **Analytics:** Dub, through `renderSite({ dubAnalytics: true })`.
+- **Required build variables:** `VITE_API_URL`.
+
+For the fleet invite flow from the operator's side, see [Driver invitations](/fleets/driver-invitations).
+
+## world-cup
+
+The campus race landing page: a live leaderboard, map, and signup ticker for 23 listed campuses.
+
+- **Serving:** Builds with `base: '/world-cup/'`. The `world-cup-router` Cloudflare Worker serves it at `rideyelo.com/world-cup*` and `joinyelo.com/world-cup*` and lets every other path fall through to Framer.
+- **API:** `worldCupGetStandings` and `worldCupGetActivity` from the dashboard client, called through the same-origin `/world-cup/api` prefix. It polls activity with a cursor.
+- **Claim flow:** Claim links point at `VITE_SIGNUP_URL`, which defaults to `https://joinyelo.com/world-cup/claim` and is handled by the `signup` site.
+- **Required build variables:** None. `VITE_SIGNUP_URL` is a cache input.
+
+See `src/sites/world-cup/README.md` for ticker and standings behavior.
+
+## Cloudflare Workers
+
+Three Cloudflare Workers in `workers/` sit in front of some sites. They deploy separately from Firebase:
+
+| Worker | Routes | Purpose |
+| --- | --- | --- |
+| `experience-router` | `joinyelo.com/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/_yelo/signup/*` | Proxies to the `signup` site origin (`yelo-signup.web.app`). |
+| `world-cup-router` | `rideyelo.com/world-cup*`, `joinyelo.com/world-cup*` | Proxies to the `world-cup` site origin and API; other paths go to Framer. |
+| `og` | `rideyelo.com/og/*` | Renders signed Open Graph images for invite links. |
+
+Run `pnpm worker:<name>:check` before you merge a Worker change. Deployment details are in [Deployment](/engineering/deployment).

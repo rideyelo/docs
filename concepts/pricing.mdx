@@ -1,0 +1,151 @@
+---
+title: "Pricing"
+description: "How the API turns distance, duration, zones, surge, fare adjustment, and discounts into the quote a rider sees and the fare they pay"
+---
+
+Yelo prices every ride server-side. When a rider requests a ride, the API quotes each available vehicle option. When the rider confirms, it recomputes the fare for the selected option and stores it on the ride.
+
+This page explains the pricing model and pipeline. To edit pricing in the dashboard, see [Ride pricing](/dashboard/ride-pricing).
+
+## Two prices per option
+
+Every priced option carries two numbers:
+
+| Field | Meaning |
+| --- | --- |
+| `price` | The **display** price. For jitter-mode configs this is an inflated "was" price. Otherwise it equals the charged fare. |
+| `discounted_price` | The **actual** fare the rider pays. |
+
+The ride stores both. `RideDetails.GetEffectivePrice()` returns `discounted_price` when it's set and `price` otherwise. Authorization, capture, cancellation fees, tips, and driver payout all use this effective price.
+
+## The pricing model
+
+Pricing lives in `RidePriceParameters` rows. Each row prices one **fleet + vehicle type** pair in one **community**.
+
+| Field | Purpose |
+| --- | --- |
+| `community_id`, `fleet_id`, `vehicle_type` | What the config prices. Vehicle types are `x`, `xl`, `cart`, and `minibus`. |
+| `pricing_type` | `per_ride` or `per_person`. |
+| `base_price` | Flat amount added to every ride. |
+| `price_per_minute` | Rate applied to trip duration. |
+| Tiers (`RidePriceTiers`) | Per-mile rates by distance band. |
+| `adjustment.mode` | `jitter` (default), `rounded`, or `none`. |
+| `display_name`, `image_asset`, `is_featured` | Rider-facing presentation. |
+| `start_time`, `end_time` | Versioning. A config is live when `start_time` is in the past and `end_time` is null. |
+
+Editing a config closes the old row and starts a new one, so pricing history is preserved.
+
+<Warning>
+The quoting query `ListActiveRidePriceParameters` (`queries/community.sql`) only loads configs with `pricing_type = 'per_ride'`. A `per_person` config can be created in the dashboard, but the rider quote and confirm flows ignore it. If a community has only `per_person` configs, riders get fallback pricing instead.
+</Warning>
+
+Two more inputs apply across configs:
+
+- **Global jitter settings**: one platform-wide row in `PricingJitterSettings`, used by every jitter-mode config.
+- **Community surge**: `Communities.surge_multiplier` and `surge_expires_at`.
+
+## The pipeline
+
+`pricing.GetRidePrice` in `internal/utilities/pricing/pricing.go` runs these steps for each config:
+
+<Steps>
+  <Step title="Convert units">
+    Mapbox returns distance in meters and duration in seconds. The engine converts them to miles (× 0.000621371) and minutes (÷ 60).
+  </Step>
+  <Step title="Meter the distance">
+    `computeMeterCharge` (`tiers.go`) slices the distance across the tiers like tax brackets. Each tier covers `[min_distance_miles, max_distance_miles)`, and the last tier can be open-ended. A first tier starting above 0 gives a free first stretch.
+  </Step>
+  <Step title="Apply zones">
+    If the community has zone overrides for this fleet, `meterAndTime` (`zoned.go`) prices the route piece by piece. See [Pricing zones](#pricing-zones).
+  </Step>
+  <Step title="Add base, time, and surge">
+    Raw fare = (base price + distance charge + time charge + zone flat fees) × surge multiplier. A raw fare of exactly 0 is a free ride. It skips adjustment and needs no payment method.
+  </Step>
+  <Step title="Adjust the fare">
+    `adjustFare` (`adjustment.go`) applies the config's fare adjustment mode and produces the actual fare and the display price. See [Fare adjustment](#fare-adjustment).
+  </Step>
+  <Step title="Apply a discount">
+    If a destination discount applies, the discounted fare becomes the actual fare. The display price stays as it was. See [Discounts](#discounts).
+  </Step>
+</Steps>
+
+## Fare adjustment
+
+| Mode | Actual fare | Display price |
+| --- | --- | --- |
+| `jitter` | Raw fare plus a random amount between the global `min` and `max`, truncated to cents. If that pushes the fare past a dollar boundary by less than `clamp_overshoot_limit`, the fare is redrawn inside the original dollar between `clamp_range_min` and `clamp_range_max`. | Actual fare × a random factor between `anchor_inflation_min` and `anchor_inflation_max`, truncated to cents. |
+| `rounded` | Raw fare rounded **up** to the next whole dollar. | Same as the actual fare. |
+| `none` | Raw fare truncated to cents. | Same as the actual fare. |
+
+The default global settings (`DefaultPricingJitterSettings` in `internal/models/pricing_adjustment.go`) add $0.50 to $1.00 of jitter, clamp overshoots under $0.20 into the $x.90 to $x.99 range, and inflate the display price by 1.15× to 1.30×. Admins change these in the dashboard. Every value, with an example, is documented on [Ride pricing](/dashboard/ride-pricing#global-jitter-settings).
+
+## Surge
+
+Surge is a single multiplier per community. It applies to the whole raw fare, including base, distance, time, and zone flat fees.
+
+- A surge is active only when `surge_multiplier` is greater than 1.0 and `surge_expires_at` is in the future. Otherwise the multiplier is 1.0.
+- Set it with `POST /dashboard/supply-demand/markets/{id}/surge`. The body takes `multiplier` (1 to 9.99) and `expires_in_hours` (1 to 168). A multiplier of `1.0` clears the surge.
+- Each change closes the previous row in the surge history, records who set the new surge, and invalidates the quote cache.
+- The dashboard's **Pricing Management** page shows the current surge per community but doesn't set it.
+
+When a quote is built under an active surge, the ride event log records `surge_pricing_applied`.
+
+## Pricing zones
+
+Zones are polygons on a community (`Zones` table). For how zones fit into communities more broadly, see [Communities and zones](/concepts/communities-and-zones#zones). Each zone has a priority, an active flag, and a `show_on_map` flag for the rider map. A zone changes pricing only when a fleet has a `ZonePricing` override for it. The override can set any of:
+
+- `per_mile`: replaces the tier rates for miles driven inside the zone.
+- `per_minute`: replaces the config's per-minute rate inside the zone.
+- `flat_fee`: charged once if the route enters the zone at all.
+
+To price a route, `meterAndTime` walks the route polyline segment by segment. It assigns each segment to the zone containing its midpoint: highest priority wins, then smallest area, then lowest ID. It then scales segment lengths so their total matches the Mapbox road distance and duration. Miles outside any overridden zone are pooled and metered through the normal tiers.
+
+If zone data fails to load, pricing falls back to the plain formula with no zones.
+
+## Discounts
+
+The only discount in the ride pricing pipeline is a **destination discount** from the `Discounts` table. `GetBestDiscount` picks the row with the highest `discount_rate` whose `target_address` matches the ride's destination address and whose time window covers the request.
+
+- Discounted fare = base amount × (1 − `discount_rate`), never below 0. The base amount is the jittered fare, or the raw fare for `rounded` configs.
+- The discounted fare is then finalized like any fare. It's rounded up to a whole dollar in `rounded` mode and truncated to cents otherwise.
+- The ride stores `discount_id` and sets `is_discounted = true`.
+
+Coupons (`internal/service/coupon`) and referrals don't change ride fares.
+
+## Fallback pricing
+
+When a community has no live per-ride configs, or none match the ride types currently available, the engine uses `GetDefaultRidePrice`: $4.00 base, $2.00 per mile, and $0.50 per minute (`internal/utilities/config/constants.go`), with jitter-mode adjustment. It doesn't apply surge or zones.
+
+## Quote caching and confirm-time pricing
+
+- **Quote cache**: `buildVehicleOptions` caches the pre-discount prices in Redis under `price:` plus the community and rounded pickup and dropoff coordinates, for 5 minutes (`internal/data/redis/price_cache.go`). A repeat quote for the same trip within that window reuses the cached fares, including the same jitter draw.
+- **Confirm**: `ConfirmRide` doesn't read the quote cache and doesn't accept a price from the client. `determineRidePriceAndFleet` reruns `GetRidePrice` against the current config, surge, zones, and discount. It then selects the price matching the requested vehicle type **and** fleet, so another fleet's pricing for the same vehicle type can't shadow the rider's choice.
+
+<Note>
+Because confirm reruns the pipeline, a jitter-mode fare stored at confirm can differ slightly from the quoted fare. Config or surge changes between quote and confirm also apply.
+</Note>
+
+Test accounts marked in the dashboard (`is_test`) are quoted and charged $0.00 in every environment except `ENVIRONMENT=dev`, the default for local runs.
+
+## Dashboard previews
+
+The dashboard's pricing overview and editor use `GET /dashboard/pricing/overview` and `POST /dashboard/pricing/preview`. Previews price three fixed trips from `QuotePresets` (`presets.go`):
+
+| Preset | Distance | Duration |
+| --- | --- | --- |
+| Short | 1 mi | 3 min |
+| Average | 3 mi | 9 min |
+| Long | 6 mi | 18 min |
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Pricing engine | `yelo-api/internal/utilities/pricing/pricing.go` |
+| Tiers, zones, fare adjustment, jitter | `yelo-api/internal/utilities/pricing/tiers.go`, `zoned.go`, `adjustment.go`, `jitter.go` |
+| Dashboard preview helpers | `yelo-api/internal/utilities/pricing/preview.go`, `presets.go` |
+| Quote and confirm pricing | `yelo-api/internal/service/ride/rider.go` (`buildVehicleOptions`, `determineRidePriceAndFleet`) |
+| Pricing and zone models | `yelo-api/internal/models/community.go`, `pricing_adjustment.go`, `zone.go`, `zone_pricing.go` |
+| Global jitter store | `yelo-api/internal/data/repository/pricing_jitter.go` |
+| Surge | `yelo-api/internal/service/dashboard/supply_demand.go` |
+| Dashboard UI | `yelo-web/src/sites/dashboard/pages/PricingPage.tsx` |
