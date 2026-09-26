@@ -20,9 +20,9 @@ A fleet row (`Fleet` in `internal/models/fleet.go`) holds:
 | `stripe_merchant_id`, `stripe_status` | The fleet's Stripe connected account and its onboarding status. |
 | `primary_vehicle_type`, `supported_vehicle_types` | The vehicle types the fleet runs. |
 | `requires_confirmation_code` | Whether drivers must enter the rider's confirm code at pickup. |
-| `is_student_only` | Hides the fleet's ride types from riders without a verified student account. |
+| `is_student_only` | Hides the fleet's ride types from riders without a verified student account, and gives its options the verified-student badge. |
 | `has_owner_operators` | Marks the fleet as having owner-operator drivers. |
-| `is_active`, `deleted_at` | Inactive or deleted fleets can't accept joins and don't serve communities. |
+| `is_active`, `deleted_at` | Inactive or archived fleets can't accept joins and don't serve communities. `deleted_at` marks an archived fleet. |
 
 ### Service communities
 
@@ -76,22 +76,21 @@ For authorization, capture, and payout timing, see [Payments and payouts](/conce
 
 ## Fleet drivers and independent drivers
 
-A driver can belong to several fleets but has one **active fleet**: the `FleetDrivers` row with `is_active = TRUE`. See [Membership and payout routing](/engineering/fleets/membership-and-payout-routing). The active fleet decides the community they drive in, the rides they can accept, and where their fares go.
+A driver can belong to several fleets but has at most one **active fleet**: the `FleetDrivers` row with `is_active = TRUE`. See [Membership and payout routing](/engineering/fleets/membership-and-payout-routing). The active fleet decides the community they drive in, the rides they can accept, and where their fares go.
 
-When a driver's application activates and they have no active fleet, Yelo picks one in this order (`reconcileFleetAssignmentForUser` in `internal/service/driver/driver.go`):
+When a driver's application activates, or they go online, and they have no active fleet, Yelo picks one (`reconcileFleetAssignmentForUser` in `internal/service/driver/driver.go`):
 
-1. The first fleet the driver already belongs to.
-2. A fleet whose whitelist contains the driver's email.
-3. The primary fleet of the driver's community.
+1. If the driver already belongs to a non-archived fleet, the first one becomes active.
+2. Otherwise, the driver joins the primary fleet of the **default** community. That fleet must be an active owner-operator fleet with personal payouts.
 
-If none apply, the driver stays independent. Independent drivers are paid on their own Stripe account.
+The driver's own community primary fleet and the email whitelist are never used. If the default community has no primary fleet, the driver stays without a fleet and can't go online.
 
 ### Switching the active fleet
 
 A driver can switch to another fleet they belong to. The switch (`SetDriverActiveFleet` in `internal/data/repository/user_fleet.go`) is rejected if:
 
 - The driver is online, has a ride, or has an open driver session. The app shows **Finish Driving First**.
-- The driver isn't a member of the target fleet.
+- The driver isn't a member of the target fleet, or the fleet is inactive or archived.
 - The target fleet uses `fleet_merchant` but isn't payout-ready. The app shows **Fleet Payouts Unavailable**.
 
 A successful switch sets the driver's payout fleet for fleet-merchant fleets, clears it for owner-operator fleets, and moves the driver to the fleet's community.
@@ -104,15 +103,15 @@ Drivers join fleets in three ways.
   <Card title="Invitation link" icon="link" href="/fleets/driver-invitations">
     The driver opens a reusable `https://yelo.link/fleet-<code>` link and joins in the app.
   </Card>
-  <Card title="Admin assignment" icon="user-plus">
-    An admin assigns the driver from the dashboard (`PUT /dashboard/users/detail/{id}/fleet`).
+  <Card title="Admin membership edit" icon="user-plus">
+    An admin adds or removes fleets and picks the active fleet in the user sheet's **Fleet membership** section.
   </Card>
-  <Card title="Email whitelist" icon="list-check">
-    An admin whitelists a non-`.edu` email. The driver joins the fleet when their application activates.
+  <Card title="Default enrollment" icon="rotate">
+    A driver with no fleet is enrolled in the default community's primary fleet automatically.
   </Card>
 </CardGroup>
 
-Join links and admin assignment both go through the fleet join service (`internal/service/fleetjoin/fleet_join.go`). A join:
+Join links go through the fleet join service (`internal/service/fleetjoin/fleet_join.go`). A join:
 
 - Requires the fleet to pass `CanAcceptDriverJoins()`.
 - Deactivates the driver's other fleet memberships and makes this fleet active.
@@ -124,7 +123,9 @@ Join links and admin assignment both go through the fleet join service (`interna
   Joining never skips application steps. Owner-operator drivers still finish their personal vehicle and Stripe onboarding. When a fleet manages both vehicles and payouts, only the profile photo and license review remain. See [Driver onboarding](/concepts/driver-onboarding).
 </Warning>
 
-The whitelist (`FleetDriverWhitelist`) rejects `.edu` emails and emails that already belong to a Yelo user.
+Admin membership edits (`PUT /dashboard/users/detail/{id}/fleets`) differ from a join. They keep the driver's community, keep memberships that aren't explicitly removed, take the driver offline, and are blocked while the driver has an unfinished ride. See [Joins and invitations](/engineering/fleets/joins-and-invitations#admin-membership-editing).
+
+The API still stores email whitelist entries (`FleetDriverWhitelist`), but no dashboard page manages them and Yelo doesn't enroll drivers from them.
 
 ## Fleet-owned vehicles
 
@@ -136,6 +137,10 @@ Fleets can own shared vehicles that every member drives. Each physical vehicle i
 - Drivers must be offline to change vehicles.
 
 See [Fleet vehicles](/dashboard/fleet-vehicles) for inventory management and `yelo-api/docs/fleet-owned-vehicles.md` for the migration history.
+
+## Archiving a fleet
+
+Removing a fleet archives it. Yelo keeps the fleet row, ride and payment history, and the Stripe account reference. Archive is refused until the fleet has no active drivers or payout assignments, no open rides or driver sessions, no community that uses it as **Primary Fleet**, no unarchived vehicles, and no active QR payment links. Archiving disables the join link and whitelist, retires the fleet's service communities, and ends its pricing. See [Archive](/engineering/fleets/stripe-and-lifecycle#archive).
 
 ## Fleets in the dashboard
 
@@ -159,7 +164,8 @@ Dashboard user and lead tags include a derived `Fleet: <name>` tag for activated
 | Active fleet switching | `yelo-api/internal/data/repository/user_fleet.go` |
 | Auto fleet assignment | `yelo-api/internal/service/driver/driver.go` (`reconcileFleetAssignmentForUser`) |
 | Payout routing and fleet isolation | `yelo-api/internal/service/ride/driver.go` |
-| Whitelist | `yelo-api/internal/models/fleet_driver_whitelist.go`, `internal/service/dashboard/dashboard.go` |
-| Design notes | `yelo-api/docs/owner-operator-fleet-joins.md`, `docs/fleet-owned-vehicles.md`, `docs/fleet-community-dashboard.md` |
+| Admin membership edits | `yelo-api/internal/data/repository/driver_fleet_memberships.go`, `internal/service/dashboard/fleet_transfer.go` |
+| Fleet archive | `yelo-api/internal/data/repository/fleet_archive.go`, `migrations/000346_fleet_archive_reference_guards.up.sql` |
+| Design notes | `yelo-api/docs/owner-operator-fleet-joins.md`, `docs/fleet-owned-vehicles.md`, `docs/fleet-community-dashboard.md`, `docs/admin-fleet-transfers.md` |
 | Mobile join screen | `yelo-frontend/app/fleet-join/[code].tsx` |
 | Dashboard pages | `yelo-web/src/sites/dashboard/pages/FleetsPage.tsx`, `ManageFleetsPage.tsx` |

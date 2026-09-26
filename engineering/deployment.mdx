@@ -97,7 +97,7 @@ See [testing](/engineering/testing#mobile-e2e) for how the mobile suite uses thi
   </Step>
 </Steps>
 
-Build-time values come from GitHub repository variables (`VITE_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_SENTRY_DSN`, and the rest). They are inlined into the bundle, so never put a secret in a `VITE_` variable.
+Build-time values come from GitHub repository variables (`VITE_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_SENTRY_DSN`, and the rest). They are inlined into the bundle, so never put a secret in a `VITE_` variable. `firebase.yml` reads `VITE_SENTRY_DSN` from `vars.VITE_SENTRY_DSN`, but no repository variable with that name is set on `rideyelo/yelo-web`, so production dashboard builds ship without a Sentry DSN. See [Workflows](/engineering/ci/workflows).
 
 Each site's Firebase target maps to its own Hosting site in `.firebaserc`: `dashboard` to `yelo-dashboard-v2`, and each other site to `yelo-<site>`. Each site owns its Hosting headers and rewrites in `src/sites/<site>/firebase.json`. Run `pnpm firebase:config` after you edit one to regenerate the combined root `firebase.json`.
 
@@ -130,7 +130,7 @@ Mobile has two release paths. See [mobile releases](/engineering/mobile/releases
     `main` is always the next store version. The previous release branch, named for its version (for example `5.7.3`), receives OTA-safe backports until the next store version ships.
 
     - `backport-supported-release.yml` considers every merged pull request for the supported release. Add the `skip-supported-release-backport` label to opt out. Pull requests that touch native inputs are never backported automatically.
-    - `sync-frontend-release.yml` in `yelo-api` runs hourly and keeps a rolling draft pull request that squash-merges `main` onto the release branch named by the `PREVIOUS_RELEASE_BRANCH` variable. `app.json` and `eas.json` stay release-owned. Review it for OTA safety before you mark it ready.
+    - `sync-frontend-release.yml` in `yelo-api` is disabled in GitHub Actions. It used to keep an hourly rolling draft pull request from `main` onto the release branch. `backport-supported-release.yml` in `yelo-frontend` replaces it. See [Release pipelines](/engineering/ci/release-pipelines) and [Workflows](/engineering/ci/workflows).
     - `fingerprint.yml` comments on pull requests when native inputs change. The check is advisory on `main` and blocking on release branches.
   </Tab>
 </Tabs>

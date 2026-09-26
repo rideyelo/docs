@@ -1,0 +1,102 @@
+---
+title: "Support overview"
+description: "How to use the support section, look up a user or ride in the dashboard, and hand off to an engineering runbook"
+---
+
+This section helps ops and support staff answer questions from riders, drivers, and fleet managers. Every answer comes from the current code: the exact text the apps show, what actually triggers it, and which dashboard control you can use.
+
+| Page | Use it when |
+| --- | --- |
+| [User-facing messages](/support/user-facing-messages) | Someone quotes an error, alert, or banner and you need to know what caused it. |
+| [Rider FAQ](/support/rider-faq) | A rider asks about prices, charges, cancellations, tips, or why there are no rides. |
+| [Driver FAQ](/support/driver-faq) | A driver asks about their application, going online, ride cards, earnings, or Stripe. |
+| [Fleet manager FAQ](/support/fleet-manager-faq) | A fleet manager asks what they can do in the dashboard, or about join links, QR payments, hours, or payouts. |
+
+When a question turns out to be an incident, such as a stuck ride, a hold that never released, or a driver who can't go online for no visible reason, switch to the matching [runbook](/runbooks). Runbooks are written for engineers and on-call staff. They include SQL, logs, and fixes that support can't run.
+
+## Before you start
+
+Ask for these details first. They make every lookup faster.
+
+- **Name and phone number** or email on the account.
+- **Rider or driver**, and for drivers, which fleet they drive for.
+- **Roughly when** it happened, and the pickup or dropoff if it's about a ride.
+- **The exact message** they saw. Screenshots are best, because many flows replace server errors with generic text. See [User-facing messages](/support/user-facing-messages#how-the-apps-show-errors).
+- **App version.** In the mobile app it's at the bottom of **Profile** → **Settings**, shown as `Version X (build) · environment`. The user detail sheet in the dashboard also shows the app version and device under **Operations**.
+- **Support code.** If sign-in failed, the error screen may show `Support code:` followed by an ID. That's the API request ID. Engineers can search Cloud Logging for it as `jsonPayload.request_id`.
+
+## Look up a user
+
+You need the `admin` role to open a user's details. Interns can search and browse the directory for their community, but can't open the detail sheet. Fleet managers can't open **Users**. See [Dashboard roles and access](/administration/dashboard-roles).
+
+<Steps>
+  <Step title="Search">
+    Press <kbd>Cmd</kbd>+<kbd>K</kbd> (<kbd>Ctrl</kbd>+<kbd>K</kbd> on Windows) and type a name, phone number, or user ID. Or open **Users** and use **Search any name, phone, email, or ID…**. See [Find a user](/dashboard/user-directory#find-a-user).
+  </Step>
+  <Step title="Open the detail sheet">
+    Select the user. Check these sections first:
+    - **Profile**: the user's **Community** and **Home Community**. Most "no rides" and "outside service area" questions start here.
+    - **Driver Info**: **Payout fleet**, **Active fleet**, and **Online** for drivers.
+    - **Fleet membership**: every fleet the driver belongs to, with **Active** and **Archived** badges.
+    - **Operations**: app version, device, and the **Test account** toggle.
+    - **Recent Notifications**, **Ride History**, and **Drive History**.
+  </Step>
+  <Step title="Correct profile details if needed">
+    Select **Edit profile** to fix a name, phone number, **Active community**, or **Home community**. See [Edit a profile](/dashboard/user-directory#edit-a-profile).
+  </Step>
+</Steps>
+
+## Look up a ride
+
+<Steps>
+  <Step title="Find the ride">
+    Open **Rides** → **Trips**. Type in **Search rider, driver or ride ID...**. Use the **All**, **Active**, **Completed**, and **Canceled** buttons to narrow the list. Rides older than 24 hours are collapsed under **Show N older rides (24hr+)**. See [Trips tab](/dashboard/rides#trips-tab).
+  </Step>
+  <Step title="Open Ride Details">
+    Admins can select a row to open **Ride Details**. The **Ride Timeline** lists every event with its **Time**, **Elapsed**, **Event**, **Actor**, and **Transition**. Fleet managers see **Trips** for their fleets but can't open the details panel.
+  </Step>
+  <Step title="Read the timeline">
+    The event names tell you what happened. The ones support uses most:
+
+    | Event | What it tells you |
+    | --- | --- |
+    | `price_calculated` | The quote. Its metadata shows whether default pricing or surge applied. |
+    | `ride_confirmed` | The rider confirmed and the ride went on the board. |
+    | `ride_declined` | A driver declined, with the reason they picked. |
+    | `ride_auto_queued` | Auto-queue assigned the ride to a driver. |
+    | `payment_processing_failed` | The card couldn't be authorized when a driver accepted. |
+    | `ride_canceled`, `payment_canceled` | A cancellation, with `canceled_by` and `cancellation_fee`. |
+    | `no_drivers_available` | The request expired after 10 minutes without a match. |
+    | `tip_captured`, `tip_window_expired` | The tip was charged, or the 24-hour window closed without one. |
+
+    For every event and its metadata, see [Ride events](/reference/ride-events#event-types).
+  </Step>
+</Steps>
+
+To watch a market in real time, open **Live**. The **Drivers** table shows who is **On trip**, **Idle**, or **Offline**. The **Rides** table shows live rides, and completed or canceled rides from the last 24 hours. Select a row to open **Ride Details**. See [Live operations](/dashboard/live).
+
+## What support can't do in the dashboard
+
+Some requests have no dashboard control. Set expectations early and escalate with the ride ID and user ID.
+
+| Request | Why | Escalate to |
+| --- | --- | --- |
+| Refund a fare, fee, or tip, or release a card hold | Yelo has no endpoint, dashboard control, or script that refunds, captures, or cancels a payment. | [Payment failures and holds](/runbooks/payment-issues) |
+| Cancel a stuck paid ride | **Cancel ride silently** only works on $0 rides with no payment. | [Stuck or ghost ride](/runbooks/stuck-ride) |
+| Delete an account for a user | No admin or dashboard deletion endpoint exists. Users delete from the app or the web page. | [Account deletion and retention](/engineering/identity/account-deletion) |
+| Suspend or unsuspend an account | The **Banned** filter on **Users** shows suspended accounts, but no dashboard control sets or clears a suspension. | Engineering |
+| Change a driver's bank account or Stripe details | Stripe owns this. The driver updates it in Stripe from the app. | [Payout issues](/runbooks/payout-issues) |
+
+## Escalate to a runbook
+
+| What the user reports | Runbook |
+| --- | --- |
+| Stuck on a ride screen, or "You already have a ride" when there isn't one | [Stuck or ghost ride](/runbooks/stuck-ride) |
+| Driver can't go online, or is online but gets no rides | [Driver can't go online](/runbooks/driver-cannot-go-online) |
+| Rider sees no Yelo options or can't confirm | [Rider can't request](/runbooks/rider-cannot-request) |
+| A charge, hold, or cancellation fee looks wrong | [Payment failures and holds](/runbooks/payment-issues) |
+| Driver or fleet payout problems, restricted Stripe account | [Payout issues](/runbooks/payout-issues) |
+| A push notification never arrived | [Push notifications not delivered](/runbooks/push-notifications) |
+| Sign-in code never arrives, or "Too many attempts" | [SMS, OTP, and sign-in failures](/runbooks/sms-and-sign-in) |
+
+The [runbooks index](/runbooks) has the full triage table.

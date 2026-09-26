@@ -5,7 +5,7 @@ description: "How the mobile app reports presence, what POST /heartbeat/ and POS
 
 Presence is the answer to "who has the app open right now, and where". Two endpoints feed it, one Redis hash per user holds it, and three sorted sets per community index it. Postgres gets a delayed, lossy copy of the coordinates. This page traces a heartbeat end to end and lists every threshold that decides whether someone counts as online.
 
-For the admin view of this data, see [Presence](/dashboard/presence). For the driver background task that also writes presence, see [Driver location tracking](/engineering/location/driver-location-tracking).
+Admins see this data on the dashboard **Live** page. For the driver background task that also writes presence, see [Driver location tracking](/engineering/location/driver-location-tracking).
 
 ## Two write paths
 
@@ -92,7 +92,7 @@ All presence keys live in the shared Redis client. Constants are in `internal/da
 Every heartbeat runs a `ZREMRANGEBYSCORE` that removes members older than 120 seconds from both community sets. Readers also filter by score (`now - 120`), so a stale member is never counted even before pruning.
 
 <Note>
-  `driver:loc:{userID}` is written on every heartbeat, including riders'. The name reflects its only consumers (activation, the vehicles map layer fallback, and the dashboard warm-pool map), not who writes it. It is not refreshed by `POST /user/location`, so a backgrounded driver whose JS heartbeat timer has stopped keeps a `driver:loc` that ages up to 2 hours.
+  `driver:loc:{userID}` is written on every heartbeat, including riders'. The name reflects its only consumers (activation, the vehicles map layer fallback, and the warm-pool markers on the **Live** map), not who writes it. It is not refreshed by `POST /user/location`, so a backgrounded driver whose JS heartbeat timer has stopped keeps a `driver:loc` that ages up to 2 hours.
 </Note>
 
 ## What "online" means
@@ -102,12 +102,12 @@ The API has several independent definitions. They disagree by design, so check w
 | Definition | Source | Window | Used by |
 | --- | --- | --- | --- |
 | Presence online | `presence:{user}` exists | 120 seconds since last write | `IsOnline` (queued-ride offline grace), friends layer `is_online` |
-| Community online count | `community:online:{c}` score | 120 seconds | Heartbeat response `online_users_count`, dashboard **Online Users** |
-| Community driver count | `community:drivers:{c}` score | 120 seconds | Heartbeat response `online_drivers_count`, dashboard **Online Drivers** |
+| Community online count | `community:online:{c}` score | 120 seconds | Heartbeat response `online_users_count`. The **Live** market cards subtract online drivers from it to count online riders |
+| Community driver count | `community:drivers:{c}` score | 120 seconds | Heartbeat response `online_drivers_count`. The **Live** market cards count only members within 10 km of the community box (`populateLivePresence`) |
 | Online driver on the map | `community:drivers:{c}` score, plus hash `screen == "drive"` and a non-empty `vehicle` | 120 seconds | `GetVehiclePresences` (vehicles layer, driver options, direct-request checks) |
 | Auto-queue candidate | Same as above, plus `aq == "1"` | 120 seconds | `GetAutoQueueDrivers` |
 | DB online driver | `Users.is_online_driver` | Expires after 30 minutes without `last_pinged_driver` | Matching, `ShouldShareDriverLocation`, `/user/status` |
-| Warm pool driver | `community:warm:{c}` score | 60 minutes (`warmPoolMaxAge`) | Activation tiers, dashboard **Warm Pool** |
+| Warm pool driver | `community:warm:{c}` score | 60 minutes (`warmPoolMaxAge`) | Activation tiers, **Recently active** status in the **Live** driver table |
 | Market live | Any online driver, operating window, or last offline under 1 hour | See [Communities and zones](/concepts/communities-and-zones#operating-hours-and-market-status) | Rider app market status |
 
 ### DB driver liveness
@@ -147,7 +147,7 @@ Postgres coordinates feed the rider's view of the driver (`GET /ride/i/{id}/map-
 | Reader | Method | Notes |
 | --- | --- | --- |
 | Heartbeat response | `GetOnlineCount`, `GetOnlineDriverCount` | Scoped to the JWT community |
-| Dashboard presence | `GetOnlineMembers`, `GetDriverMembers`, `GetPresenceFields` | `internal/service/dashboard/presence.go`. The page polls every 10 seconds |
+| Dashboard **Live** page | `GetOnlineCount`, `GetDriverMembers`, `GetPresenceFields` | Market cards in `internal/service/dashboard/supply_demand.go` (`populateLivePresence`). Map markers from `/dashboard/presence/map` in `presence.go`. The page polls every 10 seconds |
 | Vehicles map layer | `GetVehiclePresences` | Pipelined `HMGET` of `lat`, `lng`, `orient`, `vehicle`, `screen`, `ts`, `aq`. Logs a warning with the count of rejected presences |
 | Driver options and direct requests | `GetVehiclePresences` | `internal/service/ride/driver_options.go`, `rider.go` |
 | Friends layer | `GetPresenceBatch` | `lat`, `lng`, `ts` only |
@@ -173,13 +173,13 @@ Postgres coordinates feed the rider's view of the driver (`GET /ride/i/{id}/map-
 
 <AccordionGroup>
   <Accordion title="The warm pool is never filled">
-    Only `PresenceCache.GoOffline` and `ActivationCache.AddToWarmPool` add members to `community:warm:{c}`, and neither has a caller outside tests. Heartbeats only remove members. Unless something outside the API writes that key, the dashboard **Warm Pool** card reads zero and activation's warm-pool tier finds no candidates.
+    Only `PresenceCache.GoOffline` and `ActivationCache.AddToWarmPool` add members to `community:warm:{c}`. `AddToWarmPool` has no caller outside tests. `GoOffline` is called only by `clearFleetEditPresence` in `internal/service/dashboard/fleet_transfer.go`, when an admin transfers a driver to another fleet or edits their fleet memberships. Going offline in the app never adds a driver. Heartbeats only remove members. The warm pool therefore holds only drivers whose fleet an admin just changed, so activation's warm-pool tier and the **Recently active** status on the **Live** page rarely have anyone in them.
   </Accordion>
   <Accordion title="An online driver off the drive screen drops out of the driver set">
-    `community:drivers:{c}` only gets a member when the hash's `screen` is exactly `drive`. An online driver who opens the map tab or profile sends `screen: map` or `profile`, which overwrites the hash. Within 120 seconds they stop counting in **Online Drivers**, disappear from the vehicles layer, and stop being offered as a driver option. They stay `is_online_driver` in Postgres.
+    `community:drivers:{c}` only gets a member when the hash's `screen` is exactly `drive`. An online driver who opens the map tab or profile sends `screen: map` or `profile`, which overwrites the hash. Within 120 seconds they drop out of the online driver count on the **Live** page, disappear from the vehicles layer, and stop being offered as a driver option. They stay `is_online_driver` in Postgres.
   </Accordion>
   <Accordion title="Substring matching catches unrelated routes">
-    `pathname.includes('/drive')` also matches `/driver-earnings` and `/driver-signup`. Those routes get the 10-second cadence. `/driver-earnings` maps to screen `drive` (or `drive_offline`), so an online driver checking earnings still counts as a driver. `/ride` also matches `/ride-matching`.
+    `pathname.includes('/drive')` also matches `/driver-earnings`, `/driver-marketing`, and `/driver-signup`. Those routes get the 10-second cadence. `/driver-earnings` and `/driver-marketing` map to screen `drive` (or `drive_offline`), so an online driver on those screens still counts as a driver. `/ride` also matches `/ride-matching`.
   </Accordion>
   <Accordion title="A stationary user can stop heartbeating">
     Heartbeats require a fix no older than 60 seconds. The foreground watcher only runs while a map or ride-planning screen needs it, and ongoing tracking uses a 50 m distance filter. On a screen without tracking, or when the device does not move, `getLastPosition()` can return `null` and every heartbeat is skipped. The user's presence expires 120 seconds later.

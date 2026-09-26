@@ -411,7 +411,7 @@ Membership errors:
 
 ## Gotchas and edge cases
 
-- **Email changes block instead of creating.** The product page says Yelo recreates contacts as unsubscribed after prior contact. In code, prior contact without an observed opt-out blocks with `subscription_review_required`.
+- **Email changes block instead of creating.** A user who has had a Resend contact and has no observed opt-out is blocked with `subscription_review_required` when their email changes (`service.go:339-347`, `resend.go:264`). Someone must review and replay each one; nothing recreates the contact automatically.
 - **Daily revision bumps unblock everything.** `SetProviderReady` bumps `config_revision` about every 24 hours, and each reconcile page bumps `desired_version`. Blocked rows retry daily, not permanently.
 - **Segment runs scan every user.** Each run calls `MarketingProfiles`, which runs `ReadContactProfiles` with ride-count laterals for all non-deleted, non-test users. It repeats every dispatch (about 5 s) while any segment has pending changes.
 - **Segment throughput is capped.** One segment and at most 50 membership changes per job. A 1,000-member initial load takes at least 20 runs.

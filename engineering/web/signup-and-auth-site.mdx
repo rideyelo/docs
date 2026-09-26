@@ -69,6 +69,10 @@ Every request goes through `authV3Fetch` (`authV3Fetch.ts`): a 12-second `AbortC
 
 The API base is `authV3APIBaseURL()`: `VITE_API_URL`, or `https://api.joinyelo.com` when a production build has a relative value.
 
+### App recovery
+
+For an app transaction whose secret is missing or expired, `AppRecovery` navigates to `com.rideyelo://auth/v3/callback?error=web_recovery` when the app advertised `app_recovery=1` (captured and stored with the transaction). Without that capability it shows "Close this browser to return to Yelo". The recovery URL is a signal, not a credential. The app resumes with its own stored secret. The canonical web redirect is `/auth/v3/callback`, and `/auth/v3` is still accepted.
+
 ### Terminal errors
 
 `conflict`, `account_merge_required`, `verify_existing_account`, and `expired` replace the page with `TerminalError`. Configuration failures show the same screen with **Try again**, which resets the cached config and acceptance promises. Every error screen shows the support phone, email, and the `request_id` from the error envelope as a "Support ID".
@@ -95,7 +99,7 @@ People who reach `/auth/v3` without a request secret, for example from a tip lin
     After the provider or OTP step, the API redirects to the web callback with `code` and `state`. `completeAuthV3WebFlow()` checks `state`, calls `POST /authv3/token` with `credentials: 'include'` so the API can set its refresh cookie, stores the returned JWT with `setSignupToken()`, and rewrites the URL to `/auth/v3` plus the saved return search.
   </Step>
   <Step title="Route to the intent">
-    `authV3WebCompletionPath()` maps `intent=world-cup` to `/world-cup/claim?auth=complete` and `intent=tip` to `/pay/tip/<slug>?auth=complete[&amount=]`, or `?status=success&signed_up=true` when `after=tip-success`. Otherwise the page shows `WebHandoff` with an **Open Yelo** link.
+    `authV3WebCompletionPath()` maps `intent=world-cup` to `/world-cup/claim?auth=complete` and `intent=tip` to `/pay/tip/<slug>?auth=complete[&amount=]`, or `?status=success&signed_up=true` when `after=tip-success`. Otherwise the page shows `WebHandoff` with an **Open Yelo** link. On current main the intent is stripped before this mapping runs, so every web completion shows `WebHandoff`. See [Gotchas and edge cases](#gotchas-and-edge-cases).
   </Step>
 </Steps>
 
@@ -121,13 +125,13 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 
 ## Account deletion
 
-`/delete-account` runs Auth v2 phone OTP (`POST /authv2/phone/request-otp`, `/verify-otp`). Only a response with `status: 'authenticated'` and a token can continue (`classifyVerifyResponse`), so Google- or Apple-only Auth v3 accounts cannot delete here. The page then loads `GET /user/current-user`, shows a masked email or last four phone digits, requires the word `DELETE`, and calls `DELETE /user/i/{id}`. A `401` or `404` on that call is treated as already deleted, because `UserService.Delete` commits `is_deleted` before it wipes details.
+`/delete-account` runs Auth v2 phone OTP (`POST /authv2/phone/request-otp`, `/verify-otp`). Only a response with `status: 'authenticated'` and a token can continue (`classifyVerifyResponse`), so Auth v3 accounts without an email (phone sign-ups) or without a phone (web Google or Apple sign-ups) can't delete here. The page then loads `GET /user/current-user`, shows a masked email or last four phone digits, requires the word `DELETE`, and calls `DELETE /user/i/{id}`. A `401` or `404` on that call is treated as already deleted, because the identity transaction can commit `is_deleted` and a later step (the legacy scrub or the response) can still fail. The comment in `deleteAccount.ts` says `is_deleted` is committed before details are wiped, but each scrub sets both in one `UPDATE`.
 
 ## Browser storage and cookies
 
 | Key | Type | Written by | Purpose |
 | --- | --- | --- | --- |
-| `yelo.auth-v3.request-record-v1` | `sessionStorage` | `requestSecret.ts` | The request secret and its context (`id`, `app`, `transactionID`, `recovery`) committed together. Cleared after an app handoff. |
+| `yelo.auth-v3.request-record-v1` | `sessionStorage` | `requestSecret.ts` | The request secret and its context (`id`, `app`, `transactionID`, `recovery`) committed together. An app transaction survives a reload when the history marker matches, or when the URL has `channel=app` and the same `transaction_id`. Cleared after an app handoff. |
 | `yeloAuthV3` | `history.state` | `requestSecret.ts` | Binds the stored record to this history entry so an unrelated visit cannot adopt it. Never holds the secret. |
 | `yelo.auth-v3.request-secret`, `yelo.auth-v3.request-context` | `sessionStorage` | Legacy | Only removed now; never read. |
 | `yelo.auth-v3.web-pending` | `sessionStorage` | `webFlow.ts` | PKCE `state`, `codeVerifier`, redirect URI, and return search |
@@ -137,7 +141,7 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 | `dub_id` | Cookie (read only) | Dub | Fallback click ID when `?dub_id=` is absent |
 | Dub analytics cookie | Cookie, `.joinyelo.com`, 90 days | `renderSite({ dubAnalytics })` | Main bundle only |
 
-`signupSession.ts` installs an axios interceptor on import. It attaches the token only to signup paths. On a `401` it calls `POST /authv3/session/refresh` with credentials once, retries the request, and clears the token if the refresh fails. A `401` whose body marks the account deleted clears the token and sends the browser to `/`.
+`signupSession.ts` installs an axios interceptor on import. It attaches the token only to signup paths. On a `401` it calls `POST /authv3/session/refresh` with credentials and retries that request once (`_yeloAuthRetried`). Concurrent 401s in one tab share a single module-level refresh promise. Other tabs don't share it. A failed refresh clears the token. A `401` whose body marks the account deleted clears the token and sends the browser to `/`.
 
 ## Analytics
 
@@ -159,7 +163,7 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 
 ## Gotchas and edge cases
 
-- **Web completion likely loses the intent.** On the callback load, `AuthV3Page` calls `initializeAuthV3Analytics()` before `authV3WebCompletionPath(window.location.search)` (`AuthV3Page.tsx:595-596`). The analytics initializer rewrites the URL to `sanitizedAuthV3Search()`, which keeps only correlation keys and drops `intent`, `tip_slug`, `amount`, and `after`. The completion path then sees no intent and the user lands on the generic **Open Yelo** screen instead of the tip or World Cup page. Verify end to end before relying on the redirect.
+- **Web completion loses the intent.** On the callback load, `completeAuthV3WebFlow()` restores the saved return search with `replaceState`, so `intent`, `tip_slug`, `amount`, and `after` are briefly back in the URL. Its `.then` then calls `initializeAuthV3Analytics()` before `authV3WebCompletionPath(window.location.search)` (`AuthV3Page.tsx:595-596`). The provider round trip was a full page load, so analytics initializes again, and `sanitizedAuthV3Search()` rewrites the URL to the safe correlation keys only. The completion path then sees no intent, and the user lands on the generic **Open Yelo** screen instead of the tip or World Cup page. Computing the path from the pending record's `returnSearch` would avoid this.
 - **Stale comment about tip config.** The preview stub in `App.tsx` says the tip config "needs a verified session". `GET /tips/{slug}` is public (`tipping/routes.go`); only `visit` and `checkout` need a token.
 - **Authenticated tippers see a signup prompt.** Stripe returns to `?status=success&checkout=yelo` without `signed_up=true`, so `TipComplete` still shows **continue with yelo signup** after a signed-in tip.
 - **Two app schemes.** Auth v3 uses `VITE_AUTH_V3_APP_SCHEME` (default `com.rideyelo`, `com.rideyelo.e2e` for maestro). The fleet invite page on the `invite` site uses `yelo:///`.

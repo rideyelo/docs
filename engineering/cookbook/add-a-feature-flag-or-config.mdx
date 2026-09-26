@@ -1,0 +1,161 @@
+---
+title: "Add a feature flag or config value"
+description: "Recipe for choosing and wiring a runtime switch: an API environment variable through config.go, .env.example, and the release trigger; a per-request X-Features capability; a mobile experiment; or an admin-editable database setting."
+---
+
+Yelo has four kinds of switch. Each one has a different owner and a different way to change it. Pick the kind first, then follow its recipe. [Feature flags and runtime gates](/reference/feature-flags) lists every switch that exists today.
+
+| Kind | Who changes it | How it changes | Use it for |
+| --- | --- | --- | --- |
+| API environment variable | Engineers | New Cloud Run revision from the release trigger | Secrets, provider credentials, kill switches, staged rollouts across all users |
+| `X-Features` request header | The client build | App release or OTA update | Server behavior that only newer clients can handle |
+| Mobile experiment | Admins per community, then each user opts in | Dashboard edit and app setting, no deploy | Trying a mobile surface with a few people |
+| Admin-editable setting | Admins in the dashboard | Database write, no deploy | Operational tuning such as pricing, activation, and templates |
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#279](https://github.com/rideyelo/yelo-api/pull/279) | A new secret (`METRICS_AUTH_TOKEN`): config field, fail-closed default, `.env.example`, and the Secret Manager entry appended to `_RUNTIME_SECRET_REFS` on the release trigger |
+| [yelo-api#197](https://github.com/rideyelo/yelo-api/pull/197) | A group of calendar settings in their own file (`internal/utilities/config/calendar.go`) with separate validation, plus the change that moved runtime env vars onto the trigger |
+| [yelo-api#232](https://github.com/rideyelo/yelo-api/pull/232) | An admin-editable singleton settings table (`PricingJitterSettings`) with an admin-only endpoint and a dashboard control ([yelo-web#141](https://github.com/rideyelo/yelo-web/pull/141)) |
+| [yelo-frontend#399](https://github.com/rideyelo/yelo-frontend/pull/399) | A new experiment key that gates both the settings row and the route |
+
+## Recipe: API environment variable
+
+<Steps>
+  <Step title="Add the field and loader">
+    In `internal/utilities/config/config.go`, add a field to the right nested struct and read it in `Load()` with the typed helper:
+
+    ```go
+    WidgetRefreshEnabled: getEnvBool("WIDGET_REFRESH_ENABLED", false),
+    ```
+
+    Use `getEnv`, `getEnvBool`, `getEnvInt`, `getEnvFloat`, `getEnvDuration`, or `getEnvAsSlice`. Pure feature flags go in `FeatureFlags` via `loadFeatureFlags()`. Larger groups get their own file, as `calendar.go`, `contact_sync.go`, and `quo.go` do.
+
+    Pick a default that is safe when the variable is missing in production. New integrations and anything that contacts people default to off.
+  </Step>
+  <Step title="Validate it">
+    If the app can't run correctly without the value, add it to `Validate()` so startup panics with a clear message. If enabling it in E2E would contact real people or providers, reject it in `validateE2EIntegrations`.
+  </Step>
+  <Step title="Read it from the config, not the environment">
+    Pass the value through constructors from `service.NewService` (`internal/service/service.go`), as `cfg.Features.DriverVerifiedPhoneRequired` is. Don't call `os.Getenv` in service code. A few legacy values do, and those are hard to test.
+  </Step>
+  <Step title="Document it for local development">
+    Add the variable to `.env.example` with a safe local value and a comment explaining when to change it.
+  </Step>
+  <Step title="Test both states">
+    Add a config test like `features_test.go` that sets the variable with `t.Setenv` and calls the loader. Test the behavior by setting the field on the struct you pass in.
+  </Step>
+  <Step title="Configure production">
+    Production runtime configuration lives on the `yelo-api-release-manual` Cloud Build trigger, not in the repo:
+
+    - Plain values: append `NAME=value` to the `_RUNTIME_ENV_VARS` substitution.
+    - Secrets: create the secret in Secret Manager in `prod-yelo`, grant the runtime service account access, and append `NAME=secret-name:latest` to `_RUNTIME_SECRET_REFS`.
+
+    `cloudbuild.yaml` passes these to `gcloud run deploy` as `--update-env-vars` and `--update-secrets`, and fails if either is empty. The change applies on the next release. Record the trigger change in the PR description as required non-code configuration.
+  </Step>
+  <Step title="Update the references">
+    Add the variable to [Configuration](/engineering/api/configuration), [Environment variables](/reference/environment-variables), and, if it's a behavior switch, [Feature flags and runtime gates](/reference/feature-flags).
+  </Step>
+</Steps>
+
+## Recipe: X-Features capability
+
+Use `X-Features` when the server must change a response only for clients that understand the new shape. The client sends `X-Features: tips,driver-options` and the handler checks for a token.
+
+<Steps>
+  <Step title="Add the token">
+    Add a constant to `internal/utilities/features/features.go`:
+
+    ```go
+    FeatureWidgets = "widgets"
+    ```
+  </Step>
+  <Step title="Read it in the handler">
+    Check it in the handler and pass a plain boolean down. Services never see the request:
+
+    ```go
+    req.WidgetsEnabled = features.HasFeature(c.Request(), features.FeatureWidgets)
+    ```
+
+    Mark the model field `json:"-"` so clients can't set it in the body, as `DriverOptionsEnabled` does in `internal/models/ride.go`.
+  </Step>
+  <Step title="Send it from the client">
+    Add the token to the header on the generated mutation in the mobile app. For ride creation, that's in `hooks/usePreRideRequest.ts`:
+
+    ```ts
+    request: { headers: { 'X-Features': 'tips,driver-options,widgets' } }
+    ```
+  </Step>
+</Steps>
+
+## Recipe: mobile experiment
+
+An experiment is on for a user only when **both** `Communities.active_experiments` and `Users.active_experiments` contain the key. The app evaluates this. The API only stores the lists.
+
+<Steps>
+  <Step title="Register the key">
+    Add it to `EXPERIMENTS` in `yelo-frontend/lib/experiments/index.ts`. Never inline the string at a call site.
+
+    ```ts
+    widgetPreview: 'widget-preview',
+    ```
+  </Step>
+  <Step title="Gate the surface">
+    Use `<ExperimentGate experiment={EXPERIMENTS.widgetPreview}>` for inline UI, and `useExperimentEnabled` for a boolean. If a route must redirect when the experiment is off, use `useExperiment` and wait until `loading` is false before redirecting. On `error`, fail open.
+  </Step>
+  <Step title="Turn it on">
+    An admin adds the key as free text under **Experimental Features** in the dashboard community editor. Users in that community then see it under **Settings → Experiments** and opt in there (`PUT /user/experiments`).
+  </Step>
+</Steps>
+
+## Recipe: admin-editable setting
+
+Use a database setting when operators need to tune a value without a deploy.
+
+<Steps>
+  <Step title="Store it">
+    Add a migration. For a global value, use a singleton table like `PricingJitterSettings`: `singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton)`, with the default row inserted in the same migration. For a per-community value, add a column to `Communities` or a table keyed by `community_id`. See [Add a migration](/engineering/cookbook/add-a-migration).
+  </Step>
+  <Step title="Mirror the default in code">
+    Add a model with a `Validate()` method and a `Default...()` constructor in `internal/models`, so reads can fall back when the row is missing. `DefaultPricingJitterSettings()` matches the seeded row.
+  </Step>
+  <Step title="Expose read and write endpoints">
+    Add dashboard routes behind the admin gate. See [Add an endpoint](/engineering/api/adding-an-endpoint) and [Dashboard authorization](/engineering/fleets/dashboard-authorization). If the value is cached, invalidate or shorten the cache on write, because other instances keep serving the old value until their cache expires.
+  </Step>
+  <Step title="Build the control">
+    Add the form to the relevant dashboard page. See [Add a dashboard page](/engineering/web/adding-a-dashboard-page).
+  </Step>
+</Steps>
+
+## Checklist
+
+- [ ] The switch kind matches who needs to change it and how fast.
+- [ ] The default is safe when unset, and production gets an explicit value.
+- [ ] Required values fail validation at startup. Values that contact real people or providers are rejected in E2E.
+- [ ] `.env.example` and the reference pages are updated.
+- [ ] Trigger or Secret Manager changes are listed in the PR description.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Config is read once">
+    `config.Load()` memoizes behind `sync.Once`. Changing an environment variable on a running instance does nothing. A trigger change takes effect only when the next release deploys a new revision.
+  </Accordion>
+  <Accordion title="Unparseable values fall back silently">
+    `getEnvBool("X", true)` with `X=yes` returns `true` because `yes` doesn't parse, not because it means yes. Use `true` and `false` literally.
+  </Accordion>
+  <Accordion title="CORS_TRUSTED_ORIGINS replaces the defaults">
+    If the variable is set, its list replaces the built-in origin list in `corsTrustedOrigins()` completely. Adding one origin means repeating all the others.
+  </Accordion>
+  <Accordion title="Browsers can't send X-Features">
+    CORS preflight allows only `Authorization, Content-Type, Accept, Origin, X-Requested-With` (plus `X-API-Version` on Auth v3 paths). A web client sending `X-Features` would fail preflight. Today only the mobile app sends it.
+  </Accordion>
+  <Accordion title="X-Features is not in the contract">
+    The header isn't declared in `openapi.json`, so Orval doesn't type it. Clients set it by hand on the request options.
+  </Accordion>
+  <Accordion title="Experiment keys are free text">
+    The dashboard doesn't validate keys against the app. A typo in the community editor silently leaves the experiment off. The experiments screen shows any key the community has, even ones the app doesn't use.
+  </Accordion>
+</AccordionGroup>

@@ -75,7 +75,7 @@ Rider and driver mutations go through `hooks/useRideCommand.ts`. It captures the
 | Queue detail | `GET /driver/queue` | Every 10s while there are queued rides |
 | Current ride map | `GET /ride/i/:id/map-details` | Every 10s, only while `/drive` is visible |
 | Vehicles | `driverGetVehicles` | On mount and on demand |
-| Demand dashboard | `driverGetDemandDashboard` | On mount |
+| Demand dashboard | `driverGetDemandDashboard` | On mount. No component reads the result. |
 
 The provider filters the board through locally declined and accepted ids (`eligibleBoardRides`) and picks the active card (`selectActiveCardRide`). If a card disappears in under 15 seconds without being accepted, it sets `tooSlowRideId` so the UI can tell the driver someone else took it.
 
@@ -95,6 +95,8 @@ The provider filters the board through locally declined and accepted ids (`eligi
   </Step>
   <Step title="Update local state">
     Sends an immediate heartbeat with the driver presence override, invalidates `currentUser`, registers `user_role: driver` in analytics, and sets audio to play in silent mode so ride alerts are audible.
+
+    `useCurrentUser` registers `user_role: rider` after every successful `currentUser` fetch (`api/helpers/authUser.ts:102`), and the `setOnline` error path also registers `rider`. So an online driver's `user_role` super property usually reads `rider`.
   </Step>
 </Steps>
 

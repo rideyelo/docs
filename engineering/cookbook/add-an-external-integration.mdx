@@ -1,0 +1,143 @@
+---
+title: "Add an external integration"
+description: "Recipe for a new third-party client in yelo-api: a package under internal/data, failure containment with circuit breakers, retries, or River, configuration and E2E safety, service wiring, mocks, and tests against an httptest server."
+---
+
+Third-party clients live in `yelo-api/internal/data/<provider>`. Services depend on a small interface, and handlers never call a provider directly. This recipe follows the shape of the existing clients. For the current list of integrations and their breakers, see [Integrations](/engineering/api/integrations).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#197](https://github.com/rideyelo/yelo-api/pull/197) | A new read-only client (`internal/data/googlecalendar`) with a bounded response size, redirect refusal, and typed error codes. Retries are left to River. Settings live in `internal/utilities/config/calendar.go`, and production values are on the release trigger. |
+| [yelo-api#227](https://github.com/rideyelo/yelo-api/pull/227) | A rate-limited client (`internal/data/resend`) with a Redis-backed `Gate` shared across replicas, `Retry-After` handling, an E2E guard on `CONTACT_SYNC_RESEND_ENABLED`, and a dedicated secret on the release trigger. |
+| [yelo-api#61](https://github.com/rideyelo/yelo-api/pull/61) | Classifying Google Maps failures so quota and provider errors trip the breaker, while valid "no route" answers and caller cancellations don't. |
+
+## Choose a failure strategy
+
+| The call happens | Contain failures with | Examples |
+| --- | --- | --- |
+| On a user request, and must answer quickly | `circuitbreaker.Execute` around a `retry.NewNetworkRetrier` | Twilio, Stripe, Mapbox, Google Maps, Google Places |
+| In a River job | River's retry and backoff. Classify errors and return them, and don't retry inside the job. | Google Calendar, Resend contacts, Quo |
+| Against a shared rate budget | A `Gate` that waits for admission and records cooldowns in Redis, plus River retries | Resend contacts, Quo |
+
+## Recipe
+
+<Steps>
+  <Step title="Create the package and interface">
+    Add `internal/data/widgetco/` with the interface services depend on, usually in `provider.go`, and the implementation in `widgetco.go` or `client.go`:
+
+    ```go
+    type Provider interface {
+    	GetWidget(ctx context.Context, id string) (models.Widget, errors.Error)
+    }
+    ```
+
+    Return `errors.Error` from `internal/utilities/errors`, not a plain `error`. Callers and the breaker classify outcomes by error type. Map the provider's DTOs to `internal/models` types inside the package, so provider shapes don't leak into services.
+  </Step>
+  <Step title="Build the HTTP client defensively">
+    Follow `googlecalendar.NewClient` and `resend.NewClient`:
+
+    - Set an explicit `http.Client.Timeout`.
+    - Refuse redirects with `CheckRedirect` returning `http.ErrUseLastResponse`, unless the provider needs them.
+    - Keep `baseURL` as a field so tests can point it at an `httptest.Server`.
+    - Read bodies through `io.LimitReader`.
+    - Never put request URLs, bodies, or credentials into returned errors. `resend` strips the `url.Error` because the URL can contain an email address.
+  </Step>
+  <Step title="Contain failures">
+    For request-path calls, create a named breaker once in the constructor, and wrap each call:
+
+    ```go
+    cb := gobreaker.NewCircuitBreaker[any](circuitbreaker.NewSettings("widgetco", l))
+
+    result, err := circuitbreaker.Execute(c.cb, func() (models.Widget, error) {
+    	var out models.Widget
+    	retryErr := retry.NewNetworkRetrier(ctx, c.logger).Do(func() error {
+    		w, callErr := c.call(ctx, id)
+    		if callErr != nil {
+    			return classify(callErr)
+    		}
+    		out = w
+    		return nil
+    	})
+    	return out, retryErr
+    })
+    ```
+
+    - Classify 4xx and bad-input responses as `ValidationError`, `NotFoundError`, or `InputError`. The breaker counts them as successes and `shouldRetry` doesn't retry them.
+    - Wrap caller cancellations with `circuitbreaker.Exclude` so they don't affect breaker health.
+    - Return `retrygo.Unrecoverable(err)` for failures that retrying can't fix, such as a provider rate limit on an OTP send. The Twilio client does this.
+    - If the provider defines its own transient errors, pass a predicate to `retry.NewNetworkRetrierWithRetryIf`.
+
+    Opening a breaker posts a Slack alert and closing it posts a recovery. Pass a `metrics.MetricsProvider` as the third argument to `NewSettings` to record breaker metrics.
+  </Step>
+  <Step title="Trace it">
+    Start a span in each public method, following the Twilio client:
+
+    ```go
+    _, end := otel.CustomSpan(ctx, "widgetco-client", "Client.GetWidget")
+    defer end(&outErr)
+    ```
+  </Step>
+  <Step title="Add configuration">
+    Add the credentials and an enable flag to `internal/utilities/config`, in `config.go` or in a new file for a larger group. Add them to `.env.example`. Follow [Add a feature flag or config value](/engineering/cookbook/add-a-feature-flag-or-config#recipe-api-environment-variable) for validation and for the release trigger.
+
+    If the integration can contact people or change systems outside Yelo, add its secret to the must-be-unset map in `validateE2EIntegrations`, or reject its enable flag there. E2E then refuses to start with it configured.
+  </Step>
+  <Step title="Wire it">
+    Construct the client in `service.NewService` (`internal/service/service.go`) and pass it to the services that need it. If it's disabled or unconfigured, pass `nil` or a no-op implementation, and have callers handle that. For River workers, add it to `notifyqueue.Deps` in `cmd/api/main.go`.
+  </Step>
+  <Step title="Generate mocks">
+    Add the package to `.mockery.yaml`, following the existing `internal/data/*` entries:
+
+    ```yaml
+    api.rideyelo.com/internal/data/widgetco:
+      config:
+        all: true
+        dir: "{{.InterfaceDir}}/mocks"
+        pkgname: "mocks"
+    ```
+
+    Run `make mocks` and commit `internal/data/widgetco/mocks/`. `make mocks-check` fails on stale or orphaned mocks.
+  </Step>
+  <Step title="Test it">
+    - **Client tests** start an `httptest.Server`, point `baseURL` at it, and assert the request (method, path, headers, body) and how each status code maps to an error. `googlecalendar/client_test.go` and `resend/client_test.go` are the models. Include 429, 5xx, oversized bodies, and redirects.
+    - **Service tests** use the generated mock from `mocks/`.
+    - Never call the real provider from tests.
+
+    Run `make check`, which includes lint, generated-code checks, and the coverage floor.
+  </Step>
+  <Step title="Document it">
+    Add the provider to [Integrations](/engineering/api/integrations) with its purpose, client path, configuration, and breaker name. List new variables in [Environment variables](/reference/environment-variables).
+  </Step>
+</Steps>
+
+## Checklist
+
+- [ ] The client is in `internal/data/<provider>` behind an interface, and returns `errors.Error`.
+- [ ] Timeouts, a redirect policy, and response size limits are set.
+- [ ] Request-path calls use a named breaker and a retrier, and 4xx responses don't trip the breaker.
+- [ ] Job-path calls return classified errors and let River retry.
+- [ ] Configuration has a safe default, is in `.env.example`, and is on the release trigger.
+- [ ] E2E refuses the integration's secret or enable flag if it can contact people.
+- [ ] Mocks are generated and committed, and client tests use `httptest`.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Retries inside the breaker">
+    The existing clients run the retrier inside `circuitbreaker.Execute`. The breaker sees one outcome per call, not per attempt, so it takes five fully retried failures to trip. With five attempts each, that can be 25 provider requests.
+  </Accordion>
+  <Accordion title="Retrying non-idempotent calls">
+    Retrying a create or send after a timeout can duplicate it. Use the provider's idempotency key if it has one, as Stripe does, or make the call unrecoverable after the request may have reached the provider.
+  </Accordion>
+  <Accordion title="Test phones">
+    `+1555` test numbers short-circuit Twilio and Photon before any provider work (`phone.IsTestPhone`). A new messaging integration should do the same, or test accounts will attempt real sends.
+  </Accordion>
+  <Accordion title="Rolling deploys with different settings">
+    During a release, old and new revisions run together with possibly different configuration. River queues for a provider should only be consumed by replicas that have its credentials. `queueConfigs` does this for contact sync queues.
+  </Accordion>
+  <Accordion title="Shared breaker names">
+    Breaker names label logs, alerts, and metrics. Reusing a name across two clients makes the alerts ambiguous. Pick a unique name per dependency, or per endpoint when one endpoint can fail independently, as `google-places` and `google-geocoding` do.
+  </Accordion>
+</AccordionGroup>

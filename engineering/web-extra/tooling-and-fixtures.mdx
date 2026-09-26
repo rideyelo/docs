@@ -1,0 +1,60 @@
+---
+title: "Web build helpers and fixtures"
+description: "The yelo-web scripts and dev fixtures not covered by the multisite docs: the home-site build wrapper, the /fleets coverage map generator, the school-management UI fixture, and Cloudflare worker package scripts."
+---
+
+Most `yelo-web` scripts are covered in [Multisite](/engineering/web/multisite) and [Public sites](/engineering/web/public-sites). This page covers the remaining helpers.
+
+## Script catalog
+
+| Script | Run | Purpose |
+| --- | --- | --- |
+| `scripts/build-partner.mjs` | `node scripts/build-partner.mjs` | Builds the `home` site: `vite build` with `SITE=home`, then `scripts/emit-partner-html.mjs`. It stops on the first failing step and doesn't typecheck |
+| `scripts/gen-fleets-map.mjs` | `node scripts/gen-fleets-map.mjs` | Regenerates `src/sites/home/public/map/us-growth-map.svg`, the coverage map on `/fleets` |
+| `tools/testing/schools/` | `pnpm exec vite --config tools/testing/schools/vite.config.ts` | Standalone fixture for the dashboard school-management UI |
+| `tools/vite/home/gen-home-images.ts` | `pnpm images:home` | Home-site responsive images. See [Public sites](/engineering/web/public-sites) |
+| `scripts/format-firebase-deploy-slack.sh` | CI | Formats the Firebase deploy Slack message. Tested by `pnpm test:deploy-slack` |
+
+## Home-site build wrapper
+
+`build-partner.mjs` exists for a hosting config whose build command is a plain string with nowhere to set `SITE`. Its header names `vercel.json` as the caller, but no `vercel.json` is committed to the repository. The Firebase deploy path in [Deployment](/engineering/deployment) doesn't use it.
+
+The order matters: `emit-partner-html.mjs` reads `dist/home/index.html` and writes one document per route next to it. Running it first throws on the missing file.
+
+## /fleets coverage map
+
+The `/fleets` page shows a static SVG, referenced with an `<img>` tag, rather than drawing the map at runtime. `gen-fleets-map.mjs` produces it once:
+
+1. Fetch the `us-atlas@3` states topology from jsDelivr.
+2. Project with `geoAlbersUsa` (scale 1300) and draw the nation outline and interior state borders at 1-decimal precision.
+3. Plot each entry in the script's `cities` list as a dot sized `xl`, `lg`, `md`, or `sm`. The larger sizes get a glow halo, and `xl` cities also get a static ring and an outward ping.
+4. Write the SVG with its CSS animations embedded, because an `<img>`-referenced SVG can't be styled by the page. Every animation delay is negative so dots start mid-cycle and out of phase.
+
+To change the cities, edit `cities` in the script, rerun it, and commit the SVG. The script needs network access and the `d3-geo` and `topojson-client` packages from `package.json`.
+
+## School-management fixture
+
+`tools/testing/schools/` renders the dashboard school-management components against an Axios fixture adapter at `http://127.0.0.1:5187`. There is no authentication, no production network access, and no database write. It's outside every production build.
+
+Use it to check UI behavior: deactivation previews, filters, provenance display, and the disabled community selector for geocoded schools. It doesn't test SQL policy or real Mapbox rendering. The pure-logic tests for the same module run with `pnpm test:schools` (`src/lib/school-management.test.ts`). For the API side, see [Communities and schools admin](/engineering/domains/communities-and-schools-admin).
+
+## Cloudflare worker scripts
+
+Each worker has `check`, `dev`, and `deploy` package scripts that wrap `wrangler`:
+
+| Worker | Check | Dev | Deploy | Tests |
+| --- | --- | --- | --- | --- |
+| `world-cup-router` | `pnpm worker:world-cup:check` | `pnpm worker:world-cup:dev` | `pnpm worker:world-cup:deploy` | `pnpm test:world-cup-router` |
+| `experience-router` | `pnpm worker:experience-router:check` | `pnpm worker:experience-router:dev` | `pnpm worker:experience-router:deploy` | `pnpm test:experience-router` |
+| `og` | `pnpm worker:og:check` | `pnpm worker:og:dev` | `pnpm worker:og:deploy` | `pnpm test:og` |
+
+`check` verifies the generated `worker-configuration.d.ts` is current (router workers only), typechecks the worker, and runs `wrangler deploy --dry-run`. For what each worker does, see [Edge and routing](/engineering/web/edge-and-routing).
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Build wrapper | `yelo-web/scripts/build-partner.mjs`, `scripts/emit-partner-html.mjs` |
+| Coverage map | `yelo-web/scripts/gen-fleets-map.mjs`, `src/sites/home/public/map/us-growth-map.svg`, `src/sites/home/fleets/FleetsPage.tsx` |
+| School fixture | `yelo-web/tools/testing/schools/` |
+| Worker scripts | `yelo-web/package.json`, `workers/*/wrangler.jsonc` |

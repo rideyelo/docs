@@ -1,9 +1,9 @@
 ---
 title: "Dashboard analytics internals"
-description: "Exact SQL definitions, time windows, delta math, Redis reads, and background refresh behind the dashboard's KPI, supply and demand, driver ops, presence, telemetry, rides, search, and notification analytics endpoints."
+description: "Exact SQL definitions, time windows, delta math, Redis reads, and background refresh behind the dashboard's KPI, live operations, driver ops, presence, telemetry, rides, search, and notification analytics endpoints."
 ---
 
-The dashboard's reporting surfaces are computed on request from Postgres and Redis. Nothing is pre-aggregated except the GTM prospect snapshot. This page documents what each number means in SQL, which window it covers, and how deltas are calculated. For which screen calls which endpoint and how often, see [Dashboard data map](/engineering/web/dashboard-data-map). For the product definitions, see [Ride metrics](/dashboard/ride-metrics). For the user directory, access management, and role scoping, see [Dashboard directory and scope](/engineering/domains/dashboard-directory-and-scope).
+The dashboard's reporting surfaces are computed on request from Postgres and Redis. Nothing is pre-aggregated except the GTM prospect snapshot and the five-minute competitor quote cache. This page documents what each number means in SQL, which window it covers, and how deltas are calculated. For which screen calls which endpoint and how often, see [Dashboard data map](/engineering/web/dashboard-data-map). For the product definitions, see [Ride metrics](/dashboard/ride-metrics). For the user directory, access management, and role scoping, see [Dashboard directory and scope](/engineering/domains/dashboard-directory-and-scope).
 
 Paths are relative to `yelo-api/`.
 
@@ -11,25 +11,27 @@ Paths are relative to `yelo-api/`.
 
 | Store | Objects | Used by |
 | --- | --- | --- |
-| Postgres | `Rides`, `Users`, `UserAttribution`, `DriverApplications`, `Communities`, `EventAttendees` | KPI, supply and demand, market KPIs |
+| Postgres | `Rides`, `Users`, `UserAttribution`, `DriverApplications`, `Communities`, `EventAttendees` | KPI, live analytics, market KPIs |
 | Postgres | `DriverSessions`, `FleetDrivers`, `Fleets`, `Vehicles`, `RideDeclineReasons` | Market cards, market drivers, driver ops |
+| Postgres | `CommunityOperatingWindows` | Market operating hours |
 | Postgres | `LocationSearches`, `LocationBrowses` | Search insights, market KPI searches |
 | Postgres | `DeviceTelemetry` | Telemetry summary |
 | Postgres | `AttributionTouches`, `referral_sources`, `AuthTransactions`, `Referrals` | Acquisition breakdown |
 | Postgres | `KpiManualLog` | Manual KPI log |
 | Postgres | `surge_history`, `Communities.surge_*` | Surge set and history |
 | Postgres | `Notifications`, `NotificationCohorts`, `NotificationDeliveries` | Notification analytics |
-| Redis | `presence:{userId}` hash, `community:online:{id}` and `community:drivers:{id}` sorted sets | Presence, market driver status, user last seen |
+| Redis | `presence:{userId}` hash, `community:online:{id}` and `community:drivers:{id}` sorted sets | Presence, market online counts, market driver status, user last seen |
 | Redis | `community:warm:{id}` sorted set, `driver:loc:{userId}` hash | Warm pool counts and markers |
 | Redis | `gtm:resolved`, `gtm:city:{lat}:{lng}` | GTM snapshot and reverse-geocode cache |
 | Mapbox | `ReverseGeocodeCity` | GTM refresh and approvals city labels |
 | Clerk | `user.Get` | Surge audit name and email |
+| PostHog Query API | `ride_aggregator_prices_loaded` events | Observed competitor quotes on **Live** |
 
 Presence and warm-pool mechanics are owned by [Heartbeat and presence](/engineering/location/heartbeat-and-presence) and [Activation tiers](/engineering/matching/activation-tiers). This page only covers how the dashboard aggregates them.
 
 ## Endpoints
 
-All routes sit under the `/dashboard` group, which runs Clerk auth and `dashboardScopeAllows` first. "Admin (scope)" means the scope middleware rejects `intern` and `fleet` with a 401 before the handler runs.
+All routes sit under the `/dashboard` group, which runs Clerk auth and `dashboardScopeAllows` first. "Admin (scope)" means the scope middleware rejects `intern` and `fleet` with a 401 before the handler runs. There is no `/dashboard/supply-demand` prefix. "No dashboard caller" means no routed `yelo-web` page calls the endpoint.
 
 | Method | Path | Auth | Handler and purpose |
 | --- | --- | --- | --- |
@@ -42,14 +44,17 @@ All routes sit under the `/dashboard` group, which runs Clerk auth and `dashboar
 | GET | `/dashboard/community/{id}/uncompletes/kpis`, `/uncompletes`, `/uncompletes/breakdowns` | Same | Uncompleted-ride KPIs, table, breakdowns |
 | GET | `/dashboard/{id}/search-insights`, `/search-map-data` | Admin, or intern for own community | Search conversion and map points |
 | GET | `/dashboard/fleet/{fleet_id}/kpis`, `/histogram` | Admin, or fleet with `HasFleetAccess` | Fleet KPIs and hourly histogram |
-| GET | `/dashboard/supply-demand/kpis`, `/markets` | Admin (scope) | `SupplyDemandHandler.getKPIs`, `getMarkets` |
-| GET | `/dashboard/supply-demand/markets/{id}/drivers`, `/rides?older=` | Admin (scope) | Market drivers and rides |
-| POST | `/dashboard/supply-demand/markets/{id}/surge` | Admin (scope) | `setSurge` |
-| GET | `/dashboard/supply-demand/markets/{id}/surge-history` | Admin (scope) | `getSurgeHistory` |
-| POST | `/dashboard/supply-demand/markets/{id}/notify` | Admin (scope) | `notifyMarket` |
-| POST | `/dashboard/supply-demand/drivers/{id}/ping`, `/riders/{id}/ping` | Admin (scope and `requireAdmin`) | `pingDriver`, `pingRider` |
-| GET | `/dashboard/driver-ops` | Admin (scope and `requireAdmin`) | `DriverOpsHandler.getSnapshot` |
-| GET | `/dashboard/presence/summary`, `/users`, `/map` | Admin (scope) | `PresenceDashboardHandler` |
+| GET | `/dashboard/live/analytics?period=` | Admin (scope) | `SupplyDemandHandler.getAnalytics`: period KPIs, service timing, outcome counts, ride journey |
+| GET | `/dashboard/live/competitor-prices?period=` | Admin (scope) | `getCompetitorPrices`: observed UberX and Lyft Standard quotes |
+| GET | `/dashboard/live/kpis`, `/markets` | Admin (scope) | `getKPIs` (no dashboard caller), `getMarkets` |
+| GET | `/dashboard/live/markets/{id}/drivers`, `/rides?older=` | Admin (scope) | Market drivers; market rides has no dashboard caller |
+| POST | `/dashboard/live/markets/{id}/surge` | Admin (scope) | `setSurge` |
+| GET | `/dashboard/live/markets/{id}/surge-history` | Admin (scope) | `getSurgeHistory` (no dashboard caller) |
+| POST | `/dashboard/live/markets/{id}/notify` | Admin (scope) | `notifyMarket` (no dashboard caller) |
+| POST | `/dashboard/live/drivers/{id}/ping`, `/riders/{id}/ping` | Admin (scope and `requireAdmin`) | `pingDriver`, `pingRider` (no dashboard caller) |
+| GET | `/dashboard/driver-ops` | Admin (scope and `requireAdmin`) | `DriverOpsHandler.getSnapshot` (no dashboard caller) |
+| GET | `/dashboard/presence/map` | Admin (scope) | `PresenceDashboardHandler`: markers for the **Live** map |
+| GET | `/dashboard/presence/summary`, `/users` | Admin (scope) | `PresenceDashboardHandler` (no dashboard caller) |
 | GET | `/dashboard/telemetry/summary` | Admin (scope only) | `TelemetryDashboardHandler.GetSummary` |
 | GET | `/dashboard/rides` | Admin, intern, fleet | `DashboardRidesHandler.ListRides` |
 | GET | `/dashboard/rides/{id}/events`, `/{id}/route` | Admin (scope and handler) | Ride timeline and stored route |
@@ -63,9 +68,12 @@ Three different window builders and three different delta functions exist. They 
 | --- | --- | --- | --- | --- |
 | Community, fleet, cancellation, uncomplete KPIs | `DashboardService.calculateTimeRanges` | `now - d` to `now` | `now - 2d` to `now - d` | `calculateKPI` |
 | Global KPI cards | `KpiService.GetGlobalKPIs` | Monday 00:00 UTC to `now` | Previous Monday to this Monday | `kpiDelta` |
-| Supply and demand KPIs | `SupplyDemandService.GetKPIs` | `now - 24h` to `now` | `now - 48h` to `now - 24h` | `computeKPIValue` |
+| Live analytics | `SupplyDemandService.GetLiveAnalytics` | `now - p` to `now` for `24h`, `7d`, `30d`; 2020-01-01 to `now` for `all` | `now - 2p` to `now - p`; none for `all` | `computeKPIValue` |
+| `/live/kpis` (no caller) | `SupplyDemandService.GetKPIs` | `now - 24h` to `now` | `now - 48h` to `now - 24h` | `computeKPIValue` |
 
-`calculateTimeRanges` maps `last_14_days` to 14 days and `last_30_days` to 30 days. Everything else becomes 7 days. The HTTP layer validates `range` with `requests.GetKPIsRequest.Validate` first, so an unknown value returns 400 before reaching it. The API default is `last_7_days` (`defaultKPIRange`), while the Overview page requests 30 days.
+`calculateTimeRanges` maps `last_24_hours`, `last_14_days`, and `last_30_days` to their durations. `all_time` returns 2020-01-01 UTC to `now`, with an equally long previous window that ends at 2020-01-01, so its previous values are always 0. Anything else becomes 7 days. The HTTP layer validates `range` with `requests.GetKPIsRequest.Validate` first, which accepts only empty, `last_24_hours`, `last_7_days`, `last_14_days`, `last_30_days`, and `all_time`, so an unknown value returns 400 before reaching it. The API default is `last_7_days`. The Rides **KPIs** tab, **Community** page, and fleet overview default to `last_30_days`.
+
+`GetLiveAnalytics` rejects any `period` other than empty, `24h`, `7d`, `30d`, or `all` with 400. It sets `comparison_available` to false for `all`.
 
 | Function | Value | Percentage change |
 | --- | --- | --- |
@@ -77,7 +85,7 @@ Worked examples:
 
 - Market KPIs, `last_7_days`, requested at 2026-09-25 15:00. Current window is 09-18 15:00 to 09-25 15:00. Previous is 09-11 15:00 to 09-18 15:00. Completes go from 24 to 30: delta 6, change 25.
 - Market KPIs, cancels go from 0 to 3: delta 3, change 100 (not infinity, not 0).
-- Supply and demand, cancels go from 0 to 3: delta 3, change 0.
+- Live analytics, completes go from 0 to 3: delta 3, change 0. The **Live** page hides the percentage when `value == delta`, so it shows only +3.
 - Global KPIs on a Tuesday at 12:00 UTC: this week has 1.5 days of signups (40) and last week has 7 days (100). Delta is -60 and change is -60, even if growth is flat.
 
 ## Community market KPIs
@@ -199,52 +207,88 @@ The touch is the user's `first_touch_id`, falling back to `last_touch_id`, then 
 
 `GetGlobalApprovals` returns `GetGlobalPendingDriverApplications` unscoped. For rows in catch-all communities with non-zero signup coordinates, `resolveSignupCities` sets `SignupCity` to "City, ST" through the GTM geocode cache.
 
-## Supply and demand
+## Live operations
 
-### 24-hour KPIs
+For the full request flow, polling, and presence behind the **Live** page, see [Live operations internals](/engineering/domains/live-operations).
 
-`GetSupplyDemandKPIs` (`queries/supply_demand.sql`) runs twice with `[now-24h, now)` and `[now-48h, now-24h)`. The optional `community_id` narrows every subquery.
+The **Live** page and its API share the `supply_demand` handler package and `SupplyDemandService`. Every read is scoped with `resolveCommunityScope` (aggregates) or `resolveCommunityID` (market paths). The page always passes one `community_id`.
+
+### Live analytics
+
+`GetLiveAnalytics` (`service/dashboard/live.go`) makes four reads for a bounded period: `GetLiveRideCohorts` and `GetSupplyDemandKPIs` for the current window and again for the previous one. `all` makes two.
+
+`GetLiveRideCohorts` (`queries/supply_demand.sql`) groups rides with `request_time` in `[start, end)` in non-test, ride-enabled communities by `status`, `cancel_phase`, `cancel_user`, and whether `confirm_time`, `match_time`, `at_pickup_time`, and `pickup_time` are set. It has no status filter, so unconfirmed `requested` rows are included. `aggregateLiveCohorts` (`repository/live.go`) derives:
 
 | Field | Definition |
+| --- | --- |
+| `requests` | Every ride in the window |
+| `completed` | `status IN ('complete','pending_rider_rating')` and no `cancel_phase` |
+| `cancelled_by_rider`, `cancelled_by_driver` | Canceled rows by `cancel_user`. System cancels only appear in `flow`. |
+| `unmatched` | `status = 'no_drivers_available'` without a `cancel_phase` |
+| `failed_after_pickup` | Canceled rows with `pickup_time` set |
+| `match_seconds` | Average of `match_time - confirm_time` where `match_time >= confirm_time`, with min and max |
+| `pickup_seconds` | Average of `pickup_time - match_time` where `pickup_time >= match_time`, with min and max |
+| `wait_seconds` | Average of `pickup_time - confirm_time` over rows that pass both checks, with min and max |
+| `average_fare` | `SUM(COALESCE(discounted_price, price))` of completed rides divided by `completed` |
+| `flow` | Sankey links. Each cohort walks `Request`, `Confirmed`, `Matched`, `Queue / en route`, `At pickup`, `In progress` as far as its timestamps go, then exits to `Completed`, `Unmatched`, `<Actor> canceled · <stage>`, or `Pending · <stage>`. |
+
+Timing averages are `null` when no row qualifies.
+
+`kpis` reuses `GetSupplyDemandKPIs` for `user_signups`, `driver_signups`, `gmv`, and `incompletes`, but replaces `completes` with the cohort `completed`. `completion_rate` is `completed / requests × 100` for each window, compared with `computeKPIValue`, so its `delta` is in percentage points.
+
+| `GetSupplyDemandKPIs` field | Definition |
 | --- | --- |
 | `user_signups` | Qualifying users with `COALESCE(profile_completed_at, created_timestamp)` in the window |
 | `driver_signups` | Active applications with `COALESCE(activated_at, created_timestamp)` in the window |
 | `completes`, `gmv` | Same as global KPIs, windowed on `request_time` |
 | `incompletes` | `no_drivers_available`, or canceled with no driver and not `requested`, or not in `complete`, `pending_rider_rating`, `requested` with no cancel and requested more than 1 hour before the window end |
 
-`incompletes` is looser than the market `ride_uncompletes`. It does not require `confirm_time`, does not exclude `superseded`, and its stale branch does not require `driver_id IS NULL`. A ride stuck `in_progress` with a driver for more than an hour counts here but not on the Overview.
+`incompletes` is looser than the market `ride_uncompletes`. It does not require `confirm_time`, does not exclude `superseded`, and its stale branch does not require `driver_id IS NULL`. A ride stuck `in_progress` with a driver for more than an hour counts on **Live** but not on **Rides** > **KPIs**.
+
+### Competitor prices
+
+`GetLiveCompetitorPrices` (`service/dashboard/live_pricing.go`) accepts the same periods and asks PostHog's Query API for `ride_aggregator_prices_loaded` events in the window, scoped by `properties.community_id` and excluding `properties.is_test`. It averages `price_value` for options where the provider is `uber` with name `UberX`, or `lyft` with key `standard`, the price is above 0, `needs_connect` is false, and `error_kind` is empty.
+
+| `status` | When |
+| --- | --- |
+| `not_configured` | `POSTHOG_PERSONAL_API_KEY` or `POSTHOG_PROJECT_ID` is empty, the project ID isn't numeric, or `POSTHOG_QUERY_HOST` isn't an `https` URL |
+| `unavailable` | The request fails, returns non-200, or has an unexpected row shape |
+| `ready` | Results parsed. Cached in memory for 5 minutes per scope and window length, up to 512 entries. |
+
+The HTTP client times out after 12 seconds. Any valid `period` returns 200, whatever the status.
 
 ### Market summaries
 
-`ListMarketSummaries` returns every `Communities.is_active` row:
+`ListMarketSummaries` returns `Communities` rows that are `is_active` and not `rides_disabled`:
 
 | Field | Definition |
 | --- | --- |
-| `drivers_online` | Open `DriverSessions` (`end_time IS NULL`) for drivers whose `Users.community_id` is the market |
-| `active_rides` | Rides in `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress`, with no time bound |
-| `unmatched_requests` | Last 24 hours, `driver_id IS NULL`, and `status = 'confirmed'` or non-superseded `no_drivers_available` |
+| `active_rides` | Rides in `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress` with no `cancel_phase`, with no time bound |
+| `unmatched_requests` | Last 24 hours, `driver_id IS NULL`, and `status = 'confirmed'` or non-superseded `no_drivers_available`. The **Live** page doesn't show it. |
 | `last_driver_offline_at` | `MAX(DriverSessions.end_time)` for the market's drivers |
-| `time_zone` | `Communities.time_zone`, default `America/New_York` |
-| `market_status` | `Community.GetByID(...).MarketStatus`, one call per market. `OFF_PEAK` on error. |
+| `market_status`, `operating_windows`, `limited_hours_enabled`, `next_operating_window`, `time_zone`, `bounding_box` | `Community.GetByID(...)`, one call per market with at most six in flight. `OFF_PEAK` and no windows on error. |
+| `drivers_online` | Members of `community:drivers:{id}` whose `presence:{id}` coordinates fall within the bounding box plus 10 km, or have no parseable coordinates. The SQL open-session count is discarded. |
+| `riders_online` | `community:online:{id}` count minus the driver member count, floored at 0 |
+| `presence_available` | True only when Redis presence was read. Otherwise `drivers_online` is 0 and `riders_online` is `null`. |
 
 The service re-sorts by `active_rides` descending, then `LIVE` before `OFF_PEAK`, then `drivers_online` descending, then name.
 
 ### Market drivers and rides
 
-`GetMarketDrivers` lists users with an active application in the market whose latest session is open, ended within 7 days, or whose `last_pinged_driver` is within 7 days. Each row is then enriched:
+`GetMarketDrivers` lists users in the market with an active application whose latest session is open, ended within 7 days, or whose `last_pinged_driver` is within 7 days. `fleet_name` joins the names of the driver's active `FleetDrivers` memberships, so a driver in two fleets is one row. Each row also carries `photo_url` (thumbnail first) and the stored `Users.latitude` and `longitude`. Each row is then enriched:
 
 1. Status is `online` if the user is in `community:drivers:{id}` (scored in the last 120 seconds), `warm` if in `community:warm:{id}` (last 60 minutes, `warmPoolMaxAge`), else `offline`.
 2. Online and warm drivers take `LastPingedDriver` from `presence:{id}.ts`. Warm and offline drivers get `SessionEndTime` set to the later of `last_pinged_driver` and `session_end_time`, ignoring timestamps before 2020.
 3. `decline_reasons` are `RideDeclineReasons` since today's start.
 4. Rows sort online, warm, offline, then `rides_today` descending, then last active.
 
-`rides_today` counts `complete` and `pending_rider_rating` rides with `request_time` at or after today's start. Tags prepend `EDU` for student accounts.
+Today starts at local midnight in the community's time zone, falling back to UTC when the zone doesn't load. `rides_today` counts `complete` and `pending_rider_rating` rides with `request_time` at or after that start. Tags prepend `EDU` for student accounts.
 
-`GetMarketRides` returns non-`requested` rides from the last hour. With `older=true` the cutoff is 24 hours. Without it, `HasOlderMarketRides` sets `has_older` when rides exist between 24 hours and 1 hour ago. Rider and driver names are first name plus last initial.
+`GetMarketRides` returns non-`requested` rides from the last hour. With `older=true` the cutoff is 24 hours. Without it, `HasOlderMarketRides` sets `has_older` when rides exist between 24 hours and 1 hour ago. Rider and driver names are first name plus last initial. The **Live** page reads rides from `GET /dashboard/rides` instead.
 
 ### Surge
 
-`SetSurgeRequest` validates `multiplier` 1 to 9.99 and `expires_in_hours` 1 to 168. The dashboard UI limits these to 1.0 to 3.0 and 1 to 4 hours.
+`SetSurgeRequest` validates `multiplier` 1 to 9.99 and `expires_in_hours` 1 to 168. The dashboard `SurgeSlider`, on **Live** and on **Pricing Management**, limits these to 1.0 to 3.0 and 1 to 4 hours.
 
 <Steps>
   <Step title="Resolve the actor">
@@ -265,11 +309,11 @@ Surge history lists 20 rows by default and falls back to 20 when `limit` is 0 or
 
 ### Notify and ping
 
-`NotifyMarket` calls `SendNotificationToCommunity` with the request `recipient` and always returns `sent_to: 1`. `PingDriver` and `PingRider` call `NotifyDashboardPingDriver` and `NotifyDashboardPingRider`. A send failure returns HTTP 200 with `sent: false`. Push delivery is covered in [Send pipeline](/engineering/notifications/send-pipeline).
+No routed dashboard page calls these endpoints. `NotifyMarketDialog` and `PingDialog` in `yelo-web/src/components/live/` are only imported by the unrouted `DriverOpsPage`. `NotifyMarket` has no `requireAdmin` check; it relies on the scope middleware and `resolveCommunityID`. It calls `SendNotificationToCommunity` with the request `recipient` and always returns `sent_to: 1`. `PingDriver` and `PingRider` call `NotifyDashboardPingDriver` and `NotifyDashboardPingRider`. A send failure returns HTTP 200 with `sent: false`. Push delivery is covered in [Send pipeline](/engineering/notifications/send-pipeline).
 
 ## Driver ops snapshot
 
-`DriverOpsService.GetSnapshot` composes existing supply and demand calls. For N markets with D drivers it makes 1 summary query, N `Community.GetByID` calls, N driver lists, N ride lists, and per-driver Redis and Postgres reads.
+No routed dashboard page calls this endpoint; `/driver-ops` redirects to `/live`. `DriverOpsService.GetSnapshot` composes existing live operations calls. For N markets with D drivers it makes 1 summary query, N `Community.GetByID` calls, N driver lists, N ride lists, and per-driver Redis and Postgres reads.
 
 | Field | Source |
 | --- | --- |
@@ -296,6 +340,8 @@ Handlers build a `dashboard.CommunityScope`. Admins without `community_id` get `
 | `warm_pool` | Members of `community:warm:{id}` scored in the last 60 minutes |
 | `unmatched_rides` | `GetUnmatchedRidesForActivation`: `confirmed`, no driver, no live offer in the last 30 seconds, confirmed within `config.RideRequestExpiry` |
 
+The **Live** page calls only `/presence/map`, every 10 seconds, with `community_id`. `/presence/summary` and `/presence/users` have no dashboard caller.
+
 `/presence/users` builds the full list in memory (online first, then warm, deduplicated by user ID), slices `offset` and `limit` (default 50, negatives rejected with 400), then loads each page row with `User.GetByID`. `/presence/map` returns online markers from the presence hash and warm markers from `driver:loc:{userId}`. Warm drivers without a stored location are omitted from the map.
 
 ## Telemetry summary
@@ -320,7 +366,8 @@ Handlers build a `dashboard.CommunityScope`. Admins without `community_id` get `
 | Fleet | `FleetIDs` replaced by `GetFleetIDsForCommunity`; 403 if empty; `fleet_id` is ignored |
 | `limit` | Default 50. Values below 1 or above 1000 become 50. With `include_routes=true` (admin only) capped at 200. |
 | `sort` | Service allows `request_time`, `rider_name`, `driver_name`, `status`, `price`, `fleet_name`; others become `request_time` |
-| `status` | `active`, `completed`, `canceled`; any other value means no filter |
+| `status` | `live`, `active`, `completed`, `canceled`; any other value means no filter. `live` is uncanceled `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress`, plus `requested` rows from the last 5 minutes. |
+| `recent_only` | `true` limits rows and `total` to `request_time` in the last 24 hours |
 | `search` | `ILIKE '%' + search + '%'` on rider name, driver name, or ride ID text |
 | Routes | Encoded routes over 131072 bytes are skipped in SQL and in `dashboardMapRoute` |
 | `has_active` | Any ride in scope with `status <> 'complete'` and no `cancel_phase`, unbounded in time |
@@ -367,7 +414,8 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 | Surface | Cache |
 | --- | --- |
 | KPI, market, fleet, cancellation, search, telemetry, rides | None. Every request queries Postgres with a 5-second `WithPostgresTimeout`, except telemetry at 15 seconds. |
-| Presence, market driver status, AQ flag | Live Redis reads, no memoization |
+| Presence, market online counts, market driver status, AQ flag | Live Redis reads, no memoization |
+| Competitor quotes | In-process map, 5 minutes per scope and window length, cleared at 512 entries |
 | GTM | Redis snapshot and geocode cache, 24-hour TTL, refreshed every 5 minutes |
 | Surge | Writes invalidate the community price cache asynchronously |
 | User detail edits | Invalidate the user profile cache (best effort) |
@@ -381,8 +429,8 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 | Global KPIs | `internal/service/dashboard/kpi.go`, `internal/data/repository/kpi.go` | `GetGlobalKPIs`, `kpiDelta`, `GetGlobalTotals`, `GetWeeklySeries` |
 | Global KPI SQL | `queries/analytics.sql` | `GetGlobalKPITotals`, `ListWeeklyKPISeries`, `ListKPIAcquisitionChannels` |
 | KPI routes | `internal/server/http/dashboard/kpi/router.go`, `handlers.go` | `RegisterRoutes`, `requireAdmin` |
-| Supply and demand | `internal/service/dashboard/supply_demand.go`, `queries/supply_demand.sql` | `GetKPIs`, `GetMarketSummaries`, `GetMarketDrivers`, `SetSurge` |
-| Supply and demand routes | `internal/server/http/dashboard/supply_demand/handlers.go` | `resolveCommunityScope`, `resolveCommunityID`, `requireAdmin` |
+| Live operations | `internal/service/dashboard/supply_demand.go`, `live.go`, `live_pricing.go`, `queries/supply_demand.sql`, `data/repository/live.go` | `GetMarketSummaries`, `populateLivePresence`, `GetMarketDrivers`, `SetSurge`, `GetLiveAnalytics`, `aggregateLiveCohorts`, `GetLiveCompetitorPrices` |
+| Live routes | `internal/server/http/dashboard/supply_demand/router.go`, `handlers.go`; mounted at `/dashboard/live` in `server/http/router.go` | `resolveCommunityScope`, `resolveCommunityID`, `requireAdmin` |
 | Driver ops | `internal/service/dashboard/driver_ops.go` | `GetSnapshot`, `buildMarket`, `buildDriver` |
 | Presence | `internal/service/dashboard/presence.go`, `server/http/dashboard/presence/presence_handler.go` | `CommunityScope`, `GetPresenceSummary`, `resolveCommunityScope` |
 | Telemetry | `internal/data/repository/dashboard.go` | `GetTelemetrySummary` |
@@ -393,22 +441,25 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 
 ## Gotchas and edge cases
 
-- **"Rides today" does not start at local midnight.** `GetMarketDrivers` uses `time.Now().In(loc).Truncate(24 * time.Hour)`. Go's `Truncate` works on absolute time, so the result is 00:00 UTC. At 20:00 PDT, "today" starts at 17:00 PDT. Decline reasons use the same cutoff.
-- **Multi-fleet drivers appear more than once.** `ListMarketDrivers` joins `FleetDrivers` without `is_active`. `FleetDrivers` has primary key `(fleet_id, driver_id)`, so a driver in two fleets produces two rows in market drivers and driver ops.
-- **Rides sort options are silently dropped.** `GetDashboardRides` rewrites any `sort` outside its six fields to `request_time`, even though `resolveDashboardRideSortField` and the SQL support `time_to_match`, `time_to_pickup`, `ttd`, `wait`, `time`, and `ride_distance`.
-- **`active` and `completed` overlap.** The rides `active` filter includes `pending_rider_rating`, which `completed` also includes.
-- **Rides search treats `%` and `_` as wildcards.** `GetDashboardRides` does not escape them, unlike the user directory search.
+- **Rides sort options are silently dropped.** `GetDashboardRides` (`service/dashboard/rides.go`) rewrites any `sort` outside its six fields to `request_time`, even though `resolveDashboardRideSortField` and the SQL support `time_to_match`, `time_to_pickup`, `ttd`, `wait`, `time`, and `ride_distance`.
+- **`active` and `completed` overlap.** The rides `active` filter includes `pending_rider_rating`, which `completed` also includes. `active` also includes `requested` and `no_drivers_available`.
+- **Rides search treats `%` and `_` as wildcards.** `GetDashboardRides` (`data/repository/dashboard_rides.go`) does not escape them, unlike the user directory search.
+- **`has_active` never expires.** `HasActiveDashboardRides` counts any uncanceled ride that isn't `complete`, with no time bound, so stale `no_drivers_available` or `pending_rider_rating` rows keep the Trips tab on its 10-second poll. Every `GET /dashboard/rides` call runs it, including the two **Live** ride polls.
+- **Live and Rides use different completion math.** **Live** `completion_rate` divides by every request, including unconfirmed `requested` rows. Market `completion_rate` divides by confirmed, non-superseded requests. **Live** `incompletes` is also looser than market `ride_uncompletes`.
+- **Zero-baseline percentages disagree.** `computeKPIValue` returns 0 when the previous value is 0, while `calculateKPI` returns 100. The **Live** page hides the percentage in that case; other pages show 100%.
+- **`all_time` comparisons are empty.** `calculateTimeRanges` gives `all_time` a previous window that ends at 2020-01-01, so every non-zero KPI shows +100% on the Rides **KPIs** tab, **Community** page, and fleet overview.
+- **Three definitions of unmatched.** `unmatched_requests` on market summaries counts `confirmed` plus non-superseded `no_drivers_available` over 24 hours. Live analytics `unmatched` counts only `no_drivers_available` in the period. Presence counts only `confirmed` within the request expiry.
+- **`active_rides` has no time bound.** A ride stuck in `confirmed` or `in_progress` counts on its market card indefinitely, while the **Live** rides list drops unconfirmed requests after 5 minutes.
+- **Competitor quotes serialize.** `liveQuoteClient.prices` holds its mutex across the PostHog request, so concurrent cache misses wait on each other for up to 12 seconds each.
 - **"Last req" is blank after an hour.** Driver ops calls `GetMarketRides` without `older`, so only rides from the last hour qualify.
 - **`no_activity_7d` rarely fires.** `ListMarketDrivers` already drops drivers inactive for 7 days, so the flag is true only when every listed driver has an open session and no valid heartbeat.
-- **Three definitions of unmatched.** Market cards count `confirmed` plus `no_drivers_available` over 24 hours. Presence counts only `confirmed` within the request expiry. Market uncompletes use the full uncomplete predicate.
-- **Two definitions of online.** Market card `drivers_online` counts open `DriverSessions`. The drivers table and presence use the 120-second Redis window.
 - **Warm pool totals double count.** `countWarmPoolDrivers` does not remove online drivers, while `/presence/users` does.
-- **Reads mutate Redis.** `GetWarmPoolDrivers` runs `ZREMRANGEBYSCORE` on every call, so the 10-second presence poll prunes the warm pool.
+- **Reads mutate Redis.** `GetWarmPoolDrivers` runs `ZREMRANGEBYSCORE` on every call, so the 10-second **Live** presence map and market driver polls prune the warm pool.
 - **Warm users always look fresh.** `collectWarmUsers` sets `LastSeen` to `time.Now()`.
 - **Invalid telemetry community means global.** `GetSummary` ignores an unparseable `community_id`.
-- **`all_time` search range is unreachable.** `calculateSearchTimeRange` handles it, but `GetKPIsRequest.Validate` rejects it with 400.
 - **GTM has no HTTP surface.** The `GtmService` comment points to `server/http/dashboard/gtm`, which does not exist. `GetCities`, `GetCityDrivers`, `GetCityCSV`, and `GetPoints` have no callers. The 5-minute refresh still geocodes every prospect, and its only consumer is the approvals city label via the shared `gtm:city:*` cache.
 - **Manual KPI log and approvals are API-only.** The generated client has the operations, but no dashboard page calls them.
 - **Series comment is stale.** `GetWeeklySeries` says the service back-fills empty weeks. The SQL already does it; the service does not.
+- **Pricing previews apply expired surge.** Rider quotes in `service/ride/rider.go` apply `surge_multiplier` only while `surge_expires_at` is in the future. The dashboard pricing overview (`surgeFor` in `service/dashboard/pricing_overview.go`) and pricing preview (`GetCommunitySurgeMultiplier` in `service/dashboard/pricing_preview.go`) ignore `surge_expires_at`, so after a surge expires they keep showing surged prices that riders no longer pay.
 - **Market notify always reports one.** `NotifyMarket` returns `sent_to: 1` regardless of recipients.
 - **Mixed interval types.** Market and fleet metrics use half-open windows; cancellation, uncomplete, and search queries use `BETWEEN`. A ride exactly on the boundary can count in both windows.

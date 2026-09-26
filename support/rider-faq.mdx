@@ -1,0 +1,159 @@
+---
+title: "Rider FAQ"
+description: "Code-grounded answers to rider questions about quotes and fares, card holds, cancellation fees, tips, ride history, missing drivers, off-peak hours, communities, and account deletion"
+---
+
+Each answer describes what the app and API do today. Links go to the concept pages with the full rules. If an answer points to a problem Yelo's code can't fix on its own, the last line says where to escalate.
+
+## Prices and fares
+
+### How is my price set?
+
+Yelo prices every ride on the server when the rider picks a destination. The price depends on the community's pricing for that fleet and vehicle type: a base fare, a per-mile rate, and a per-minute rate. Pricing zones and an active surge change it. A community with no pricing uses Yelo's default fare. See [Pricing](/concepts/pricing).
+
+Many ride options show two prices: a crossed-out higher price and the price the rider pays. The rider always pays the lower one. The crossed-out price is a display anchor from the fare adjustment settings, or the pre-discount price when a destination discount applies.
+
+A $0 option is free. It needs no card, and nothing is authorized or charged.
+
+### Why is my final fare different from the quote?
+
+Two reasons:
+
+- **Confirm reprices the ride.** When the rider taps to confirm, the API recalculates the fare from the current pricing, surge, zones, and discounts. It doesn't reuse the quote. A small difference is normal, and a surge that started or ended in between also changes the price.
+- **Tips.** The rider's total includes any tip they add at the end.
+
+A repeat quote for the same trip within 5 minutes reuses the cached price, so refreshing the options doesn't reshuffle it. See [Quote caching and confirm-time pricing](/concepts/pricing#quote-caching-and-confirm-time-pricing).
+
+To check what was stored, open the ride in **Ride Details**. The `price_calculated` event shows the quote, including whether surge or default pricing applied.
+
+### When am I charged?
+
+The matching screen says "You won't be charged until your driver arrives." Here's what actually happens to the card:
+
+| Moment | What happens |
+| --- | --- |
+| Confirm | The card is saved for the ride. Nothing is authorized. |
+| A driver accepts | The card is authorized (a hold) for the fare, plus $5.00 for a possible tip. |
+| Trip ends, rider rates | The fare, plus any tip, is captured. The rest of the hold is released. |
+| Trip ends, rider never rates | The fare alone is captured 24 hours after the trip. The rest is released. |
+| Rider cancels | A fee is captured if one applies. Otherwise the hold is canceled. |
+
+Fees can apply before the driver arrives. See [Cancellation fees](#cancellation-fees).
+
+### Why is there a pending charge bigger than my fare?
+
+The hold at accept is the fare plus a $5.00 tip buffer. On Apple Pay the rider saw this at confirm as **Tip authorization**, marked pending. When the fare is captured, Yelo captures only the exact amount, and Stripe releases the rest. Yelo has no control over how long the rider's bank keeps showing the released part as pending.
+
+### Can I get a refund?
+
+Support can't issue refunds from the dashboard. Yelo has no refund, capture, or release tool. Collect the ride ID from **Rides** → **Trips** and escalate through [Payment failures and holds](/runbooks/payment-issues).
+
+## Cancellations
+
+### Cancellation fees
+
+The app checks the fee before the rider confirms a cancellation. If the fee changes by the time they confirm, the app shows "The cancellation fee changed. Review the fee before confirming again."
+
+| Ride status when the rider cancels | Fee |
+| --- | --- |
+| Waiting for a match, or queued behind the driver's current trip | $0 |
+| Driver on the way, more than 5 minutes' drive from pickup | $0 |
+| Driver on the way, 5 minutes or less from pickup | 40% of the fare, at least $1.00 |
+| Driver waiting at pickup | 75% of the fare, at least $1.00 |
+| Trip in progress | 100% of the fare, at least $1.00 |
+
+- A free ride never has a fee.
+- The 5-minute test uses the driver's last reported location. If Yelo doesn't know where the driver is, the fee is $0.
+- When a fee applies, the app says "Your driver is on the way. Cancelling now charges a fee." That sentence shows for every fee, including when the driver is already waiting.
+- The fee goes to the driver, or to the driver's fleet when the fleet handles payouts.
+
+To confirm a disputed fee, open **Ride Details** and read `cancellation_fee` on the `ride_canceled` event. See [Cancellations](/concepts/cancellations#fee-rules).
+
+### My driver canceled. Was I charged?
+
+No. If the driver cancels before the trip starts, the ride goes back to finding a driver with no fee. The rider gets **Finding a new driver** / "Your driver canceled. We're finding you a new driver!" The card hold stays and moves to the next driver who accepts.
+
+If the driver cancels after the trip started, the ride ends with no fee and the hold is canceled.
+
+## Matching
+
+### Why are there no drivers?
+
+A confirmed ride waits on the board for drivers in the rider's community who are online for the ride's fleet. Yelo also pushes the ride to nearby offline drivers in widening circles, and after 2 minutes it can auto-assign it to a driver who opted in. See [Matching and auto-queue](/concepts/matching-and-auto-queue).
+
+If nobody accepts within 10 minutes, the ride ends and the rider gets **Ride Request Canceled** / "No drivers were available this time." No driver accepted, so the card was never authorized and there's no charge.
+
+<Warning>
+One exception: if a driver accepted and then canceled, the ride went back on the board with its card hold. If it then expires, Yelo doesn't release that hold. Escalate through [Payment failures and holds](/runbooks/payment-issues#cases-and-what-the-code-does).
+</Warning>
+
+To see how many drivers were online, open **Live** and select the market. See [Live operations](/dashboard/live).
+
+### What does OFF-PEAK or a day and time on the search bar mean?
+
+The market is off-peak: no driver is online, the market is outside its operating hours, and the last driver went offline more than an hour ago. The chip shows the next operating window, such as **THU | 9PM**, or just **OFF-PEAK**. Tapping it opens **Operating hours**.
+
+Riders can still request a ride. The matching screen shows **Off-Peak Hours** / "Yelo isn't a 24/7 service, but you can still request a ride." A driver who comes online nearby gets a push about the waiting ride.
+
+Admins set a community's hours on the **Community** page. See [Operating hours](/dashboard/communities#operating-hours).
+
+<Note>
+When the market isn't off-peak, the chip reads **COMING**, even in live markets. Don't read **COMING** as "rides are disabled." A rider in a community with rides disabled sees no Yelo options at all, only other ride apps. See [Rider can't request](/runbooks/rider-cannot-request).
+</Note>
+
+## Tips
+
+### How do tips work?
+
+After the trip, the rating screen shows **Add a tip** with $2, $5, $10, and **Custom** up to $100.
+
+- The rider has 24 hours to rate and tip. After that, Yelo captures the fare and closes the window. Tipping later isn't possible in the app.
+- A tip of $5.00 or less is captured together with the fare, from the existing hold.
+- A larger tip is charged separately to the same card.
+- The whole tip goes to the driver, or to the driver's fleet when the fleet handles payouts.
+- A ride can only be tipped once.
+
+If the tip fails, the rider sees "Could not confirm your review. Check your ride status before trying again." Check the ride timeline for `tip_captured`. If it's missing, no tip was charged. A driver or fleet without a payout account can't receive tips.
+
+See [Tips and earnings](/concepts/tips-and-earnings#in-app-ride-tips).
+
+### Can I tip without a ride?
+
+Yes, through a QR code or a driver's tip link. It opens a web page where anyone can pay with Stripe Checkout, with or without a Yelo account. The minimum is $0.50. These payments show in the fleet's **QR Payment History**, not in the rider's **Ride History**.
+
+## Receipts and ride history
+
+Yelo doesn't send receipt emails. Riders see past trips in **Profile** → **Ride History**. Tapping a trip opens **Ride details**:
+
+- **YOU PAID**: the fare plus any tip.
+- **Base fare**, **Tip**, **Distance**, **Duration**, **Date**, and **Paid with** (the card brand).
+- **Get help**, which opens **Contact Yelo** with the ride attached.
+
+<Warning>
+Ride history includes canceled rides and shows their full fare under **YOU PAID**, even when the rider paid a smaller fee or nothing. The duration value is in seconds but labeled "min". Use **Ride Details** in the dashboard for the real outcome.
+</Warning>
+
+## Communities
+
+### Which community am I in?
+
+Every account has an active community and a home community, set by location. The app moves the user to the smallest community area that contains a recent location, and to the default community when they're more than 20 miles outside their current one. Users can also pick one by hand in the profile's **Change Community** screen. See [How users are assigned to a community](/concepts/communities-and-zones#how-users-are-assigned-to-a-community).
+
+Requesting a ride also fixes a stale community. If the rider's community is the default one, has rides disabled, or doesn't contain the trip, Yelo moves them to the community that contains the pickup before pricing.
+
+A rider still gets **Pickup Outside Service Area** or **Destination Outside Service Area** when no single community contains both stops. Service areas are rectangles around the community, not the zones drawn on the map.
+
+To check or fix a user's community, open their detail sheet. **Profile** shows **Community** and **Home Community**. **Edit profile** changes them. See [Edit a profile](/dashboard/user-directory#edit-a-profile).
+
+## Accounts
+
+### How do I delete my account?
+
+Two ways:
+
+- **In the app**: **Profile** → **Settings** → **Delete account**, then confirm. The app shows "Your Yelo account has been deleted".
+- **On the web**: the signup site's `/delete-account` page. The rider verifies their phone by text and types `DELETE`. This only works for accounts that have a phone, an email, and a completed profile. Others see "We couldn't find a completed Yelo account for that number..." and should use the app.
+
+Deletion erases the name, email, phone, photo, linked Apple and Google sign-ins, and the saved card. Ride and payment records are kept, no longer linked to contact details. The same phone or Apple or Google account can sign up again as a new account. See [Account deletion and retention](/engineering/identity/account-deletion).
+
+Support can't delete an account from the dashboard. If a user can't use either path, escalate to engineering.

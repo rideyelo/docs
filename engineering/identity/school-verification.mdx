@@ -83,9 +83,11 @@ During a v2 **signup** (caller has a presignup token, not a `user` role), a Goog
 | Caller | School is a whitelist entry | Result |
 | --- | --- | --- |
 | Signed-in user (`user` role) | No | Collision check, then `CompleteSchoolVerification`. `Users.email` is **not** changed. |
-| Signed-in user | Yes | No collision check, no student change, and nothing written. The call still returns success. |
+| Signed-in user | Yes | No collision check, no student change, and nothing written. The call still returns success, as the code comment intends. |
 | v2 signup with a user ID | Either | Collision check, student change unless whitelist, and fill `Users.email` only if blank |
 | v2 signup without a user ID | Either | Find a user by email and attach the phone (legacy v1 migration), or create a user |
+
+A signed-in caller always gets a full user JWT back, scoped to their current `community_id` (`buildPostEmailResponse` with `authenticated = true`). Presignup and new-account callers still get a full token only when `IsV2SignupComplete` is true, and a presignup token otherwise.
 
 `checkCollisionExceptSelf` refuses an email already owned by another user. After a non-whitelist verification, `EducationClaim.ReconcileVerifiedEmail` marks any matching World Cup claim as verified.
 
@@ -149,9 +151,9 @@ The app ignores the callback's parameters and completes with the server-created 
 
 ## Gotchas and edge cases
 
-- **The mobile disconnect copy is wrong for the last proof.** The **Accounts** screen says disconnecting "does not remove your existing student status". The API downgrades the account to `community` when the last proof is removed.
+- **The mobile disconnect copy is wrong for the last proof.** The **Accounts** screen says disconnecting "removes the linked proof but does not remove your existing student status" (`accounts.tsx`). The API downgrades the account to `community`, clears `school_id`, and clears `graduation_year` when the last proof is removed.
 - **Legacy students have no ledger row.** Users verified before `EducationVerifications` existed may have `account_type = 'student'` with no proof row (migration 280 only backfilled Google). They can't disconnect, and disconnecting a newer proof may drop them to `community` even though they were verified earlier.
-- **Proofs outlive deleted accounts.** Account deletion doesn't delete `EducationVerifications`. Because provider subjects are unique per provider, the same school Google account or StudID identity can't verify a new Yelo account later. It fails with `identity_conflict`.
+- **Proofs outlive deleted accounts.** Account deletion doesn't delete `EducationVerifications`. Because provider subjects are unique per provider, the same school Google account, Microsoft account, or StudID identity can't verify a new Yelo account later. It fails with `identity_conflict`. Email code proofs have no subject and don't block.
 - **StudID with no affiliations passes.** `studentAffiliationAllowed` returns true for an empty list. Only a non-empty list without `student` or `member` is rejected.
 - **Microsoft proofs are weaker.** Any Microsoft access token for any app is accepted, and `userPrincipalName` can be used as the email. The school match still depends on the domain.
 - **The client suffix list is broader than the server.** `SCHOOL_EMAIL_SUFFIXES` allows `.edu`, `.ca`, and `@rideyelo.com`, and matches case-sensitively. The server decides by `Schools.extensions`, case-insensitively.

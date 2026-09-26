@@ -48,10 +48,10 @@ Almost every event goes through `rideevents.EventRecorder` in `internal/service/
 
 1. The caller runs `Record(ctx, RecordOpts)`, which builds a `models.RideEvent` and pushes it onto a buffered channel. The buffer holds 500 events (`recorder.go:15`).
 2. If the channel stays full for 100 ms (`recorder.go:16`), the event is dropped. The recorder logs `Ride event dropped: channel full after timeout`.
-3. One goroutine started by `Start` (`cmd/api/main.go:239`) reads the channel and calls `InsertRideEvent` for each event. It uses the sqlc query `InsertRideEvent` in `internal/data/repository/queries/engagement.sql:530`.
+3. One goroutine started by `Start` (`cmd/api/main.go:246`) reads the channel and calls `InsertRideEvent` for each event. It uses the sqlc query `InsertRideEvent` in `internal/data/repository/queries/engagement.sql:530`.
 4. Insert failures log `Failed to insert ride event` and are never retried or returned to the caller (`recorder.go:100`).
 
-The recorder instance is built once in `internal/service/service.go:107`. The ride service, the activation service (`internal/service/service.go:182`), and the notification queue workers (`cmd/api/main.go:320`) all share it.
+The recorder instance is built once in `internal/service/service.go:109`. The ride service, the activation service (`internal/service/service.go:184`), and the notification queue workers (`cmd/api/main.go:328`) all share it.
 
 ### Writes are not transactional
 
@@ -65,7 +65,7 @@ The one transactional write is `message_sent`. The `InsertMessageTimeline` query
 
 ### Shutdown
 
-`main.go` calls `EventRecorder.Stop()` (`cmd/api/main.go:521`), which closes the channel and returns right away. It does not wait for the insert goroutine to drain. The goroutine also inserts with the root `ctx` passed to `Start`, and that context is already canceled at shutdown. Buffered events are likely lost on every deploy.
+`main.go` calls `EventRecorder.Stop()` (`cmd/api/main.go:531`), which closes the channel and returns right away. It does not wait for the insert goroutine to drain. The goroutine also inserts with the root `ctx` passed to `Start`, and that context is already canceled at shutdown. Buffered events are likely lost on every deploy.
 
 ## Event types
 
@@ -82,10 +82,10 @@ Common metadata keys:
 
 | Event type | Recorded when | Source | Actor | Status | Metadata |
 | --- | --- | --- | --- | --- | --- |
-| `price_calculated` | Vehicle prices are computed while a ride is created, before `ride_requested` | `internal/service/ride/rider.go:1281` (`buildVehicleOptions`), `rider.go:1579` (`buildVehicleOptionsV2`), helper `events.go:527` | `system` | — | `cache_hit`, `distance_meters`, `duration_seconds`, `surge_multiplier`, `price_params`, `vehicle_prices`, `community_id`, `used_default_pricing`, optional `price_breakdowns`, `discount_id`, `discount_rate` |
-| `ride_requested` | `CreateRide` or `CreateRideV2` inserts the ride row | `internal/service/ride/rider.go:104` (V1), `rider.go:1445` (V2) | `rider`, with `actor_id` set to the rider | — → `requested` | `distance`, `duration`, `pickup_name`, `destination_name`, `community_id`, `pickup_lat`, `pickup_lng`, `destination_lat`, `destination_lng`, `is_public_pickup`, `is_public_destination`. V2 also adds `quoted_prices`, an array of `fleet_id`, `vehicle_type`, `price`, `discounted_price`, and `is_discounted`. |
-| `surge_pricing_applied` | Right after `ride_requested`, when the community surge multiplier is above 1.0 and not expired | `internal/service/ride/rider.go:126` (V1), `rider.go:1455` (V2), helper `events.go:462` | `system` | — | `surge_multiplier`, `community_id` (from the rider's user record, `prep.user.CommunityID`) |
-| `ride_confirmed` | `finalizeConfirmRide` after `Ride.Confirm` succeeds | `internal/service/ride/rider.go:395` | `rider`, with `actor_id` set to the requesting user | `requested` → `confirmed` | `price`, `actual_price`, `display_price`, `vehicle_type`, `discount_id`, `discounted_price`, `payment_method_brand`, `fleet_id`, `confirm_code` |
+| `price_calculated` | Vehicle prices are computed while a ride is created, before `ride_requested` | `internal/service/ride/rider.go:1271` (`buildVehicleOptions`), `rider.go:1569` (`buildVehicleOptionsV2`), helper `events.go:527` | `system` | — | `cache_hit`, `distance_meters`, `duration_seconds`, `surge_multiplier`, `price_params`, `vehicle_prices`, `community_id`, `used_default_pricing`, optional `price_breakdowns`, `discount_id`, `discount_rate` |
+| `ride_requested` | `CreateRide` or `CreateRideV2` inserts the ride row | `internal/service/ride/rider.go:104` (V1), `rider.go:1435` (V2) | `rider`, with `actor_id` set to the rider | — → `requested` | `distance`, `duration`, `pickup_name`, `destination_name`, `community_id`, `pickup_lat`, `pickup_lng`, `destination_lat`, `destination_lng`, `is_public_pickup`, `is_public_destination`. V2 also adds `quoted_prices`, an array of `fleet_id`, `vehicle_type`, `price`, `discounted_price`, and `is_discounted`. |
+| `surge_pricing_applied` | Right after `ride_requested`, when the community surge multiplier is above 1.0 and not expired | `internal/service/ride/rider.go:126` (V1), `rider.go:1445` (V2), helper `events.go:462` | `system` | — | `surge_multiplier`, `community_id` (from the rider's user record, `prep.user.CommunityID`) |
+| `ride_confirmed` | `finalizeConfirmRide` after `Ride.Confirm` succeeds | `internal/service/ride/rider.go:395` | `rider`, with `actor_id` set to the requesting user | `requested` → `confirmed` | `price`, `actual_price`, `display_price`, `vehicle_type`, `discount_id`, `discounted_price`, `payment_method_brand`, `fleet_id`, `confirm_code` (the rider's pickup PIN, in plain text, or null when the fleet doesn't require one) |
 
 </Accordion>
 <Accordion title="Matching and dispatch">
@@ -93,19 +93,19 @@ Common metadata keys:
 | Event type | Recorded when | Source | Actor | Status | Metadata |
 | --- | --- | --- | --- | --- | --- |
 | `ride_board_added` | The ride is added to the community ride board after confirm, or before a direct request is sent | `internal/service/ride/rider.go:430` (`addToRideBoardAndNotify`), `rider.go:469` (`directAssignDriver`), helper `events.go:355` | `system` | — | `community_id` |
-| `notification_dispatched` (T0) | The immediate ride-available push to fleet and founding drivers is enqueued | `internal/service/ride/rider.go:2171` (`notifyDriversAboutNewRide`) | `system` | — | `tier` (always `0`), `num_drivers`, `drivers` (array of `id` and `name`), `elapsed_since_confirm_ms`, `community_id`, `fleet_id` |
+| `notification_dispatched` (T0) | The immediate ride-available push to fleet and founding drivers is enqueued | `internal/service/ride/rider.go:2161` (`notifyDriversAboutNewRide`) | `system` | — | `tier` (always `0`), `num_drivers`, `drivers` (array of `id` and `name`), `elapsed_since_confirm_ms`, `community_id`, `fleet_id` |
 | `notification_dispatched` (direct request) | A rider-chosen driver's request push is enqueued | `internal/service/ride/rider.go:488` (`directAssignDriver`) | `system` | — | `driver_id`, `direct_request` (`true`), `response_window_seconds` (`30`) |
 | `direct_assign_fallback` | A direct request can't be offered, and the ride falls back to normal matching | `internal/service/ride/rider.go:572` (`directAssignFallback`) | `system` | — | `driver_id`, `fallback_reason`: `driver_unavailable`, `driver_offline`, `no_active_session`, `session_changed`, `vehicle_changed`, `eta_unavailable`, `eta_too_long`, `board_unavailable`, or `notification_failed` |
 | `activation_tier_reached` | The activation sweep reaches a new tier for an unmatched ride. It is recorded even when there are zero candidates. | `internal/service/activation/activation.go:456` (`activateForConfigTier`) | `system` | — | `tier`, `drivers_notified`, `driver_ids`, `driver_names`, `elapsed_since_confirm_ms`, `community_id`, `search_radius_km`, `target_drivers`, `ignore_already_notified` |
 | `rescue_alert_sent` | A Slack rescue alert is sent because the ride is still unmatched past the last tier delay plus the rescue grace period. It fires once per ride (`TrySetRescueSent`). | `internal/service/activation/activation.go:775` (`checkRescue`) | `system` | — | `elapsed_minutes`, `drivers_notified` (null if the Redis read failed), `tiers_count`, `community_id` |
-| `ride_declined` | A driver declines a ride offer | `internal/service/ride/driver.go:408` (`DeclineRide`) | `driver`, with `actor_id` set to the driver | — | `reason`, `driver_id`, `total_declined_drivers`, `num_previously_declined`, `pickup_name`, `dest_name`, `distance`, optional `vehicle_type`, `elapsed_since_confirm_ms` |
+| `ride_declined` | A driver declines a ride offer | `internal/service/ride/driver.go:418` (`DeclineRide`) | `driver`, with `actor_id` set to the driver | — | `reason`, `driver_id`, `total_declined_drivers`, `num_previously_declined`, `pickup_name`, `dest_name`, `distance`, optional `vehicle_type`, `elapsed_since_confirm_ms` |
 | `pickup_route_calculated` | During `AcceptRide`, after the driver-to-pickup route is computed and before payment or the accept write | `internal/service/ride/driver.go:77`, helper `events.go:333` | `system` | — | `pickup_distance`, `pickup_duration`, `driver_id` |
 | `ride_accepted` | `AcceptRide` after `Ride.Accept` commits | `internal/service/ride/driver.go:108`, helper `events.go:31` | `driver`, with `actor_id` set to the driver | `confirmed` → `driver_en_route`, or `queued` if the driver's `QueueLength` was above 0 | `pickup_distance`, `pickup_duration`, `vehicle_id`, `fleet_id`, `queue_position`, `auto_queued` (always `false`), `driver_name` |
 | `ride_board_removed` | The ride leaves the board on accept (`reason: accepted`) or on cancel (`reason: canceled`) | `internal/service/ride/driver.go:118`, `internal/service/ride/ride.go:139`, helper `events.go:370` | `system` | — | `reason`, `community_id` |
-| `ride_auto_queued` | The activation service auto-assigns a ride into an online driver's queue (`AutoAssignRide`) | `internal/service/ride/driver.go:157` | `system` (no `actor_id`) | `confirmed` → `queued` | `driver_id` |
-| `queue_promoted` | A queued ride becomes the driver's active ride after the previous ride completes or is canceled | `internal/service/ride/driver.go:1290` (`notifyQueuePromotion`), helper `events.go:302` | `system` | `queued` → `driver_en_route` | `previous_ride_id`, `pickup_name`, `dest_name`, optional `wait_in_queue_ms` (measured from `match_time`), `driver_id` |
-| `notification_dispatched` (queue promotion) | During queue promotion, when the rider has a push token | `internal/service/ride/driver.go:1279` | `system` | — | `recipient` (`rider`), `notification_type` (`queue_promoted`), `sender_id` |
-| `no_drivers_available` | The operational sweep, every 30 s (`cmd/api/main.go:559`), expires confirmed rides that are still unassigned | `internal/service/ride/ride.go:711` (`CancelUnmatchedRides`) | `system` | `confirmed` → `complete` | `community_id` |
+| `ride_auto_queued` | The activation service auto-assigns a ride into an online driver's queue (`AutoAssignRide`), after the assignment commits and before any immediate promotion | `internal/service/ride/driver.go:167` | `system` (no `actor_id`) | `confirmed` → `queued` | `driver_id`. From the activation loop it also carries the dispatch decision: `elapsed_since_confirm_ms`, `candidate_count` (candidates that got a valid Mapbox result), `deadhead_minutes`, `final_score`, and `queue_load`. |
+| `queue_promoted` | A queued ride becomes the driver's active ride after the previous ride completes or is canceled | `internal/service/ride/driver.go:1300` (`notifyQueuePromotion`), helper `events.go:302` | `system` | `queued` → `driver_en_route` | `previous_ride_id`, `pickup_name`, `dest_name`, optional `wait_in_queue_ms` (measured from `match_time`), `driver_id` |
+| `notification_dispatched` (queue promotion) | During queue promotion, when the rider has a push token | `internal/service/ride/driver.go:1289` | `system` | — | `recipient` (`rider`), `notification_type` (`queue_promoted`), `sender_id` |
+| `no_drivers_available` | The operational sweep, every 30 s (`cmd/api/main.go:569`), expires confirmed rides that are still unassigned | `internal/service/ride/ride.go:711` (`CancelUnmatchedRides`) | `system` | `confirmed` → `complete` | `community_id` |
 | `direct_assigned` | Never written. See [Defined but never written](#defined-but-never-written). | helper only: `internal/service/ride/events.go:386` | `system` | `confirmed` → `queued` | `driver_id`, `vehicle_id`, `fleet_id` |
 
 </Accordion>
@@ -113,9 +113,9 @@ Common metadata keys:
 
 | Event type | Recorded when | Source | Actor | Status | Metadata |
 | --- | --- | --- | --- | --- | --- |
-| `driver_at_pickup` | `AtPickup` after `Ride.AtPickup` commits | `internal/service/ride/driver.go:448`, helper `events.go:215` | `driver` | `driver_en_route` → `driver_waiting` | `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_match_ms`, `elapsed_since_confirm_ms` |
-| `rider_picked_up` | `Pickup` after the confirm code check and `Ride.Pickup` commit | `internal/service/ride/driver.go:506`, helper `events.go:247` | `driver` | `driver_waiting` → `in_progress` | `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_match_ms`, `wait_at_pickup_ms`, `elapsed_since_confirm_ms` |
-| `ride_completed` | `Complete` after `Ride.Complete` commits | `internal/service/ride/driver.go:597`, helper `events.go:66` | `driver` | `in_progress` → `pending_rider_rating` | `distance`, `price`, `pickup_name`, `dest_name`. Adds `tip_pending` (`true`) when tips are enabled, otherwise `driver_payout`. Optional `elapsed_since_confirm_ms`, `ride_duration_ms`. |
+| `driver_at_pickup` | `AtPickup` after `Ride.AtPickup` commits | `internal/service/ride/driver.go:458`, helper `events.go:215` | `driver` | `driver_en_route` → `driver_waiting` | `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_match_ms`, `elapsed_since_confirm_ms` |
+| `rider_picked_up` | `Pickup` after the confirm code check and `Ride.Pickup` commit | `internal/service/ride/driver.go:516`, helper `events.go:247` | `driver` | `driver_waiting` → `in_progress` | `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_match_ms`, `wait_at_pickup_ms`, `elapsed_since_confirm_ms` |
+| `ride_completed` | `Complete` after `Ride.Complete` commits | `internal/service/ride/driver.go:607`, helper `events.go:66` | `driver` | `in_progress` → `pending_rider_rating` | `distance`, `price`, `pickup_name`, `dest_name`. Adds `tip_pending` (`true`) when tips are enabled, otherwise `driver_payout`. Optional `elapsed_since_confirm_ms`, `ride_duration_ms`. |
 | `ride_rated` | `Rate` after the rating is saved, for either party | `internal/service/ride/ride.go:280`, helper `events.go:478` | `rider` or `driver`, based on who rated | — | `rating`, `feedback`, `rated_by`, `pickup_name`, `dest_name`, `distance`, `price`, optional `elapsed_since_complete_ms`. Adds `tips_enabled` and `tip_amount` when tips are on. |
 | `message_sent` | A rider or driver sends an in-ride chat message (`SendMessage`, `messaging_sync.go`). Written in the same transaction as the message. | `internal/data/repository/queries/messaging.sql:49` via `internal/data/repository/messaging.go:55` | `rider` or `driver`, with `actor_id` set to the sender | — | `content` (full message text), `message_length` (bytes), `sender_type` |
 
@@ -126,20 +126,20 @@ Common metadata keys:
 | --- | --- | --- | --- | --- | --- |
 | `payment_canceled` | `Cancel` after `handleCancellationPayment`, before the cancel write. Only when the ride has a payment intent. | `internal/service/ride/ride.go:122`, helper `events.go:105` | `system` | — | `payment_intent_id`, `cancellation_fee`, `original_amount`, `cancel_phase` |
 | `ride_canceled` (user) | `Cancel` after `Ride.Cancel` commits, for a rider cancel or a non-requeue driver cancel | `internal/service/ride/ride.go:133`, helper `events.go:123` | `rider` or `driver`, with `actor_id` set to the canceler | the prior status → `complete` | `cancel_reason`, `cancel_phase`, `cancellation_fee`, `canceled_by`, `had_driver`, `pickup_name`, `dest_name`, `distance`, optional `elapsed_since_confirm_ms` |
-| `ride_canceled` (superseded) | A rider creates a new ride while an older open request exists. `CancelOpenRequest` closes the old ride, and the event is written against the old ride's ID. | `internal/service/ride/rider.go:77` (V1), `rider.go:1384` (V2), helper `events.go:283` | `system`, with `actor_id` set to the rider | — → `complete` | `cancel_reason` (`superseded`), `triggered_by` (`new_ride_request`) |
+| `ride_canceled` (superseded) | A rider creates a new ride while an older open request exists. `CancelOpenRequest` closes the old ride, and the event is written against the old ride's ID. | `internal/service/ride/rider.go:77` (V1), `rider.go:1374` (V2), helper `events.go:283` | `system`, with `actor_id` set to the rider | — → `complete` | `cancel_reason` (`superseded`), `triggered_by` (`new_ride_request`) |
 | `auto_requeued` | A driver cancels in `queued`, `driver_en_route`, or `driver_waiting`. The ride returns to `confirmed` instead of ending. It is recorded last in `requeueAfterDriverCancel`. | `internal/service/ride/ride.go:1118`, helper `events.go:164` | `driver`, with `actor_id` set to the canceling driver | the prior status → `confirmed` | `ride_id`, `rider_id`, `canceled_driver_id`, `cancel_reason`, `cancel_comment`, `cancel_phase`, `price`, `actual_price`, `pickup_name`, `destination_name`, `community_id`, optional `vehicle_type`, `original_confirm_time`, `time_since_confirm_seconds`, `original_match_time` |
 
-The payment-failure paths during accept also call `Cancel` (`internal/service/ride/driver.go:974` and `driver.go:1058`). Those cancels produce the usual `payment_canceled` and `ride_canceled` rows after `payment_processing_failed`.
+The payment-failure paths also call `Cancel` as the request user (`internal/service/ride/driver.go:984` and `driver.go:1068`). What follows `payment_processing_failed` depends on who that user is. During a manual accept, the driver isn't assigned yet, so `Cancel` rejects the call and no cancel or requeue event is written. During queue promotion or idle recovery, the user is the assigned driver, so the ride is requeued and an `auto_requeued` row follows. See [Cancellations](/concepts/cancellations#system-initiated-endings).
 
 </Accordion>
 <Accordion title="Payment and tips">
 
 | Event type | Recorded when | Source | Actor | Status | Metadata |
 | --- | --- | --- | --- | --- | --- |
-| `merchant_selected` | The Stripe merchant is chosen during accept (skipped when an existing authorization is reused) and again at complete | `internal/service/ride/driver.go:843` (`processRidePayment`), `driver.go:567` (`Complete`), helper `events.go:413` | `system` | — | `merchant_id`, `merchant_type`, `driver_id` |
-| `payment_processing_failed` | A step of the accept-time payment flow fails | `internal/service/ride/driver.go:969`, `driver.go:984` (`operation: clone_payment_method`), `driver.go:1056`, `1068`, `1081`, `1094` (`create_payment_intent`), `driver.go:1124` (`persist_payment_intent`), helper `events.go:436` | `system` | — | `operation`, `error`, plus `merchant_id` and `rider_id` (clone); `merchant_id`, `rider_id`, `driver_id`, and `amount` (create); or `payment_intent_id` (persist) |
-| `payment_intent_created` | A new authorization is created and persisted during accept | `internal/service/ride/driver.go:873` (`processRidePayment`) | `system` | — | `payment_intent_id`, `amount`, `auth_amount` (fare plus `TipBuffer` when tips are enabled), `merchant_id`, `rider_id`, `driver_id` |
-| `payment_confirmed` | The fare is captured. This happens at complete when tips are off, or at rating time when tips are on (`captureTipWithinBuffer`, `captureFareOnly`). Only when a payment intent exists. | `internal/service/ride/driver.go:583`, `internal/service/ride/tip_charge.go:84`, `tip_charge.go:100`, helper `events.go:50` | `system` | — | `payment_intent_id`, `amount` |
+| `merchant_selected` | The Stripe merchant is chosen during accept (skipped when an existing authorization is reused) and again at complete | `internal/service/ride/driver.go:853` (`processRidePayment`), `driver.go:577` (`Complete`), helper `events.go:413` | `system` | — | `merchant_id`, `merchant_type`, `driver_id` |
+| `payment_processing_failed` | A step of the accept-time payment flow fails | `internal/service/ride/driver.go:979`, `driver.go:994` (`operation: clone_payment_method`), `driver.go:1066`, `1078`, `1091`, `1104` (`create_payment_intent`), `driver.go:1134` (`persist_payment_intent`), helper `events.go:436` | `system` | — | `operation`, `error`, plus `merchant_id` and `rider_id` (clone); `merchant_id`, `rider_id`, `driver_id`, and `amount` (create); or `payment_intent_id` (persist) |
+| `payment_intent_created` | A new authorization is created and persisted during accept | `internal/service/ride/driver.go:883` (`processRidePayment`) | `system` | — | `payment_intent_id`, `amount`, `auth_amount` (fare plus `TipBuffer` when tips are enabled), `merchant_id`, `rider_id`, `driver_id` |
+| `payment_confirmed` | The fare is captured. This happens at complete when tips are off, or at rating time when tips are on (`captureTipWithinBuffer`, `captureFareOnly`). Only when a payment intent exists. | `internal/service/ride/driver.go:593`, `internal/service/ride/tip_charge.go:84`, `tip_charge.go:100`, helper `events.go:50` | `system` | — | `payment_intent_id`, `amount` |
 | `tip_captured` | A tip is captured inside the existing authorization, by a separate tip charge that succeeds right away, or by `ConfirmTip` after the rider completes an on-session confirmation | `internal/service/ride/tip_charge.go:85`, `tip_charge.go:174`, `tip_charge.go:231`, helper `tip_charge.go:290` | `rider`, with `actor_id` set to the rider | — | `tip_amount`, `fare`, `total_capture`, `driver_payout` |
 | `tip_window_expired` | `AutoCaptureTipWindowExpired` captures the fare only, after the 24-hour tip window, and wins the `CompleteTip` race | `internal/service/ride/tip_capture.go:77` | `system` | — (no status recorded, although the ride moves `pending_rider_rating` → `complete`) | `fare`, `tip_amount` (`0`), `driver_payout` |
 
@@ -173,9 +173,9 @@ All other event types are written through `models.RideEvent*` constants.
 
 ### Dashboard endpoint
 
-`GET /dashboard/rides/{id}/events` returns one ride's timeline. It is registered in `internal/server/http/dashboard/rides/rides_routes.go:25` under the `/dashboard/rides` group (`internal/server/http/router.go:552`), with operation ID `dashboard.GetRideEvents`.
+`GET /dashboard/rides/{id}/events` returns one ride's timeline. It is registered in `internal/server/http/dashboard/rides/rides_routes.go:26` under the `/dashboard/rides` group (`internal/server/http/router.go:552`), with operation ID `dashboard.GetRideEvents`.
 
-- **Auth:** A Clerk dashboard session with role `admin` (`rides_handler.go:130`). Other roles get `403 admin access required`.
+- **Auth:** A Clerk dashboard session with role `admin` (`rides_handler.go:132`). Other roles get `403 admin access required`.
 - **Errors:** A path ID that isn't a UUID returns `400 invalid ride ID`. An unknown ride returns `200` with an empty `events` array.
 - **Query:** `ListRideEventsByRideID` (`internal/data/repository/queries/engagement.sql:544`) left-joins `"Users"` on `actor_id` to build `actor_name` and orders by `created_at ASC, id ASC`.
 
@@ -224,14 +224,14 @@ The response is wrapped in the standard envelope, with `success`, `data`, and `m
 
 ### Dashboard UI
 
-In `yelo-web`, `useRideEvents` (`src/hooks/useRideEvents.ts`) calls the generated `dashboardGetRideEvents`. `RideEventsTimeline` (`src/sites/dashboard/components/RideEventsTimeline.tsx`) renders the timeline inside `RideDetailSheet` (`src/components/rides/RideDetailSheet.tsx`). The sheet opens from the Rides trips table, the Issues tab, supply-demand tables, and recent pricing activity.
+In `yelo-web`, `useRideEvents` (`src/hooks/useRideEvents.ts`) calls the generated `dashboardGetRideEvents`. `RideEventsTimeline` (`src/sites/dashboard/components/RideEventsTimeline.tsx`) renders the timeline inside `RideDetailSheet` (`src/components/rides/RideDetailSheet.tsx`). The sheet opens from the Rides trips table, the Issues tab, the live operations tables (`src/components/live/LiveTables.tsx`), and recent pricing activity.
 
 - Badge colors cover 19 event types (`RideEventsTimeline.tsx:11`). Other types use the default zinc badge.
-- `notification_dispatched` rows get a bell icon. They are meant to expand into notification details through `dashboardGetNotificationDetail`, which reads `metadata.notification_log_id`. The API never writes that key, so the row falls back to showing raw metadata JSON.
+- `notification_dispatched` rows get a bell icon. They are meant to expand into notification details through `dashboardGetNotificationDetail`, which reads `metadata.notification_log_id` (`RideEventsTimeline.tsx:138`). The orchestrator writes `notification_id` instead, so the row falls back to showing raw metadata JSON. The row label reads `metadata.title`, which no writer sets, so it shows the actor name or a dash.
 
 ### Other consumers
 
-There is no rider or driver API for ride events. The mobile app (`yelo-frontend`) does not read them. The only other code that touches the table is the E2E fixture cleanup, which runs `DELETE FROM "RideEvents"` before deleting fixture rides (`internal/server/http/e2econtrol/ride_fixture.go:65`).
+There is no rider or driver API for ride events. The mobile app (`yelo-frontend`) does not read them. The only other code that touches the table is the E2E fixture cleanup, which runs `DELETE FROM "RideEvents"` before deleting fixture rides (`internal/server/http/e2econtrol/ride_fixture.go:70`).
 
 ## Query a ride's history in SQL
 

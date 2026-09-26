@@ -79,12 +79,12 @@ Auth v2 is the phone-first mobile sign-up flow under `/authv2`. The router regis
 - Verifying the phone OTP returns a full JWT for a returning user whose sign-up is complete. Otherwise it returns a **presignup token**: HS256, 1-hour lifetime, role `presignup`, with the verified phone in `app_metadata.phone` and `sub` set to the user ID or `pending`.
 - `getValidatePresignupTokenMiddleware` accepts both presignup and full tokens, stores `PresignupClaims` in context under `PresignupClaimsKey`, and masks the phone in logs. It does not check that the user exists. Handlers read `claims.UserID` themselves.
 - The OTP send route shares the Auth v3 durable rate limiter through `authv2.WithPhoneSendRateLimit` when Auth v3 is enabled.
-- Email verification refreshes the presignup token with the user and community, or returns a full JWT when it authenticates a completed account.
+- Email verification refreshes the presignup token with the user and community, or returns a full JWT when it authenticates a completed account. A caller that already holds a full `user` token always gets a full JWT back, scoped to their current community.
 - Completing profile setup issues the full JWT.
 
 ## Auth v3
 
-Auth v3 is a web-native sign-in surface under `/authv3`, used by the web sign-up site and native Sign in with Apple. It is disabled unless `AUTH_V3_ENABLED=true`. When disabled, the router registers no Auth v3 routes and answers `/authv3` and `/authv3/*` with `AuthV3UnavailableError` (503) so clients can fall back.
+Auth v3 is the primary sign-up and sign-in surface under `/authv3`, used by the mobile app (hosted page and native screens) and the web signup site. It is disabled unless `AUTH_V3_ENABLED=true`. When disabled, the router registers no Auth v3 routes and answers `/authv3` and `/authv3/*` with `AuthV3UnavailableError` (503) so clients can fall back.
 
 `internal/service/authv3_composition.go` builds the components only when enabled and all required keys parse. Startup fails if a required Auth v3 setting is invalid.
 
@@ -151,9 +151,11 @@ Other default TTLs: transaction 10 minutes, provider start 5 minutes, handoff co
 `dashboardScopeAllows` in `dashboard_scope.go` is a path-based allowlist that runs before any dashboard handler:
 
 - **`admin`**: every dashboard path.
-- **`intern`**: requires a valid `community_id`. Allows `GET /dashboard/rides`, `/dashboard/leads/drivers/*`, selected read-only community endpoints (`kpis`, `drivers`, `demographics`, `fleets`, `users`, `search-insights`, `search-map-data`), `top-locations`, and the intern's own community `events`, `locations`, and read-only `feed`, `zones`, and `map`.
-- **`fleet`**: requires at least one valid fleet assignment. Allows `GET /dashboard/rides`, `/dashboard/qr/*`, `/dashboard/calendar-owner/*`, and fleet- or community-scoped resources that match an assignment.
+- **`intern`**: requires a valid `community_id`. Allows `GET /dashboard/rides`, `/dashboard/leads/drivers/*`, selected read-only community endpoints (`kpis`, `drivers`, `demographics`, `fleets`, `users`, `search-insights`, `search-map-data`, `cancellations`, `uncompletes`), `top-locations` with any method, and the intern's own community `events`, `locations`, and read-only `feed`, `zones`, and `map`.
+- **`fleet`**: requires at least one valid fleet assignment. Allows `GET /dashboard/rides`, `/dashboard/qr/*`, `/dashboard/calendar-owner/*`, `GET /dashboard/fleet/{fleet}/kpis|histogram|drivers`, `/dashboard/fleets/driver-join-link/{fleet}`, `/dashboard/fleets/{fleet}/communities/{community}/calendar`, `/dashboard/communities/{community}/fleets/{fleet}/*` and `/dashboard/communities/{community}/price-parameters` with any method, and `GET /dashboard/{community}/fleets`, each only for an assigned pair.
 - Any other role is rejected.
+
+`/dashboard/live/*` (live market operations, which replaced `/dashboard/supply-demand`) matches neither the intern nor the fleet allowlist, so it is admin-only in practice.
 
 Handlers still own object-level checks and mutation permissions. The gate only prevents a role from reaching a surface it should never see.
 
@@ -164,7 +166,7 @@ Handlers still own object-level checks and mutation permissions. The gate only p
 | Group | Allowed roles |
 | --- | --- |
 | Education claim routes (`/dashboard/education-claims/*`) | `admin` |
-| `/dashboard/users/*` (including fleet admin routes and user notifications) | `admin` |
+| `/dashboard/users/*` (including fleet admin routes, driver fleet memberships and transfers, and user notifications) | `admin` |
 | `/dashboard/notifications/*` | `admin` |
 | `/dashboard/leads/drivers/*` | `admin`, `intern` |
 | `/riverui/*` and `POST /riverui/session` | `admin` |
@@ -197,4 +199,4 @@ If only one of `TWILIO_EVENTS_WEBHOOK_USER` and `TWILIO_EVENTS_WEBHOOK_PASSWORD`
 
 ## Metrics and pprof
 
-`/metrics` and `/debug/pprof/` require `Authorization: Bearer <METRICS_AUTH_TOKEN>` when `METRICS_AUTH_TOKEN` is set. When it is empty, they are open.
+`mountObservability` in `internal/server/http/middleware_metrics_auth.go` mounts `/metrics` only when `METRICS_AUTH_TOKEN` is set. Every request must then send `Authorization: Bearer <METRICS_AUTH_TOKEN>`, compared in constant time. `/debug/pprof/` is mounted behind the same token only when `PPROF_ENABLED=true` (default `false`). With `METRICS_AUTH_TOKEN` empty, neither route exists, and the API logs `metrics and pprof endpoints disabled`.

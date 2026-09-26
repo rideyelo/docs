@@ -3,7 +3,7 @@ title: "Pricing configuration and admin"
 description: "How pricing configs are versioned and validated, who can edit them, zone pricing overrides and backtesting, global jitter settings, and how dashboard previews and the pricing overview compute quotes."
 ---
 
-This page covers the write side of pricing: the dashboard endpoints and services that create pricing configs, zone overrides, and jitter settings, plus the read-only preview and overview quotes. For the fare math itself, see [Pricing engine internals](/engineering/domains/pricing-engine). For the admin UI, see [Ride pricing](/dashboard/ride-pricing). Zone polygons and their CRUD are covered in [Zones geometry](/engineering/location/zones-geometry). Surge is set from [Supply and demand](/dashboard/supply-and-demand).
+This page covers the write side of pricing: the dashboard endpoints and services that create pricing configs, zone overrides, and jitter settings, plus the read-only preview and overview quotes. For the fare math itself, see [Pricing engine internals](/engineering/domains/pricing-engine). For the admin UI, see [Ride pricing](/dashboard/ride-pricing). Zone polygons and their CRUD are covered in [Zones geometry](/engineering/location/zones-geometry). Surge is set from [Live operations](/dashboard/live#set-or-clear-surge-pricing) and **Pricing Management**.
 
 ## Data touched
 
@@ -174,7 +174,7 @@ The table uses a config equal to the fallback defaults ($4.00 base, one open tie
 - **Preview and overview skip zones.** Neither passes a `ZoningContext`, so zone overrides never appear in dashboard quotes. Use the backtest for zones.
 - **Overview role filtering is unreachable.** The scope middleware rejects fleet and intern roles on `/dashboard/pricing/*`, so `buildAllowedCommunitySet` only ever runs for admins.
 - **Fleet managers can change adjustment mode and pricing type.** `UpdatePriceParameter` allows any fleet user with access to the config's fleet to PATCH every field, including `adjustment` and `pricing_type`. Only create and delete are admin-only.
-- **Switching `pricing_type` hides a config from riders.** A PATCH to `per_person` creates a live `per_person` version, which `ListActiveRidePriceParameters` ignores. The update path doesn't re-run the duplicate check, so it can also create two live rows for the same combination.
+- **Switching `pricing_type` hides a config from riders.** A PATCH to `per_person` creates a live `per_person` version, which `ListActiveRidePriceParameters` ignores. The update path doesn't re-run the duplicate check. If a live row already exists for the new combination, the partial unique index `idx_price_params_unique_active` rejects the insert and the PATCH fails with a server error instead of a readable message.
 - **`vehicle_type` isn't validated on create.** The request only checks it's non-empty.
 - **Zone overrides aren't community-checked.** `PUT /dashboard/zone-pricing` takes `zone_id` and `fleet_id` from the body and doesn't verify the fleet serves the zone's community.
 - **Zone upsert clears omitted fields.** Sending only `per_mile` resets an existing `flat_fee` to null.

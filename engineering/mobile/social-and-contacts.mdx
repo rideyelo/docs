@@ -143,7 +143,7 @@ All three share `ProviderAccountView` for signed-out, error, and signed-in state
 
 | Route | Data | Behavior |
 | --- | --- | --- |
-| `events/[eventId]` | `GET /event/{id}`, `GET /event/{id}/attendees` | Hero, attendee faces, venue, and a drive ETA (prompts for location). **Get tickets** opens `ticket_url` in an in-app browser. **Send** opens the bump sheet. **Get a ride** pushes the request sheet with the venue as dropoff. **Save** is a TODO. |
+| `events/[eventId]` | `GET /event/{id}`, `GET /event/{id}/attendees` | Hero, attendee faces, venue, and a drive ETA (prompts for location). **Get tickets** opens `ticket_url` in an in-app browser. **Send** opens the bump sheet. **Get a ride** pushes the request sheet with the venue as dropoff, serialized with `serializeRideStop`. **Save** is a TODO. |
 | `deals/[dealId]` | none | Hard-coded placeholder data (see gotchas) |
 
 `routeToFeedItem` in `components/map/feed/routeToFeedItem.ts` sends any feed event tagged `deal` to the deals route and everything else to the events route. Upcoming events come from `GET /event/upcoming` and are persisted for first paint.
@@ -188,7 +188,6 @@ The standings and activity endpoints (`/world-cup/standings`, `/world-cup/activi
 - **Empower failures are silent.** `connect-empower.tsx` logs and reports but shows no alert, unlike Uber and Lyft.
 - **Friend bumps don't preselect the friend.** The **Bump** button on a friend's detail opens the generic bump flow with no recipient, by design.
 - **The friends query embeds the JWT** in its key (`['friends', jwt]`) and polls without `refetchIntervalInBackground: false` (`FriendsProvider.tsx:221-224`). That contradicts the conventions in [State and data](/engineering/mobile/state-and-data#query-keys).
-- **The World Cup prompt ignores ride state.** It is suppressed only on `/tip/`, so it can push over an active ride or the drive screen.
+- **The World Cup prompt ignores ride state.** It is suppressed only on `/tip/`. Over an active ride or the drive screen, the ride lifecycle hook or `StatusGuard` replaces it immediately, and the prompt doesn't return until the next launch.
 - **Truncated snapshots never skip.** Over 5,000 numbers, every trigger uploads, and failures are reported as `incomplete_snapshot`.
-- **Event "Get a ride" double-encodes the dropoff.** `events/[eventId]/index.tsx:148` wraps the JSON in `encodeURIComponent`, while `request.tsx` calls `JSON.parse` on the param directly. Other callers pass raw JSON. Verify on device before relying on it.
 - **The Snapchat share link isn't URL-encoded.** `AppsSection` interpolates the invite link straight into `?link=`.

@@ -82,6 +82,8 @@ A read error on the tier key returns `-1` and skips the ride's tiers and rescue 
 
 `buildExcludeSet` starts with `declined_drivers`. Unless the tier has `ignore_already_notified`, it adds every member of `ride:notified:{rideId}`. That set is fed by T0, direct requests, pending-ride pushes, and earlier tiers. If the set can't be read, the tier proceeds without deduplication.
 
+T0 targets every eligible member of the ride's fleet, online or offline, and adds them all to the notified set. The inactive pool is also filtered to that fleet's members. So for a fleet ride, tiers 1 to 3 mostly reach fleet members that T0 filtered out (for example, not payout-ready or no available vehicle), plus drivers with no fleet when the ride's fleet is the community's primary fleet.
+
 ### Quota fill
 
 `fillDriverQuota` fills `TargetDrivers` from two pools in order:
@@ -189,7 +191,6 @@ Unlike `determineTierIdx`, this picks the **highest** due tier, and it uses tier
 
 ## Gotchas and edge cases
 
-- **The concepts page says "highest tier".** The code fires the lowest unfired due tier, one per tick. Only `pendingRideTier` uses the highest.
 - **Two instances can double a tier.** Each instance reads `currentTier = 0`, picks disjoint drivers because cooldowns are `SETNX`, and enqueues under different recipient hashes. A tier can reach up to `TargetDrivers` times the number of instances.
 - **Cooldown is global.** One busy ride can starve activation for another ride nearby for the cooldown period. There's no per-ride cooldown.
 - **Warm age does nothing.** The dashboard describes warm age as a pass over recently offline drivers. The code reads a Redis sorted set of online drivers that nothing populates, so every tier is filled from the inactive pool.

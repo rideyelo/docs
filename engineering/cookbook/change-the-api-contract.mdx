@@ -1,0 +1,123 @@
+---
+title: "Change the API contract"
+description: "Recipe for changing a yelo-api request or response: regenerate openapi.json, update the lock files and Orval clients in yelo-web and yelo-frontend, order the releases, and keep installed app versions working."
+---
+
+`yelo-api/openapi.json` is the contract. It is generated from route registrations, and `yelo-web` and `yelo-frontend` pin it with a lock file and generate typed clients from it with Orval. Web deploys replace every user's client at once. Installed mobile binaries don't, so compatibility is mostly a mobile concern. For the pipeline itself, see [OpenAPI and generated clients](/engineering/openapi-and-clients).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#255](https://github.com/rideyelo/yelo-api/pull/255) and [yelo-web#151](https://github.com/rideyelo/yelo-web/pull/151) | An additive response field (`confirmed_requests`). The API PR says the field is additive. The web PR syncs the spec, lock, and generated client, and says the API must deploy first. |
+| [yelo-api#254](https://github.com/rideyelo/yelo-api/pull/254) | A changed value set (`pre_match_cancel` split into four categories). The PR states the compatibility impact and confirms the dashboard renders the values from API data, so it needs no client change. |
+| [yelo-api#265](https://github.com/rideyelo/yelo-api/pull/265) | A breaking dashboard write contract (place references instead of venue snapshots), released API first with a coordinated dashboard release. |
+| [yelo-frontend#633](https://github.com/rideyelo/yelo-frontend/pull/633) | The propagation bot's PR: `openapi.json` and `openapi.lock.json` pinned to an API commit. |
+
+## Recipe
+
+<Steps>
+  <Step title="Classify the change">
+    | Change | Web | Installed mobile apps |
+    | --- | --- | --- |
+    | New endpoint, new optional request field, new response field | Safe | Safe |
+    | New required request field | Breaks callers until they send it | Breaks every installed version that calls it |
+    | Removing or renaming a response field, or changing its type | Breaks at compile time in the consumer PR | Breaks installed versions that read it |
+    | New value in an enum or category a client switches on | Check the client's handling of unknown values | Unknown values reach old builds |
+    | Changing an operation ID or DTO type name | Renames generated hooks and types | None at runtime, but the next client regeneration breaks call sites |
+
+    If the change isn't additive, plan a compatible path first. See [Stay compatible with installed apps](#stay-compatible-with-installed-apps).
+  </Step>
+  <Step title="Change the API and regenerate">
+    Edit the model, request, handler, or route options. Then:
+
+    ```bash
+    make openapi
+    make check
+    ```
+
+    `make openapi` runs `TestGenerateOpenAPIContract` with stubbed services and writes `openapi.json`. `make check` includes `openapi-check`, which fails if the committed file is stale. Commit `openapi.json` with the change.
+
+    The schema customizer in `internal/server/http/openapi_schema.go` decides the generated types:
+
+    - A response field is required unless it has `omitempty`. A pointer field is nullable. Slices are non-nullable.
+    - A `...Request` struct field is required only with `validate:"required"`.
+    - An enum appears only if the type implements `OpenAPIEnum()` or the request field has a `oneof` tag.
+  </Step>
+  <Step title="Build the client changes against your API branch">
+    Check out your API branch in the sibling `yelo-api` directory, or set `YELO_API_DIR`. The sync scripts read the **committed** `openapi.json` at that checkout's `HEAD`, so commit it first.
+
+    <Tabs>
+      <Tab title="yelo-web">
+        ```bash
+        make openapi orval
+        make api-check
+        ```
+
+        Commit `docs/openapi.json`, `docs/openapi.lock.json`, and `src/generated/`. `YELO_API_COMMIT` pins a specific API commit.
+      </Tab>
+      <Tab title="yelo-frontend">
+        ```bash
+        make api
+        make api-check
+        ```
+
+        Commit `openapi.json`, `openapi.lock.json`, and `api/generated/`.
+      </Tab>
+    </Tabs>
+
+    Fix the type errors the regeneration surfaces. They show every call site that depends on the changed shape.
+  </Step>
+  <Step title="Merge and release the API first">
+    The API releases on merge to `main`. Wait for the release to promote before you merge client code that calls the new contract. A web deploy or mobile OTA reaches users within minutes and would otherwise call an endpoint production doesn't serve yet.
+
+    Link the companion PRs in each description, and state the required order.
+  </Step>
+  <Step title="Reconcile the bot PR">
+    When `openapi.json` changes on `main`, `propagate-openapi.yml` opens or updates `automation/update-openapi-contract` in each consumer, titled `chore(api): update OpenAPI contract to <short-sha>`. If your client PR already merged the same contract, the hashes match and the bot skips that consumer. Otherwise, review and merge the bot PR. Its CI shows any consumer code the change breaks.
+  </Step>
+  <Step title="Ship the mobile side">
+    A regenerated Orval client is JavaScript only, so it ships over the air. An OTA-safe PR merged to `main` is also considered for automatic backport to the supported store release branch. See [Mobile releases](/engineering/mobile/releases).
+  </Step>
+</Steps>
+
+## Stay compatible with installed apps
+
+Installed apps keep calling the API until users update. The API can only force an update through the store-version floor.
+
+- **Add, then remove.** Add the new field or endpoint next to the old one. Remove the old one only after the builds that read it are gone.
+- **Keep old shapes where old clients read them.** `NeedsUpdateResponse` in `internal/server/http/healthcheck/healthcheck_handler.go` still puts `app_link` at the top level for clients released before `StandardResponse`, and also inside `data` for current clients.
+- **Opt in with a header.** For behavior that only newer clients can handle, have the client announce it and branch on the header. The app sends `X-Features: tips,driver-options`. The ride state snapshot is gated on `X-Ride-State-Protocol: 1`. The v2 error envelope is gated on `X-Api-Version: v2`. See [Add a feature flag or config value](/engineering/cookbook/add-a-feature-flag-or-config#recipe-x-features-capability).
+- **Raise the floor as a last resort.** `minimumFrontendVersion` in `healthcheck_handler.go` is the lowest store version allowed. Older apps get `426` from `GET /update-required` and a blocking update screen. It checks the native version only, not the OTA bundle. Raise it only after the new version is live in both stores. See [Update-required gate](/engineering/mobile/releases#update-required-gate).
+
+## Checklist
+
+- [ ] The change is classified, and any breaking part has a compatible path.
+- [ ] `openapi.json` is regenerated and committed in `yelo-api`.
+- [ ] Consumer PRs include the spec, lock file, and generated client from the same API commit.
+- [ ] Operation IDs and DTO names are unchanged unless the rename is intended.
+- [ ] PR descriptions link companions, state the release order, and call out breaking changes.
+- [ ] The API is promoted before the client merges.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Making a field optional is a breaking type change">
+    Adding `omitempty` or making a field a pointer turns it optional or nullable in the generated TypeScript. Consumer code that used it as always present stops type-checking. It's safe at runtime for old apps only if the field is still always sent.
+  </Accordion>
+  <Accordion title="DTO name collisions">
+    Every Go type becomes a named schema. `TestOpenAPIResponseDTOsHaveDistinctComponents` fails if two response types share a name. Renaming a type to fix it renames the generated TypeScript model too.
+  </Accordion>
+  <Accordion title="The sync reads the commit, not your working tree">
+    `sync-openapi.sh` uses `git show <commit>:openapi.json`. An uncommitted `make openapi` result isn't picked up. The script copies the older contract or fails.
+  </Accordion>
+  <Accordion title="Mobile excludes some tags">
+    The mobile Orval config excludes the `Auth v3`, `Dashboard`, and `System` tags. An endpoint tagged `Dashboard` never gets a mobile hook, even if the app needs it. Pick the tag with the consumers in mind.
+  </Accordion>
+  <Accordion title="Headers aren't in the contract">
+    Opt-in headers such as `X-Features` aren't declared in `openapi.json`. The generated client doesn't send them, so each call site sets them by hand.
+  </Accordion>
+  <Accordion title="Old apps and new enum values">
+    `RideStatus` and similar types are plain strings in the contract, not enums. The generated client accepts any value, so an old build receives new values without a type error and falls through whatever default its `switch` has. Check what the shipped code does with an unknown value before you add one.
+  </Accordion>
+</AccordionGroup>

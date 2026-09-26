@@ -126,13 +126,22 @@ If the request carries `yelo_place_id`, the handler skips all of this and calls 
 | Use | Method | Details |
 | --- | --- | --- |
 | `POST /mapping/reverse-geocode` | `mapbox.Client.ReverseGeocode` | Geocoding v6 `reverse`, any type |
-| Ride stops with no address, or a relative label such as "Current location" | `ReverseGeocodeAddress` | `types=address&permanent=true`. Up to 2 attempts, 1.5 seconds each. An open breaker is not retried |
-| Ride public-place classification | `GetReverseSearchSuggestions` | Search Box `reverse`, `limit=5`, `types=poi,address`. Cached as `reverse:{communityID}:{lat4}:{lng4}` for 10 minutes |
+| Ride stops with no address, or a relative label such as "Current location" | `ReverseGeocodeAddress` | `types=address&permanent=true`. Up to 2 attempts, 1.5 seconds each, inside a 3.5-second deadline shared by both stops. An open breaker is not retried |
+| Ride public-place classification | `GetReverseSearchSuggestions` | Search Box `reverse`, `limit=5`, `types=poi,address`, 1.5-second deadline. A failure counts as no features. Non-empty results are cached as `reverse:{communityID}:{lat4}:{lng4}` for 10 minutes |
 | City and state | `ReverseGeocodeCity` | Geocoding v6 `reverse` with `types=place` |
 
-`resolveRideLocation` in `internal/service/ride/ride_locations.go` rejects a stop when the permanent geocode doesn't return an `address` type. The error types are `ErrorTypePickupAddressRequired` ("Confirm your pickup") and `ErrorTypeDestinationAddressRequired`. A 401 or 403 from Mapbox on a `permanent=true` request becomes a server error, because it means the account isn't licensed for permanent geocoding.
+`resolveRideLocations` in `internal/service/ride/ride_locations.go` resolves both stops in parallel before the ride is written. Address lookup is optional metadata and never moves the pin:
 
-`populatePickupDetails` and `selectDestinationFeature` in `rider.go` mark a stop public when a `poi` feature with categories exists that doesn't map to `misc`, `airport`, `bus_stop`, `subway`, or `train_station` (`nonPublicCategories`).
+- A stop that already has a real address keeps it. The lookup only runs for an empty address or the "Current location" label.
+- When the lookup fails or doesn't return an `address` feature, the stop keeps its coordinates with an empty address. The failure logs `ride.stop.address_unavailable`.
+- A missing or relative name becomes the address. With no address either, the name falls back to **Pickup pin** or **Destination pin** (`CanonicalRideLocationName`).
+- A relative label is never stored as a shared stop name or address.
+
+A 401 or 403 from Mapbox on a `permanent=true` request becomes a server error inside the lookup, because it means the account isn't licensed for permanent geocoding. The ride still proceeds without an address. `ErrorTypePickupAddressRequired` and `ErrorTypeDestinationAddressRequired` still exist in the error package, but no ride path returns them.
+
+A stop without an address is still a valid coordinate stop, but it skips address-keyed work: `rideAddressDiscount` returns no address-targeted discount, `recordRideLocationSearch` records no search, and the stop is never marked public.
+
+`populatePickupDetails` and `populateDestinationDetails` in `rider.go` mark a stop public only when a reverse-search feature has the **same Mapbox ID the rider selected** and is a `poi` with categories that don't map to `misc`, `airport`, `bus_stop`, `subway`, or `train_station` (`nonPublicCategories`). A nearby business alone doesn't make a dropped pin public. The reverse search runs with a 1.5-second deadline. A failure logs `ride.stop.classification_unavailable` and the stop stays private.
 
 ## Recents and likes
 
@@ -203,10 +212,10 @@ River runs a dispatcher every 5 minutes (`topLocationDispatchPeriodic`) that enq
 
 <AccordionGroup>
   <Accordion title="The app starts a new session on every keystroke">
-    `useSearchSuggestions` never sends `session_token`, so the server mints a new UUID for each suggestion request. Only the last request's token reaches the retrieve call. Provider session pricing then sees many one-request sessions instead of one per search, and the `search_session` hash only holds the last response.
+    `useSearchSuggestions`, which backs the map tab search and the change-stop sheet, never sends `session_token`, so the server mints a new UUID for each suggestion request. Only the last request's token reaches the retrieve call. Provider session pricing then sees many one-request sessions instead of one per search, and the `search_session` hash only holds the last response. The older `ride/pickup` and `ride/dropoff` screens do reuse their token, but nothing outside those two screens navigates to them.
   </Accordion>
   <Accordion title="The app never sends search_purpose">
-    Every mobile search is `general`. The pickup-only hard restriction to the community box never applies from the app, so a pickup search can return places outside the service area. The ride request then fails with **Pickup Outside Service Area**.
+    No mobile screen sends `search_purpose`, so every mobile search is `general`. The pickup-only hard restriction to the community box never applies from the app, so a pickup search can return places outside the service area. The ride request then fails with **Pickup Outside Service Area**.
   </Accordion>
   <Accordion title="SEARCH_PROVIDER is case-sensitive">
     `Google` or `GOOGLE` silently becomes `mapbox`. Check the startup log line `Mapping service search provider`.
@@ -215,10 +224,10 @@ River runs a dispatcher every 5 minutes (`topLocationDispatchPeriodic`) that enq
     `GetReverseSearchSuggestions` takes a `bbox` parameter but never sends it to Mapbox. The cache key includes the community ID anyway, so the same coordinate is fetched separately for each community.
   </Accordion>
   <Accordion title="Likes never age out of top-location ranking">
-    Selections are limited to 30 days, but likes count forever and follow the liker's current community. A place liked long ago by users who moved still earns 10 points each. The operator guide describes both signals as 30-day activity.
+    Selections are limited to 30 days, but likes count forever and follow the liker's current community. A like counts toward the community the liker is in now, not the one they were in when they liked the place. A user who moves takes their likes to the new community, where they still count if a public location with the same provider ID sits inside that box.
   </Accordion>
-  <Accordion title="Communities without a settings row show top locations">
-    `ListTopLocations` treats a missing settings row as enabled for every non-default community. The dashboard describes top locations as hidden by default, which only holds once a settings row exists.
+  <Accordion title="Visibility is on by default, automatic refresh is off">
+    Migration `000345_canonical_top_locations` gives every existing community a settings row with `enabled = NOT is_default` and `automatic = false`. A community created later has no row until the first slot edit or settings change. `ListTopLocations` and `GetTopLocationSettings` both resolve a missing row with `COALESCE(enabled, NOT c.is_default)`, so the public list and the dashboard toggle agree. Verified slots in a new non-default community show immediately, but nothing fills them until you pin places or turn on automatic refresh.
   </Accordion>
   <Accordion title="A partial refresh can shrink the list">
     If a refresh finds even one new candidate, it deletes every automatic slot and fills only as many as it found. Four automatic places can become one.

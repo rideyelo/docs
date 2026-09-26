@@ -1,0 +1,453 @@
+---
+title: "Architecture decisions"
+description: "Architecture decision records reconstructed from pull request descriptions and in-repo design docs, each with its written rationale, consequences, and sources."
+---
+
+These records reconstruct decisions whose reasoning is written down in a pull request description or a design document in one of the three repositories. Quotes are verbatim apart from whitespace. Where a decision shipped without a written rationale (for example, the move from swag to fuego or from SendGrid to Resend), it appears only on the [timeline](/engineering/history/timeline), not here.
+
+Each record lists:
+
+- **Date**: when the decision merged.
+- **Status**: `Accepted` if it describes the current system, `Partially implemented` if the written design is ahead of the code.
+- **Sources**: the pull requests and documents the record is built from. Links to `docs/` files on `main` reflect current text. Links pinned to a commit point at documents that have since been deleted.
+
+## Index
+
+| # | Decision | Area | Date |
+| --- | --- | --- | --- |
+| [1](#adr-1-remove-routes-only-with-traffic-evidence-and-deny-dashboard-access-by-default) | Remove routes only with traffic evidence; deny dashboard access by default | API | 2026-08-20 |
+| [2](#adr-2-generate-a-deterministic-openapi-contract-and-push-it-to-consumers) | Generate a deterministic OpenAPI contract and push it to consumers | API, clients | 2026-08-24 |
+| [3](#adr-3-release-every-merge-automatically-with-expand-and-contract-migrations) | Release every merge automatically with expand-and-contract migrations | Operations | 2026-08-25 |
+| [4](#adr-4-generate-all-repository-sql-with-sqlc) | Generate all repository SQL with sqlc | Data | 2026-09-03 |
+| [5](#adr-5-expire-time-sensitive-notification-jobs-after-15-minutes) | Expire time-sensitive notification jobs after 15 minutes | Notifications | 2026-08-26 |
+| [6](#adr-6-send-friend-bumps-from-the-server-with-separate-sms-consent) | Send friend bumps from the server with separate SMS consent | Notifications | 2026-08-25 |
+| [7](#adr-7-sync-ride-chat-with-cursors-and-push-hints-not-polling) | Sync ride chat with cursors and push hints, not polling | Messaging | 2026-09-07 |
+| [8](#adr-8-reconcile-stripe-accounts-as-durable-per-account-river-jobs) | Reconcile Stripe accounts as durable per-account River jobs | Payments | 2026-09-08 |
+| [9](#adr-9-pace-all-quo-traffic-through-one-slow-shared-gateway) | Pace all Quo traffic through one slow shared gateway | CRM | 2026-09-08 |
+| [10](#adr-10-keep-community-assignment-geographic) | Keep community assignment geographic | Identity | 2026-09-08 |
+| [11](#adr-11-adopt-a-provider-verified-email-for-auth-v2-oauth-sign-in) | Adopt a provider-verified email for auth v2 OAuth sign-in | Identity | 2026-08-10 |
+| [12](#adr-12-keep-auth-v3-on-yelo-owned-domains-with-rotating-refresh-sessions) | Keep auth v3 on Yelo-owned domains with rotating refresh sessions | Identity, web | 2026-08-25 |
+| [13](#adr-13-make-ride-state-server-authoritative-with-revisioned-snapshots) | Make ride state server-authoritative with revisioned snapshots | Rides | 2026-09-19 |
+| [14](#adr-14-inventory-ride-cardinality-before-adding-unique-indexes) | Inventory ride cardinality before adding unique indexes | Rides | 2026-09-19 |
+| [15](#adr-15-make-silent-cancellation-a-manual-guarded-admin-action) | Make silent cancellation a manual, guarded admin action | Rides | 2026-09-26 |
+| [16](#adr-16-give-places-an-application-owned-identity) | Give places an application-owned identity | Places | 2026-09-17 |
+| [17](#adr-17-make-top-locations-canonical-and-refresh-them-through-river) | Make top locations canonical and refresh them through River | Places | 2026-09-25 |
+| [18](#adr-18-model-fleet-vehicles-as-shared-inventory) | Model fleet vehicles as shared inventory | Fleets | 2026-09-18 |
+| [19](#adr-19-let-the-mobile-repository-own-vehicle-artwork) | Let the mobile repository own vehicle artwork | Fleets, mobile | 2026-09-18 |
+| [20](#adr-20-let-owner-operator-fleets-invite-drivers-without-a-fleet-stripe-account) | Let owner-operator fleets invite drivers without a fleet Stripe account | Fleets | 2026-09-19 |
+| [21](#adr-21-archive-fleets-instead-of-deleting-them) | Archive fleets instead of deleting them | Fleets | 2026-09-25 |
+| [22](#adr-22-select-calendar-zones-by-registered-prefix) | Select calendar zones by registered prefix | Calendars | 2026-09-16 |
+| [23](#adr-23-split-live-operations-reads-from-slow-provider-reads) | Split live operations reads from slow provider reads | Dashboard | 2026-09-26 |
+| [24](#adr-24-replace-maestro-with-agent-device-for-mobile-e2e) | Replace Maestro with agent-device for mobile E2E | Testing | 2026-09-03 |
+
+## ADR 1: Remove routes only with traffic evidence and deny dashboard access by default
+
+**Date**: 2026-08-20 · **Status**: Accepted · **Sources**: [yelo-api #62](https://github.com/rideyelo/yelo-api/pull/62)
+
+**Context.** The API had accumulated handlers that no client called, and dashboard authorization was checked inconsistently across route groups.
+
+**Decision.** Delete routes only when production logs show no traffic, and make dashboard community and fleet scopes deny by default.
+
+> Cloud Run request logs for `yelo-api-testflight` showed zero traffic to any removed method/path pair across the complete available 30-day retention window.
+
+> Introduce explicit deny-by-default community and fleet scopes.
+
+**Consequences.**
+
+- Registered routes dropped from 352 to 303. The PR notes that the evidence "is limited to Cloud Logging's 30-day retention window."
+- Migration `000264` dropped the legacy notification log tables. Its down migration recreates structure only.
+- The same log-evidence standard applies to remaining legacy routes. See [Deprecated and legacy](/engineering/history/deprecated-and-legacy).
+- Dashboard scope rules are described in [Fleet dashboard authorization](/engineering/fleets/dashboard-authorization).
+
+## ADR 2: Generate a deterministic OpenAPI contract and push it to consumers
+
+**Date**: 2026-08-24 · **Status**: Accepted · **Sources**: [yelo-api #64](https://github.com/rideyelo/yelo-api/pull/64), [yelo-api #65](https://github.com/rideyelo/yelo-api/pull/65)
+
+**Context.**
+
+> Runtime generation depended on environment, database connectivity, feature flags, and generator versions.
+
+**Decision.** Generate the checked-in `openapi.json` from a fully stubbed router with Auth V3 enabled, fail CI on drift (`make openapi-check`), and open one bot-owned pull request per consumer when the contract changes on `main`.
+
+> The committed contract is now generated without starting the API or connecting to external services.
+
+**Consequences.**
+
+- yelo-frontend and yelo-web receive `chore(api): update OpenAPI contract to <sha>` pull requests and regenerate their Orval clients with `make api`.
+- The bot needs a GitHub App with `OPENAPI_BOT_CLIENT_ID` and `OPENAPI_BOT_PRIVATE_KEY` configured in yelo-api.
+- See [OpenAPI and clients](/engineering/openapi-and-clients).
+
+## ADR 3: Release every merge automatically with expand-and-contract migrations
+
+**Date**: 2026-08-25 · **Status**: Accepted · **Sources**: [yelo-api #71](https://github.com/rideyelo/yelo-api/pull/71), [`docs/deployments.md` at `63839f9`](https://github.com/rideyelo/yelo-api/blob/63839f9ae87b039ff2aaff7b081ee70fce767c39/docs/deployments.md)
+
+**Context.** A legacy Cloud Build trigger deployed the API. #71 moved releases into GitHub Actions and put migrations on the release path.
+
+**Decision.** Every merge to `main` runs pending migrations as a Cloud Run job, deploys the exact image digest at 0% traffic, smoke-tests it, and then promotes it. Migrations must be backward compatible.
+
+> If build, migration, candidate deployment, or smoke testing fails, the previous revision remains at 100%. Migration changes may already be applied, so every migration must be compatible with the previously serving application revision.
+
+> Never run a down migration automatically. A Cloud Run traffic rollback does not roll back PostgreSQL.
+
+**Consequences.**
+
+- Schema changes follow expand, backfill, switch, contract. Removing old schema waits until no rollback revision depends on it.
+- Migration pull requests need code-owner review; there is no post-merge approval.
+- The production service keeps its historical name. The deployment doc says: "The name is historical; do not treat it as a staging service."
+- See [Deployment](/engineering/deployment) and [Failed migration](/runbooks/failed-migration).
+
+## ADR 4: Generate all repository SQL with sqlc
+
+**Date**: 2026-09-03 (pilot 2026-08-31) · **Status**: Accepted · **Sources**: [yelo-api #124](https://github.com/rideyelo/yelo-api/pull/124), [#158](https://github.com/rideyelo/yelo-api/pull/158), [#159](https://github.com/rideyelo/yelo-api/pull/159), [`docs/sqlc-adoption.md` at `63839f9`](https://github.com/rideyelo/yelo-api/blob/63839f9ae87b039ff2aaff7b081ee70fce767c39/docs/sqlc-adoption.md)
+
+**Context.** Repositories built SQL by hand, including a shared `updateBuilder` and a dynamic dashboard ride query builder. During the migration, the team found the integration harness didn't match production's pgx configuration.
+
+> Exec mode chooses parameter encodings from the Go type alone and returns columns as text, so a class of encoding bugs passed every parity oracle and would only have failed in production.
+
+**Decision.**
+
+> All repository SQL is generated by sqlc from `internal/data/repository/queries/*.sql`. Repository interfaces, mocks, and service call sites stay stable; repository methods are thin adapters from generated rows to `internal/models` types.
+
+**Consequences.**
+
+- 659 statements across 21 query files at completion. No repository runs hand-written or runtime-composed SQL.
+- The integration harness opens its pool in `QueryExecModeExec` with the gofrs UUID codec, like production.
+- Encoding rules follow from exec mode: bind JSON as text with `::text::jsonb`, keep `real` columns as `float64`, and express optional filters as typed nullable arguments.
+- Temporary differential "parity oracles" were converted into direct contract tests and removed in #159.
+- See [Data layer](/engineering/api/data-layer).
+
+## ADR 5: Expire time-sensitive notification jobs after 15 minutes
+
+**Date**: 2026-08-26 · **Status**: Accepted · **Sources**: [yelo-api #92](https://github.com/rideyelo/yelo-api/pull/92), [yelo-api #94](https://github.com/rideyelo/yelo-api/pull/94)
+
+**Context.** A pgx encoding bug made every River push orchestration fail and retry. Without a freshness limit, the fix would have let those retries deliver stale ride and bump pushes, some after hours of exponential backoff.
+
+**Decision.** Drop orchestration retries older than 15 minutes, cancel stale time-sensitive jobs at startup, and make template seeding a readiness requirement.
+
+> drop orchestration retries older than 15 minutes so the repair cannot deliver stale ride or bump state
+
+**Consequences.**
+
+- Durable notification types (payouts, account state, broadcasts, and unknown codes) keep their retries.
+- A candidate revision with a missing required template can't become healthy or be promoted.
+- See [Send pipeline](/engineering/notifications/send-pipeline).
+
+## ADR 6: Send friend bumps from the server with separate SMS consent
+
+**Date**: 2026-08-25 · **Status**: Accepted · **Sources**: [yelo-api #83](https://github.com/rideyelo/yelo-api/pull/83)
+
+**Context.** An earlier draft reserved a `TextMessages` row before calling Twilio. Any early return stranded the row, and a unique index then blocked every retry for that recipient.
+
+**Decision.** `POST /notification/bump` authorizes recipients against `Friendships`, sends the push first, and queues one River job per SMS recipient with a leased claim.
+
+> **Push emits before SMS**, so an SMS-side failure can't suppress the deduped, recoverable channel.
+
+> **SMS consent is its own column.** `allow_notifications` is an in-app push preference; a carrier STOP is a legal revocation that must outlive it.
+
+**Consequences.**
+
+- Migration `000269` added `Users.sms_opted_out_at`. Migration `000268` added lease and delivery state to `TextMessages`.
+- Leases use `clock_timestamp()`: "`NOW()` is transaction-start time and cannot measure a lease."
+- The Twilio inbound webhook must point at `POST /twilio-webhook`.
+- See [SMS and friend bumps](/engineering/notifications/sms-and-friend-bumps).
+
+## ADR 7: Sync ride chat with cursors and push hints, not polling
+
+**Date**: 2026-09-07 · **Status**: Accepted · **Sources**: [yelo-api #170](https://github.com/rideyelo/yelo-api/pull/170), [yelo-frontend #536](https://github.com/rideyelo/yelo-frontend/pull/536)
+
+**Context.**
+
+> Ride inbox and unread state previously required fetching individual message histories, and chat relied on polling without a durable synchronization cursor.
+
+**Decision.** Add per-ride message ordinals, monotonic read state, idempotent client message IDs, bounded inbox and delta APIs, and a `message_received` push that prompts a sync.
+
+> Pushes prompt synchronization; cursors and recovery polling handle missed delivery. This does not introduce a websocket transport.
+
+**Consequences.**
+
+- Migration `000300` backfilled ordinals for existing messages, including tied timestamps, and keeps triggers for older writers.
+- The message, timeline event, and River notification job commit in one transaction.
+- The app keeps recovery polling: 60 seconds for the inbox in the foreground, 30 seconds for an active chat.
+- See [Ride messaging](/engineering/domains/ride-messaging).
+
+## ADR 8: Reconcile Stripe accounts as durable per-account River jobs
+
+**Date**: 2026-09-08 · **Status**: Accepted · **Sources**: [yelo-api #173](https://github.com/rideyelo/yelo-api/pull/173), [`plans/001-durable-stripe-reconciliation.md` at `63839f9`](https://github.com/rideyelo/yelo-api/blob/63839f9ae87b039ff2aaff7b081ee70fce767c39/plans/001-durable-stripe-reconciliation.md)
+
+**Context.** A 24-hour in-process ticker reconciled connected accounts inside a two-minute timeout. The plan records three observed sweeps that reconciled 179, 180, and 178 of 1,701 accounts, stopped around 120 seconds, and then reported success.
+
+**Decision.** Reuse the existing River client: a short dispatcher reads Postgres-owned due state and enqueues one job per account.
+
+> River's ordinary periodic schedule is in memory and resets at elections/restarts. A short RunOnStart dispatcher should consult **Postgres-owned due/progress state**, rather than relying on another 24-hour timer.
+
+**Consequences.**
+
+- Migration `000304` added `StripeReconciliation` and its control row.
+- One bad account no longer blocks later accounts. A shutdown never records success.
+- See [Connect accounts](/engineering/payments/connect-accounts).
+
+## ADR 9: Pace all Quo traffic through one slow shared gateway
+
+**Date**: 2026-09-08 · **Status**: Accepted · **Sources**: [yelo-api #173](https://github.com/rideyelo/yelo-api/pull/173), [`plans/002-unify-and-slow-quo.md` at `63839f9`](https://github.com/rideyelo/yelo-api/blob/63839f9ae87b039ff2aaff7b081ee70fce767c39/plans/002-unify-and-slow-quo.md), [yelo-api #227](https://github.com/rideyelo/yelo-api/pull/227)
+
+**Context.** Quo returned 441 rate-limit (429) responses and 54 server errors in 48 hours. Startup metadata calls and an optional limiter bypassed pacing.
+
+**Decision.** Every Quo HTTP call goes through one credential-scoped gateway with shared admission and cooldown state. Delays are preferred over failures.
+
+> User explicitly prefers delayed updates over failed updates.
+
+**Consequences.**
+
+- The default was one request every five seconds per credential. [#227](https://github.com/rideyelo/yelo-api/pull/227) later raised default pacing to five requests per second when Quo moved onto the generic contact sync engine.
+- The contact sync engine keeps the legacy Quo writer until an explicit cutover: #227 says it will "preserve quo legacy sync until explicit cutover."
+- See [Contact sync](/engineering/domains/contact-sync).
+
+## ADR 10: Keep community assignment geographic
+
+**Date**: 2026-09-08 · **Status**: Accepted · **Sources**: [yelo-api #172](https://github.com/rideyelo/yelo-api/pull/172)
+
+**Context.** School verification moved users into the school's community and overwrote `user.email`.
+
+**Decision.**
+
+> Keep current community location-driven. School email, Google, Microsoft and StudID verification grant student status/update the home community without immediately moving the user. School OAuth no longer overwrites `user.email`.
+
+**Consequences.**
+
+- Migrations `000301` to `000303` map schools to communities from coordinates and reconcile automatically when community bounds change.
+- The annual school importer is dry-run first and never deletes school rows.
+- See [Community assignment](/engineering/location/community-assignment) and [School verification](/engineering/identity/school-verification).
+
+## ADR 11: Adopt a provider-verified email for auth v2 OAuth sign-in
+
+**Date**: 2026-08-10 · **Status**: Accepted · **Sources**: [yelo-api #45](https://github.com/rideyelo/yelo-api/pull/45)
+
+**Context.** Signing back in with Apple created a new account. The auth v2 community OAuth path keyed identity on a phone lookup, and 245 nondeleted accounts had no phone number.
+
+**Decision.** Adopt the existing account that holds the provider-verified email, add a digits-only phone fallback, and persist the provider subject.
+
+> **Adopt on verified email** — the provider verified the address, so the row holding it is the caller's.
+
+**Consequences.**
+
+- Migrations `000261` and `000262` added a digits-only phone index and normalized phones to E.164, skipping rows whose normalized number was already taken.
+- `AuthIdentities` started filling from this path.
+- The PR states it does not merge accounts that were already duplicated.
+
+## ADR 12: Keep auth v3 on Yelo-owned domains with rotating refresh sessions
+
+**Date**: 2026-08-25 · **Status**: Accepted · **Sources**: [`yelo-web/docs/authv3-web-native.md`](https://github.com/rideyelo/yelo-web/blob/main/docs/authv3-web-native.md), [yelo-api #82](https://github.com/rideyelo/yelo-api/pull/82)
+
+**Context.** Auth v3 needed web sessions that work across signup, tip, and claim pages, while short links run on Dub.
+
+**Decision.**
+
+> `yelo.link` stays a Dub-managed short-link and redirect domain. It must not host authentication state or application logic.
+
+> An auth cookie scoped to `.joinyelo.com` is same-site on all of these hosts.
+
+**Consequences.**
+
+- Access tokens last one hour. Refresh tokens are opaque, stored hashed, rotate on every refresh, and revoke the family on reuse.
+- "Never place access, refresh, or Firebase tokens in a URL."
+- `api.rideyelo.com` stays as an alias "while installed app versions still use it."
+- See [Tokens and sessions](/engineering/identity/tokens-and-sessions) and [Signup and auth site](/engineering/web/signup-and-auth-site).
+
+## ADR 13: Make ride state server-authoritative with revisioned snapshots
+
+**Date**: 2026-09-19 · **Status**: Partially implemented · **Sources**: [yelo-api #253](https://github.com/rideyelo/yelo-api/pull/253), [`docs/ride-state-protocol.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/ride-state-protocol.md), [`yelo-frontend/plans/007-ride-sync-design.md`](https://github.com/rideyelo/yelo-frontend/blob/main/plans/007-ride-sync-design.md), [yelo-frontend #628](https://github.com/rideyelo/yelo-frontend/pull/628)
+
+**Context.** Riders and drivers saw stale state after cancellation, assignment, and queue advancement. Pushes can't carry correctness on their own:
+
+> Therefore correctness cannot depend on receiving one phone push per status or using its arrival order.
+
+**Decision.**
+
+> Use a server-authoritative command service, transactionally consistent versioned snapshots, durable side effects, one foreground live connection and one client lifecycle controller. Phone notifications are background wake-up hints.
+
+> Do not introduce event sourcing, a second database, another job broker or an independent client state machine that guesses server business transitions.
+
+**Consequences.**
+
+- Migration `000338` added `Users.ride_state_revision`, `Rides.lifecycle_revision`, and `Rides.assignment_generation`. Lifecycle commands lock participant users in UUID order, then rides, and advance counters before commit.
+- `GET /user/ride-state` and opted-in `/user/status` (`X-Ride-State-Protocol: 1`) return snapshots. A snapshot that can't meet the requested minimum revision returns 503; the API "never returns an older successful snapshot."
+- The gate `RIDE_STATE_SNAPSHOT_ENABLED` must stay off until every API and worker instance runs a revision-aware binary. After activation, an older writer is not a safe rollback target.
+- The shipped slice is "a read-only ordering foundation, not the complete command protocol." The financial command cutover and a foreground live connection are deferred. No websocket transport exists.
+- The global minimum app version became 5.7.3.
+- See [Ride timeline](/engineering/matching/ride-timeline) and [Concurrency](/engineering/matching/concurrency).
+
+## ADR 14: Inventory ride cardinality before adding unique indexes
+
+**Date**: 2026-09-19 · **Status**: Accepted · **Sources**: [`docs/ride-cardinality-preflight.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/ride-cardinality-preflight.md)
+
+**Context.** The schema permits duplicate live rides per rider or driver. Only application locks prevent them.
+
+**Decision.** Run a read-only inventory first, and add three partial unique indexes later, one per migration, with `CREATE UNIQUE INDEX CONCURRENTLY`.
+
+> Status: no uniqueness migration or data repair performed.
+
+> Age alone does not justify deleting or canceling a ride.
+
+**Consequences.**
+
+- The production inventory at 2026-09-19 00:52:18 UTC found 13 duplicate requested-draft groups and no duplicate live bookings, active driver trips, or session conflicts.
+- Snapshots exclude unconfirmed historical drafts instead of deleting them.
+- No migration number is reserved for the indexes.
+
+## ADR 15: Make silent cancellation a manual, guarded admin action
+
+**Date**: 2026-09-26 · **Status**: Accepted · **Sources**: [`docs/silent-ride-cancellation.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/silent-ride-cancellation.md), [yelo-api #278](https://github.com/rideyelo/yelo-api/pull/278)
+
+**Context.** Operators needed to clear abandoned free rides without notifying anyone or touching payments.
+
+**Decision.**
+
+> This is a manual action; there is no new automatic sweep or change to unmatched ride expiry.
+
+**Consequences.**
+
+- Only `driver_en_route`, `driver_waiting`, and `in_progress` rides with a zero fare and no PaymentIntents qualify. The request carries the expected `lifecycle_revision`.
+- The ride becomes `complete` with the prior status in `cancel_phase`, and an audit event records the Clerk admin.
+- Any future automation needs its own definition of abandonment: "Neither app backgrounding nor a missing heartbeat alone proves abandonment."
+- See [Cancellations](/concepts/cancellations#admin-silent-cancellation).
+
+## ADR 16: Give places an application-owned identity
+
+**Date**: 2026-09-17 · **Status**: Accepted · **Sources**: [yelo-api #238](https://github.com/rideyelo/yelo-api/pull/238), [`yelo-frontend/plans/006-yelo-1279-place-identity.md`](https://github.com/rideyelo/yelo-frontend/blob/main/plans/006-yelo-1279-place-identity.md)
+
+**Context.** Stored places were keyed by provider IDs in `mapbox_id`, which can also hold Google IDs. Provider refreshes and stale IDs broke POI sheets, likes, and recents.
+
+**Decision.** Every stored place gets a random `yelo_place_id` from a shared catalog, separate from its source row ID and its legacy provider reference.
+
+> A different business name cannot inherit identity merely by sharing an address or provider ID. Conservative duplicate identities are preferable to merging uncertain businesses.
+
+**Consequences.**
+
+- Migration `000328` added identity columns and attach triggers on eight tables. A River job backfills history in resumable 500-row batches without provider calls.
+- A known provider ID must match the snapshot's normalized name and lie within 150 meters.
+- See [Search and places](/engineering/location/search-and-places).
+
+## ADR 17: Make top locations canonical and refresh them through River
+
+**Date**: 2026-09-25 · **Status**: Accepted · **Sources**: [`docs/top-locations.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/top-locations.md), [yelo-api #265](https://github.com/rideyelo/yelo-api/pull/265)
+
+**Context.** Top locations stored copied snapshots and were reseeded at instance startup.
+
+**Decision.** Four community slots reference verified `PlaceProfiles.place_id` values. Refresh is opt-in per community and runs as a per-community River job.
+
+> This avoids per-instance startup reseeding.
+
+> Concurrent operator changes win.
+
+**Consequences.**
+
+- Migration `000345` keeps the old `TopLocations` table as an archive for verification and rollback, not a public read source.
+- **Breaking** for the dashboard write contract: create and update take `yelo_place_id` and `priority`.
+- See [Community top locations](/guides/community-top-locations).
+
+## ADR 18: Model fleet vehicles as shared inventory
+
+**Date**: 2026-09-18 · **Status**: Accepted · **Sources**: [`docs/fleet-owned-vehicles.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/fleet-owned-vehicles.md), [yelo-api #242](https://github.com/rideyelo/yelo-api/pull/242), [yelo-api #253](https://github.com/rideyelo/yelo-api/pull/253)
+
+**Context.** Fleet vehicles such as carts were modeled as personal vehicles owned by one driver.
+
+**Decision.** One `Vehicles` row per physical vehicle, linked through `FleetVehicles`, with no personal owner for shared inventory. Concurrent use is allowed.
+
+> Multiple drivers may use the same shared vehicle concurrently: the API exposes advisory occupancy, and updated mobile clients warn before allowing the driver to continue.
+
+#253 confirms this is intentional and that "exclusive occupancy would be a separate product-policy change."
+
+**Consequences.**
+
+- Migration `000333` made personal ownership nullable and added one-owner and one-default indexes. Migration `000334` seeded the Breeze cart.
+- Driver traffic had to be drained during the cutover because the old API couldn't read ownerless records.
+- See [Fleet vehicles](/engineering/fleets/vehicles).
+
+## ADR 19: Let the mobile repository own vehicle artwork
+
+**Date**: 2026-09-18 · **Status**: Accepted · **Sources**: [`docs/mobile-vehicle-catalog.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/mobile-vehicle-catalog.md)
+
+**Decision.**
+
+> The mobile repository owns `assets/vehicles/catalog.json` and the image files. Its generated static registry is what Metro bundles. `make fix` regenerates the registry; `make check` rejects drift. The API and dashboard have no filename list or image copies.
+
+**Consequences.**
+
+- Release workflows publish each platform's catalog to `POST /mobile-vehicle-catalog`, authenticated by GitHub Actions OIDC.
+- Dashboard choices require the same key and hash in both platform catalogs.
+- Android choices publish only through OTA Promote: "a submitted/unreleased build is not evidence of availability."
+- See [Vehicle types and catalog](/engineering/domains/vehicle-types-and-catalog).
+
+## ADR 20: Let owner-operator fleets invite drivers without a fleet Stripe account
+
+**Date**: 2026-09-19 · **Status**: Accepted · **Sources**: [`docs/owner-operator-fleet-joins.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/owner-operator-fleet-joins.md), [yelo-api #251](https://github.com/rideyelo/yelo-api/pull/251)
+
+**Decision.**
+
+> Active owner-operator fleets with custom payouts disabled can create, preview, redeem, and rotate driver join links without a fleet Stripe account.
+
+**Consequences.**
+
+- Drivers keep their personal Stripe requirement: "An owner-operator invitation does not waive personal vehicle or Stripe onboarding."
+- Previews return `payouts_managed_by_fleet: false` so clients show personal payout copy.
+- See [Joins and invitations](/engineering/fleets/joins-and-invitations).
+
+## ADR 21: Archive fleets instead of deleting them
+
+**Date**: 2026-09-25 · **Status**: Accepted · **Sources**: [`docs/admin-fleet-transfers.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/admin-fleet-transfers.md), [yelo-api #273](https://github.com/rideyelo/yelo-api/pull/273)
+
+**Decision.**
+
+> The existing DELETE fleet endpoint is an archive operation, labeled **Archive fleet** in the dashboard. It preserves the fleet row, historical rides/payments, and Stripe merchant reference.
+
+**Consequences.**
+
+- Archive is refused while memberships, payouts, outstanding rides, sessions, primary-community references, vehicles, or active QR links remain.
+- Migration `000346` adds triggers that reject new references to archived fleets.
+- Membership edits compare expected state under a user lock to reject stale edits.
+- See [Fleet Stripe accounts and lifecycle](/engineering/fleets/stripe-and-lifecycle).
+
+## ADR 22: Select calendar zones by registered prefix
+
+**Date**: 2026-09-16 · **Status**: Accepted · **Sources**: [`docs/calendar-prefixes.md`](https://github.com/rideyelo/yelo-api/blob/main/docs/calendar-prefixes.md), [yelo-api #220](https://github.com/rideyelo/yelo-api/pull/220)
+
+**Decision.**
+
+> Calendar titles select zones by the registered key, not the zone name. Two zones named FREE can use FREE-1 and FREE-2.
+
+**Consequences.**
+
+- Renaming a prefix keeps the zone ID and schedules a fresh import. Google event titles aren't rewritten, so operators update them.
+- A stale `expected_key` returns 409.
+- See [Service communities and calendars](/engineering/fleets/service-communities-and-calendars).
+
+## ADR 23: Split live operations reads from slow provider reads
+
+**Date**: 2026-09-26 · **Status**: Accepted · **Sources**: [`yelo-web/docs/live-dashboard.md`](https://github.com/rideyelo/yelo-web/blob/main/docs/live-dashboard.md), [yelo-api #277](https://github.com/rideyelo/yelo-api/pull/277)
+
+**Decision.** `/live` replaces `/supply-demand` and the presence page. Competitor pricing has its own endpoint.
+
+> The separate `/dashboard/live/competitor-prices` endpoint prevents provider latency from blocking Live analytics.
+
+**Consequences.**
+
+- Competitor quotes read PostHog events server-side and need `POSTHOG_PERSONAL_API_KEY` and `POSTHOG_PROJECT_ID`.
+- "Online rider/driver counts use Redis presence, not open database sessions."
+- Dashboard and API had to deploy together because `/dashboard/supply-demand/*` was removed.
+- See [Live operations](/dashboard/live).
+
+## ADR 24: Replace Maestro with agent-device for mobile E2E
+
+**Date**: 2026-09-03 · **Status**: Accepted · **Sources**: [`yelo-frontend/plans/002-adopt-agent-device-e2e.md`](https://github.com/rideyelo/yelo-frontend/blob/main/plans/002-adopt-agent-device-e2e.md), [yelo-frontend #498](https://github.com/rideyelo/yelo-frontend/pull/498), [yelo-api #155](https://github.com/rideyelo/yelo-api/pull/155)
+
+**Context.** The team wanted an agent to explore the running app and author flows, and CI to replay them deterministically.
+
+**Decision.**
+
+> agent-device supports that two-pass model: interactive snapshots/refs during authoring, then versioned `.ad` replay files for CI. It also avoids introducing Appium's long-running server/driver topology for the first migration.
+
+**Consequences.**
+
+- Replays run against an isolated E2E API that follows production. Runs are recorded in `E2ERuns` (migration `000295`).
+- The yelo-web Maestro viewer became a shareable run report site.
+- See [Testing](/engineering/testing).

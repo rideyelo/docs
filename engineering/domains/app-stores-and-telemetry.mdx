@@ -24,7 +24,7 @@ For how the shared-secret and webhook signatures fit into the wider auth model, 
 | `GET` | `/update-required?version=` | Public | `HttpHandler.NeedsUpdate` |
 | `GET` | `/error` | Public, hidden from OpenAPI | `HttpHandler.SampleError` |
 | `POST` | `/score-driver` | Public, hidden from OpenAPI | `HttpHandler.ScoreDriver` |
-| `GET` | `/metrics` | Bearer `METRICS_AUTH_TOKEN` when set | `promhttp.Handler` |
+| `GET` | `/metrics` | Bearer `METRICS_AUTH_TOKEN`. Not mounted when the token is empty | `promhttp.Handler` |
 
 All routes are registered in `internal/server/http/router.go`. The Google Play monitor has no endpoint. It runs as a River job.
 
@@ -286,5 +286,5 @@ Before calling a production service, the handler checks that the ride is free (`
 - **Deleted users are still found.** The context route returns `found: true` with `is_deleted: true`.
 - **Assignment fixture errors are 500s.** `transitionAssignment` wraps a missing or wrong-scenario run as a plain error, so it returns 500 instead of the 404 that `transitionExpiry` returns.
 - **`/score-driver` and `/error` are public.** They're hidden from OpenAPI but need no auth. `/score-driver` is pure computation and reads no data.
-- **`/metrics` is open when `METRICS_AUTH_TOKEN` is unset.** `metricsAuthMiddleware` skips the check entirely for an empty token.
+- **`/metrics` doesn't exist without `METRICS_AUTH_TOKEN`.** `mountObservability` skips mounting `/metrics` and `/debug/pprof/` when the token is empty, so a scrape returns 404, not 401. `/debug/pprof/` also needs `PPROF_ENABLED=true`, which defaults to `false`.
 - **The update floor is a constant.** Raising `minimumFrontendVersion` requires a deploy, and it compares only the native store version, not the OTA bundle.

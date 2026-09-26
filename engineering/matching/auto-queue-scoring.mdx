@@ -98,7 +98,7 @@ eqNorm  = (queueLoad  - minLoad) / (maxLoad - minLoad)    // 0 when range is 0
 finalScore = 0.5 * effNorm + 0.5 * eqNorm
 ```
 
-Lowest `finalScore` wins. With exactly one candidate, scoring is skipped and that candidate wins with a score of 0.
+Lowest `finalScore` wins. With exactly one candidate, both ranges are 0, so it wins with a score of 0. Its raw `queueLoad` is still computed and recorded on the `ride_auto_queued` event.
 
 What the terms mean in practice:
 
@@ -173,7 +173,7 @@ Ties compare only against the current best. The comparison isn't transitive, and
 `assignWinner` in `auto_queue.go`:
 
 1. Loads the driver and their session. A missing session returns a `NotFound` error from `GetDriverSession`, so the `session == nil` branch never runs. The error propagates, no flag is set, and the ride is retried next tick.
-2. Calls the `assignRide` callback, wired in `internal/service/service.go` to `RideService.AutoAssignRide`.
+2. Calls the `assignRide` callback, wired in `internal/service/service.go` to `RideService.AutoAssignRide`. It passes an `AutoQueueDecision` with the ride's `confirm_time`, the number of scored candidates, and the winner's deadhead minutes, final score, and queue load.
 3. On error, logs "ride may have been claimed" and returns without setting the flag.
 4. On success, removes the ride from the board provider, refreshes the driver's queue summary, and sends notifications.
 
@@ -182,7 +182,7 @@ Ties compare only against the current best. The comparison isn't transitive, and
 - Sets the request context's user to the driver, so downstream code acts as that driver.
 - Calls `Ride.AutoQueueAssign`, which is `acceptRide(..., automatic = true)` with pickup distance 0, duration 0, and an empty route. The transaction requires `accepts_auto_queue`, exactly one matching session, no live direct hold for someone else, the same fleet, and fewer than 100 rides.
 - `AssignAcceptedRideToDriver` always sets `status = 'queued'` and `auto_queued = true` for automatic assignments.
-- Records `ride_auto_queued`, refreshes the queue summary, and calls `RecoverIdleQueue`. If the driver has no active ride, this promotes the queue head right away. See [Queue promotion and recovery](/engineering/matching/queue-promotion).
+- Records `ride_auto_queued` with `driver_id` plus the decision fields (`elapsed_since_confirm_ms`, `candidate_count`, `deadhead_minutes`, `final_score`, `queue_load`), refreshes the queue summary, and calls `RecoverIdleQueue`. If the driver has no active ride, this routes from the driver's GPS, authorizes payment, and promotes the queue head right away. See [Queue promotion and recovery](/engineering/matching/queue-promotion).
 - A `RecoverIdleQueue` failure is swallowed when the ride is still assigned to this driver. The ride stays `queued` for the 3-minute recovery loop.
 
 Notifications after success:
@@ -225,3 +225,4 @@ It isn't set when the pass fails on a Redis read, a settings read, a session loo
 - **Missing cache means idle.** If a driver's summary expired, they're scored as having no queue even if they have one.
 - **Auto-queue ignores direct-request preferences.** `directAssignDriver` notes that auto-queue settings don't apply to direct requests. The reverse also holds: a lapsed direct request is auto-queued like any other ride.
 - **Two instances can race.** Both can pick a winner for the same ride. The first commit wins, and the second fails the `status = 'confirmed'` check and logs "may have been claimed".
+- **A card failure during immediate promotion requeues the ride.** `RecoverIdleQueue` runs as the assigned driver, so a failed clone or authorization calls `Cancel` as that driver and takes the requeue path, appending them to `declined_drivers`. `AutoAssignRide` then sees the ride is no longer theirs and returns the error, so `assignWinner` logs "may have been claimed" and nobody is pushed. The requeued ride has a fresh `confirm_time` and no attempted flag, so a later pass can pick another driver.

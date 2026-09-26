@@ -1,0 +1,176 @@
+---
+title: "Abuse controls"
+description: "Rate limits, OTP limits, circuit breakers, CORS, security headers, webhook verification, unauthenticated endpoints, and the intentional test-account shortcuts in Yelo."
+---
+
+This page collects every control that limits misuse of the Yelo API and web surfaces, and the places where no control exists. Route-by-route credentials are in the [Authorization matrix](/engineering/security/authorization-matrix). Sign-in limits are covered in depth in [Phone OTP and abuse controls](/engineering/identity/phone-otp-and-rate-limits).
+
+## Controls at a glance
+
+| Control | Scope | Backing store | Fails |
+| --- | --- | --- | --- |
+| Global token bucket | Every request, per IP, per instance | Process memory | Not applicable |
+| Auth v3 durable limits | `/authv3` endpoints, per requester prefix | Postgres `AuthRateLimitCounters` | Closed |
+| Auth v3 phone limits | Per transaction, per phone number, per requester | Postgres | Closed |
+| Auth v2 phone send limits | Per requester prefix and one global bucket | Postgres, only when Auth v3 is enabled | Closed |
+| Auth v2 OTP cooldown and attempts | Per phone or email | Redis | See [Phone OTP](/engineering/identity/phone-otp-and-rate-limits#auth-v2-legacy-limits) |
+| Friend bumps | 20 per hour per sender, friends only | Redis sliding window | Open |
+| Contact uploads | 30 per hour per user | Redis counter | Open |
+| Circuit breakers | Per outbound dependency | Process memory | Not applicable |
+| Webhook signatures | Each provider webhook | Shared secrets | Closed |
+| CORS allowlists | Browser callers | Config | Not applicable |
+
+## Global rate limit
+
+`rateLimit` in `internal/server/http/middleware.go` runs on every Fuego route. It keeps one `golang.org/x/time/rate` limiter per client key in memory.
+
+- Defaults are 50 requests per second with a burst of 100, from the `--limiter-rps`, `--limiter-burst`, and `--limiter-enabled` flags in `cmd/api/main.go`.
+- A rejected request gets 429 with a `null` body, an info log with the IP, and the rate-limit rejection metric.
+- Entries idle for 3 minutes are evicted every minute.
+- Buckets are per Cloud Run instance. Production runs at most 2 instances (`_MAX_INSTANCES` in `cloudbuild.yaml`), so the effective ceiling is up to twice the configured rate.
+
+The client key comes from `network.GetRealIP`. It returns `X-Real-IP` when present, otherwise the leftmost `X-Forwarded-For` entry, otherwise the TCP peer.
+
+<Warning>
+Both headers are client-controlled. A caller who sends a different `X-Real-IP` on each request gets a fresh bucket each time, so the global limiter doesn't bound a determined client. Auth v3 avoids this: its requester resolver ignores forwarding headers unless the peer is in `AUTH_V3_TRUSTED_PROXY_CIDRS`.
+</Warning>
+
+Raw mux mounts (`/metrics`, `/debug/pprof/`, `/riverui/`) are outside the Fuego middleware chain and aren't rate limited.
+
+## Sign-in and OTP limits
+
+| Surface | Limits | Details |
+| --- | --- | --- |
+| Auth v3 HTTP | Fixed windows per coarse requester prefix (`/24` IPv4, `/56` IPv6), such as 30 authorizations per 10 minutes and 120 phone sends per hour | [HTTP limits per endpoint](/engineering/identity/phone-otp-and-rate-limits#http-limits-per-endpoint) |
+| Auth v3 phone | 5 sends and 5 verifies per transaction, 30-second cooldown, 10 sends per number per hour, 20 per requester per hour | [Auth v3 phone limits](/engineering/identity/phone-otp-and-rate-limits#auth-v3-phone-limits) |
+| Auth v2 phone send | 20 per hour per requester, 60 per hour across all callers | Only while Auth v3 is enabled. With Auth v3 off, only the Redis cooldown applies |
+| Auth v2 codes | 60-second resend cooldown, 15-minute code lifetime, 5 failed verifies | Redis records under `authv2:*_otp:` |
+| E2E | Auth v3 per-requester and cross-transaction maxima multiplied by 100 | E2E API only |
+
+Session refresh, logout, onboarding routes, and authenticated `/authv3/user` routes other than link authorize have no HTTP limit beyond the global bucket.
+
+## Feature limits
+
+| Feature | Limit | Behavior when Redis is down | Code |
+| --- | --- | --- | --- |
+| `POST /notification/bump` | Every recipient must be a friend. 20 bumps per hour per sender. Recipient count capped by request validation | Allowed | `NotifyFriendBump`, `bumpRateLimited` in `internal/service/notifications/bump.go` |
+| Bump SMS | One text per recipient per cooldown, enforced by `ClaimTextMessage` | Postgres, unaffected | `queries/engagement.sql` |
+| `POST /user/friends/contacts` | 30 uploads per hour per user | Allowed | `contactUploadRateLimited` in `internal/service/user/contacts.go` |
+| `POST /ride/i/{id}/accept` | Reserved for the offered driver for 30 seconds | Not applicable | `validateRideRequestAcceptance` |
+
+Search, mapping, and routing endpoints have no per-user limit. Each cache miss calls Mapbox or Google, so a signed-in user can spend provider quota at the global bucket's rate.
+
+## Circuit breakers
+
+`circuitbreaker.NewSettings` in `internal/utilities/circuitbreaker/circuitbreaker.go` protects Yelo from failing dependencies. It isn't an abuse control.
+
+- A breaker opens after 5 consecutive failures, stays open for 60 seconds, and allows 3 half-open probes. Opening and closing post Slack alerts.
+- Validation, not-found, unauthorized, and similar client errors count as successes, so bad input can't open a breaker.
+- Provider `RateLimit`, `ProviderUnavailable`, and server errors count as failures. Traffic that exhausts a provider's quota (for example Mapbox 429s) opens that breaker for every user until it recovers.
+
+Named breakers and retry policy are listed in [Integrations](/engineering/api/integrations#circuit-breakers).
+
+## CORS
+
+`enableCORS` in `internal/server/http/middleware.go` wraps the entire mux.
+
+| Environment | Behavior |
+| --- | --- |
+| `ENVIRONMENT=dev` | Reflects any `Origin` without credentials and answers every preflight |
+| Other environments, `/authv3` paths | Only exact `AUTH_V3_CORS_ORIGINS` entries. Sets `Access-Control-Allow-Credentials: true` and exposes `Retry-After` and `X-Request-ID`. Never inherits the legacy list |
+| Other environments, other paths | Exact match against `CORS_TRUSTED_ORIGINS`, or the built-in list of Yelo web origins (`corsTrustedOrigins` in `config.go`). Credentials allowed |
+
+A request from an unlisted origin still reaches the handler. It just gets no CORS headers, so the browser hides the response. CORS doesn't restrict native apps, scripts, or server-side callers.
+
+## Security headers
+
+The API sets few response headers itself: `Cache-Control: no-store` on `/update-required` and the calendar routes, and `Referrer-Policy: no-referrer` on the calendar OAuth callback.
+
+Firebase Hosting sets headers per site in `yelo-web/firebase.json`:
+
+| Site and path | Headers |
+| --- | --- |
+| `signup` and `maestro`, `/auth/v3` | CSP (`default-src 'self'`, `script-src 'self'`, `frame-ancestors 'none'`, `form-action` limited to self plus Google and Apple on signup), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy` disabling camera, microphone, and geolocation, `Cache-Control: no-store` |
+| `signup`, `/delete-account` | `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `no-store`. No CSP |
+| `dashboard` | `Cache-Control` only. No CSP or frame protection |
+| `home`, `event`, `invite`, `world-cup`, other `signup` paths | `Cache-Control` and `Content-Type` only |
+
+The Cloudflare workers (`yelo-experience-router`, `yelo-world-cup-router`, `yelo-og`) proxy or render content and add only an `X-Yelo-Proxy` header. See [Edge and routing](/engineering/web/edge-and-routing).
+
+## Webhook verification
+
+| Route | Verification | Unset secret | Replay protection |
+| --- | --- | --- | --- |
+| `POST /stripe-webhook` | `webhook.ConstructEvent` with `STRIPE_WEBHOOK_SECRET` | 500 | Stripe's signed timestamp tolerance, plus idempotent handlers. See [Stripe webhooks](/engineering/payments/webhooks#replays-duplicates-and-ordering) |
+| `POST /appstore-webhook` | HMAC-SHA256 of the body in `X-Apple-Signature` with `APP_STORE_WEBHOOK_SECRET` | 500 | None beyond the signature |
+| `POST /twilio-webhook` | Twilio `RequestValidator.Validate` over the reconstructed public URL and form params with `TWILIO_AUTH_TOKEN` | 401 | None beyond the signature |
+| `POST /twilio-verify-events` | Twilio `ValidateBody` with `TWILIO_AUTH_TOKEN`, plus optional basic auth | 401 | None beyond the signature |
+| `POST /mobile-vehicle-catalog` | GitHub OIDC, pinned to repository, ref, workflow, and environment | Not applicable | Run ID and attempt recorded with each publication |
+| `GET /oauth/google-calendar/callback` | Stored OAuth flow keyed by `state` | Not applicable | Flows expire and are deleted |
+
+Stripe signature failures return 500, not 400, so Stripe retries them and a stream of unsigned requests shows up as server errors.
+
+## Unauthenticated endpoints
+
+These routes accept anonymous traffic. Each is protected only by the global bucket and whatever the handler does.
+
+| Route | Cost or exposure |
+| --- | --- |
+| `POST /authv2/phone/request-otp` | Sends an SMS. Durable limits apply only when Auth v3 is enabled |
+| `/authv3` public routes | Durable per-requester limits |
+| `GET /ride/{id}` | Full ride details, including rider and driver phone numbers, for any ride UUID |
+| `POST /tips/{slug}/guest-checkout` | Creates a Stripe Checkout session per call |
+| `GET /tips/{slug}` | Driver first name and photo for a tip slug |
+| `POST /link/encode` | Inserts a `ShortenedLinks` row with any non-empty path |
+| `GET /link/decode` | Returns the stored path for a code |
+| `GET /referral/invite/{code}` | Inviter's user ID, first name, and photo |
+| `GET /fleet-join/{code}` | Fleet name, logo, and community |
+| `GET /healthcheck/deep` | Pings Postgres and returns pool, disk, and memory stats |
+| `GET /error`, `POST /score-driver` | Hidden test endpoints |
+| `GET /swagger`, `/swagger/openapi.json` | Full API schema. Served regardless of `SWAGGER_ENABLED` |
+| `GET /community/`, `GET /school/`, `GET /public/events/slug/{slug}`, `GET /world-cup/standings`, `GET /world-cup/activity` | Public catalog data |
+
+## Test-account shortcuts
+
+These shortcuts are intentional and documented in [Test, E2E, and internal auth paths](/engineering/identity/test-and-internal-auth). They're listed here because they bypass normal verification in production.
+
+| Shortcut | Where it applies | Effect |
+| --- | --- | --- |
+| `+1555` plus 7 digits | Auth v3 and Auth v2 phone sign-in, every environment | No SMS is sent. Only `12345` verifies. Auth v3 rate limits still count |
+| `rider*`, `driver*`, `test_runner*` at `@rideyelo.com`, and `test*` at any `.edu` school domain | Auth v2 email verification | Code `12345`, no email sent. New users created this way get `is_test = true` |
+| `rideyelo@` at any `.edu` school domain, any other `@rideyelo.com` address | Auth v2 email verification | Code `12345`. Other `@rideyelo.com` addresses still receive the email |
+| `is_test = true` | Ride pricing outside `ENVIRONMENT=dev` | Every price is overridden to $0.00 (`isTestAccountFreeRideEnabled` in `internal/service/ride/rider.go`) |
+| Email ending in `@rideyelo.com` | Ride confirmation | The pickup confirm code is the fixed `1234` (`testConfirmCode`) |
+| `DELETE /ride/` | `ENVIRONMENT=dev` only | Deletes every ride, unless `RIDE_STATE_SNAPSHOT_ENABLED` is on |
+| E2E mode | `ENVIRONMENT=e2e` with `E2E_ENABLED=true` only | Startup validation rejects a production DSN, live Stripe keys, and messaging secrets |
+
+Admins can also set `is_test` on any account with `PUT /dashboard/users/detail/{id}/test-status`.
+
+## Bans and deletion
+
+- `getValidateJWTMiddleware` rejects banned and deleted users through `AuthCache` (Redis, 15-minute TTL, Postgres fallback).
+- No API route sets `Users.is_banned`. A ban is a direct database change, and it takes effect once the user's `auth:user:<id>` cache entry expires or is invalidated.
+- The presignup middleware and optional auth don't consult `AuthCache`. See [Routes weaker than their data](/engineering/security/authorization-matrix#routes-weaker-than-their-data).
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Global limiter and CORS | `yelo-api/internal/server/http/middleware.go` |
+| Client IP resolution | `yelo-api/internal/utilities/network/ip.go` |
+| Limiter and CORS flags | `yelo-api/cmd/api/main.go` |
+| Default CORS origins | `corsTrustedOrigins` in `yelo-api/internal/utilities/config/config.go` |
+| Auth v3 durable limiter | `yelo-api/internal/server/http/authv3/durable_rate_limiter.go` |
+| Auth v2 send limit | `allowPhoneSend` in `yelo-api/internal/server/http/authv2/handler.go` |
+| Circuit breakers | `yelo-api/internal/utilities/circuitbreaker/circuitbreaker.go` |
+| Webhooks | `yelo-api/internal/server/http/payment/`, `appstore/`, `twiliowebhook/`, `verifyevents/` |
+| Test shortcuts | `yelo-api/internal/utilities/phone/phone.go`, `yelo-api/internal/service/authv2/authv2.go`, `yelo-api/internal/service/ride/rider.go` |
+| Web security headers | `yelo-web/firebase.json` |
+
+## Gotchas and edge cases
+
+- **Redis-backed limits fail open.** With Redis down or disabled, friend bumps and contact uploads are unlimited.
+- **The Auth v2 send limit depends on Auth v3.** Turning off `AUTH_V3_ENABLED` also removes the only durable limit on `POST /authv2/phone/request-otp`.
+- **Test emails plus free pricing.** Anyone who can type a `test...@<school>.edu` address gets a new `is_test` account through Auth v2, and `is_test` accounts ride for $0.00 outside dev.
+- **Upload bodies aren't capped.** Multipart handlers call `ParseMultipartForm` with a 100 MB memory limit and no `MaxBytesReader`. The server's 30-second read timeout is the only bound.
+- **Rate-limit rejections log the client key.** Because the key is taken from forwarding headers, the logged `ip` can be any value the caller sent.

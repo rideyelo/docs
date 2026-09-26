@@ -72,11 +72,11 @@ These should hold. Each lists what enforces it and how the code can break it.
 
 ### Holds and rides
 
-1. **A paid ride that reached `driver_en_route` has a `payment_intent_id` and `stripe_merchant_id`.** Enforced by `processRidePayment` running before `Ride.Accept`. Broken for queue promotions, where `PromoteNextQueuedRide` moves the ride to `driver_en_route` in the `Complete` transaction and authorization runs afterward in `advanceQueuedRide`.
+1. **A paid ride that reached `driver_en_route` has a `payment_intent_id` and `stripe_merchant_id`.** Enforced by `processRidePayment` running before `Ride.Accept`. Broken for queue promotions after `Complete` or a cancel, where `PromoteNextQueuedRide` moves the ride to `driver_en_route` in the same transaction and authorization runs afterward in `advanceQueuedRide`. Idle-queue recovery (`prepareAndPromoteQueuedRide`) authorizes before it promotes.
 2. **`Rides.stripe_merchant_id` owns `Rides.payment_intent_id`.** Both are written together by `AddRidePaymentIntent`. Broken when concurrent accepts both pass the unbumped revision check.
 3. **The PaymentIntent's `metadata.driver_id` equals `Rides.driver_id` while assigned.** Checked by `reuseRideAuthorization`. Broken by the concurrent-accept race above.
 4. **At most one live hold per ride.** Rematch cancels the previous driver's hold before creating a new one. Broken by `CancelUnmatchedConfirmedRides`, which never releases a requeued ride's hold, and by Stripe timeouts on `NewPaymentIntent`.
-5. **`pre_auth_amount` equals the Stripe `amount` divided by 100.** Both come from `authAmount`, but the Stripe amount is truncated to cents and `pre_auth_amount` is stored as `real`.
+5. **`pre_auth_amount` equals the Stripe `amount` divided by 100.** Both come from `authAmount`, but the Stripe amount is `int(authAmount * 100)`, which truncates, while `pre_auth_amount` is `numeric(10,2)`, which rounds. A $4.35 fare with tips stores `9.35` and authorizes 934 cents.
 
 ### Settlement
 
@@ -123,7 +123,7 @@ These log messages and metrics indicate money is stuck or out of sync. Search fo
 | `failed to cancel prior tip payment intent` | `createTipCharge` | An abandoned tip intent may still be open |
 | `[stripe-webhook] signature verification failed` | `HandleStripeEvent` | Secret or API version mismatch. All webhooks are failing |
 | `CIRCUIT_BREAKER_TRIPPING` with component `stripe` | `circuitbreaker.NewSettings` | Wrapped Stripe calls are failing fast for 60 seconds |
-| `Stripe reconciliation coverage` at warning level | `reconciliationDispatchWorker` | Accounts are failed or overdue by more than 25 hours |
+| `Stripe reconciliation coverage` at warning level | `reconciliationDispatchWorker` | Accounts are failed or overdue by more than 25 hours. Accounts Stripe rejects as invalid are counted separately and don't trigger it |
 
 There's no admin endpoint to recapture, cancel, or refund. All manual fixes happen in the Stripe Dashboard, and the Yelo row must be corrected separately, because refunds and cancellations made in Stripe don't flow back through webhooks.
 

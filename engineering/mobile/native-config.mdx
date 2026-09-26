@@ -1,0 +1,217 @@
+---
+title: "Native configuration"
+description: "How app.json, app.config.ts, and eas.json produce the native iOS and Android projects for each build variant: identifiers, schemes, domains, entitlements, Info.plist, Android manifest, config plugins, and runtime versioning."
+---
+
+`yelo-frontend` uses Expo continuous native generation. There are no committed `ios/` or `android/` directories. Every native setting comes from three files:
+
+| File | Role |
+| --- | --- |
+| `app.json` | Static base config: identifiers, icons, Info.plist, entitlements, Android permissions and intent filters, and most config plugins |
+| `app.config.ts` | Dynamic layer on top of `app.json`. Switches identity for the E2E variant, adds four plugins, sets `updates` and `runtimeVersion`, and applies three inline config mods. |
+| `eas.json` | Build profiles, channels, EAS environments, and submit settings |
+
+Any change to these files is a native change. It needs a new build and can't ship as an OTA update. See [Releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
+## Build variants
+
+`app.config.ts` has exactly two identities, chosen by `EXPO_PUBLIC_APP_ENV`. When it's `e2e`, the build is the E2E variant. Every other value, including unset, is the production identity. The `staging`, `preview`, `development`, and `simulator` profiles don't set `EXPO_PUBLIC_APP_ENV`, so they build the production identity and differ only by channel and distribution.
+
+| Setting | Production identity (`production`, `staging`, `preview`, `development`, `simulator`) | E2E (`e2e-simulator`) |
+| --- | --- | --- |
+| App name | `Yelo` | `Yelo E2E` |
+| iOS bundle identifier | `io.flutterflow.ridedesi.desirider` | `io.flutterflow.ridedesi.desirider.e2e` |
+| Android package | `com.rideyelo` | `com.rideyelo.e2e` |
+| URL schemes (`scheme`) | `com.rideyelo`, `yelo` | `com.rideyelo.e2e`, `yelo-e2e` |
+| Widget extension bundle ID | `io.flutterflow.ridedesi.desirider.ExpoWidgetsTarget` | `io.flutterflow.ridedesi.desirider.e2e.ExpoWidgetsTarget` |
+| App group | `group.io.flutterflow.ridedesi.desirider` | `group.io.flutterflow.ridedesi.desirider.e2e` |
+| `google-services.json` | `GOOGLE_SERVICES_JSON` env var, else `./google-services.json` | `GOOGLE_SERVICES_JSON_E2E` env var, else `./google-services.e2e.json` |
+| Android `uberauth` intent filter | Added | Not added |
+| EAS Update | Enabled, `checkAutomatically: ON_LOAD`, `fallbackToCacheTimeout: 3000` | Disabled, `checkAutomatically: NEVER`, `fallbackToCacheTimeout: 0` |
+| Auth v3 redirect URI | `com.rideyelo://auth/v3/callback` | `com.rideyelo.e2e://auth/v3/callback` |
+
+The two `google-services*.json` files are git-ignored. CI pulls the production file from the EAS `production` environment and validates it with `scripts/prepare-google-services.mjs`, which requires the Android package from `app.json`.
+
+The auth redirect URI isn't in the Expo config. `lib/auth/security.ts` derives it from the same env var, so it must stay in sync with `scheme`. See [Auth and onboarding](/engineering/mobile/auth-and-onboarding).
+
+Settings that are the same in both identities:
+
+| Setting | Value |
+| --- | --- |
+| Expo owner and slug | `rideyelo/yelo` |
+| EAS project ID | `174d3057-0fb3-49db-bbf5-6caa04fe0e3c` (`extra.eas.projectId`, also the `updates.url` path) |
+| Apple team ID | `6CUL8VB632` |
+| App Store Connect app ID | `1667384111` (`submit.production.ios.ascAppId`) |
+| Marketing version | `app.json` `version`. Build numbers come from EAS (`appVersionSource: remote`). |
+| Platforms | `ios`, `android` |
+| Orientation, appearance | `portrait`, `userInterfaceStyle: automatic` |
+| iOS tablets | `supportsTablet: true` |
+| iOS deployment target | `16.4` (`expo-build-properties`) |
+| Associated domains | `applinks:yelo.link`, `applinks:join.yelo.link`, `applinks:invite.yelo.link` |
+| Expo experiments | `typedRoutes: true`, `reactCompiler: true` |
+| `extra.router.origin` | `false` |
+
+## EAS build profiles
+
+`eas.json` requires EAS CLI `>= 9.0.0`.
+
+| Profile | Distribution | Channel | EAS environment | Extra settings |
+| --- | --- | --- | --- | --- |
+| `production` | Store | `production` | `production` | `autoIncrement` |
+| `staging` | Internal | `staging` | `production` | |
+| `preview` | Internal | `preview` | `production` | |
+| `development` | Internal | `development` | `production` | `autoIncrement` |
+| `simulator` | Internal | `development` | `production` | iOS simulator build |
+| `e2e-simulator` | Internal | `e2e` | `preview` | iOS simulator build, Android APK, and the inline `env` below |
+
+`developmentClient` is `false` on every profile that sets it, so no EAS profile produces a dev-client build. Local dev clients come from `expo run:ios` and `expo run:android`.
+
+`e2e-simulator` sets these variables inline:
+
+| Variable | Value |
+| --- | --- |
+| `EXPO_PUBLIC_APP_ENV` | `e2e` |
+| `EXPO_PUBLIC_API_URL` | The E2E Cloud Run API origin |
+| `EXPO_PUBLIC_E2E_AUTH_ORIGIN` | `https://yelo-maestro.web.app` |
+| `EXPO_PUBLIC_DISABLE_ANIMATIONS` | `true` |
+
+Every other `EXPO_PUBLIC_*` value comes from the EAS environment named in the profile. For what each variable does, see [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments#build-time-environment-flags). For how channels map to OTA branches, see [Releases](/engineering/mobile/releases#build-profiles).
+
+## iOS
+
+### Info.plist
+
+| Key | Value | Set by |
+| --- | --- | --- |
+| `CFBundleURLTypes` | `google-oauth` with the reversed Google iOS client ID, and `com.rideyelo.yelo` with `yelo` | `app.json` `ios.infoPlist`. Expo adds the `scheme` entries on top. |
+| `LSApplicationQueriesSchemes` | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam` | `app.json`. `react-native-share` adds `fb`, `instagram`, `twitter`, `tiktoksharesdk`. |
+| `UIBackgroundModes` | `location`, `remote-notification` | `app.json`. `withoutBackgroundFetch` removes the `fetch` mode that `expo-task-manager` adds. |
+| `NSAppTransportSecurity` | `localhost` allows insecure HTTP loads | `app.json` |
+| `ITSAppUsesNonExemptEncryption` | `false` | `app.json` |
+| Location, camera, photo library, and contacts usage strings | See [Permissions and device](/engineering/mobile/permissions-and-device#native-configuration) | `expo-location`, `expo-image-picker`, `expo-camera`, `expo-contacts` plugins |
+| Microphone usage string | Not added | `microphonePermission: false` on `expo-image-picker`, `expo-camera`, and `expo-audio` |
+
+### Entitlements
+
+| Entitlement | Value | Set by |
+| --- | --- | --- |
+| `aps-environment` | `production` | `app.json`, then `withProductionAps` in `app.config.ts` |
+| `com.apple.developer.in-app-payments` | `merchant.com.rideyelo.yelo` | `app.json` and the Stripe plugin's `merchantIdentifier` |
+| `com.apple.developer.associated-domains` | The three `applinks:` domains | `ios.associatedDomains` |
+| Sign in with Apple | Enabled | `ios.usesAppleSignIn: true` and `expo-apple-authentication` |
+| App groups | The variant's app group | `expo-widgets` |
+
+<Warning>
+  `expo-widgets` sets `aps-environment` to `development` when `enablePushNotifications` is on. `withProductionAps` puts it back to `production`. If you remove that mod, store builds register sandbox push tokens and production pushes stop arriving.
+</Warning>
+
+### Widget extension
+
+`expo-widgets` adds a second iOS target, `ExpoWidgetsTarget`, with its own bundle ID and a shared app group. `enablePushNotifications: true` enables push-to-update for Live Activities. For the E2E variant, `app.config.ts` rewrites only this plugin's `bundleIdentifier` and `groupIdentifier`. See [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments#ios-live-activities).
+
+## Android
+
+### Manifest
+
+| Setting | Value | Set by |
+| --- | --- | --- |
+| `permissions` | `ACCESS_NETWORK_STATE`, `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION` | `app.json` |
+| Plugin-added permissions | Background location and foreground service (`expo-location`), camera (`expo-camera`, `expo-image-picker`), contacts (`expo-contacts`), notifications (`expo-notifications`) | Plugins |
+| `blockedPermissions` | `READ_PHONE_STATE`, `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS` | `app.json`. These are stripped even when a dependency declares them. |
+| `<queries>` | One intent block with `VIEW` for `uber`, `lyft`, `waymo`, `rideyazam` | `withRideProviderQueries` in `app.config.ts` |
+| Adaptive icon | Foreground and monochrome `android-foreground.png`, background `#F7FB32` | `app.json` |
+
+`withRideProviderQueries` removes any existing `<queries>` entry for those schemes before adding its own, so reruns don't duplicate it. Keep `RIDE_PROVIDER_SCHEMES` in sync with the iOS `LSApplicationQueriesSchemes` list, or install probes for ride providers break on one platform.
+
+### Intent filters
+
+| Filter | `autoVerify` | Data | Variant |
+| --- | --- | --- | --- |
+| App Links | Yes | `https://yelo.link/` and `https://yelo.link/fleet-*` | Both |
+| App Links | Yes | `https://join.yelo.link` (any path) | Both |
+| App Links | Yes | `https://invite.yelo.link` (any path) | Both |
+| Uber login callback | No | `uberauth:` | Production identity only |
+
+On `yelo.link`, only the root path and paths starting with `/fleet-` open the app. Other `yelo.link` paths open in the browser on Android even though iOS claims the whole domain. For how incoming URLs are rewritten, see [Navigation](/engineering/mobile/navigation#url-schemes-and-domains).
+
+The `uberauth` filter exists because Android Custom Tabs can't intercept an unregistered callback scheme the way iOS `ASWebAuthenticationSession` can. Uber's first-party login returns to `uberauth://`.
+
+## Config plugins
+
+Plugins are applied in array order. `app.config.ts` appends its four plugins after the `app.json` list, then wraps the result in three inline mods.
+
+| Plugin | Source | Configuration | What it does |
+| --- | --- | --- | --- |
+| `expo-router` | `app.json` | none | File-based routing and linking |
+| `expo-asset` | `app.json` | none | Bundled asset support |
+| `expo-status-bar` | `app.json` | none | Status bar config |
+| `expo-apple-authentication` | `app.json` | none | Sign in with Apple capability |
+| `expo-dev-client` | `app.json` | `launchMode: most-recent`, `showMenuAtLaunch: false`, `skipOnboarding: true`, `toolsButton: false` | Dev launcher behavior for local dev clients |
+| `react-native-bootsplash` | `app.json` | Logo `assets/yelo/yelo-text.png` at 180 px, background `#fdfde2` | Native splash screen. `app/_layout.tsx` hides it. |
+| `expo-image` | `app.json` | none | Native image module |
+| `expo-secure-store` | `app.json` | none | Keychain and Keystore storage |
+| `expo-web-browser` | `app.json` | none | Auth sessions and in-app browser |
+| `expo-build-properties` | `app.json` | `ios.deploymentTarget: 16.4` | Minimum iOS version |
+| `expo-location` | `app.json` | Background location on both platforms, Android foreground service with `notification-icon.png`, three usage strings | Driver background location |
+| `expo-image-picker` | `app.json` | Photo and camera strings, `microphonePermission: false` | Profile and license photos |
+| `expo-notifications` | `app.json` | Icon `notification-icon.png`, color `#F7F169`, `defaultChannel: default`, sound `kaching.wav` | Push notification resources |
+| `react-native-share` | `app.json` | iOS query schemes `fb`, `instagram`, `twitter`, `tiktoksharesdk` | Share targets |
+| `expo-font` | `app.json` | Switzer (six weights) and Boston Angel Medium, per platform | Embedded fonts |
+| `@rnmapbox/maps` | `app.json` | `RNMapboxMapsVersion: 11.20.1` | Mapbox native SDK version |
+| `@stripe/stripe-react-native` | `app.json` | `merchantIdentifier: merchant.com.rideyelo.yelo`, `enableGooglePay: true` | Apple Pay and Google Pay |
+| `@sentry/react-native/expo` | `app.json` | `url: https://sentry.io/`, project `yelo`, organization slug | Native crash reporting and source map upload |
+| `expo-widgets` | `app.json` (rewritten for E2E) | `bundleIdentifier`, `groupIdentifier`, `enablePushNotifications: true` | Live Activity extension target |
+| `expo-audio` | `app.config.ts` | `enableBackgroundPlayback: false`, `microphonePermission: false`, `recordAudioAndroid: false` | Ride alert sounds, no recording |
+| `expo-contacts` | `app.config.ts` | Contacts usage string | Contact sync |
+| `expo-camera` | `app.config.ts` | Camera string, `microphonePermission: false`, `recordAudioAndroid: false` | QR scanning and identity photos |
+| `expo-localization` | `app.config.ts` | none | Locale APIs |
+
+Inline mods in `app.config.ts`:
+
+| Mod | Type | Effect |
+| --- | --- | --- |
+| `withProductionAps` | `withEntitlementsPlist` | Forces `aps-environment` to `production` |
+| `withRideProviderQueries` | `withAndroidManifest` | Adds the ride-provider `<queries>` block |
+| `withoutBackgroundFetch` | `withInfoPlist` | Removes `fetch` from `UIBackgroundModes` |
+
+Two dependencies carry pnpm patches, declared in `pnpm-workspace.yaml` under `patchedDependencies`: `expo-glass-effect@57.0.3` (GlassView touch areas, explained in `patches/expo-glass-effect.md`) and `expo-linear-gradient@57.0.2`. Patches to native modules change the native binary, so treat them like any other native change.
+
+## Runtime version and fingerprint
+
+`runtimeVersion` uses `policy: 'fingerprint'`. EAS hashes every native input, and an OTA update only installs on binaries with the same hash. Bumping `version` alone doesn't change the runtime.
+
+`fingerprint.config.js` normalizes two inputs before hashing:
+
+| Input | Normalization | Why |
+| --- | --- | --- |
+| Expo config `platforms` | Hashed as `['android', 'ios', 'web']` | `app.json` declares only iOS and Android. Hashing Expo's default keeps older binaries compatible. |
+| `eas.json` `submit` section | Replaced with `{ production: { ios: { ascAppId } } }` | Submit settings only choose where artifacts upload. They shouldn't create a new runtime. |
+
+Everything else in `eas.json`, `app.json`, and `app.config.ts` is hashed. On Android, the contents of `google-services.json` are part of the fingerprint too. The **Fingerprint** CI check pulls the production file, computes both platforms for base and head, and comments on the PR when the hash changes. See [Releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
+<Note>
+  Don't put build metadata in the Expo config. `EXPO_PUBLIC_SOURCE_COMMIT` is read straight from Metro's substitution in `app/(app)/profile/settings.tsx` because putting the commit SHA in config would change the fingerprint on every commit.
+</Note>
+
+## Gotchas and edge cases
+
+- **The E2E build still registers `yelo://`.** `app.config.ts` overrides `scheme`, but `ios.infoPlist.CFBundleURLTypes` in `app.json` still declares `yelo`. With both apps installed on one simulator, iOS may route `yelo://` links to either one.
+- **The E2E build keeps the production link config.** `ios.associatedDomains` and the App Links intent filters aren't overridden for E2E. Whether a link opens the E2E app depends on the domain's hosted verification files, not on the app config.
+- **Staging is not a separate app.** `staging`, `preview`, and `development` builds use the production bundle ID and package, so installing one replaces the store app on a device.
+- **Mod placement matters.** `withProductionAps` and `withoutBackgroundFetch` exist to correct what `expo-widgets` and `expo-task-manager` write. If you move either into the `plugins` array or reorder plugins, run `npx expo prebuild --clean` locally and check the generated entitlements and `Info.plist`.
+- **Block, don't just omit, Android permissions.** Transitive dependencies can add `READ_PHONE_STATE` or `SYSTEM_ALERT_WINDOW`. Only `blockedPermissions` guarantees they stay out of the merged manifest.
+- **A missing `EXPO_PUBLIC_APP_ENV` builds production.** If a local E2E build drops the variable, the app gets the production identity. `lib/config.ts` compiles in the E2E API origin as a fallback only when the variant is `e2e`, and it throws if an E2E build targets the production API.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Static config | `app.json` |
+| Variant switch, extra plugins, inline mods, updates, runtime version | `app.config.ts` |
+| Build profiles and submit | `eas.json` |
+| Fingerprint normalization | `fingerprint.config.js` |
+| Google services validation | `scripts/prepare-google-services.mjs` |
+| Fingerprint CI | `.github/workflows/fingerprint.yml` |
+| Native patches | `patches/`, `pnpm-workspace.yaml` |
+| API base URL per variant | `lib/config.ts` |
+| Auth redirect scheme per variant | `lib/auth/security.ts` |

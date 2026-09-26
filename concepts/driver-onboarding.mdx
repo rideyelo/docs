@@ -75,12 +75,12 @@ The steps are `profile_picture`, `license`, `vehicle`, and `stripe`. The vehicle
 The response also includes each step status, `payout_source` (`personal_stripe` or `fleet`), the payout fleet, `vehicle_managed_by_fleet`, and `phone_verified`.
 
 <Warning>
-  The app counts `pending` steps as done on the hub, so drivers reach **Submitted** before any approval. Going online still requires `complete`.
+  The app counts `pending` steps as done on the hub, so drivers reach **Submitted** before any approval. A rejected (`failed`) step shows **NOT APPROVED** and blocks the hub, including a rejected profile photo that already has an uploaded file. Going online still requires `complete`.
 </Warning>
 
 ## Admin review
 
-Admins review applications from the **Drivers** page (`/drivers`) in the dashboard. The review sheet lists each requirement with **Approve** and **Reject** buttons. Rejecting asks for a reason that is shown to the driver.
+Admins review applications from the **Drivers** page (`/drivers`) in the dashboard. The review sheet lists each requirement with **Approve** and **Reject** buttons. Rejecting asks for a reason, which the API stores as `rejection_reason`. The mobile app never displays it, so the driver only sees **NOT APPROVED** on that step.
 
 - The API endpoint is `POST /dashboard/drivers/review` with `step` set to `profile_picture`, `license`, or `vehicle`, and `action` set to `approve` or `reject`.
 - Only the `admin` role can review. Other roles get "Forbidden: Admins only".
@@ -91,7 +91,7 @@ Admins review applications from the **Drivers** page (`/drivers`) in the dashboa
 When a step changes to `complete`, the driver gets a `driver_application_approved` push: "You're approved!" / "We approved your `{{step_label}}`!". The step labels are `photo`, `license`, `vehicle`, and `payout info`. Yelo sends no push on rejection or activation.
 
 <Warning>
-  The approval push deep-links to `/driver-signup/1-application-status`, which has no matching screen in the current app.
+  The approval push deep-links to `/driver-signup/1-application-status` (from the seeded `driver_application_approved` template). The app has no such screen, so tapping the push opens the "This screen doesn't exist." page.
 </Warning>
 
 ## Stripe Connect payouts
@@ -137,9 +137,9 @@ Who triggers activation depends on how the driver is paid:
 | --- | --- |
 | Personal Stripe | An admin clicks **Activate driver** on the lead after the manual background check. Approval alone never activates these drivers. |
 | Fleet-managed payouts | Automatically, the next time the app loads `GET /driver/signup-status` after the application is complete. |
-| Joined through a fleet link | The join tries to activate the driver immediately. |
+| Joined through a fleet link | The join tries to activate the driver immediately. An owner-operator fleet (custom payouts disabled) doesn't manage payouts, so its drivers still need personal Stripe. |
 
-On activation, Yelo assigns an active fleet if the driver has none. See [Fleets](/concepts/fleets#fleet-drivers-and-independent-drivers).
+On activation, Yelo assigns an active fleet if the driver has none: the primary fleet of the default community. See [Fleets](/concepts/fleets#fleet-drivers-and-independent-drivers).
 
 ### Driver leads
 
@@ -159,7 +159,7 @@ Only admins can activate a lead. See [Driver leads](/dashboard/driver-leads) for
 
 ## Phone requirement
 
-When `DRIVER_VERIFIED_PHONE_REQUIRED` is `true`, drivers must have a verified phone number before they upload photos, register a vehicle, create a Stripe account, activate, or go online. The flag defaults to `false`. Auth v3 accounts always have a verified phone, so this mostly affects legacy accounts.
+When `DRIVER_VERIFIED_PHONE_REQUIRED` is `true`, drivers must have a verified phone number before they upload photos, register a vehicle, create a Stripe account, activate, or go online. The flag defaults to `false`. Auth v3 accounts created in the app always have a verified phone. Accounts created with Google or Apple on the web signup site can have no phone, and so can legacy accounts.
 
 ## Going online and staying online
 

@@ -3,7 +3,7 @@ title: "Test, E2E, and internal auth paths"
 description: "Every hardcoded test behavior in Yelo auth: reserved 555 phone numbers, the fixed 12345 code, test and admin email patterns, is_test accounts, E2E mode, the device-test page, and shared-key internal routes."
 ---
 
-Yelo auth has several built-in shortcuts for testing. Most of them are **not** limited to non-production environments. This page lists each one, what it bypasses, and where it lives, so you can use them deliberately and spot them in incident reviews.
+Yelo auth has several built-in shortcuts for testing. The reserved phone numbers and test email patterns are intentional and work in every environment, including production, so QA and app review can sign in without a real phone or mailbox. This page lists each shortcut, what it bypasses, and where it lives, so you can use them deliberately and recognize them in incident reviews.
 
 ## Reserved phone numbers
 
@@ -21,9 +21,9 @@ A number is a test number when it normalizes to `+1555` followed by exactly seve
 | Legacy SMS (`SendText`) | Returns success without contacting Twilio (`internal/data/twilio/twilio.go`) |
 | Photon iMessage | Skipped (`internal/data/photon/photon.go`) |
 
-<Warning>
-None of these checks look at the environment. Anyone can sign up on production with any `+1555` number and the code `12345`. Accounts created this way through Auth v3 are **not** marked `is_test`, because `resolveInTransaction` never sets `IsTest` when it creates a user.
-</Warning>
+<Note>
+These checks don't look at the environment, by design. Any `+1555` number with the code `12345` signs in on production too. Accounts created this way through Auth v3 aren't marked `is_test`, because `resolveInTransaction` never sets `IsTest` when it creates a user. Mark them from the dashboard if you need test behavior (see the recipe below).
+</Note>
 
 Auth v2 matches test numbers with a plain `strings.HasPrefix(phone, "+1555")` (`isTestPhone` in `internal/service/authv2/authv2.go`), without the length check.
 
@@ -41,9 +41,9 @@ Auth v2 school email verification uses fixed codes for some addresses (`isTest`,
 
 A fixed code still requires the domain to match a school, a subdomain of one, or a fleet whitelist entry.
 
-<Warning>
-The `test*.edu` rule applies at every real school. Anyone can request a code for an address like `test.someone@<any school domain>`, enter `12345` without owning the mailbox, and get `account_type = 'student'` for that school. The same is true for `rideyelo@<school domain>`.
-</Warning>
+<Note>
+The `test*.edu` and `rideyelo@*.edu` patterns are intentional and apply at every school in `Schools`. An address like `test.qa@<school domain>` verifies with `12345` without a real mailbox and sets `account_type = 'student'` for that school. Keep this in mind when you review student counts for a school.
+</Note>
 
 ## Recipes
 
@@ -63,9 +63,12 @@ The `test*.edu` rule applies at every real school. Anyone can request a code for
 
 | Behavior | Where |
 | --- | --- |
-| Skips location-based community resolution after sign-in | `ActiveCommunityService.Resolve` in `internal/service/authv3/active_community.go` |
+| Skips location-based community resolution after sign-in. `Resolve` still validates the transaction and user, then returns `already_active` without reading coordinates or changing the community. The token and auth cache are still refreshed. The Yelo-community repair is skipped too. | `ActiveCommunityService.Resolve` in `internal/service/authv3/active_community.go`, `internal/service/authv3/yelo_community_repair.go` |
 | Allows switching into test and hidden communities | `SetUserActiveCommunityValidated` in `internal/data/repository/queries/user_profile.sql` |
+| Prices every ride option and booking at $0.00, except when the API runs with the dev environment | `isTestAccountFreeRideEnabled` in `internal/service/ride/rider.go` |
 | Set or cleared by admins | `PUT /dashboard/users/detail/{id}/test-status` |
+
+Separately from `is_test`, every rider whose email ends in `@rideyelo.com` (case-insensitive) gets the fixed ride confirm code `1234` instead of a random one (`generateConfirmCode` and `testConfirmCode` in `internal/service/ride/rider.go`). This applies in every environment.
 
 Signup Slack alerts are skipped separately, by school and email rather than `is_test`, when `SKIP_TEST_SCHOOL_NOTIFICATIONS` is true (the default). The rule skips the school named "Yelo University", the school ID `c9817564-6850-4497-a248-67ea43e32d78`, and any email starting with `test` (`shouldSkipSlackForUser` in `internal/service/notifications/notification.go`).
 
@@ -104,9 +107,9 @@ The signup site has a device keyboard test mode for Auth v3. It only exists when
 | --- | --- | --- | --- |
 | `/internal/*` | `X-Internal-Key` | `INTERNAL_API_KEY` | Rejects every request |
 | `/internal/e2e/*` | `X-E2e-Key` | `E2E_CONTROL_API_KEY` | Group not mounted unless E2E is enabled |
-| `/metrics`, `/debug/pprof/` | `Authorization: Bearer` | `METRICS_AUTH_TOKEN` | Open |
+| `/metrics`, `/debug/pprof/` | `Authorization: Bearer` | `METRICS_AUTH_TOKEN` | Not mounted. `/debug/pprof/` also requires `PPROF_ENABLED=true` (default `false`). |
 
-Both key middlewares compare in constant time. `GET /internal/context/user` looks a user up by `phone` (normalized, then matched like Auth v2) or `user_id`, and returns profile, test flag, ban flag, and driver progress for automation.
+All three middlewares compare in constant time. `GET /internal/context/user` looks a user up by `phone` (normalized, then matched like Auth v2) or `user_id`, and returns profile, test flag, ban flag, and driver progress for automation.
 
 ## Where this lives in code
 

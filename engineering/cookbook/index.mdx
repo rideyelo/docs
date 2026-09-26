@@ -1,0 +1,67 @@
+---
+title: "Engineering cookbook"
+description: "Step-by-step recipes for the changes Yelo engineers make most often, each derived from how merged pull requests actually did it."
+---
+
+Each recipe lists the exact files, commands, and follow-ups for one kind of change. They build on these reference pages. Read those for the full background.
+
+- [API structure](/engineering/api/structure)
+- [OpenAPI and clients](/engineering/openapi-and-clients)
+- [Deployment](/engineering/deployment)
+
+Every recipe links to one or two merged pull requests that made the same kind of change. Use them as worked examples. Don't copy them line for line, because code on `main` may have moved on since.
+
+## Existing recipes
+
+<CardGroup cols={2}>
+  <Card title="Add an endpoint" icon="plug" href="/engineering/api/adding-an-endpoint">
+    Model, sqlc query, repository, service, handler, route, mocks, tests, and OpenAPI in `yelo-api`.
+  </Card>
+  <Card title="Add a dashboard page" icon="table-columns" href="/engineering/web/adding-a-dashboard-page">
+    Generated hook, page component, lazy route, roles, sidebar entry, and tests in `yelo-web`.
+  </Card>
+</CardGroup>
+
+## API and data
+
+<CardGroup cols={2}>
+  <Card title="Add a migration" icon="database" href="/engineering/cookbook/add-a-migration">
+    Numbered golang-migrate pairs, the immutability check, sqlc regeneration, enums in SQL and Go, backfills, and release ordering.
+  </Card>
+  <Card title="Change the API contract" icon="file-contract" href="/engineering/cookbook/change-the-api-contract">
+    Regenerate `openapi.json`, propagate it to web and mobile, and stay compatible with installed app versions.
+  </Card>
+  <Card title="Add a background job" icon="clock-rotate-left" href="/engineering/cookbook/add-a-background-job">
+    Choose between an in-process ticker and a River job, schedule periodic work, and add a disable switch.
+  </Card>
+  <Card title="Add an external integration" icon="cloud" href="/engineering/cookbook/add-an-external-integration">
+    A `internal/data` client with a circuit breaker and retries, plus configuration, mocks, tests, and E2E safety.
+  </Card>
+  <Card title="Add a feature flag or config value" icon="toggle-on" href="/engineering/cookbook/add-a-feature-flag-or-config">
+    Environment variables and the release trigger, `X-Features`, mobile experiments, and admin-editable settings.
+  </Card>
+  <Card title="Add a notification" icon="bell" href="/engineering/cookbook/add-a-notification">
+    Template code, seed, variables, emit, a deep link that resolves, and app cache invalidation.
+  </Card>
+</CardGroup>
+
+## Clients
+
+<CardGroup cols={2}>
+  <Card title="Add a dashboard metric" icon="chart-line" href="/engineering/cookbook/add-a-dashboard-metric">
+    SQL in `analytics.sql`, the service and response model, the generated hook, and the `MetricCard`.
+  </Card>
+  <Card title="Add a mobile screen" icon="mobile" href="/engineering/cookbook/add-a-mobile-screen">
+    Expo Router route, guards, an Orval hook, analytics events, and whether it ships over the air.
+  </Card>
+  <Card title="Add a web site" icon="globe" href="/engineering/cookbook/add-a-web-site">
+    `make new-site`, `sites.config.json`, the Firebase target, API CORS, and Cloudflare routing.
+  </Card>
+</CardGroup>
+
+## Conventions every recipe assumes
+
+- Branch from `main`. Run each repository's full gate before you push: `make check` in `yelo-api` and `yelo-frontend`, and `pnpm check` in `yelo-web`.
+- Commit generated output with the change that caused it. This covers sqlc, mocks, `openapi.json`, the consumer lock files, and Orval output. CI regenerates each one and fails on any diff.
+- For a cross-repo change, merge and release the API first, then the clients. PR descriptions link their companion PRs and state any required non-code configuration.
+- Describe migrations, breaking changes, and trigger or secret changes in the PR description. Reviewers and the release owner rely on it.

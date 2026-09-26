@@ -111,7 +111,7 @@ When the driver is online and `DriveProvider` selects an `activeCardRide`, `Driv
 The card shows the rider's initials, first name, and graduation year (`'27`), an elapsed timer since `request_time` (green, then yellow after 30 seconds, red after 120), total price and combined distance and duration, a dark route map, and **TO PICKUP** and **THE RIDE** legs.
 
 <Warning>
-The accept button auto-accepts. `RideAcceptButton` fills over 30 seconds (`durationSeconds={30}` in `RideRequestCard.tsx:365`) and calls `onAutoAccept` when it completes. The label reads "Accepting in [N]s". The only way to avoid it is to tap **Decline**.
+The accept button auto-accepts by design. `RideAcceptButton` fills over 30 seconds (`durationSeconds={30}` in `RideRequestCard.tsx:365`) and calls `onAutoAccept` when it completes. The label reads "Accepting in [N]s", so the countdown is visible to the driver. The only way to avoid it is to tap **Decline**.
 </Warning>
 
 **Accept** (tap or timeout):
@@ -200,12 +200,15 @@ Ratings of 4 or 5 count as positive for the shift. Going offline after 3 or more
 | --- | --- |
 | `fleet` | `FleetManagedEarnings`: `driver_earnings` from `/user/status` and the last 5 drives |
 | `personal_stripe` | Balance (**Available**, **Pending**), `EarningsNextPayoutCard`, optional cash-out button, **Recent activity**, **Recent payouts** |
-| Error | `EarningsUnavailable` with retry |
+| `signup-status` request failed | `EarningsUnavailable` with retry |
+| Anything else, including `personal_stripe` before the earnings data loads | Spinner |
+
+The API always sends `fleet` or `personal_stripe`. `DriverApplication.GetStatuses` in `yelo-api/internal/models/driver.go` defaults to `personal_stripe` when no payout fleet is set.
 
 Personal-Stripe data comes from `GET /earnings/balance`, `/earnings/external-account`, `/earnings/payout-schedule`, `/earnings/payouts`, and `/earnings/activity`.
 
 - **Payout schedule** (`PayoutScheduleSheet`): **Daily** ("Every business day · free") or **Weekly** ("Every Friday · free"). `PUT /earnings/payout-schedule`.
-- **Cash out** appears only when `instant_eligible`. **Cash out $X now** / "Arrives in seconds" opens `CashOutSheet`: available balance, **1% instant fee**, **You'll receive**, and "Skip the fee by waiting for your free weekly payout on [date]." It posts `POST /earnings/payouts/instant` with `amount` equal to the balance minus the 1% fee.
+- **Cash out** appears only when `instant_eligible`. **Cash out $X now** / "Arrives in seconds" opens `CashOutSheet`: available balance, **1% instant fee**, **You'll receive**, and "Skip the fee by waiting for your free weekly payout on [date]." It posts `POST /earnings/payouts/instant` with `amount` equal to the balance minus the 1% fee, rounded to the nearest cent.
 - `StripeLinkButton` opens `GET /stripeaccount/login-link` (or the onboarding link) for the Stripe Express dashboard.
 - `2-all-activity` and `3-all-payouts` page through the same endpoints (payouts up to 100). Payout rows show **PENDING**, **SCHEDULED**, or **FAILED**.
 
@@ -231,16 +234,16 @@ Personal-Stripe data comes from `GET /earnings/balance`, `/earnings/external-acc
 
 ## Gotchas and edge cases
 
-- **Silence means accept.** A driver who looks away from a ride card for 30 seconds accepts it. Pausing only happens while the decline sheet is open.
+- **Silence means accept.** This is the intended card design, not a bug. A driver who looks away from a ride card for 30 seconds accepts it. Pausing only happens while the decline sheet is open.
 - **Every accept failure reads as "too slow".** `DriverMapOverlay.tsx:282` sets `tooSlowRideId` for network errors, 5xx, and validation errors alike.
 - **Server go-online reasons are hidden.** The API returns specific titles (Application Incomplete, Payment Setup Required, Fleet Not Found, No Vehicle, Outside Service Area), but `DriveProvider.tsx:369` replaces them all with "Failed to update online status."
 - **Disabled Go online has no explanation.** When `canGoOnline` is false the button just greys out.
 - **The demand dashboard is fetched and never shown.** `DriveProvider` prefetches `GET /driver/demand-dashboard` on mount (`DriveProvider.tsx:215`), but no component reads that query.
-- **Earnings can spin forever.** `driver-earnings/1-hub` shows a spinner whenever `payout_source` is neither `fleet` nor `personal_stripe`, for example before any payout setup.
-- **Cash-out fee is computed on the client.** `CashOutSheet.tsx:14` hard-codes 1% and ignores `GET /earnings/payouts/instant-quote`. A failed payout is swallowed with the comment "Mock can't fail" (line 52).
-- **Waze and Apple Maps fall back to Google.** See [Permissions](/engineering/mobile/permissions-and-device#gotchas-and-edge-cases). On Android, choosing Apple Maps opens `maps.apple.com` in a browser.
-- **`StatusGuard` matches by substring.** `pathname.includes('/drive')` also matches `/driver-earnings`, `/driver-signup`, and `/driver-marketing`, so an online driver can sit on those screens without being pulled back to the map.
-- **License step is skippable in dev.** `5-license.tsx:76` lets `__DEV__` builds continue without photos.
+- **Earnings can spin forever.** For `personal_stripe`, `driver-earnings/1-hub` shows a spinner until the earnings data loads (`1-hub.tsx:96`). The hub never reads the earnings queries' `isError`, so a failing `/earnings/balance` (for example, a driver with no Stripe account yet) spins with no retry.
+- **Cash-out fee is computed on the client.** `CashOutSheet.tsx:14` hard-codes 1% and ignores `GET /earnings/payouts/instant-quote`. The API fee (`instantFeeFor` in `yelo-api/internal/service/earnings/mappers.go`) rounds up and has a $0.50 minimum, so small cash-outs show the wrong fee. A failed payout is swallowed with the comment "Mock can't fail" (line 52). The sheet stays open with no error.
+- **Waze falls back to Google.** See [Permissions](/engineering/mobile/permissions-and-device#gotchas-and-edge-cases). Apple Maps and Google Maps use `http://` URLs, which `canOpenURL` always accepts. On Android, choosing Apple Maps opens `maps.apple.com` in a browser.
+- **`StatusGuard` matches by substring.** `pathname.includes('/drive')` (`StatusGuard.tsx:31`) also matches `/driver-earnings`, `/driver-signup`, and `/driver-marketing`, so an online driver can sit on those screens without being pulled back to the map. The earnings and payouts rows in the driver hub rely on this. An exact match would bounce them.
+- **License step is skippable in dev.** `5-license.tsx:76` lets `__DEV__` builds continue without photos. Release builds require both.
 - **Vehicle year has no validation.** Any non-empty string passes `3-vehicle-basic`.
 - **Stripe onboarding opens in the system browser,** not an auth session. The app only notices completion when it returns to the foreground and refetches.
 - **The `driver-approved` feedback and review prompts never fire.** `lib/prompts/feedbackPrompt.ts:116` and `reviewPrompt.ts:157` wait for `driver_application_status` to become `approved`, but the API only emits `not_applied`, `pending`, `complete`, `failed`, `restricted`, and `unknown`.

@@ -13,6 +13,8 @@ Every repository exposes one command that runs exactly what CI runs. Run it befo
 
 Mobile device E2E is a separate, manually triggered suite. It is not a merge gate.
 
+For release sign-off by hand, use the [Manual QA checklists](/engineering/qa/manual-qa-checklists).
+
 ## API
 
 ### Unit and integration tests
@@ -34,6 +36,8 @@ grep -rln '^//go:build integration' --include='*_test.go' internal \
   | xargs -n1 dirname | sort -u
 ```
 </Warning>
+
+For the test packages, harnesses, and fakes in depth, see [API tests](/engineering/qa/api-tests).
 
 `internal/data/twilio` is deliberately excluded. Its integration test calls the live Twilio API and skips itself unless `TWILIO_TEST_ACCOUNT_SID` and the matching auth token are set.
 
@@ -67,7 +71,7 @@ In CI these run as separate jobs: **Migration Policy**, **Generated Code**, **Li
 
 ## Web
 
-`workspace-quality:ci` is an Nx target that depends on six cached checks. Every one depends on `api-contract` (`make api-check`), so a stale generated client fails first.
+`workspace-quality:ci` is an Nx target that depends on six cached checks. For the test runners and what each suite covers, see [Web tests](/engineering/qa/web-tests). Every one depends on `api-contract` (`make api-check`), so a stale generated client fails first.
 
 | Check | Command |
 | --- | --- |
@@ -93,7 +97,7 @@ Because the test scripts list files explicitly, a new test file does not run unt
 
 ## Mobile
 
-`make check` runs the same six steps as `ci.yml`, in one job:
+`make check` runs the same six steps as `ci.yml`, in one job. For the Jest setup and what the unit tests cover, see [Mobile tests](/engineering/qa/mobile-tests).
 
 | Step | Command | What it covers |
 | --- | --- | --- |
@@ -110,7 +114,7 @@ Jest uses the `jest-expo` preset and matches `**/*.test.ts` and `**/*.test.tsx`.
 
 ## Mobile E2E
 
-Mobile E2E uses [agent-device](https://agent-device.dev/) replay files, not Maestro. `yelo-frontend/E2E.md` is the operating guide, and `yelo-api/docs/E2E_CONTROL_PLANE.md` documents the fixture API.
+Mobile E2E uses [agent-device](https://agent-device.dev/) replay files, not Maestro. `yelo-frontend/E2E.md` is the operating guide, and `yelo-api/docs/E2E_CONTROL_PLANE.md` documents the fixture API. For the full suite catalog and runner internals, see [E2E environment](/engineering/qa/e2e).
 
 ```mermaid
 flowchart LR
@@ -127,6 +131,8 @@ flowchart LR
 - **App.** A release-like build with the bundle ID `io.flutterflow.ridedesi.desirider.e2e`, from the `e2e-simulator` EAS profile or a local build. It embeds the isolated E2E API URL and uses the native Auth v3 screens. `lib/config.ts` refuses to let an E2E build target the production API.
 - **API.** The `yelo-api-e2e` Cloud Run service runs the exact production image against the separate `yelo_e2e` database, a nonzero Redis database, and Stripe test keys. Background consumers and messaging credentials are disabled. See [deployment](/engineering/deployment#e2e-api-convergence).
 - **Fixtures.** Routes under `/internal/e2e/runs` create, read, and delete an isolated scenario per test. They require the `X-E2e-Key` header and exist only when `E2E_ENABLED=true` and `ENVIRONMENT=e2e`. Each run owns its synthetic `+1555` actors, school, community, fleet, pricing, and optional vehicle. OTP is always `12345`.
+
+Suites include `core-smoke.json` and `ride-coordinate-stops.json`. The latter runs `e2e/flows/ride-addressless-poi.ad` as an `auth_existing_rider`: it opens a saved-place deep link with coordinates and an empty address, presses the POI sheet's **Ride** button (`poi-get-ride-button`), and checks that a draft with vehicle options is created without a confirm-location or confirm-stop prompt.
 
 Supported scenarios include `auth_existing_rider`, `auth_rider_driver_pair`, `ride_confirmed_rider`, `ride_queued_pair`, and `ride_notification_rider`. Adding a scenario requires an API change and a migration that extends the scenario constraint.
 

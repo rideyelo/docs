@@ -1,0 +1,170 @@
+---
+title: "Driver FAQ"
+description: "Code-grounded answers to driver questions about the application, going online, ride cards and auto-queue, the rider PIN, cancelling, earnings and payouts, instant cash-out, fleet pay, and Stripe"
+---
+
+Each answer describes what the driver app and API do today. For the exact text of every driver-facing error, see [User-facing messages](/support/user-facing-messages#going-online).
+
+## Application
+
+### Where is my application?
+
+The driver works through **DRIVER SETUP** in the app. It has four tasks: **Profile photo**, **Vehicle info**, **Driver's license**, and **Stripe payouts**. Each task shows a status:
+
+| Status | Meaning | What the driver does |
+| --- | --- | --- |
+| **UP NEXT** | Not submitted yet. | Complete the task. |
+| **IN REVIEW** | Submitted and waiting for an admin, or Stripe still needs information. | Wait. |
+| **NOT APPROVED** | An admin rejected it. | Tap the task and resubmit. |
+| **COMPLETED** | Approved, or Stripe verified the account. | Nothing. |
+
+After the four tasks, the app offers optional student verification and then says "Typically approved within 24 hours." That's copy, not a timer. An admin reviews each step on the **Drivers** page. See [Review a driver application](/dashboard/drivers#review-a-driver-application).
+
+- When an admin approves a step, the driver gets **You're approved!** / "We approved your [photo, license, vehicle, or payout info]!"
+- A rejection sends no push, and the app shows **NOT APPROVED** without the reason. Look up the application in the dashboard and tell the driver what to fix.
+- If a fleet manages the driver's payouts, the Stripe task reads **Payouts managed by** the fleet name and needs nothing from the driver. If the fleet provides the vehicle, the vehicle task reads **Vehicle provided by your fleet**.
+
+### I'm approved on every step. Why can't I drive?
+
+Approval of each step isn't activation. An admin activates the driver separately, after a background check that happens outside Yelo. Activation fails if any step isn't approved or payout setup isn't complete. See [Activate a driver](/dashboard/driver-leads#activate-a-driver) and [Driver onboarding](/concepts/driver-onboarding#activation).
+
+Yelo sends no push when a driver is activated. The **Go Online** button simply becomes available.
+
+## Going online
+
+### What do I need to go online?
+
+All of these:
+
+- **An active application.** The admin activation above.
+- **Payout setup complete.** The driver's own Stripe account, or the payout fleet's account, must be fully verified.
+- **An active fleet.** A driver with no fleet is added to the default fleet automatically on their first attempt, when that's possible.
+- **An approved vehicle** that belongs to the active fleet, or a personal vehicle when the fleet has none.
+- **Location set to Always.** The app blocks with **Keep your driver location updated** otherwise.
+- **Being inside the community's service area**, a rectangle around the driver's community.
+- **A verified phone number**, when that requirement is on.
+- **A current app version.**
+
+Until the first two are true, the **Go Online** button is greyed out with no explanation.
+
+When the server rejects a go-online attempt, the app always shows **Error** / "Failed to update online status. Please try again." The real reason is one of these server checks. Find it with the user's **Driver Info** and **Fleet membership** in the dashboard:
+
+| Server reason | Cause | Fix |
+| --- | --- | --- |
+| **Phone Number Required** | No verified phone. | The driver verifies a phone in the app. |
+| **Application Incomplete** | The application isn't active. | Admin activation. |
+| **Payment Setup Required** | The driver's or payout fleet's Stripe status isn't complete. | See [Stripe account problems](#stripe-account-problems). |
+| **Fleet Not Found** | No active fleet and none could be assigned. | Send the fleet's join link, or an admin sets the fleet in **Fleet membership**. |
+| **No Vehicle** | The driver has no vehicle. | The driver adds one, or the fleet assigns one. |
+| **Location Not Found** | The server has no location for the driver. | Turn on location and retry. |
+| **Outside Service Area** | The driver is outside their community's rectangle. | Move into the area, or fix **Active community** with **Edit profile**. |
+| **Fleet Mismatch** | The selected vehicle belongs to another fleet. | Pick a vehicle from the active fleet, or switch fleet. |
+
+For the full checklist, see [Driver can't go online](/runbooks/driver-cannot-go-online).
+
+### Why did the app take me offline?
+
+A driver whose app hasn't checked in for 30 minutes, and who has no active or recent ride, is set offline. Shortly before that, they get **Renew Online Status** / "Click back to keep your status online." Opening the app keeps them online. Background location must be on **Always** so the app can keep checking in.
+
+## Ride cards and auto-queue
+
+### Why did a ride get accepted without me tapping?
+
+This is intentional. While a driver is online, each ride on their board opens a full-screen ride card. The accept button reads **Accepting in Ns** and fills over 30 seconds. When it fills, the ride is accepted automatically.
+
+To skip a ride, the driver taps **Decline** and picks a reason: **Not enough money**, **Too far away**, **Not actively driving**, or **Other**. The countdown pauses while the reason sheet is open. A declined ride doesn't come back to that driver.
+
+Drivers who don't want rides should go offline. Leaving the app open and online means rides get accepted.
+
+### What does "Too slow this time" mean?
+
+**RIDE GONE** / **Too slow this time.** appears when an accept fails for any reason, or when the ride disappears from the board within 15 seconds. Usually another driver accepted first. It also appears when the rider's card couldn't be authorized. The timeline shows `payment_processing_failed` in that case, and the ride stays on the board.
+
+### What is auto-queue?
+
+Auto-queue lets Yelo assign rides to an online driver without a card. The driver turns it on from the **Auto-queue** tile and picks how far ahead to queue: 30, 45, 60, 90, or 120 minutes, capped by the community's limit. They can pause it for 5, 10, 15, or 30 minutes.
+
+- Auto-queue only picks up rides that nobody accepted within 2 minutes.
+- It picks the driver who can start soonest with the lightest queue, among drivers online for the ride's fleet with the right vehicle type.
+- The driver gets "$X.XX ride auto-queued". If they're idle, the ride starts right away. Otherwise it waits in their queue.
+
+See [Auto-queue](/concepts/matching-and-auto-queue#auto-queue).
+
+### Why am I online but not getting rides?
+
+A driver only sees rides in their current community, for the fleet they went online under, that they haven't declined. Other causes are in [Online but not receiving rides](/runbooks/driver-cannot-go-online#online-but-not-receiving-rides).
+
+## During a ride
+
+### What is the rider PIN?
+
+Some fleets require a confirm code. When the driver taps to start the trip, the app asks **ENTER RIDER PIN** / "Ask [name] for their pin". The rider sees the four-digit PIN on their ride screen. A wrong code shows "Incorrect PIN. Ask the rider for their code." Rides in fleets without the requirement skip this step. See [Confirm code](/concepts/ride-lifecycle#confirm-code).
+
+### What happens if I cancel?
+
+- **Before the trip starts**: the ride goes back on the board for other drivers, the rider pays nothing, and this driver can't get that ride again. The rider gets "Your driver canceled. We're finding you a new driver!"
+- **After the trip starts**: the ride ends, and the rider pays nothing.
+
+Drivers don't earn a fee from their own cancellation. When the rider cancels late, the fee goes to the driver, and the driver's push says "You will receive [$X.XX]."
+
+## Earnings and payouts
+
+### Earnings balance and payouts
+
+What the **Earnings** screen shows depends on who receives the driver's money.
+
+| | Owner-operator (own Stripe) | Fleet-paid driver |
+| --- | --- | --- |
+| Where fares and tips land | The driver's Stripe account | The fleet's Stripe account |
+| **Earnings** screen | **TOTAL BALANCE** with **Available** and **Pending**, recent activity, recent payouts, and cash-out | **YOUR EARNINGS THIS WEEK**, **Today**, **All time**, and "PAYOUTS MANAGED BY [FLEET]" |
+| Payout timing and bank | Set by the driver in the app and Stripe | Set by the fleet |
+| Instant cash-out | Yes, when the bank supports it | No |
+
+The owner-operator balance comes straight from Stripe. **Pending** money isn't paid out yet. **Available** money goes out on the payout schedule.
+
+- **Payout schedule**: the app offers **Daily** ("Every business day · free") and **Weekly** ("Every Friday · free"). New driver Stripe accounts start on daily payouts.
+- **Bank account**: **Change bank account** opens Stripe. The **Stripe** button on **Earnings** opens the driver's Stripe dashboard, or Stripe onboarding if it isn't finished.
+- **Payout pushes**: **Payout deposited**, **Payout failed**, or **Payout canceled**, sent from Stripe events.
+
+The setup screen says "Yelo takes $0. Stripe charges 2.9% + $0.30 per ride (~$0.59 on a $10 fare). The rest is yours." In code, Yelo adds no platform fee to ride payments.
+
+See [Tips and earnings](/concepts/tips-and-earnings#driver-earnings).
+
+### What's the instant cash-out fee?
+
+The **Cash out instantly** sheet shows a **1% instant fee** and **You'll receive**, and sends the payout to the driver's debit card or bank in seconds. It suggests "Skip the fee by waiting for your free weekly payout on [date]."
+
+- Cash-out needs a bank or card that supports instant payouts, and an instant balance. Otherwise the button reads "No instant balance available".
+- The API's own quote uses 1% rounded up with a $0.50 minimum. The app's sheet computes a plain 1%, so for small balances the two can differ.
+- If a cash-out fails, the sheet stays open with no error. Ask the driver to check **Recent payouts** before retrying, so they don't send two.
+
+See [Instant payouts](/concepts/tips-and-earnings#instant-payouts).
+
+### I drive for a fleet. Who pays me?
+
+It depends on the fleet's payment model:
+
+- **Fleet-managed payouts**: rides and tips are paid into the fleet's Stripe account. The fleet pays its drivers under its own arrangement, outside Yelo. The Yelo app shows the driver's ride totals but no balance. Pay questions go to the fleet.
+- **Owner-operator fleets**: the driver uses their own vehicle and their own Stripe account, and the money lands with them.
+
+The join screen tells the driver which one applies. See [Fleets](/concepts/fleets#payment-models) and [Fleet driver invitations](/fleets/driver-invitations).
+
+### My earnings screen keeps loading
+
+The owner-operator **Earnings** screen has no error state for a failed balance request. It spins forever when the driver has no Stripe account yet or Stripe returns an error. Check the Stripe step in the user's application. See [Payout issues](/runbooks/payout-issues).
+
+## Stripe account problems
+
+Yelo keeps its own copy of each Stripe account's status:
+
+| Stripe says | Yelo status | Effect |
+| --- | --- | --- |
+| Something is currently due or past due | `restricted` | Can't go online. |
+| Nothing due, but payouts not enabled | `pending` | Can't go online. |
+| All clear | `complete` | Can go online. |
+
+The driver fixes Stripe issues themselves. During setup, the Stripe task opens Stripe onboarding with **Connect your bank**. After setup, the **Stripe** button on **Earnings** opens their Stripe dashboard. Support can't edit a driver's Stripe details.
+
+Yelo refreshes the status when Stripe sends an update, when the driver opens driver setup, and in a daily re-check. If Stripe looks fine but the driver is still blocked, ask them to open **DRIVER SETUP** to refresh it, then see [Payout issues](/runbooks/payout-issues).
+
+For a fleet-paid driver, their own Stripe doesn't matter. The fleet's account must be complete. If it isn't, every driver in that fleet is blocked.

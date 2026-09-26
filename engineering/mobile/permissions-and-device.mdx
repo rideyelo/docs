@@ -198,6 +198,11 @@ The permission string (from `app.config.ts`) is: "Yelo securely sends phone numb
 
 Feedback text goes only to PostHog as `appFeedbackSubmitted` with the full `text`. It is not sent to the Yelo API.
 
+- **The store prompt has its own cadence.** `maybeRequestReview` (`lib/prompts/reviewPrompt.ts`) keeps a separate per-user `reviewPrompt:<userId>` record. For `ride-positive` it counts every call and continues only on the 1st and every 10th, and `first-like` and `driver-approved` fire once each. Because it counts only finished funnels, the native prompt can lag the custom funnel's cadence.
+- **Dismissing the first dialog skips the store prompt.** Dismissing **Thoughts on the app?** calls `reset`, not `finish`, so `maybeRequestReview` never runs. Declining on **What can we improve?** or the text modal still finishes the funnel.
+
+For client toggles and experiment gates that sit next to these prompts, see [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments).
+
 ### Telemetry payload
 
 `lib/observability/TelemetryService.ts` posts `POST /telemetry/` at most every 5 minutes (forced on contact-permission changes). It includes platform, OS version, device model and manufacturer, native app version and build, `expo_update_id`, screen size and pixel ratio, locale and timezone, `notifications_enabled`, `location_permission` (`always`, `when_in_use`, `denied`, `undetermined`), contact status and access scope, the Expo push token, carrier, total memory, and the Android install referrer.

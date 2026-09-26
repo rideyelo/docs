@@ -1,0 +1,499 @@
+---
+title: "Migrations log"
+description: "Every yelo-api SQL migration from 000001 to 000347, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
+---
+
+This page indexes every file in `yelo-api/migrations/`. Use it to find when a table or column appeared, which pull request shipped it, and which migrations rewrote or removed data. For the current shape of each table, see the [database reference](/reference/database/overview). For how migrations run in production, see [Deployment](/engineering/deployment) and [Failed migration](/runbooks/failed-migration).
+
+## How to read this log
+
+- **Migration** is the file name without `.up.sql`. golang-migrate applies files in numeric order and records the highest version in `schema_migrations`.
+- **Date** is the commit date of the first commit that added the file under its current number. A migration renumbered to resolve a collision shows the renumbering date.
+- **PR** is the GitHub pull request that merged the commit. Migrations before `000161` predate the GitHub pull request history and show a dash. Several early-2026 PRs merged into `dev` or a version branch rather than `main` (`#3`, `#7`, `#8`, `#9`, `#10`, `#11`, `#16`). Those changes reached `main` through [#12](https://github.com/rideyelo/yelo-api/pull/12) on 2026-04-04 and [#17](https://github.com/rideyelo/yelo-api/pull/17) on 2026-06-17. Summer 2026 work reached `main` through the 5.6.0 release PR [#30](https://github.com/rideyelo/yelo-api/pull/30) on 2026-08-03.
+- **Flags**:
+  - **Backfill** rewrites or copies existing rows (`UPDATE`, `INSERT ... SELECT`, or a trigger-driven seed).
+  - **Destructive** drops a table or a populated column, or deletes rows. The down migration can't restore the data.
+  - **River** marks the vendored River job queue schema. River owns these tables; don't edit them by hand.
+
+## Eras at a glance
+
+| Era | Migrations | Dates | What changed |
+| --- | --- | --- | --- |
+| [Foundation](#foundation-2024) | 000001 to 000102 | 2024-06 to 2024-12 | Users, rides, payments, events, venues, locations, first dashboard users, waitlist churn. |
+| [Growth](#growth-2025) | 000103 to 000160 | 2025-01 to 2025-09 | Driver applications and sessions, soft deletion, referrals, coupons, promo placements, home and default communities, fleets. |
+| [Platform rebuild](#platform-rebuild-early-2026) | 000161 to 000215 | 2026-01 to 2026-06 | Indexes, Dub links, fleet whitelist, ClickHouse replacement tables, auto-queue, ride timeline, surge, vehicle types, QR payments, tipping, tiered pricing, liked locations. |
+| [Zones, social, and durable notifications](#zones-social-and-durable-notifications-summer-2026) | 000216 to 000253 | 2026-06 to 2026-07 | Zones and zone pricing, friendships and contacts, notification templates and deliveries, River. |
+| [Auth v3 and hardening](#auth-v3-and-hardening-august-2026) | 000254 to 000299 | 2026-08 to 2026-09 | Auth v3 storage and sessions, phone normalization, bumps and SMS consent, map layers, education verification, history indexes, Quo outbox, E2E runs. |
+| [Durable domain systems](#durable-domain-systems-september-2026) | 000300 to 000347 | 2026-09 | Durable messaging, school mapping, Stripe reconciliation, driver leads, recents, calendars, contact sync, place identity, fleet-owned vehicles, ride state protocol, canonical top locations. |
+
+## Migrations by domain
+
+Use this map to jump to the migrations that shaped a domain.
+
+| Domain | Key migrations |
+| --- | --- |
+| Rides and lifecycle | 001, 006, 019, 033, 098, 107, 108, 162, 183, 186, 191, 288, 289, 298, 338 to 340 |
+| Pricing | 012, 077, 147, 159, 163, 166, 187, 196, 198, 199, 209, 210, 224, 225, 297, 311, 324, 325 |
+| Payments and tips | 017, 023, 024, 048 to 050, 173, 203 to 205, 207, 219, 236, 251, 287, 290, 291, 304 |
+| Identity and auth | 001, 013, 014, 036, 054, 090, 114, 115, 254 to 258, 261 to 263, 266, 267, 280, 284, 294 |
+| Drivers and applications | 030, 109, 116, 117, 126, 135, 184, 222, 232, 233, 282, 306 |
+| Fleets and vehicles | 025, 035, 082, 083, 157 to 160, 168, 170, 177, 200, 208, 231, 299, 316, 321, 333 to 335, 343, 344, 346 |
+| Communities, zones, and schools | 002, 032, 131, 136 to 140, 154, 155, 185, 216, 223, 230, 234, 281, 301 to 303, 307, 314, 315 |
+| Calendars | 317 to 320 |
+| Places and locations | 022, 046, 051, 058, 084, 095, 171, 172, 174, 181, 182, 213, 217, 218, 227, 259, 260, 270, 271, 274, 309, 326 to 328, 331, 345, 347 |
+| Notifications and messaging | 029, 047, 125, 167, 175, 176, 180, 195, 197, 237 to 241, 249, 250, 264, 268, 269, 286, 293, 300, 329, 330 |
+| Growth, social, and events | 020, 041 to 045, 079, 085, 113, 141 to 146, 149 to 153, 164, 178, 201, 220, 228, 229, 235, 252, 255, 265, 272, 273, 275 to 277, 283, 312, 313 |
+| CRM and contact sync | 188, 190, 292, 305, 306, 308, 322, 323, 332 |
+| Platform and tooling | 104, 123, 179, 221, 242 to 248, 253, 279, 295, 296, 310, 336, 337, 341, 342 |
+
+## Destructive migrations
+
+These migrations drop data. Most are early schema churn. The 2026 entries either move data first or remove tables that newer systems replaced.
+
+| Migration | What was lost | Replacement |
+| --- | --- | --- |
+| 010, 014, 068 | `Users.type`, `email_verified`, `phone_number`, `phone_verified`, `status`, `username` | Phone restored by 036. Verification now lives in auth tables and `is_verified`. |
+| 011, 031, 099, 102 | Waitlist `school_id`, the whole first `Waitlist` table, then email and phone columns in turn | `Waitlist` is now legacy. See [Deprecated and legacy](/engineering/history/deprecated-and-legacy). |
+| 013 | First `PhoneOTPs` table | Recreated by 036. |
+| 030, 117 | Per-step driver signup columns on `Users` | `DriverApplications` (116). |
+| 037 | `Users.current_drive_id`, `current_ride_id` | Current ride state comes from `Rides`. |
+| 041, 055, 059, 060 | Event address and coordinates, ride driver coordinates, venue `business_type`, event `community_id` | Venues; `Events.community_id` re-added by 132. |
+| 058, 088, 112 | Single-value `category`, poll `answer_1` to `answer_3`, school `extension` | Array columns. Old values weren't copied. |
+| 106 | `Communities.minimum_version` | Global `/update-required` version floor. |
+| 108 | `Rides.cancel_type` | `cancel_phase`, `cancel_user`, `cancel_comment`. |
+| 129 | Community demand curve columns and `RideTrafficEstimates` | `RideDemandCurves`. |
+| 150 | `Coupons.num_per_user` | Unique claim per user (151). |
+| 190 | `DriverApplications.quo_contact_id` | Copied to `Users.quo_contact_id` first. |
+| 195 | Duplicate push tokens (older owners cleared) | Unique token index. |
+| 209 | `RidePriceParameters.price_per_mile` | Copied into `RidePriceTiers` first. |
+| 213 | Favorite rows in `SavedLocations` | Copied into `LikedLocations` first. |
+| 249 | `PushNotificationTickets` | `NotificationDeliveries` receipts. |
+| 250 | `NotificationTemplates.cooldown_seconds` | Copied into policy columns first. |
+| 255 | Duplicate `Referrals` rows | One referrer per user. |
+| 258 | `AuthHandoffCodes.failed_attempt_count` | Auth v3 runtime state. |
+| 263 | `AuthDeniedSubjects` rows with `ambiguous_match` or `provider_slot_occupied` | Provisional account recovery. |
+| 264 | `NotificationLog`, `NotificationRecipients`, `CommunityNotificationHistory` | `Notifications` and `NotificationDeliveries`. The down migration recreates empty tables. |
+| 285 | Duplicate `RideDeclineReasons` | Unique per ride and driver. |
+| 328 | `PlaceResolutions` cache | Place identity catalog. The down migration recreates the cache empty. |
+
+## Backfills
+
+These migrations rewrite existing rows. Rehearse a new backfill on a representative database first to measure lock time and cost.
+
+- **Identity and users**: 212 (`profile_completed`), 214 (`account_type` values), 220 (`acquisition_source` inference), 226 (stuck students), 254 (profile nulls and missing `DriverApplications`), 262 (E.164 phones, skipping collisions), 263 (provisional accounts), 278 (`location_updated_at`), 279 (test users), 280 (Google education proofs), 282 (auto-queue off for everyone), 314 (clear `is_waitlisted`).
+- **Pricing and fleets**: 166 (price parameter IDs), 177 (fleet community), 199 (end duplicate prices), 200 (vehicle types), 209 (price tiers), 231 (student-only Yelo fleet), 297 (end archived community prices), 316 (fleet community services), 325 (jitter settings), 333 and 334 (fleet-owned vehicles and the Breeze cart).
+- **Places**: 227 (empty `mapbox_id`), 260 (canonical categories), 328 and 331 (place identity backfill runs through River in resumable 500-row batches, not inside the migration), 345 (canonical top locations).
+- **Messaging and notifications**: 190 (Quo contact ID), 195 (duplicate push tokens), 249 and 250 (notification receipts and policies), 286 (push tokens from telemetry), 300 (message ordinals and streams).
+- **Schools and communities**: 230 (test community), 301 and 307 (school community remapping), 315 (timezone history and cache invalidations), 336 (synthetic E2E schools).
+- **Sync seeds**: 332 enqueues a contact sync request for every nondeleted, nontest user. The contact sync workers make the provider calls later. The Quo and contact sync triggers in 292, 308, and 323 only enqueue future changes.
+- **Rides**: 340 (`payment_consent_at` from `confirm_time`).
+- **Other**: 178 (publish draft events), 233 (`activated_at` from review times), 306 (driver leads from existing applicants).
+
+## Quirks and incidents
+
+- **Duplicate rename in 000083.** Migrations 082 and 083 both rename `car_size` to `vehicle_size`. `scripts/release/run-migrations.sh` migrates a fresh database to 82 and then forces 83. `internal/data/migrationprep` skips 83 for test databases and the sqlc schema.
+- **Renumbering on collision.** Parallel branches sometimes claimed the same number. The later branch renames its files before merge. For example, `a2c03869` renamed `000265_auth_v3_otp_delivery` to `000266` to resolve a collision with `main`. Dates in this log reflect the final file name.
+- **000267 applied before it merged.** `000267_auth_v3_web_sessions` reached production from an unmerged branch. [#74](https://github.com/rideyelo/yelo-api/pull/74) copied the exact migration pair into `main` so the release runner saw a clean version 267.
+- **000270 failed in production.** A B-tree index on `Locations.mapbox_id` hit a 3,584-byte legacy value, above the 2,704-byte B-tree entry limit, and left `schema_migrations` dirty at 270. [#93](https://github.com/rideyelo/yelo-api/pull/93) added 271 to replace it with a hash index and made release failures visible.
+- **000280 failed in production.** A legacy user with a zero-UUID `school_id` broke the education proof backfill. The migration rolled back and the marker was repaired to 279. [#119](https://github.com/rideyelo/yelo-api/pull/119) filtered the backfill to existing schools.
+- **Concurrent indexes.** 165, 189, 270, and 288 to 291 use `CREATE INDEX CONCURRENTLY`. Keep one concurrent statement per file, because golang-migrate submits a whole file as one execution.
+- **Schema drift repair in 000347.** Production already had a unique constraint on `Locations.address` that no migration created. 347 adds it only where it's missing.
+- **River tables are vendored.** 242 to 248 reproduce River's schema migrations v1 to v7 as golang-migrate files. No code runs River's own migrator (`rivermigrate`), so a River upgrade that changes its schema needs a new numbered migration.
+
+## Full index
+
+### Foundation (2024)
+
+The first schema. Most tables that still exist were created here. Frequent reshaping of the waitlist, driver signup, and event columns means many early migrations are destructive.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000001_init_db` | 2024-06-23 | — | Initial schema: `Users`, `Communities`, `Schools`, `Rides`, `EmailOTPs`, `PhoneOTPs`, and the `RidesStatus`, `CancelType`, and `DriverApplicationStatus` enum types. |  |
+| `000002_add_community_signup_columns` | 2024-06-23 | — | Adds `min_drivers` and `min_riders` launch thresholds to `Communities`. |  |
+| `000003_add_lat_lng_columns` | 2024-06-23 | — | Adds pickup and user coordinates to `Rides` and `Users`. |  |
+| `000004_add_time_remaining_column` | 2024-06-23 | — | Adds `Rides.time_remaining` and a `Users.lock` flag used by early matching. |  |
+| `000005_add_waitlist_table` | 2024-06-29 | — | Creates the pre-launch `Waitlist` table. |  |
+| `000006_add_ride_length` | 2024-06-29 | — | Adds ride distance, duration, and driver coordinates; relaxes coordinate columns. |  |
+| `000007_add_graduation_year` | 2024-07-01 | — | Adds `Users.graduation_year`. |  |
+| `000008_unique_email_waitlist_constraint` | 2024-07-02 | — | Makes waitlist emails unique. |  |
+| `000009_add_gender_column_to_users` | 2024-07-02 | — | Adds `Users.gender`. |  |
+| `000010_drop_type_column` | 2024-07-02 | — | Drops `Users.type`. | Destructive |
+| `000011_change_waitlist_school_to_text` | 2024-07-03 | — | Replaces `Waitlist.school_id` with free-text `school`. | Destructive |
+| `000012_add_x_xl_prices_and_pickups` | 2024-07-04 | — | Adds X and XL prices and pickup times to `Rides`. |  |
+| `000013_remove-phone-otp-table` | 2024-07-13 | — | Drops the first `PhoneOTPs` table. | Destructive |
+| `000014_update-verified-fields` | 2024-07-13 | — | Drops `Users.email_verified`, `phone_number`, and `phone_verified`. | Destructive |
+| `000015_add-community-to-rides` | 2024-07-13 | — | Adds `Rides.community_id`. |  |
+| `000016_add-ride-rating` | 2024-07-13 | — | Adds rider and driver ratings to `Rides`. |  |
+| `000017_add-payment-intent-table` | 2024-07-13 | — | Creates `PaymentIntents`. |  |
+| `000018_add-school-logo-url` | 2024-07-14 | — | Adds `Schools.logo_url`. |  |
+| `000019_add-ride-confirm-code` | 2024-07-16 | — | Adds `Rides.confirm_code` (the pickup PIN). |  |
+| `000020_add-events-table` | 2024-07-20 | — | Creates `Events`. |  |
+| `000021_add-email-otp-request-counter` | 2024-07-20 | — | Adds an email OTP request counter. |  |
+| `000022_featured-locations` | 2024-07-20 | — | Creates `FeaturedLocations`. |  |
+| `000023_stripe-customer-id` | 2024-07-20 | — | Renames `Users.stripe_id` to the Stripe customer ID column. |  |
+| `000024_ride-payment-intent-secret` | 2024-07-20 | — | Adds ride PaymentIntent ID and client secret, and `Users.stripe_merchant_id`. |  |
+| `000025_car-table` | 2024-07-21 | — | Creates `Cars` and links it from `Users` and `Rides`. |  |
+| `000026_event-photo-url` | 2024-07-21 | — | Adds `Events.photo_url`. |  |
+| `000027_add-ride-offer-time` | 2024-07-21 | — | Adds `Rides.offer_time`. |  |
+| `000028_add-driving-flag` | 2024-07-22 | — | Adds `Users.is_driving`. |  |
+| `000029_add-messages-table` | 2024-07-22 | — | Creates `Messages`, the first ride chat table. |  |
+| `000030_split-driver-signup-fields` | 2024-08-02 | — | Splits driver signup state into per-step status columns on `Users`; drops the old registration columns and car insurance image. | Destructive |
+| `000031_waitlist-to-phone-number` | 2024-08-04 | — | Drops and recreates `Waitlist` keyed by phone number. | Destructive |
+| `000032_community-bounding-box` | 2024-08-04 | — | Adds a community bounding box. |  |
+| `000033_change-ride-status-col-type` | 2024-08-04 | — | Converts `Rides.status` from the `RidesStatus` enum to `text`. |  |
+| `000034_add-route-column` | 2024-08-04 | — | Adds `Rides.route`. |  |
+| `000035_add-num-seats-to-car` | 2024-08-06 | — | Adds `Cars.num_seats`. |  |
+| `000036_add-phone-otp-table` | 2024-08-10 | — | Recreates `PhoneOTPs` and restores `Users.phone_number`. |  |
+| `000037_driver-online` | 2024-08-11 | — | Renames `is_driving` to an online flag and drops current ride and drive pointers from `Users`. | Destructive |
+| `000038_dashboard-users` | 2024-08-13 | — | Creates `DashboardUsers` for the first dashboard. |  |
+| `000039_community-photo` | 2024-08-13 | — | Adds a community background photo. |  |
+| `000040_dashboard-user-roles` | 2024-08-15 | — | Adds dashboard user roles. |  |
+| `000041_event-schema` | 2024-08-15 | — | Reshapes `Events` around venues; creates `Merchants` and `Venues`; drops event address and coordinates. | Destructive |
+| `000042_ticket_url_event` | 2024-08-15 | — | Adds event price, ticket URL, and Posh event ID. |  |
+| `000043_enterprise-accounts` | 2024-08-16 | — | Renames `Merchants` to `EnterpriseAccounts` and extends venues. |  |
+| `000044_discounts` | 2024-08-16 | — | Creates `Discounts`. |  |
+| `000045_follows` | 2024-08-17 | — | Creates `EventFollows`. |  |
+| `000046_location-table` | 2024-08-20 | — | Creates `LocationFollows`. |  |
+| `000047_notification-token` | 2024-08-25 | — | Adds `Users.push_notification_token`. |  |
+| `000048_payment-ephemeral-key` | 2024-08-25 | — | Adds payment ephemeral key and payment method to `Rides`. |  |
+| `000049_payment-mandate-info` | 2024-08-25 | — | Adds rider IP and user agent for payment mandates. |  |
+| `000050_driver-payout` | 2024-08-26 | — | Adds `Rides.driver_payout`. |  |
+| `000051_locations-table` | 2024-08-26 | — | Creates `Locations`. |  |
+| `000052_featured-location-category` | 2024-08-26 | — | Adds featured location category and graduation years; adds ride destination category. |  |
+| `000053_ride-discounts` | 2024-08-28 | — | Adds discounted prices to `Rides`. |  |
+| `000054_otp-transfer-school` | 2024-08-29 | — | Adds school transfer fields to email OTPs. |  |
+| `000055_remove-driver-lat-lng` | 2024-08-30 | — | Drops driver coordinates from `Rides`. | Destructive |
+| `000056_add-venue-category` | 2024-08-31 | — | Adds `Venues.category`. |  |
+| `000057_ride-event` | 2024-08-31 | — | Adds `Rides.destination_event_id`. |  |
+| `000058_location-categories` | 2024-09-01 | — | Replaces single `category` columns with `categories` arrays on locations, featured locations, and venues. Old values are not copied. | Destructive |
+| `000059_veneus` | 2024-09-03 | — | Adds `Venues.community_id`; drops `business_type`. | Destructive |
+| `000060_event_community_id` | 2024-09-03 | — | Drops `Events.community_id` (re-added by 132). | Destructive |
+| `000061_discount_community_id` | 2024-09-04 | — | Adds `Discounts.community_id`. |  |
+| `000062_destination-categories` | 2024-09-04 | — | Adds `Rides.destination_categories`. |  |
+| `000063_follow-location-id` | 2024-09-07 | — | Links follows and featured locations to `Locations`. |  |
+| `000064_waitlist-name` | 2024-09-11 | — | Adds `Waitlist.name`. |  |
+| `000065_last-pinged-driver` | 2024-09-12 | — | Adds `Users.last_pinged_driver`. |  |
+| `000066_community-max-riders` | 2024-09-13 | — | Adds `Communities.max_riders`. |  |
+| `000067_user-waitlist` | 2024-09-13 | — | Adds `Users.is_waitlisted`. |  |
+| `000068_user-status` | 2024-09-13 | — | Drops `Users.status` and `username`. | Destructive |
+| `000069_push-notification-nullity` | 2024-09-16 | — | Relaxes push token nullability. |  |
+| `000070_event-card-size` | 2024-09-17 | — | Adds `Events.card_size`. |  |
+| `000071_ride-issues` | 2024-09-19 | — | Creates `RideIssues`. |  |
+| `000072_featured-discount` | 2024-09-19 | — | Adds featured discount partner fields to `Communities`. |  |
+| `000073_rating-num-riders` | 2024-09-20 | — | Adds `Rides.num_riders`. |  |
+| `000074_ride-cancel-reason` | 2024-09-20 | — | Adds `Rides.cancel_reason`. |  |
+| `000075_issue-table` | 2024-09-20 | — | Creates `Issues`. |  |
+| `000076_ride-discount` | 2024-09-23 | — | Adds `Rides.discount_id`. |  |
+| `000077_ride-prices` | 2024-09-23 | — | Creates `RidePriceParameters`, the first configurable pricing table. |  |
+| `000078_ride-feedback` | 2024-09-24 | — | Adds rider and driver feedback text to `Rides`. |  |
+| `000079_polls` | 2024-09-25 | — | Creates `PollQuestions` and `PollAnswers`. |  |
+| `000080_event-tickets-available` | 2024-09-25 | — | Adds `Events.tickets_available`. |  |
+| `000081_community-banner-type` | 2024-09-26 | — | Adds community banner type and driver banner flag. |  |
+| `000082_car-to-vehicle` | 2024-10-01 | — | Renames `Cars` to `Vehicles` and car columns to vehicle columns. |  |
+| `000083_car-size-to-vehicle-size` | 2024-10-01 | — | Repeats the `car_size` to `vehicle_size` rename. The release script and test harness special-case this duplicate. |  |
+| `000084_mapbox-location-id` | 2024-10-04 | — | Adds Mapbox IDs to locations, featured locations, and ride stops. |  |
+| `000085_promo-banners` | 2024-10-06 | — | Creates `PromoBanners`. |  |
+| `000086_set-ping-default` | 2024-10-08 | — | Sets a default for `last_pinged_driver`. |  |
+| `000087_discount-sponsor-id` | 2024-10-08 | — | Adds `Discounts.sponsor_id`. |  |
+| `000088_poll-question-answers` | 2024-10-09 | — | Replaces three poll answer columns with an `answers` array. Old values are not copied. | Destructive |
+| `000089_daily-ride-traffic` | 2024-10-10 | — | Creates `RideTrafficEstimates` (dropped by 129). |  |
+| `000090_phone-otp-user-id` | 2024-10-24 | — | Adds `PhoneOTPs.user_id`. |  |
+| `000091_community-promo-text` | 2024-10-28 | — | Adds community promo text and color. |  |
+| `000092_community-promo-text-color` | 2024-10-29 | — | Adds community promo text color. |  |
+| `000093_poll-shortened-answers` | 2024-10-29 | — | Adds shortened poll answers. |  |
+| `000094_created-timestamp` | 2024-10-30 | — | Adds `Users.created_timestamp`. |  |
+| `000095_location-feature-type` | 2024-10-31 | — | Adds `Locations.feature_type`. |  |
+| `000096_add-event-tags` | 2024-12-03 | — | Adds `Events.tags`. |  |
+| `000097_add-user-orientation` | 2024-12-03 | — | Adds `Users.orientation`. |  |
+| `000098_add_driver_pickup_route` | 2024-12-12 | — | Adds driver pickup route, distance, and duration to `Rides`. |  |
+| `000099_waitlist_phone_to_email` | 2024-12-18 | — | Switches `Waitlist` from phone to unique email. | Destructive |
+| `000100_waitlist_email_not_null` | 2024-12-18 | — | Makes waitlist email required. |  |
+| `000101_ride_driver_drive_count` | 2024-12-18 | — | Adds the driver's drive count to `Rides`. |  |
+| `000102_waitlist-back-to-phone` | 2024-12-19 | — | Switches `Waitlist` back from email to phone. | Destructive |
+
+### Growth (2025)
+
+Driver applications move off `Users`, soft deletion lands, and growth features arrive. Migration 157 introduces fleets.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000103_license-plate-state` | 2025-01-04 | — | Adds `Vehicles.license_plate_state`. |  |
+| `000104_is-test-user` | 2025-01-05 | — | Adds `Users.is_test`. |  |
+| `000105_community-min-version` | 2025-01-06 | — | Adds `Communities.minimum_version` (dropped by 106). |  |
+| `000106_drop-frontend-version` | 2025-01-15 | — | Drops `Communities.minimum_version`. | Destructive |
+| `000107_add-at-pickup-time` | 2025-01-16 | — | Adds `Rides.at_pickup_time`. |  |
+| `000108_cancel-comment` | 2025-01-16 | — | Replaces `cancel_type` with `cancel_comment`, `cancel_phase`, and `cancel_user`. | Destructive |
+| `000109_driver-sessions` | 2025-01-16 | — | Creates `DriverSessions`. |  |
+| `000110_issue-comment` | 2025-01-17 | — | Adds a misspelled `isssue_comment` column to `Issues`. |  |
+| `000111_issue_comment` | 2025-01-21 | — | Renames it to `issue_comment`. |  |
+| `000112_school-extensions` | 2025-01-23 | — | Replaces `Schools.extension` with an `extensions` array. Old values are not copied. | Destructive |
+| `000113_links` | 2025-01-23 | — | Creates `ShortenedLinks`. |  |
+| `000114_email-uniqueness` | 2025-01-23 | — | Replaces the users email constraint with a unique index. |  |
+| `000115_user-is-deleted` | 2025-01-23 | — | Adds soft deletion (`is_deleted`, `deleted_at`) to `Users`. |  |
+| `000116_driver_application` | 2025-01-24 | — | Creates `DriverApplications` and adds application review fields to `Vehicles`. |  |
+| `000117_user-application-fields` | 2025-01-24 | — | Drops the per-step driver application columns from `Users` (moved to `DriverApplications`). | Destructive |
+| `000118_link-url-to-path` | 2025-01-24 | — | Renames short link URL columns to paths. |  |
+| `000119_event-has-dynamic-pricing` | 2025-01-28 | — | Adds `Events.has_dynamic_pricing`. |  |
+| `000120_promo-banner-new-campus` | 2025-01-31 | — | Adds a new-campus promo banner flag. |  |
+| `000121_promo-banner-is-pinned` | 2025-01-31 | — | Renames it to `is_pinned`. |  |
+| `000122_driver-speed` | 2025-02-01 | — | Adds driver speed to `Users`. |  |
+| `000123_user-app-version` | 2025-02-04 | — | Adds app version and Expo update ID to `Users`. |  |
+| `000124_school-admin-otp` | 2025-02-20 | — | Adds a school admin OTP. |  |
+| `000125_scheduled-community-notifications` | 2025-02-23 | — | Creates `ScheduledCommunityNotifications`. |  |
+| `000126_driver-application-action-required` | 2025-03-17 | — | Adds `DriverApplications.is_action_required`. |  |
+| `000127_demand-graph` | 2025-03-17 | — | Adds hourly demand graph arrays to `Communities`. |  |
+| `000128_community-slack-updates-channel` | 2025-03-19 | — | Adds a per-community Slack updates channel. |  |
+| `000129_ride-demand-curve` | 2025-03-20 | — | Creates `RideDemandCurves`; drops the community curve columns and `RideTrafficEstimates`. | Destructive |
+| `000130_enterprise-account-to-event` | 2025-03-31 | — | Links events to enterprise accounts. |  |
+| `000131_community-time-zone` | 2025-04-01 | — | Adds `Communities.time_zone`. |  |
+| `000132_event-community-id` | 2025-04-01 | — | Re-adds `Events.community_id`. |  |
+| `000133_event-is-repeating` | 2025-04-03 | — | Adds `Events.is_repeating`. |  |
+| `000134_venue-mapbox` | 2025-04-03 | — | Adds Mapbox ID and address fields to `Venues`. |  |
+| `000135_power-drivers` | 2025-04-07 | — | Adds `Users.is_power_driver`. |  |
+| `000136_school-coords` | 2025-04-22 | — | Adds school coordinates. |  |
+| `000137_home-community` | 2025-04-24 | — | Adds `Users.home_community_id`. |  |
+| `000138_default-community` | 2025-04-24 | — | Adds `Communities.is_default`. |  |
+| `000139_allow-notifications` | 2025-04-26 | — | Adds `Users.allow_notifications`. |  |
+| `000140_primary_schools` | 2025-05-01 | — | Adds `Communities.primary_school_ids`. |  |
+| `000141_referral_code` | 2025-06-08 | — | Adds referral codes and creates `Referrals`. |  |
+| `000142_referral_values` | 2025-06-11 | — | Creates `ReferralRewards` and `ReferralPayouts`. |  |
+| `000143_ad-and-impressions` | 2025-06-19 | — | Creates `Ads` and impression tracking. |  |
+| `000144_promo_bars` | 2025-07-15 | — | Creates `PromoBars`. |  |
+| `000145_promo_bars_add_text_color` | 2025-07-16 | — | Adds promo bar text color. |  |
+| `000146_referral_lookup` | 2025-07-25 | — | Creates `ReferralLookup` keyed by phone number. |  |
+| `000147_ride-price-param-end-time` | 2025-07-25 | — | Makes `RidePriceParameters.end_time` nullable so a row can stay current. |  |
+| `000148_add_logo_to_venue` | 2025-08-05 | — | Adds `Venues.logo_url`. |  |
+| `000149_coupon_tables` | 2025-08-05 | — | Creates `Coupons` and `CouponClaims`. |  |
+| `000150_remove_num_per_user` | 2025-08-05 | — | Drops `Coupons.num_per_user`. | Destructive |
+| `000151_add_coupon_claims_unique_constraint` | 2025-08-05 | — | Makes coupon claims unique per user. |  |
+| `000152_default_community_to_200` | 2025-08-07 | — | Sets community launch threshold defaults to 200 riders and 50 drivers. |  |
+| `000153_event_story_views` | 2025-08-14 | — | Creates `EventStoryViews`. |  |
+| `000154_hidden-communities` | 2025-08-14 | — | Adds `Communities.is_hidden`. |  |
+| `000155_disable-rides` | 2025-08-14 | — | Adds `Communities.rides_disabled`. |  |
+| `000156_public-locations` | 2025-08-22 | — | Adds public pickup and destination flags to `Rides`. |  |
+| `000157_fleets` | 2025-08-31 | — | Introduces fleets: `Fleets`, `FleetDrivers`, `FleetVehicles`, community primary fleet, and fleet and vehicle references on sessions and rides. |  |
+| `000158_primary-vehicle-type` | 2025-09-01 | — | Adds `Fleets.primary_vehicle_type`. |  |
+| `000159_pricing-fleet-vehicle` | 2025-09-02 | — | Scopes `RidePriceParameters` by fleet and vehicle type. |  |
+| `000160_ride-vehicle-type` | 2025-09-15 | — | Renames `Rides.vehicle_size` to `vehicle_type`. |  |
+
+### Platform rebuild (early 2026)
+
+The API rebuild: indexes, the fleet email whitelist, Postgres replacements for ClickHouse (174, 180), auto-queue (184), the ride timeline (186), surge, vehicle types, QR payments, tipping, and tiered pricing.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000161_rename_is_cancelled_to_is_canceled` | 2026-01-30 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Renames `is_cancelled` to `is_canceled` on follow tables. |  |
+| `000162_add_rides_indexes` | 2026-02-16 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Adds ride indexes for community, completion, driver, rider, and potential driver lookups. |  |
+| `000163_add_pricing_type` | 2026-02-18 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Adds `RidePriceParameters.pricing_type` (`per_ride` or `per_person`). |  |
+| `000164_dub_referral_links` | 2026-03-02 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Adds Dub referral link flags to `Users`. |  |
+| `000165_add_phone_number_index` | 2026-03-05 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Adds a concurrent phone number index. |  |
+| `000166_add_price_parameters_id_and_indexes` | 2026-03-05 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Gives every price parameter row an `id` and replaces the primary key. | Backfill |
+| `000167_notification_sending_lock` | 2026-03-05 | [#3](https://github.com/rideyelo/yelo-api/pull/3) | Adds a sending lock to scheduled community notifications. |  |
+| `000168_fleet_driver_whitelist` | 2026-03-07 | [#7](https://github.com/rideyelo/yelo-api/pull/7) | Creates `FleetDriverWhitelist` for fleet email enrollment. |  |
+| `000169_make_school_id_nullable` | 2026-03-07 | [#7](https://github.com/rideyelo/yelo-api/pull/7) | Makes `Users.school_id` nullable. |  |
+| `000170_make_whitelist_added_by_nullable` | 2026-03-07 | [#7](https://github.com/rideyelo/yelo-api/pull/7) | Makes whitelist `added_by` nullable. |  |
+| `000171_top-locations` | 2026-03-08 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Creates `TopLocations`. |  |
+| `000172_saved-locations` | 2026-03-08 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Creates `SavedLocations`. |  |
+| `000173_payment-method-brand` | 2026-03-09 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Adds `Rides.payment_method_brand`. |  |
+| `000174_search-analytics-postgres` | 2026-03-11 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Moves search analytics into Postgres: `LocationSearches`, `LocationBrowses`, `LocationShares`. |  |
+| `000175_community_notification_history` | 2026-03-11 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Creates `CommunityNotificationHistory` (dropped by 264). |  |
+| `000176_push_notification_tickets` | 2026-03-11 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Creates `PushNotificationTickets` (dropped by 249). |  |
+| `000177_fleet_onboarding` | 2026-03-11 | [#8](https://github.com/rideyelo/yelo-api/pull/8) | Fleet onboarding: indexes and a `community_id` backfill from primary fleets and current prices. | Backfill |
+| `000178_events_dashboard` | 2026-03-20 | [#9](https://github.com/rideyelo/yelo-api/pull/9) | Events dashboard: `EventAttendees`, status indexes, and publishes existing drafts. | Backfill |
+| `000179_device-telemetry` | 2026-03-21 | [#9](https://github.com/rideyelo/yelo-api/pull/9) | Creates `DeviceTelemetry`. |  |
+| `000180_clickhouse_deprecation` | 2026-03-21 | [#9](https://github.com/rideyelo/yelo-api/pull/9) | ClickHouse deprecation: Postgres tables for ad impressions, driver and ride notifications, event shares, ride messages, and ticket purchases. |  |
+| `000181_community_spots` | 2026-03-26 | [#11](https://github.com/rideyelo/yelo-api/pull/11) | Creates `CommunitySpots`. |  |
+| `000182_locations_extensions` | 2026-03-26 | [#11](https://github.com/rideyelo/yelo-api/pull/11) | Adds community, description, image, and timestamps to `Locations`. |  |
+| `000183_ride_decline_reasons` | 2026-04-01 | [#11](https://github.com/rideyelo/yelo-api/pull/11) | Creates `RideDeclineReasons`. |  |
+| `000184_auto_queue` | 2026-04-02 | [#10](https://github.com/rideyelo/yelo-api/pull/10) | Auto-queue: community and user queue windows and ride auto-queue fields. |  |
+| `000185_community_operating_windows` | 2026-04-11 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `CommunityOperatingWindows`. |  |
+| `000186_ride_events` | 2026-04-11 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `RideEvents`, the ride timeline. |  |
+| `000187_surge_pricing` | 2026-04-15 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds surge multiplier, expiry, and setter to `Communities`. |  |
+| `000188_add_quo_contact_id` | 2026-04-15 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds a Quo contact ID to driver applications. |  |
+| `000189_schools-community-index` | 2026-04-15 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds a concurrent schools community index. |  |
+| `000190_move_quo_contact_id_to_users` | 2026-04-15 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Moves the Quo contact ID from `DriverApplications` to `Users`. | Backfill, Destructive |
+| `000191_critical_missing_indexes` | 2026-04-15 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds indexes for online drivers, community users, and unmatched confirmed rides. |  |
+| `000192_add_photo_thumbnail_urls` | 2026-04-16 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds profile and driver photo thumbnail URLs. |  |
+| `000193_add_user_tags` | 2026-04-16 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `Users.tags`. |  |
+| `000194_add_users_school_id_index` | 2026-04-16 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds a users school index. |  |
+| `000195_unique_push_notification_token` | 2026-04-17 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Clears duplicate push tokens and makes them unique. | Backfill, Destructive |
+| `000196_surge_set_by_text` | 2026-04-17 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Changes `surge_set_by` to text (Clerk IDs). |  |
+| `000197_notification_log` | 2026-04-17 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `NotificationLog` and `NotificationRecipients` (dropped by 264). |  |
+| `000198_surge_history` | 2026-04-17 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `surge_history`. |  |
+| `000199_fix_price_params_unique_constraint` | 2026-04-19 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Ends duplicate current price rows before a uniqueness fix. | Backfill |
+| `000200_vehicle_types` | 2026-04-19 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `VehicleTypes`, seeds `x`, `xl`, and `cart`, and normalizes ride and vehicle types. | Backfill |
+| `000201_referral_sources` | 2026-04-19 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `referral_sources`. |  |
+| `000202_add_account_type` | 2026-04-19 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `Users.account_type`. |  |
+| `000203_qr_payments` | 2026-04-24 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `QrPayments`. |  |
+| `000204_qr_payment_configs` | 2026-04-24 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `QrPaymentConfigs` and links QR payments to fleets. |  |
+| `000205_ride_tipping` | 2026-04-24 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Ride tipping columns: pre-auth amount, tip amount, tip window, cloned payment method. |  |
+| `000206_activation_configs` | 2026-04-25 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `ActivationConfigs` (driver activation tiers). |  |
+| `000207_ride_stripe_merchant_id` | 2026-04-28 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `Rides.stripe_merchant_id`. |  |
+| `000208_fleet_requires_confirmation_code` | 2026-04-28 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `Fleets.requires_confirmation_code`. |  |
+| `000209_tiered_pricing` | 2026-04-28 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Tiered pricing: creates `RidePriceTiers` from each row's per-mile price, then drops `price_per_mile`. | Backfill, Destructive |
+| `000210_price_params_is_featured` | 2026-04-28 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `RidePriceParameters.is_featured`. |  |
+| `000211_relax_ride_confirm_code_nullable` | 2026-04-28 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Makes `Rides.confirm_code` nullable. |  |
+| `000212_user_profile_completed` | 2026-06-16 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `Users.profile_completed` and marks named users complete. | Backfill |
+| `000213_liked_locations` | 2026-06-16 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Creates `LikedLocations` from favorite `SavedLocations` and deletes the copied favorites. | Backfill, Destructive |
+| `000214_account_type_not_empty` | 2026-06-16 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Normalizes `account_type` to `student` or `community` and adds a check. | Backfill |
+| `000215_event_slug` | 2026-06-17 | [#16](https://github.com/rideyelo/yelo-api/pull/16) | Adds `Events.slug`. |  |
+
+### Zones, social, and durable notifications (summer 2026)
+
+Zones and zone pricing, the friend graph, and the template-driven notification pipeline on River (237 to 250). All of these reached `main` in the 5.6.0 release.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000216_community-zones` | 2026-06-21 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `Zones`. |  |
+| `000217_location_show_on_map` | 2026-06-21 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Locations.show_on_map`. |  |
+| `000218_locations_unique_community_address` | 2026-06-24 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Makes locations unique per community and address. |  |
+| `000219_ride_tip_payment_intent` | 2026-06-26 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Rides.tip_payment_intent_id`. |  |
+| `000220_user_acquisition_source` | 2026-06-26 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Users.acquisition_source` and infers it from referrals, events, and QR payments. | Backfill |
+| `000221_kpi_manual_log` | 2026-06-26 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `KpiManualLog` and the `kpi_manual_metric` enum. |  |
+| `000222_driver_auto_queue_log` | 2026-06-26 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `DriverAutoQueueLog`. |  |
+| `000223_zone_description_visibility` | 2026-06-26 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds zone description and map visibility. |  |
+| `000224_zone_pricing` | 2026-06-30 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `ZonePricing`. |  |
+| `000225_zone_pricing_double_precision` | 2026-07-01 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Changes zone pricing columns to double precision. |  |
+| `000226_backfill_stuck_students` | 2026-07-01 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Marks community users with a school as students. | Backfill |
+| `000227_locations_mapbox_id_not_null` | 2026-07-04 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Fills null `Locations.mapbox_id` with an empty string and makes it required. | Backfill |
+| `000228_friendships` | 2026-07-06 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `Friendships`. |  |
+| `000229_user_contacts` | 2026-07-08 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `UserContacts` (hashed phone contacts). |  |
+| `000230_community_is_test` | 2026-07-08 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Communities.is_test` and marks the Yelo community. | Backfill |
+| `000231_fleet_is_student_only` | 2026-07-10 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Fleets.is_student_only` and marks the Yelo fleet. | Backfill |
+| `000232_auto_queue_pause` | 2026-07-10 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Users.auto_queue_paused_until`. |  |
+| `000233_driver_activated_at` | 2026-07-11 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `DriverApplications.activated_at` and derives it from review times. | Backfill |
+| `000234_community_limited_hours` | 2026-07-11 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds `Communities.limited_hours_enabled`. |  |
+| `000235_world_cup_education_claims` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `UserEducationClaims` and `WorldCupWinners`. |  |
+| `000236_qr_tip_visits` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `QrTipVisits`. |  |
+| `000237_notification_templates` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `NotificationTemplates`. |  |
+| `000238_notification_template_variants` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `NotificationTemplateVariants`. |  |
+| `000239_notification_template_versions` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `NotificationTemplateVersions`. |  |
+| `000240_notifications` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `Notifications`. |  |
+| `000241_notification_deliveries` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Creates `NotificationDeliveries`. |  |
+| `000242_river_v1` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v1: `river_migration`. | River |
+| `000243_river_v2` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v2: `river_job`, its state enum, indexes, and notify trigger. | River |
+| `000244_river_v3` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v3. | River |
+| `000245_river_v4` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v4: `river_queue` and job column defaults. | River |
+| `000246_river_v5` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v5: new `river_migration` layout and unique job index. | River |
+| `000247_river_v6` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v6: unique states bitmask. | River |
+| `000248_river_v7` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | River schema v7: `river_notification`; drops `river_client` tables. | River |
+| `000249_drop_push_notification_tickets` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Expires sent notification receipts and drops `PushNotificationTickets`. | Backfill, Destructive |
+| `000250_notification_cohorts_policies` | 2026-07-17 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Notification cohorts and policies: copies template cooldowns into new policy columns, normalizes variant weights, drops `cooldown_seconds`. | Backfill, Destructive |
+| `000251_driver_referral_tipping` | 2026-07-20 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Lets QR tip visits target a referring driver. |  |
+| `000252_world_cup_verified_edu_signup_index` | 2026-07-21 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds a World Cup verified `.edu` signup index. |  |
+| `000253_device_telemetry_contact_permission` | 2026-07-30 | [#30](https://github.com/rideyelo/yelo-api/pull/30) | Adds contact permission to `DeviceTelemetry`. |  |
+
+### Auth v3 and hardening (August 2026)
+
+Auth v3 (256 to 258, 263, 266, 267, 280, 284, 294), legacy notification table removal (264), bumps and SMS consent, map layers, history indexes, the Quo outbox, and the E2E control plane.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000254_normalize_user_shape` | 2026-08-05 | [#37](https://github.com/rideyelo/yelo-api/pull/37) | Normalizes user profile nulls to empty strings and creates missing `DriverApplications` rows. | Backfill |
+| `000255_referrals_one_referrer_per_user` | 2026-08-05 | [#37](https://github.com/rideyelo/yelo-api/pull/37) | Deletes duplicate referrals so each user has one referrer. | Destructive |
+| `000256_auth_v3_storage` | 2026-08-05 | [#37](https://github.com/rideyelo/yelo-api/pull/37) | Auth v3 storage: transactions, handoff codes, identities, attribution, legal acceptances. `AuthIdentities` starts empty. |  |
+| `000257_auth_v3_runtime_state` | 2026-08-05 | [#37](https://github.com/rideyelo/yelo-api/pull/37) | Auth v3 runtime state: phone attempts, rate limit counters, denied subjects. |  |
+| `000258_auth_v3_drop_failed_attempt_count` | 2026-08-05 | [#37](https://github.com/rideyelo/yelo-api/pull/37) | Drops `AuthHandoffCodes.failed_attempt_count`. | Destructive |
+| `000259_location_raw_categories` | 2026-08-06 | [#39](https://github.com/rideyelo/yelo-api/pull/39) | Adds `Locations.raw_categories`. |  |
+| `000260_backfill_canonical_categories` | 2026-08-06 | [#39](https://github.com/rideyelo/yelo-api/pull/39) | Maps legacy location categories to canonical categories. | Backfill |
+| `000261_users_phone_digits_index` | 2026-08-10 | [#45](https://github.com/rideyelo/yelo-api/pull/45) | Adds a digits-only phone expression index. |  |
+| `000262_normalize_user_phone_numbers` | 2026-08-10 | [#45](https://github.com/rideyelo/yelo-api/pull/45) | Normalizes unambiguous legacy phone numbers to E.164. | Backfill |
+| `000263_auth_v3_account_recovery` | 2026-08-18 | [#55](https://github.com/rideyelo/yelo-api/pull/55) | Auth v3 account recovery: clears two denied-subject reasons and flags provisional accounts. | Backfill, Destructive |
+| `000264_drop_legacy_notification_log_tables` | 2026-08-20 | [#62](https://github.com/rideyelo/yelo-api/pull/62) | Drops `NotificationLog`, `NotificationRecipients`, and `CommunityNotificationHistory`. The down migration restores structure only. | Destructive |
+| `000265_add_experimental_flag_to_users_and_communities` | 2026-08-20 | [#67](https://github.com/rideyelo/yelo-api/pull/67) | Adds `active_experiments` to users and communities. |  |
+| `000266_auth_v3_otp_delivery` | 2026-08-24 | [#70](https://github.com/rideyelo/yelo-api/pull/70) | Adds OTP delivery tracking to Auth v3 phone attempts. |  |
+| `000267_auth_v3_web_sessions` | 2026-08-24 | [#74](https://github.com/rideyelo/yelo-api/pull/74) | Creates `AuthWebSessions` for rotating web refresh sessions. |  |
+| `000268_bump_sms_delivery_state` | 2026-08-25 | [#83](https://github.com/rideyelo/yelo-api/pull/83) | Adds delivery state, lease, and rate-limit indexes to `TextMessages`. |  |
+| `000269_sms_consent_revocation` | 2026-08-25 | [#83](https://github.com/rideyelo/yelo-api/pull/83) | Adds `Users.sms_opted_out_at`. |  |
+| `000270_locations_mapbox_id_index` | 2026-08-25 | [#90](https://github.com/rideyelo/yelo-api/pull/90) | Adds a concurrent B-tree index on `Locations.mapbox_id`. Failed in production; see 271. |  |
+| `000271_repair_locations_mapbox_id_index` | 2026-08-26 | [#93](https://github.com/rideyelo/yelo-api/pull/93) | Replaces the failed index from 270 with a hash index. |  |
+| `000272_map_layer_user_columns` | 2026-08-26 | [#100](https://github.com/rideyelo/yelo-api/pull/100) | Adds `location_updated_at` and `share_location_with_friends` to `Users`. |  |
+| `000273_bumps` | 2026-08-26 | [#100](https://github.com/rideyelo/yelo-api/pull/100) | Creates `Bumps`. |  |
+| `000274_locations_is_public` | 2026-08-26 | [#100](https://github.com/rideyelo/yelo-api/pull/100) | Adds `Locations.is_public`. |  |
+| `000275_mobility_feeds` | 2026-08-26 | [#100](https://github.com/rideyelo/yelo-api/pull/100) | Creates `MobilityFeeds` (GBFS and GTFS-RT). |  |
+| `000276_community_map_moves_window` | 2026-08-26 | [#100](https://github.com/rideyelo/yelo-api/pull/100) | Adds `Communities.map_moves_window_hours`. |  |
+| `000277_mobility_feeds_static_gtfs` | 2026-08-26 | [#104](https://github.com/rideyelo/yelo-api/pull/104) | Allows static GTFS mobility feeds. |  |
+| `000278_backfill_location_updated_at` | 2026-08-27 | [#105](https://github.com/rideyelo/yelo-api/pull/105) | Sets `location_updated_at` for users with stored coordinates. | Backfill |
+| `000279_backfill_test_users` | 2026-08-28 | [#114](https://github.com/rideyelo/yelo-api/pull/114) | Marks known test accounts with `is_test`. | Backfill |
+| `000280_auth_v3_education_verifications` | 2026-08-28 | [#115](https://github.com/rideyelo/yelo-api/pull/115) | Creates `EducationVerifications`, `SchoolAcademicEntities`, and `StudIDVerificationAttempts`; copies existing Google education proofs. | Backfill |
+| `000281_archive_communities` | 2026-08-31 | [#128](https://github.com/rideyelo/yelo-api/pull/128) | Adds `Communities.archived_at`. |  |
+| `000282_auto_queue_default_off` | 2026-08-31 | [#129](https://github.com/rideyelo/yelo-api/pull/129) | Makes auto-queue default off and turns it off for every user. | Backfill |
+| `000283_mobility_feeds_health` | 2026-08-31 | [#135](https://github.com/rideyelo/yelo-api/pull/135) | Adds mobility feed health columns. |  |
+| `000284_auth_v3_attempt_id` | 2026-09-02 | [#148](https://github.com/rideyelo/yelo-api/pull/148) | Adds `AuthTransactions.attempt_id`. |  |
+| `000285_unique_ride_decline_reason` | 2026-09-02 | [#150](https://github.com/rideyelo/yelo-api/pull/150) | Deletes duplicate ride decline reasons and makes them unique. | Destructive |
+| `000286_sync_telemetry_push_tokens` | 2026-09-02 | [#151](https://github.com/rideyelo/yelo-api/pull/151) | Copies push tokens from `DeviceTelemetry` to `Users` and adds a sync trigger for the legacy telemetry field. | Backfill |
+| `000287_history_fees_contact_snapshot` | 2026-09-02 | [#153](https://github.com/rideyelo/yelo-api/pull/153) | Adds Stripe fee columns to `Rides` and a contacts snapshot hash to `Users`. |  |
+| `000288_driver_history_index` | 2026-09-02 | [#153](https://github.com/rideyelo/yelo-api/pull/153) | Adds a concurrent driver history index. |  |
+| `000289_rider_history_index` | 2026-09-02 | [#153](https://github.com/rideyelo/yelo-api/pull/153) | Adds a concurrent rider history index. |  |
+| `000290_stripe_fee_repair_index` | 2026-09-02 | [#153](https://github.com/rideyelo/yelo-api/pull/153) | Adds a concurrent Stripe fee repair index. |  |
+| `000291_stripe_fee_payment_intent_index` | 2026-09-02 | [#153](https://github.com/rideyelo/yelo-api/pull/153) | Adds a concurrent missing-fee PaymentIntent index. |  |
+| `000292_quo_sync_outbox` | 2026-09-02 | [#153](https://github.com/rideyelo/yelo-api/pull/153) | Creates `QuoSyncOutbox` with user, driver application, and vehicle triggers. |  |
+| `000293_notification_template_silent` | 2026-09-03 | [#154](https://github.com/rideyelo/yelo-api/pull/154) | Adds `NotificationTemplates.silent` (data-only pushes). |  |
+| `000294_auth_v3_native_phone_step` | 2026-09-03 | [#154](https://github.com/rideyelo/yelo-api/pull/154) | Adds `AuthTransactions.native_phone_step`. |  |
+| `000295_e2e_runs` | 2026-09-03 | [#155](https://github.com/rideyelo/yelo-api/pull/155) | Creates `E2ERuns`. |  |
+| `000296_e2e_paired_actors` | 2026-09-03 | [#160](https://github.com/rideyelo/yelo-api/pull/160) | Adds paired rider and driver E2E scenarios. |  |
+| `000297_close_archived_community_pricing` | 2026-09-04 | [#162](https://github.com/rideyelo/yelo-api/pull/162) | Ends current prices for archived communities. | Backfill |
+| `000298_add_ride_routes_map_index` | 2026-09-04 | [#162](https://github.com/rideyelo/yelo-api/pull/162) | Adds a ride routes map index. |  |
+| `000299_fleet_driver_join` | 2026-09-04 | [#163](https://github.com/rideyelo/yelo-api/pull/163) | Adds fleet driver join codes. |  |
+
+### Durable domain systems (September 2026)
+
+Durable ride messaging, automatic school mapping, Stripe reconciliation, driver leads, recents, Google Calendar schedules, the contact sync engine, place identity, fleet-owned vehicles, the ride state protocol, and canonical top locations.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000300_durable_ride_messaging` | 2026-09-06 | [#170](https://github.com/rideyelo/yelo-api/pull/170) | Durable ride messaging: per-ride ordinals, read state, sender counts, streams, idempotent client IDs; backfills existing messages. | Backfill |
+| `000301_automatic_school_community_mapping` | 2026-09-08 | [#172](https://github.com/rideyelo/yelo-api/pull/172) | Automatic school-to-community mapping from coordinates, with reconciliation triggers; remaps existing schools. | Backfill |
+| `000302_school_catalog_metadata` | 2026-09-08 | [#172](https://github.com/rideyelo/yelo-api/pull/172) | Creates `SchoolCatalogMetadata`. |  |
+| `000303_school_management_visibility` | 2026-09-08 | [#172](https://github.com/rideyelo/yelo-api/pull/172) | Creates `SchoolCoordinateProvenance` and school management preview functions. |  |
+| `000304_stripe_reconciliation` | 2026-09-08 | [#173](https://github.com/rideyelo/yelo-api/pull/173) | Creates `StripeReconciliation` and its control row. |  |
+| `000305_quo_durable_controls` | 2026-09-08 | [#173](https://github.com/rideyelo/yelo-api/pull/173) | Adds Quo request pacing, scan progress, and outbox scheduling columns. |  |
+| `000306_driver_leads_crm` | 2026-09-08 | [#174](https://github.com/rideyelo/yelo-api/pull/174) | Creates `DriverLeads` and `DriverLeadNotes` with application triggers; backfills leads from existing applicants. | Backfill |
+| `000307_school_synthetic_protection` | 2026-09-08 | [#175](https://github.com/rideyelo/yelo-api/pull/175) | Adds `Schools.is_synthetic` and protects test schools from coordinate remapping. | Backfill |
+| `000308_quo_sync_requests` | 2026-09-11 | [#184](https://github.com/rideyelo/yelo-api/pull/184) | Creates `QuoSyncRequests` and routes the Quo trigger through it. |  |
+| `000309_recent_locations` | 2026-09-11 | [#187](https://github.com/rideyelo/yelo-api/pull/187) | Creates `RecentLocations` with a deletion cleanup trigger. |  |
+| `000310_google_play_release_states` | 2026-09-11 | [#191](https://github.com/rideyelo/yelo-api/pull/191) | Creates `GooglePlayReleaseStates`. |  |
+| `000311_pricing_option_display` | 2026-09-11 | [#194](https://github.com/rideyelo/yelo-api/pull/194) | Adds pricing option display name and image asset. |  |
+| `000312_contact_sync_timestamp` | 2026-09-11 | [#195](https://github.com/rideyelo/yelo-api/pull/195) | Adds `Users.contacts_synced_at`. |  |
+| `000313_contact_match_outcomes` | 2026-09-11 | [#195](https://github.com/rideyelo/yelo-api/pull/195) | Adds contact match outcomes and contact permission details. |  |
+| `000314_retire_community_waitlisting` | 2026-09-15 | [#197](https://github.com/rideyelo/yelo-api/pull/197) | Retires community waitlisting: clears `is_waitlisted` and blocks new waitlisting. | Backfill |
+| `000315_community_timezone_derivation` | 2026-09-15 | [#197](https://github.com/rideyelo/yelo-api/pull/197) | Community timezone derivation history and community cache invalidation triggers. | Backfill |
+| `000316_fleet_community_services` | 2026-09-15 | [#197](https://github.com/rideyelo/yelo-api/pull/197) | Creates `FleetCommunityServices` and history; backfills from current prices and primary fleets. | Backfill |
+| `000317_google_calendar_owner` | 2026-09-15 | [#197](https://github.com/rideyelo/yelo-api/pull/197) | Creates the Google Calendar owner and OAuth flow tables. |  |
+| `000318_calendar_snapshots` | 2026-09-15 | [#197](https://github.com/rideyelo/yelo-api/pull/197) | Creates calendar connections, aliases, snapshots, and occurrences with guard triggers. |  |
+| `000319_editable_calendar_prefixes` | 2026-09-16 | [#220](https://github.com/rideyelo/yelo-api/pull/220) | Makes calendar prefixes editable with audit fields and a re-import trigger. |  |
+| `000320_replace_calendar_id` | 2026-09-16 | [#224](https://github.com/rideyelo/yelo-api/pull/224) | Replaces the calendar connection guard so admins can replace a calendar ID. |  |
+| `000321_derived_fleet_tags` | 2026-09-16 | [#224](https://github.com/rideyelo/yelo-api/pull/224) | Creates `dashboard_user_tags()` for derived `Fleet:` tags. |  |
+| `000322_contact_sync_state` | 2026-09-17 | [#227](https://github.com/rideyelo/yelo-api/pull/227) | Contact sync engine state: requests, providers, state, identities, scan progress, provider request control. |  |
+| `000323_contact_sync_triggers` | 2026-09-17 | [#227](https://github.com/rideyelo/yelo-api/pull/227) | Contact sync triggers on users, driver applications, vehicles, rides, schools, and communities. |  |
+| `000324_pricing_adjustment` | 2026-09-17 | [#232](https://github.com/rideyelo/yelo-api/pull/232) | Adds `RidePriceParameters.adjustment` (`jitter`, `rounded`, `none`). |  |
+| `000325_global_pricing_jitter` | 2026-09-17 | [#232](https://github.com/rideyelo/yelo-api/pull/232) | Creates `PricingJitterSettings` and trims per-row adjustment settings to the mode. | Backfill |
+| `000326_bump_place_metadata` | 2026-09-17 | [#238](https://github.com/rideyelo/yelo-api/pull/238) | Adds place metadata to `Bumps`. |  |
+| `000327_place_resolutions` | 2026-09-17 | [#238](https://github.com/rideyelo/yelo-api/pull/238) | Creates `PlaceResolutions` (replaced by 328). |  |
+| `000328_place_identity` | 2026-09-17 | [#238](https://github.com/rideyelo/yelo-api/pull/238) | Application-owned place identity: catalog, provider aliases, identity columns on eight tables, attach triggers, River-driven backfill; drops `PlaceResolutions`. | Backfill, Destructive |
+| `000329_scheduled_notification_defaults` | 2026-09-17 | [#240](https://github.com/rideyelo/yelo-api/pull/240) | Defaults for scheduled notification IDs and optional sender. |  |
+| `000330_dashboard_notification_actors` | 2026-09-17 | [#240](https://github.com/rideyelo/yelo-api/pull/240) | Records Clerk actors on scheduled notifications, notifications, and templates. |  |
+| `000331_bound_place_provider_aliases` | 2026-09-17 | [#241](https://github.com/rideyelo/yelo-api/pull/241) | Bounds oversized provider aliases and reschedules the place identity backfill. | Backfill |
+| `000332_marketing_segments` | 2026-09-17 | [#239](https://github.com/rideyelo/yelo-api/pull/239) | Creates `MarketingSegments` and members, activity triggers, and seeds sync requests for all users. | Backfill |
+| `000333_fleet_owned_vehicles` | 2026-09-18 | [#242](https://github.com/rideyelo/yelo-api/pull/242) | Fleet-owned vehicles: nullable personal owner, archival and default flags, ownership indexes, `AvailableDriverVehicles` view, selection triggers. | Backfill |
+| `000334_breeze_shared_cart` | 2026-09-18 | [#242](https://github.com/rideyelo/yelo-api/pull/242) | Seeds the Breeze shared cart for one verified fleet and selects it for idle members. | Backfill |
+| `000335_mobile_vehicle_catalog` | 2026-09-18 | [#242](https://github.com/rideyelo/yelo-api/pull/242) | Creates `MobileVehicleCatalogs`. |  |
+| `000336_e2e_fixture_school_identity` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Marks E2E fixture schools synthetic. | Backfill |
+| `000337_e2e_confirmed_ride` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Adds a confirmed-ride E2E scenario. |  |
+| `000338_ride_state_revisions` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Ride state protocol counters: `Users.ride_state_revision`, `Rides.lifecycle_revision`, `Rides.assignment_generation`. |  |
+| `000339_ride_operation_journal` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Creates the `RideOperations` and `RideOperationSteps` journal. |  |
+| `000340_ride_cancellation_quotes` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Creates `RideCancellationQuotes`; adds `payment_consent_at` backfilled from `confirm_time`. | Backfill |
+| `000341_e2e_queued_pair` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Adds a queued-pair E2E scenario. |  |
+| `000342_e2e_notification_rider` | 2026-09-18 | [#253](https://github.com/rideyelo/yelo-api/pull/253) | Adds a notification-rider E2E scenario. |  |
+| `000343_activated_driver_fleet_tags` | 2026-09-25 | [#261](https://github.com/rideyelo/yelo-api/pull/261) | Derived fleet tags require an activated driver. |  |
+| `000344_scope_fleet_tag_activation` | 2026-09-25 | [#263](https://github.com/rideyelo/yelo-api/pull/263) | Scopes fleet tag activation to the target user. |  |
+| `000345_canonical_top_locations` | 2026-09-25 | [#265](https://github.com/rideyelo/yelo-api/pull/265) | Canonical top locations: `PlaceProfiles`, `CommunityTopLocations`, settings; migrates up to four legacy slots per community. | Backfill |
+| `000346_fleet_archive_reference_guards` | 2026-09-25 | [#273](https://github.com/rideyelo/yelo-api/pull/273) | Fleet archive reference guard triggers. |  |
+| `000347_restore_location_address_constraint` | 2026-09-25 | [#274](https://github.com/rideyelo/yelo-api/pull/274) | Adds the unique `Locations.address` constraint that production already had outside migration history. It is a no-op where the constraint exists. |  |
+
+## Related pages
+
+- [Database reference](/reference/database/overview) for current tables and columns.
+- [Enums](/reference/database/enums) for the orphaned enum types from 000001.
+- [Data layer](/engineering/api/data-layer) for the migration workflow and sqlc schema generation.
+- [Timeline](/engineering/history/timeline) and [Architecture decisions](/engineering/history/decisions) for why these changes happened.

@@ -1,0 +1,275 @@
+---
+title: "User-facing messages"
+description: "Catalog of the errors, alerts, banners, and pushes riders, drivers, and tippers see in the Yelo app and web pages, what triggers each one, and what support should do"
+---
+
+Use this page when a user quotes a message. Find the flow, match the text, and follow the **What to do** column. Messages are quoted exactly as the code writes them, including capitalization.
+
+For the API error types behind these messages, see [Errors](/reference/errors). For every push notification, see [Notification catalog](/engineering/notifications/catalog).
+
+## How the apps show errors
+
+The same server error can look different depending on the screen. Knowing the pattern tells you how much a user's quote can tell you.
+
+| Pattern | What the user sees | Where it's used |
+| --- | --- | --- |
+| **Generic alert** | A native alert whose title is the specific message and whose body is always "Please try again later, or if the problem persists, please contact us". | Most one-off failures, such as photo uploads, chat, and profile edits (`errorAlert` in `yelo-frontend/lib/ui/alerts.ts`). |
+| **Server copy** | The API's own title or body. | Ride options (request), fleet join, sign-in, and the web tip page. |
+| **Fixed client copy** | One message for every failure, whatever the server said. | Going online, confirming a ride, accepting a ride, rating and tipping, cancelling. |
+| **Silent** | Nothing. The sheet stays open. | Instant cash-out, payout schedule changes, and fleet switching. |
+
+<Note>
+Only one alert shows at a time. If several requests fail at once, the user sees the first alert, and the rest are dropped until they dismiss it.
+</Note>
+
+Because of the fixed-copy pattern, a driver who says "it just says Failed to update online status" can be blocked by any of several server checks. Use the dashboard to find the real cause, as described in each section below.
+
+## Sign-in
+
+Sign-in runs in the app (`app/(auth-v3)/`) or, as a fallback, in the browser.
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| "Could not send a code to your phone number. Please try again later." | Sending the code failed and the server gave no specific body. | Ask the user to check the number and retry. If it keeps failing, see [SMS, OTP, and sign-in failures](/runbooks/sms-and-sign-in). |
+| "The code you entered is incorrect." or "That code didn't match. Check it and try again, or request a new one." | The code check failed. The app shows the server's sentence when there is one, and the first sentence otherwise. | The user re-enters the code or requests a new one. |
+| "That number can't receive verification codes. Check it and try again." | The SMS provider rejected the number. | Ask the user to check the number. If it's correct, suggest Apple or Google sign-in. |
+| "That code expired, so we sent you a new one." | The sign-in session timed out while the user was typing the code. The app opened a new session and resent a code. | The user enters the newest code. |
+| "Too many attempts. Try again in N seconds." (or minutes) | A sign-in or phone verification rate limit. The wait comes from the server. | The user waits. Support can't reset the limit. |
+| "You can request a new code in N seconds." | The user tapped resend during the cooldown. | Wait for the countdown. |
+| **Sign in didn't finish** / "Please try again. If this keeps happening, contact Yelo support." | Any sign-in failure without its own copy. The screen may show `Support code:` and an ID. | Get the support code and escalate to engineering. It's the API request ID. |
+| **Couldn't verify sign in** / "Return to Yelo and start sign in again." | The browser sign-in returned an error to the app. The app discards the specific reason. | The user starts over from the app. |
+| "Sign in is temporarily unavailable. Continue in your browser, or try again in a few minutes." with **Continue in browser** | In-app sign-in is disabled or a provider is down (503). | The user taps **Continue in browser**. If many users report it, escalate. |
+| **Account Conflict** / "This sign-in method is already associated with another account. Contact support for help." | The Apple, Google, or phone identity already belongs to a different account. | Find both accounts in **Users** by phone or email and escalate. Support can't merge accounts. |
+
+<Warning>
+A suspended account never sees the "Account Suspended" message. The app treats the 401 as a dead session and signs the user out, and sign-in doesn't complete. If a user says they keep getting signed out, check whether they appear under the **Banned** filter on **Users**.
+</Warning>
+
+## Requesting a ride
+
+These show on the map's request sheet. The failure text appears inline with a **Retry ride options** button, and also as a generic alert.
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| **Pickup Outside Service Area** or **Destination Outside Service Area** ("The pickup location is outside the service area. Please select a pickup location within the service area") | A stop is outside the rider's community boundary, and no other community contains both stops. | The rider picks stops inside the service area. See [Rider FAQ](/support/rider-faq#which-community-am-i-in). |
+| "You already have a ride. Return to your current ride to continue." | The app's status check found a live ride. | If the rider has no real ride, see [Stuck or ghost ride](/runbooks/stuck-ride). |
+| "Could not calculate your route. Please try again." | The route lookup returned nothing. | Try different stops. |
+| "Choose where your driver should meet you." / "Choose where you want to arrive." | A stop has no coordinates, or the API asked the rider to confirm the exact address or entrance. The app reopens the stop picker with **Confirm pickup** or **Confirm destination**. | The rider picks a specific address. |
+| "Your account is reconnecting. Please try again shortly." | The app hasn't finished loading the signed-in profile. | Retry after a few seconds. Force-quit if it persists. |
+| "Could not load ride options. Check your connection and try again." | A network error or a 5xx from the API. | Retry. If widespread, escalate. |
+| "Couldn't load this location" / "Tap the search result to try again." | A tapped search result couldn't be resolved to a place. | Retry or search again. |
+| **Update required** / "Update Yelo before starting another ride." with **Update Yelo** | The installed version is below the store version floor. | The rider updates from the store. |
+| **App update check** / "Could not check the required app version. Please try again." | The version check itself failed, usually offline. | Retry with a connection. |
+
+### Status chip on the search bar
+
+| Chip | Meaning |
+| --- | --- |
+| A window such as **THU \| 9PM**, or **OFF-PEAK** | The market is off-peak. Rides can still be requested. Tapping the chip opens **Operating hours**. |
+| **COMING** | Shown whenever the market isn't off-peak. On current `main` that includes live markets, so **COMING** alone doesn't mean rides are disabled. |
+
+When rides are disabled for a community, the request returns no Yelo options at all and the sheet only offers other ride apps. There's no error. See [Rider can't request](/runbooks/rider-cannot-request).
+
+## Confirming and paying
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| "Could not confirm this request. Check your ride status before trying again." | **Any** confirm failure: a declined card in the payment sheet, a missing payment method, a stale ride, or an API error. The server's own message isn't shown. | Look up the ride in **Rides** → **Trips**. If it's **Awaiting match**, the confirm actually worked. If not, have the rider pick a different card and try again. |
+| "Payment options are still loading. Please try again." | The rider tapped too early. | Wait a moment. |
+| "Payment details changed. Please choose your payment method again." | The ride quote was refreshed after the card sheet loaded. | Re-select the card. |
+| "No payment method found. Please choose a payment method again." | The card sheet returned no card. | Re-select or add a card. |
+| "Your ride has changed. Check your current ride before continuing." | Another ride became active on this account. | Check **Trips** for a live ride. |
+| "The previous ride request is still being checked. Please try again shortly." | The rider tapped again during a confirm. | Wait. |
+
+On the Apple Pay sheet the rider sees **Ride fare**, a pending **Tip authorization** of $5.00, and a pending total. See [Rider FAQ](/support/rider-faq#why-is-there-a-pending-charge-bigger-than-my-fare).
+
+## Waiting, riding, and cancelling
+
+| Message | Where | Trigger and meaning |
+| --- | --- | --- |
+| **FINDING YOUR SPOT**, with "You won't be charged until your driver arrives." | Matching screen | Shown while the ride waits for a driver. A card hold is still placed when a driver accepts, and cancellation fees can apply before arrival. See [Rider FAQ](/support/rider-faq#when-am-i-charged). |
+| **Off-Peak Hours** / "Yelo isn't a 24/7 service, but you can still request a ride." | Matching screen | The market is off-peak. The ride can still match. |
+| **Holding your place in line** | Queued screen | A driver accepted and the ride is in their queue behind another trip. |
+| **Cancel ride?** / "You won't be charged for cancelling — your ride hasn't started yet." | Cancel sheet | The fee check returned $0. |
+| **Cancel ride?** / "Your driver is on the way. Cancelling now charges a fee." with **Cancellation fee** | Cancel sheet | The fee check returned more than $0. This copy shows for any fee, including when the driver is waiting or the trip is in progress. |
+| "We need to check the cancellation fee before you cancel." with **Retry fee check** | Cancel sheet | The fee preview failed. The rider can't cancel until it succeeds. |
+| "The cancellation fee changed. Review the fee before confirming again." | Cancel sheet | The fee was re-checked at confirm and differed, usually because the driver got closer. |
+| "Cancellation accepted. Reconnecting to check your ride status." | Cancel sheet | The cancel went through, but the status refresh failed. |
+| "A $X.XX cancellation fee now applies. Return to your ride to review cancellation." | **Leave the queue?** sheet | The rider tried to leave a queued ride but a fee now applies. They must cancel from the ride screen. |
+| "Driver phone number is unavailable", "Calling is not supported on this device", "Unable to start phone call" | Ride screen | The call button couldn't place a call. |
+| **Couldn't start the call** / "Please dial 911 directly from your phone." | Emergency button | The device couldn't start the emergency call. |
+| **Submission Successful.** / "Thank you for bringing this to our attention" | Safety report | The safety issue was saved. Find it on the ride and follow your safety process. |
+| "Message failed to send", "Earlier messages could not be loaded" | Ride chat | Chat request failed. Retry. |
+
+For the full fee rules, see [Rider FAQ](/support/rider-faq#cancellation-fees).
+
+## Rating and tipping
+
+### In the app
+
+The rating screen asks "How was your trip to [destination]?" with **Rate your ride**, **Add a tip**, and **Leave a comment**. The tip buttons are $2, $5, $10, and **Custom**, up to $100.
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| "Review saved. Updating your ride status." | Rating and any tip were accepted. | None. |
+| "Could not confirm your review. Check your ride status before trying again." | **Any** rating failure, including the server's **Tip unavailable** errors: "This driver can't accept tips right now." (no payout account) or "Add a payment method to leave a tip." | Check the ride's timeline for `tip_captured`. If there's none, the tip wasn't charged. |
+| "Your ride changed. Refreshing your current ride." | The ride left `pending_rider_rating` first, for example the 24-hour window closed. | Tips after the window aren't possible in the app. |
+
+<Warning>
+The **Add a tip** card shows on every ride, but a tip is only charged on rides created with tips enabled. On other rides the rating saves and the tip amount is silently ignored. The current app enables tips on every ride it creates.
+</Warning>
+
+### Web tip page (QR codes and tip links)
+
+The page at `joinyelo.com/pay/tip/{slug}` shows "leave a tip." with **tip with yelo** and **tip as guest**. It hands off to Stripe Checkout.
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| "This tip link isn't available right now." | The slug doesn't resolve: the QR config is inactive, or the driver isn't eligible. | Check the QR config's **Active** badge on the fleet's **Payments** tab. See [Fleet manager FAQ](/support/fleet-manager-faq#qr-payment-links). |
+| "Oops! Something didn't go as planned. Try again, or come back later." | Checkout was rejected: the amount is under $0.50 or outside the link's range, or the fleet or driver can't accept payments. | Check the amount against the QR config. For a driver link, check the driver's payout setup. |
+| "Couldn't start checkout. Please try again." | Network or server failure. | Retry. |
+| "Couldn't open secure sign-in. Please try again." | The **tip with yelo** sign-in handoff failed. | Use **tip as guest**. |
+| "tip sent." / "thanks for taking care of your driver. you're all set." | Stripe redirected back after payment. | The payment shows in **QR Payment History** once Stripe confirms it. |
+| **Invalid tip link** / "Scan the QR code and try again." | In the app, a tip link had no slug. | Rescan. |
+| **Could not open tipping** / "Please try again." | In the app, the browser couldn't open. | Retry. |
+
+## Going online
+
+<Note>
+The **Go Online** button on **Start your shift** is greyed out until the driver's application is active and their payout setup (their own Stripe, or their fleet's) is complete. The app shows no reason. Check **Driver Info** in the user detail sheet.
+</Note>
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| **Keep your driver location updated**, with **Open Settings** | Background location isn't set to **Always**. | The driver picks **Always** or **Allow all the time** in Settings → Yelo → Location. |
+| **Location Error** / "Unable to determine your location. Please check your signal and try again." | No GPS fix and no last known location. | Retry outdoors or with better signal. |
+| **Outside Service Area** / "You must be within the [community] community boundaries to go online. Please move to the service area and try again." | The phone's location is outside the driver's community boundary, checked in the app. | The driver moves into the area. If the community is wrong, fix **Active community** with **Edit profile**. |
+| **Could not check vehicle** / "Check your connection and approved vehicle selection, then try again." | No approved vehicle for the active fleet, or the vehicle list didn't load. | Check that the driver's vehicle is approved. See [Driver FAQ](/support/driver-faq#what-do-i-need-to-go-online). |
+| **Vehicle already in use**, with **Go online anyway** | Another driver has an open session on the same vehicle. | Informational. Shared fleet vehicles trigger this. |
+| **Error** / "Failed to update online status. Please try again." | **Any** server rejection when going online. The server's reason (such as **Payment Setup Required**, **Application Incomplete**, **Fleet Mismatch**, or **No Vehicle**) isn't shown. | Work through [Driver can't go online](/runbooks/driver-cannot-go-online). The server reason is in the API logs. |
+| **App update check** / "Update Yelo before starting another ride." | The app version is below the store floor. | The driver updates the app. |
+
+## Driving
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| Full-screen ride card with **Accepting in Ns** | A ride is on the board for this driver. The button fills over 30 seconds and then accepts automatically. | This is intentional. The driver taps **Decline** to skip. See [Driver FAQ](/support/driver-faq#why-did-a-ride-get-accepted-without-me-tapping). |
+| **RIDE GONE** / **Too slow this time.** / "Rides on Yelo move fast. Monitor your notifications and tap in fast." | The accept failed for any reason, or the ride left the board within 15 seconds. That includes a failed card authorization, not only another driver winning. | If the driver insists they were first, check the ride timeline for `payment_processing_failed`. |
+| **ENTER RIDER PIN** / "Ask [name] for their pin" | The ride's fleet requires a confirm code. | The rider shows the four-digit PIN on their ride screen. |
+| "Incorrect PIN. Ask the rider for their code." | The PIN didn't match. | The driver re-enters the rider's code. |
+| "Could not confirm pickup. Your PIN is saved; check the ride status and try again." | Pickup failed for another reason. | Retry. Check for a stuck ride if it repeats. |
+| **Couldn't confirm arrival**, **Couldn't start the ride**, **Couldn't confirm completion** / "Check your ride status before trying again." | Arrival, start, or complete failed. | Retry. If the ride is stuck, see [Stuck or ghost ride](/runbooks/stuck-ride). |
+| "Cancellation was accepted. Refresh your ride when you are back online." | The driver cancel went through while offline or during a refresh failure. | None. |
+| "You're online — go offline to change vehicles." / "You're on a ride — finish it, then go offline to change vehicles." | Vehicle picker locked. | Go offline first. The same copy applies to **Switch fleet**. |
+| **Finish your ride first** / "You'll need to finish your ride first in order to switch to rider mode." | **Rider mode** tapped during a ride. | Finish the ride. |
+| "Failed to set vehicle.", "Failed to set default vehicle." | The vehicle change failed. | Retry. |
+
+Decline reasons are **Not enough money**, **Too far away**, **Not actively driving**, and **Other**. Driver cancel reasons are **Accepted trip by accident**, **Rider behavior**, **Problem with pickup**, **Made a wrong turn**, **Pickup isn't worth it**, **Not safe to pick up**, and **Vehicle issue**.
+
+## Driver setup
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| **COMPLETED**, **IN REVIEW**, **NOT APPROVED**, **UP NEXT** | Each setup task's status on **DRIVER SETUP**. **IN REVIEW** means submitted. **NOT APPROVED** means an admin rejected it. | See [Driver FAQ](/support/driver-faq#where-is-my-application). |
+| "Typically approved within 24 hours." | The submitted screen after all tasks. | This is copy, not a guarantee. Activation is a manual admin step. |
+| **PAYOUTS READY** / "Managed by [fleet]." | The driver's payouts go through a fleet. No personal Stripe needed. | None. |
+| "Failed to submit profile photo.", "Failed to submit license photos.", "Failed to save vehicle information." | Upload or save failed. | Retry on a better connection. |
+| "Missing vehicle info. Please go back to the previous step." | The vehicle form lost its first page. | Go back one step. |
+| "Camera access is needed to capture your license." / "Camera access is disabled. Enable it for Yelo in Settings to continue." | Camera permission denied. License photos are camera-only. | Enable the camera in Settings. |
+| **Camera access needed** | Camera permission denied for the profile photo. | Enable the camera, or upload from the library. |
+
+## Fleet join
+
+### In the app
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| **FLEET INVITATION** / "Join [fleet] as a driver." | A valid link. | None. |
+| "This fleet link isn't available." / "Ask the fleet manager for their current driver invitation link." | The code doesn't exist, or the link was rotated or disabled. | Ask the fleet manager for the current link. |
+| "[fleet] can't accept drivers right now." / "Contact the fleet manager and try again later." | The fleet is inactive or not payout-ready for its payment model. | See [Fleet manager FAQ](/support/fleet-manager-faq#driver-join-links). |
+| "We couldn't load this invitation." / "Check your connection and try again." | The preview request failed. | Retry. |
+| "Go offline and finish your current ride before joining this fleet." | The driver is online, in a session, or on a ride. | Go offline and retry. |
+| "This fleet cannot accept drivers right now. Contact the fleet manager and try again later." | The fleet stopped being ready between preview and join. | As above. |
+| "The fleet invitation changed while this request was running. Try again." | The link was rotated during the join. | Retry with the new link. |
+| "We couldn't add you to this fleet. Please try again or ask the fleet manager for a new link." | Any other join failure. | Retry. Escalate with the user ID if it repeats. |
+| "You joined [fleet]." / "This fleet is now your active fleet." | Success. If steps remain: "Finish the remaining driver setup items and you'll be activated automatically." | None. |
+
+If the driver is already in the fleet, the app skips the invitation and returns to the home screen with no message.
+
+### On the web
+
+`yelo.link/fleet-...` opens a page with the fleet name and **Open Yelo to join**. It shows "Sign in or create your account in the Yelo app. [fleet] will become your active fleet." followed by the payout sentence. The join itself always happens in the app.
+
+## Earnings and cash-out
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| **TOTAL BALANCE**, **Available**, **Pending** | Owner-operator earnings hub. Amounts come from the driver's Stripe balance. | See [Driver FAQ](/support/driver-faq#earnings-balance-and-payouts). |
+| **Cash out $X now** / "Arrives in seconds" | Instant cash-out is available. | None. |
+| "No instant balance available" | The bank or card doesn't support instant payouts, or there's no instant balance. | The driver waits for the scheduled payout. |
+| **Cash out instantly**, **1% instant fee**, **You'll receive**, "Skip the fee by waiting for your free weekly payout on [date]." | The cash-out sheet. | If the cash-out fails, the sheet just stays open with no error. Retry later or wait for the scheduled payout. |
+| **PAYOUTS MANAGED BY [FLEET]** / "Only rides completed by your driver account appear here. [fleet] manages your payout timing and banking details." | Fleet-paid driver. There's no balance or cash-out. | Payout questions go to the fleet. |
+| "We couldn't load your earnings. Your payout settings haven't changed." with **Try again** | The payout status or fleet earnings failed to load. | Retry. |
+| An endless spinner on **Earnings** | The owner-operator balance request failed, for example because the Stripe account is missing. The screen has no error state for this. | Check **Driver Info** and the driver's Stripe step. See [Payout issues](/runbooks/payout-issues). |
+
+Payout pushes:
+
+| Push | Trigger |
+| --- | --- |
+| **Payout deposited** / "[amount] just landed in your bank account." | Stripe paid out to the driver's bank. |
+| **Payout failed** / "Your [amount] payout couldn't be deposited. Check your banking details in the app." | Stripe couldn't deposit. The driver fixes the bank account in Stripe. |
+| **Payout canceled** / "Your [amount] payout was canceled." | The payout was canceled in Stripe. |
+
+## Account and app
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| **Update required** / "We've got a fresh new version of Yelo ready for you. Update now to keep riding, discovering, and staying in the know!" with **Stay ready** | Full-screen block when the app is below the store floor. | Update from the store. |
+| **Something went wrong** / "We hit a snag loading this. Try refreshing and if it keeps happening, contact us at hello@rideyelo.com." | A screen crashed. It shows the app version and build. | Get the version and the screen they were on, and escalate. |
+| "Your Yelo account has been deleted" | In-app deletion succeeded. | None. |
+| "Could not delete your account. Please try again." | In-app deletion failed. Apple sign-in revocation failures block deletion. | Retry later. Escalate if it keeps failing. |
+| "Failed to update profile", "Failed to update profile image" | Profile edit failed. | Retry. |
+| **Success!** / "Your feedback has been logged in our system." | **Contact Yelo** submitted. | Find it in your feedback queue. |
+| **Cannot open this code**, "No QR code found in image.", "Could not decode that image." | The QR scanner couldn't use the code. | Rescan, or open the link directly. |
+
+### Web account deletion
+
+The `/delete-account` page on the signup site verifies the phone by text, then asks the user to type `DELETE`.
+
+| Message | Trigger | What to do |
+| --- | --- | --- |
+| "We couldn't find a completed Yelo account for that number. If you signed up with Google or Apple, or you can no longer receive texts at that number, email hello@rideyelo.com from the address on your account and we'll delete it for you." | The phone verified but didn't produce a full session. Accounts created with Google or Apple, or without an email, land here. | The user can delete from **Profile** → **Settings** → **Delete account** in the app. Support has no dashboard deletion tool. Escalate email requests to engineering. |
+| "Couldn't send the code. Check the number and try again." | The code request failed or was rate-limited. | Retry later. |
+| "That code didn't work. Try again." | Wrong code. | Re-enter. |
+| "Couldn't delete the account. Please try again." | Deletion failed. | Retry. Escalate if it repeats. |
+| **Your account is deleted** | Success. | None. |
+
+## Ride pushes
+
+These are seeded template texts. Admins can change them under **Notifications** → **Templates**, so production copy can differ.
+
+| Push | Audience | Trigger |
+| --- | --- | --- |
+| "Woohoo! [driver] is on the way." / "Get ready — your driver is coming." | Rider | A driver accepted, or auto-queue assigned the ride. |
+| **Finding a new driver** / "Your driver canceled. We're finding you a new driver!" | Rider | The driver canceled before pickup. No fee, and the ride is back on the board. |
+| **Finding another driver** / "Your selected driver couldn't take this ride. We're looking for another driver." | Rider | A rider-picked driver declined or didn't answer in 30 seconds. |
+| **Ride Request Canceled** / "No drivers were available this time." | Rider | No match within 10 minutes. |
+| **Ride Canceled** / "Your rider has canceled. You will receive [$X.XX]." | Driver | The rider canceled. The fee sentence appears only when a fee was charged, with literal brackets. |
+| "$X.XX New ride available" / "From [pickup] to [destination]" | Driver | A new ride on the driver's board, or a nearby ride when coming online. |
+| "$X.XX ride auto-queued" / "[pickup] → [destination]" | Driver | Auto-queue assigned the ride. |
+| **Renew Online Status** / "Click back to keep your status online." | Driver | The driver's app hasn't checked in for almost 30 minutes. They go offline at 30 minutes. |
+
+## Where this lives in code
+
+| Surface | Location |
+| --- | --- |
+| Alert helpers | `yelo-frontend/lib/ui/alerts.ts` |
+| Ride request and confirm | `yelo-frontend/hooks/usePreRideRequest.ts`, `yelo-frontend/app/(app)/(tabs)/map/request.tsx`, `yelo-frontend/components/ride/StripePaymentScreen.tsx` |
+| Rider cancel and rating | `yelo-frontend/components/rider-flow/RiderCancelButton.tsx`, `yelo-frontend/app/(app)/ride-complete/index.tsx` |
+| Going online and ride cards | `yelo-frontend/providers/DriveProvider.tsx`, `yelo-frontend/components/drive/` |
+| Fleet join | `yelo-frontend/app/fleet-join/[code].tsx`, `yelo-web/src/sites/invite/FleetInvitePage.tsx` |
+| Earnings | `yelo-frontend/app/(app)/driver-earnings/`, `yelo-frontend/components/driver-earnings/` |
+| Sign-in | `yelo-frontend/app/(auth-v3)/`, `yelo-frontend/providers/AuthV3Provider.tsx` |
+| Web tip page and deletion | `yelo-web/src/shared/signup/steps/TipStep.tsx`, `yelo-web/src/sites/signup/delete-account/` |
+| Server error copy | `yelo-api/internal/service/`, `yelo-api/internal/data/repository/` |
+| Push templates | `yelo-api/internal/notify/seed/templates.go` |

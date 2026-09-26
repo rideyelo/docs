@@ -1,0 +1,127 @@
+---
+title: "Fleet manager FAQ"
+description: "Code-grounded answers to fleet manager questions about dashboard access, driver join links, QR payment links, operating hours calendars, and fleet payouts"
+---
+
+Fleet managers are fleet operators with the `fleet` role in the Yelo dashboard. Use this page to answer their questions and to know when a request needs a Yelo admin.
+
+## Dashboard access
+
+### What can a fleet manager see and do?
+
+A fleet manager account is tied to one or more fleets, each paired with a community. The dashboard opens on the **Fleet** page, and every list is limited to the assigned fleets. See [Dashboard roles and access](/administration/dashboard-roles#fleet-manager).
+
+| Page | What a fleet manager can do |
+| --- | --- |
+| **Fleet** → **Overview** | See fleet KPIs, including **Ride Requests**, **Completed Rides**, **Completion Rate**, **Total Earnings**, and **QR Payments**. See the **Fleet Driver Directory**, open **Invite drivers**, and view **Fleet Pricing Management**. |
+| **Fleet** → **Payments** | Edit pricing on and deactivate their own QR payment links, and see **QR Payment History**. |
+| **Fleet** → **Operating hours** | View the hours imported from the fleet's Google Calendar. |
+| **Drivers** | The **Drivers** tab only, filtered to their fleets. |
+| **Rides** | The **Trips** tab only, filtered to rides in their fleets. |
+
+See [Monitor a fleet](/dashboard/fleets#monitor-a-fleet) for every metric.
+
+### What needs a Yelo admin?
+
+Fleet managers can't do these. Route the request to an admin:
+
+- Create a QR payment link. The **Create New** button appears, but saving fails for fleet managers.
+- Change ride pricing, vehicle types, or fleet settings.
+- Add, remove, or edit fleet vehicles. See [Fleet vehicles](/dashboard/fleet-vehicles).
+- Add a driver to the fleet directly. The API answers "Only admins can enroll drivers directly. Share the fleet join link instead."
+- Review or approve a driver's application, or open a driver's details from the directory.
+- Open **Ride Details**, **Users**, **Live**, or community analytics.
+- Attach or change the fleet's Google Calendar.
+- Open the fleet's Stripe dashboard from Yelo.
+
+### The Fleet page says "You are not assigned to a fleet."
+
+The manager's Clerk account has no valid fleet assignment. An admin sets `fleet_assignments` in the user's Clerk public metadata. Each entry needs both a `fleet_id` and a `community_id`. A malformed assignment blocks all dashboard data. See [Missing or malformed assignments](/administration/dashboard-roles#missing-or-malformed-assignments).
+
+## Driver join links
+
+### How do drivers join my fleet?
+
+With the fleet's reusable join link, `https://yelo.link/fleet-<code>`. Open **Invite drivers** next to the **Fleet Driver Directory** to create, copy, rotate, or disable it. Full steps are in [Fleet driver invitations](/fleets/driver-invitations).
+
+When a driver joins:
+
+- The fleet becomes their active fleet, and they move to the fleet's community.
+- They still complete every application step. Joining doesn't skip review.
+- They're activated automatically once all remaining steps are done.
+- They must be offline with no ride to join. Otherwise the app says "Go offline and finish your current ride before joining this fleet."
+
+### Why does the card say Invitations unavailable?
+
+The fleet isn't ready to accept drivers, so links can't be created or rotated, and existing links show "[fleet] can't accept drivers right now." to drivers.
+
+| Payment model | Ready when |
+| --- | --- |
+| Fleet-managed payouts | The fleet is active and its Stripe payout setup is complete. |
+| Owner-operator | The fleet is active and custom payouts are off. |
+
+For a Stripe problem on a fleet-managed fleet, see [Fleet payouts](#fleet-payouts).
+
+### A driver says the link isn't available
+
+"This fleet link isn't available." means the link was rotated or disabled, the fleet was archived, or the code is wrong. Old `yelo.link` short links keep opening the page even after rotation. Send the driver the current link from **Invite drivers**.
+
+## QR payment links
+
+### How do QR payment links work?
+
+A QR payment link lets anyone pay the fleet directly, for example by scanning a code in a vehicle. Each link is `pay.yelo.link/{slug}` and opens Yelo's web tip page. The payer can pay with a Yelo account or as a guest through Stripe Checkout.
+
+- **Fixed** links charge one amount. **Custom** links let the payer pick an amount between a minimum and maximum, with a suggested preset.
+- Every payment must be at least $0.50.
+- Money goes to the fleet's Stripe account.
+- Payments appear in **QR Payment History** after Stripe confirms them, with the payer's name, email, and phone.
+
+See [QR payments](/dashboard/qr-payments).
+
+### What can a fleet manager change?
+
+- **Edit Pricing** switches between fixed and custom or changes the amounts. Printed QR codes keep working, because the slug doesn't change. Pricing can only change on an **Active** link in an active fleet.
+- **Deactivate** stops the link from accepting payments. The card shows **Inactive**. Payers then see "This tip link isn't available right now."
+- New links need a Yelo admin.
+
+If **Deactivate** fails, the dashboard shows **Failed to deactivate config** and the link stays active.
+
+### A payer says checkout failed
+
+"Oops! Something didn't go as planned. Try again, or come back later." on the tip page usually means the amount was under $0.50 or outside the link's range, or the fleet's Stripe account can't take payments. Check the link's pricing on the **Payments** tab, then the fleet's Stripe status.
+
+## Operating hours
+
+### How do I set my fleet's hours?
+
+Fleet hours come from a Google Calendar that a Yelo admin attaches to the fleet and community. The fleet manager edits events in that Google Calendar. Each event title starts with a bracketed zone prefix, such as `[FREE]`. Yelo imports the calendar about every five minutes. The **Operating hours** tab in the dashboard is read-only. See [Fleet operating hours](/admin/operating-hours).
+
+- If an import fails, the tab keeps showing the last successful import.
+- Imports pause while the fleet is inactive or the service community is retired.
+- Times display in the community's timezone.
+
+### Do my hours control when riders can book?
+
+No. Imported fleet hours are informational. The rider's **OFF-PEAK** chip comes from the community's own operating hours on the **Community** page, and it only shows when no driver is online. Riders can request at any time, and a ride matches whenever a driver in the fleet is online. See [Operating hours and market status](/concepts/communities-and-zones#operating-hours-and-market-status).
+
+## Fleet payouts
+
+### How does my fleet get paid?
+
+It depends on the fleet's payment model. See [Payment models](/concepts/fleets#payment-models).
+
+- **Fleet-managed payouts**: fares, cancellation fees, and ride tips from the fleet's drivers are charged directly on the fleet's Stripe account. QR payments land there too. Yelo adds no platform fee. The fleet pays its drivers outside Yelo, and those drivers see "[fleet] manages your payout timing and banking details." in their app.
+- **Owner-operator**: each driver is paid into their own Stripe account. The fleet receives only QR payments on its own account.
+
+**Total Earnings** on the **Overview** tab shows the fleet's earnings for the selected period, compared with the previous period. For metric definitions, see [Ride metrics](/dashboard/ride-metrics).
+
+### Our drivers suddenly can't go online
+
+For a fleet-managed fleet, every driver depends on the fleet's Stripe account. If Stripe marks it restricted or pending, all its drivers are blocked from going online, drop off immediate ride pushes, and can't select the fleet. New drivers can't join either.
+
+Yelo's copy of the fleet's Stripe status updates from Stripe events and a daily re-check. An admin can compare it with live Stripe data on the fleet editor's **Operations** tab, which also has **Open Stripe dashboard**. The fleet's Stripe account owner resolves anything Stripe lists as due. See [Payout issues](/runbooks/payout-issues).
+
+### Where do I see payouts to our bank?
+
+In the fleet's Stripe account, not in Yelo. Yelo doesn't show fleet bank payouts, and fleet managers can't open the Stripe dashboard from the Yelo dashboard. Ask a Yelo admin for a link, or sign in to Stripe directly.

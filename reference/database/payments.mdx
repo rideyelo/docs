@@ -142,6 +142,8 @@ A fleet's QR-code payment page: a Stripe Product, Price, and Payment Link on the
 | `is_active` | `boolean` | No | `true` | Deactivated configs stay in the table. `GetActiveQrPaymentConfigBySlug` only returns active ones. |
 | `created_at`, `updated_at` | `timestamptz` | No | `now()` | |
 
+`UpdateQrPaymentConfig` and `DeactivateQrPaymentConfig` only change a row whose `stripe_payment_link_id` still matches the one the caller read, so concurrent repricing and deactivation can't hide an active link. `UpdateQrPaymentConfig` also requires an active config on an active, unarchived fleet. The Stripe link is deactivated before the row. A Stripe failure, or a missing account reference, blocks the local deactivation. Trigger `guard_fleet_qr_archive` rejects an active config, or a new payment link, on an archived fleet. An active config blocks archiving its fleet.
+
 ## QrPayments
 
 One row per completed Stripe Checkout Session from a QR payment or driver tip page. Created in `000203_qr_payments`. `PaymentService.CheckoutSessionCompleted` inserts it from the `checkout.session.completed` webhook.

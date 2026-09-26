@@ -79,11 +79,11 @@ erDiagram
 | `hourly_demand_graph_x`, `hourly_demand_graph_y` | `double precision[]` | no | `'{}'` | Legacy. No code reads them. Demand curves now live in `"RideDemandCurves"`. |
 | `slack_updates_channel_id` | `text` | yes | | Slack channel for market updates. Read-only in the API. |
 | `time_zone` | `text` | no | `'America/New_York'` | IANA timezone. Derived from the bounds by the timezone resolver (see below). |
-| `is_default` | `boolean` | no | `false` | Marks the fallback community for users and schools outside every active market. Excluded from coordinate lookup. |
+| `is_default` | `boolean` | no | `false` | Marks the fallback community for users and schools outside every active market. Excluded from coordinate lookup. Its `primary_fleet_id` is the fleet that drivers with no membership are enrolled in (`GetDefaultCommunity`, non-test and unarchived only). |
 | `primary_school_ids` | `uuid[]` | no | `'{}'` | Schools featured for the market. Returned in reads. No write path in the API. |
 | `is_hidden` | `boolean` | no | `false` | Hides the community from listings. |
 | `rides_disabled` | `boolean` | no | `false` | Kill switch for ride requests. `CreateCommunity` inserts `true`. |
-| `primary_fleet_id` | `uuid` | yes | | Default fleet. FK to `"Fleets"`. Setting it triggers `ensure_primary_fleet_service`. |
+| `primary_fleet_id` | `uuid` | yes | | Fallback ride option fleet. FK to `"Fleets"`. Setting it triggers `ensure_primary_fleet_service`. Only the default community's value drives automatic driver enrollment. A reference blocks archiving the fleet. |
 | `primary_vehicle_type` | `text` | no | `'x'` | Default vehicle type slug (see `"VehicleTypes"`). |
 | `auto_queue_max_minutes` | `integer` | no | `120` | Maximum auto-queue depth a driver can pick. |
 | `auto_queue_default_minutes` | `integer` | no | `60` | Default auto-queue depth. |
@@ -119,6 +119,7 @@ erDiagram
 | `calendar_geography_dirty` | After update of `geography_revision`, `timezone_status`, `is_active`, or `archived_at` | Calls `dirty_calendar_sources()` to re-sync fleet calendars. See [Fleet calendars](/reference/database/fleets-calendars). |
 | `ensure_primary_fleet_service` | After update of `primary_fleet_id` on a live community | Ensures the primary fleet has an enabled service row. See [Fleets, vehicles, and driver supply](/reference/database/fleets-and-vehicles). |
 | `retire_archived_community_services` | After `archived_at` goes from null to set | Retires the community's fleet services. |
+| `guard_fleet_primary_archive` | Before insert, or update of `primary_fleet_id` | Rejects an archived or missing fleet with `Fleet is archived or missing` (SQLSTATE `23514`). See [Fleet archival](/reference/database/fleets-and-vehicles#fleet-archival). |
 | `contact_sync_communities` | After update or delete | Calls `enqueue_contact_sync()` for contact matching. |
 
 **Relationships.** Referenced by most market-scoped tables, including `"Zones"`, `"Fleets"`, `"FleetCommunityServices"`, `"Locations"`, `"Notifications"`, `"ActivationConfigs"`, `"MobilityFeeds"`, and `surge_history`. `"Users".community_id` and `home_community_id` and `"Schools".community_id` point here without a foreign key.

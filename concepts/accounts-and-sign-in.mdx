@@ -14,7 +14,7 @@ A Yelo account is a row in the `Users` table (`internal/models/user.go`). The fi
 | `account_type` | `student` or `community`. New accounts start as `community`. An account becomes `student` only after a school verification succeeds. |
 | `community_id` / `home_community_id` | The market the user belongs to. Sign-in resolves it from location. See [Communities and zones](/concepts/communities-and-zones). |
 | `school_id` | Set by school verification. Empty for community accounts. |
-| `phone_number` | Only ever stored after a successful OTP check, so a non-empty value means "verified phone". |
+| `phone_number` | Auth v3 only stores it after a successful OTP check, and legacy phones are treated as verified, so a non-empty value means "verified phone". Web-channel Google or Apple sign-ups can leave it empty. |
 | `profile_completed` | `true` once the user has finished their profile (first and last name). |
 | `driver_application_status` | Where the user is in the driver application. See [Driver onboarding](/concepts/driver-onboarding). |
 | `acquisition_source` | How the user arrived: `app_organic`, `app_referral`, `qr_payment`, `event_link`, `csv_import`, `guest`, `driver_guest`, or `other`. |
@@ -29,7 +29,7 @@ A user becomes a student by verifying a school after sign-up:
 - **School email.** The in-app **Are you a student?** screen (`app/(app)/verify/1-oauth.tsx`) verifies a `.edu` address with a school OAuth sign-in or an email code.
 - **StudID.** The API also supports StudID verification through `POST /authv3/user/student/studid/start` and `/complete`. A StudID session is valid for 60 minutes.
 
-A successful verification sets `school_id`, `account_type = 'student'`, and `is_verified = true`. StudID proofs are stored in `EducationVerifications`, and users manage them from the profile **Accounts** screen.
+A successful verification sets `school_id`, `account_type = 'student'`, and `is_verified = true`. Every school proof (StudID, school Google or Microsoft account, or email code) is stored in `EducationVerifications`, and users manage them from the profile **Accounts** screen. Removing the last proof returns the account to `community`.
 
 <Note>
   School verification doesn't move a user to another community. The school's community mapping is informational. See [Schools and communities](/administration/schools-and-communities).
@@ -75,7 +75,7 @@ flowchart TD
     The user picks Apple, Google, or phone. If the hosted page can't be used, the app falls back to its native **Create your account** screen (`app/(auth-v3)/method.tsx`) on the same transaction.
   </Step>
   <Step title="Verify a phone number">
-    If the user signs in with Apple or Google in the app and the account has no phone yet, Yelo asks for one before finishing. Web-channel sign-ins, such as the dashboard, do not require a phone. See [Provider flows](/engineering/identity/provider-flows#the-supplemental-phone-step). Phone codes are five digits and are sent through Twilio Verify.
+    If the user signs in with Apple or Google in the app and the account has no phone yet, Yelo asks for one before finishing. Web-channel sign-ins on the signup site (tip and World Cup pages) don't require a phone. The dashboard uses Clerk, not Auth v3. See [Provider flows](/engineering/identity/provider-flows#the-supplemental-phone-step). Phone codes are five digits and are sent through Twilio Verify.
   </Step>
   <Step title="Finish your profile">
     New users enter a first and last name on **Finish profile** (`app/(auth-v3)/finish-profile.tsx`). They can enter a referral code and reuse their Apple or Google photo. Names are limited to 100 characters.
@@ -142,9 +142,9 @@ Only web clients use refreshable sessions (`/authv3/session/refresh`). The mobil
 
 A user can link more than one login method to the same account. Signed-in users start a link from the profile **Accounts** screen, which calls `POST /authv3/user/link/authorize`. `GET /authv3/user/identities` lists the linked identities.
 
-Sign-in is refused for disabled, deleted, or banned accounts and for ambiguous matches (`AuthV3DeniedReason` in `internal/models/authv3.go`).
+Sign-in is refused for disabled, deleted, or banned accounts, and the refused provider identity is recorded permanently in `AuthDeniedSubjects` (`AuthV3DeniedReason` in `internal/models/authv3.go`). Ambiguous matches return a conflict instead. The older `ambiguous_match` and `provider_slot_occupied` reasons were purged by a migration.
 
-When a user deletes their account, Yelo revokes their Apple token, removes their login identities, and scrubs their user row. If Apple revocation fails, nothing is deleted, so the deletion can be retried.
+When a user deletes their account, Yelo revokes their Apple token, removes their login identities, and scrubs their user row. If Apple revocation fails, identities and the user row are left intact, but the Stripe customer has already been deleted. See [Account deletion and retention](/engineering/identity/account-deletion).
 
 ## User requirements
 

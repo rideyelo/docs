@@ -18,24 +18,24 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | `https://api.rideyelo.com` | Production API. Mobile release builds always use it | `yelo-frontend` `lib/config.ts:1`; `yelo-web` `tools/vite/base/config.ts:18` (dev proxy default); `workers/world-cup-router/wrangler.jsonc` |
     | `https://api.joinyelo.com` | Production API alias. Web production builds fall back to it when `VITE_API_URL` is relative | `yelo-web` `src/lib/api-client.ts:10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:3`; `yelo-frontend` `lib/config.ts:2` (treated as production) |
     | `https://yelo-api-e2e-798668004250.us-central1.run.app` | E2E API on Cloud Run | `yelo-frontend` `lib/config.ts:6`, `eas.json` (`e2e-simulator`) |
-    | `http://localhost:8080` | Local API default (`API_URL`) | `yelo-api` `internal/utilities/config/config.go:254` |
+    | `http://localhost:8080` | Local API default (`API_URL`) | `yelo-api` `internal/utilities/config/config.go:257` |
 
-    Top-level API route groups that browsers or third parties hit directly are in `internal/server/http/router.go`: `/redirect` (`:339`), `/stripe-reauth` (`:333`), `/stripe-webhook` (`:334`), `/appstore-webhook` (`:335`), `/twilio-verify-events` (`:336`), `/twilio-webhook` (`:337`), `/link` (`:348`), `/public/events` (`:351`), `/referral` (`:355`), `/tips` (`:305`), `/world-cup` (`:299`), `/fleet-join` (`:193`), `/authv3` (`:239`), `/riverui/` (`:513`), and `/metrics` (`:207`).
+    Top-level API route groups that browsers or third parties hit directly are in `internal/server/http/router.go`: `/redirect` (`:339`), `/stripe-reauth` (`:333`), `/stripe-webhook` (`:334`), `/appstore-webhook` (`:335`), `/twilio-verify-events` (`:336`), `/twilio-webhook` (`:337`), `/link` (`:348`), `/public/events` (`:351`), `/referral` (`:355`), `/tips` (`:305`), `/world-cup` (`:299`), `/fleet-join` (`:193`), `/authv3` (`:239`), `/riverui/` (`:513`), and `/metrics` (`:195`, via `mountObservability`).
   </Accordion>
   <Accordion title="Web sites (Firebase Hosting)">
     The Firebase project is `yelo-dashboard-v2` (`.firebaserc`). Each site in `sites.config.json` deploys to its own Hosting site.
 
     | Site | Firebase site | Public domain | Evidence |
     | --- | --- | --- | --- |
-    | dashboard | `yelo-dashboard-v2` | `https://dash.rideyelo.com` | API `YELO_DASHBOARD_URL` default (`config.go:258`), CORS list (`config.go:730-731`) |
-    | signup | `yelo-signup` | `https://signup.yelo.link`, and under `joinyelo.com` via the experience router | CORS list (`config.go:732-733`), `workers/experience-router/wrangler.jsonc` |
-    | home | `yelo-home` | `https://joinyelo.com` (likely also `rideyelo.com`) | `og:url` in `src/sites/home/index.html:33`, CORS list (`config.go:728-729,740-742`) |
-    | event | `yelo-event` | `https://event.yelo.link` | CORS list (`config.go:736-737`) |
-    | invite | `yelo-invite` | `https://invite.yelo.link` | `INVITE_LANDING_BASE_URL` default (`config.go:355`), CORS list (`config.go:738-739`) |
-    | world-cup | `yelo-world-cup` | `https://world-cup.yelo.link`, and under `/world-cup` via the world-cup router | CORS list (`config.go:734-735`) |
+    | dashboard | `yelo-dashboard-v2` | `https://dash.rideyelo.com` | API `YELO_DASHBOARD_URL` default (`config.go:261`), CORS list (`config.go:736-737`) |
+    | signup | `yelo-signup` | `https://signup.yelo.link`, and under `joinyelo.com` via the experience router | CORS list (`config.go:738-739`), `workers/experience-router/wrangler.jsonc` |
+    | home | `yelo-home` | `https://joinyelo.com` (likely also `rideyelo.com`) | `og:url` in `src/sites/home/index.html:33`, CORS list (`config.go:734-735,746-748`) |
+    | event | `yelo-event` | `https://event.yelo.link` | CORS list (`config.go:742-743`) |
+    | invite | `yelo-invite` | `https://invite.yelo.link` | `INVITE_LANDING_BASE_URL` default (`config.go:361`), CORS list (`config.go:744-745`) |
+    | world-cup | `yelo-world-cup` | `https://world-cup.yelo.link`, and under `/world-cup` via the world-cup router | CORS list (`config.go:740-741`) |
     | maestro | `yelo-maestro` | `https://yelo-maestro.web.app` | E2E Auth v3 origin (`cloudbuild.e2e.yaml:120`, `eas.json`) |
 
-    The API's default CORS allowlist is the union of these origins and their `*.web.app` hosts (`corsTrustedOrigins`, `internal/utilities/config/config.go:722-744`).
+    The API's default CORS allowlist is the union of these origins and their `*.web.app` hosts (`corsTrustedOrigins`, `internal/utilities/config/config.go:728-750`).
   </Accordion>
   <Accordion title="Cloudflare Worker routes">
     | Worker | Routes | Upstream | Config |
@@ -65,7 +65,7 @@ Which Firebase site answers on which custom domain is configured in the Firebase
   <Accordion title="Other Yelo hosts">
     | URL | Purpose | Referenced at |
     | --- | --- | --- |
-    | `https://rideyelo.com` | Default `YELO_WEBSITE_URL`, `STRIPE_RETURN_URL`, and `OG_IMAGE_BASE_URL` | `config.go:257,285,359` |
+    | `https://rideyelo.com` | Default `YELO_WEBSITE_URL`, `STRIPE_RETURN_URL`, and `OG_IMAGE_BASE_URL` | `config.go:260,288,365` |
     | `http://redirect.rideyelo.com/?deepLink=com.rideyelo://<path>` | App-open wrapper built by the mobile app. Plain HTTP | `yelo-frontend` `lib/navigation/deepLink.ts:3`, `providers/SocialContext.tsx:32,63` |
     | `https://redeem.rideyelo.com` | Coupon redemption link | `yelo-frontend` `components/modals/CouponModal.tsx:108` |
     | `https://yelo.link/terms`, `https://yelo.link/privacy` | Legal links in the app | `app/(app)/profile/settings.tsx:294,301`, `app/(auth-v3)/phone.tsx:69,79` |
@@ -76,7 +76,7 @@ Which Firebase site answers on which custom domain is configured in the Firebase
   <Accordion title="Store listings">
     | URL | Used by |
     | --- | --- |
-    | `https://apps.apple.com/us/app/yelo-social-ride-network/id1667384111` | API `APP_STORE_URL` default, `/redirect` fallback (`config.go:256`) |
+    | `https://apps.apple.com/us/app/yelo-social-ride-network/id1667384111` | API `APP_STORE_URL` default, `/redirect` fallback (`config.go:259`) |
     | `https://apps.apple.com/app/apple-store/id1667384111?pt=125924162&mt=8` plus `&ct=<code>` | Invite landing store link with campaign token (`yelo-web` `src/sites/invite/referralHandoff.ts:1-5`) |
     | `https://apps.apple.com/us/app/yelo-ride-find-events/id1667384111` | Event site and friends hub (`yelo-web` `src/sites/event/lib/openInApp.ts:6`, `yelo-frontend` `components/bottom-sheets/friends-hub/constants.ts:7`) |
     | App Store Connect app `1667384111` | `ascAppId` in `eas.json` |
@@ -95,7 +95,7 @@ Which Firebase site answers on which custom domain is configured in the Firebase
 | iOS bundle id / Android package | `io.flutterflow.ridedesi.desirider` / `com.rideyelo` | `.e2e` / `com.rideyelo.e2e` | `app.json`, `app.config.ts:32-33` |
 | Queried external schemes | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam` | Same | `app.json` `LSApplicationQueriesSchemes`, `app.config.ts:31` |
 | Auth v3 redirect URI | `com.rideyelo://auth/v3/callback` | `com.rideyelo.e2e://auth/v3/callback` | `lib/auth/security.ts:4-7`, `cloudbuild.e2e.yaml:120` |
-| API `/redirect` scheme | `com.rideyelo://` (`APP_URL_SCHEME`) | | `config.go:255` |
+| API `/redirect` scheme | `com.rideyelo://` (`APP_URL_SCHEME`) | | `config.go:258` |
 
 Web association files live in `yelo-web/public/.well-known/` and ship with every site that copies `public/`:
 

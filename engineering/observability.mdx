@@ -9,7 +9,7 @@ Each signal has one home. Use this table to decide where to look and where to ad
 | --- | --- | --- | --- |
 | Logs | zerolog, JSON to Cloud Logging | Browser console | `react-native-logs`, console plus rotated files |
 | Traces | OpenTelemetry, OTLP gRPC export | Sentry browser tracing (dashboard) | Sentry, 20% sampling |
-| Metrics | OpenTelemetry with a Prometheus exporter at `/metrics` | None | Device telemetry posted to the API |
+| Metrics | OpenTelemetry with a Prometheus exporter at `/metrics` (mounted only when `METRICS_AUTH_TOKEN` is set) | None | Device telemetry posted to the API |
 | Errors | Sentry | Sentry (dashboard) | Sentry |
 | Product analytics | PostHog business events | PostHog (signup Auth v3 only) | PostHog events and session replay |
 
@@ -36,14 +36,14 @@ golangci-lint enforces structured logging. Use typed zerolog fields instead of f
 
 `internal/utilities/otel` initializes OpenTelemetry at startup when `OTEL_ENABLED=true`, which is the default.
 
-- **Export.** Traces go to `OTEL_OTLP_ENDPOINT` over OTLP gRPC. Setting `OTEL_OTLP_AUTH_HEADER` or `ENVIRONMENT=prod` enables TLS, and the auth header is sent as HTTP basic auth, which is the format Grafana Cloud expects. Tracing is off when the endpoint is empty.
+- **Export.** Traces go to `OTEL_OTLP_ENDPOINT` over OTLP gRPC. Setting `OTEL_OTLP_AUTH_HEADER` or `ENVIRONMENT=prod` enables TLS, and the auth header is sent as HTTP basic auth, which is the format Grafana Cloud expects. Production runs with `ENVIRONMENT=production`, which the TLS check doesn't match (`otel.go:134`), so TLS depends on the auth header being set. Tracing is off when the endpoint is empty.
 - **Sampling.** `OTEL_TRACE_SAMPLING_RATIO` sets the ratio from `0.0` to `1.0`. `.env.example` uses `1.0` for development and recommends `0.01` to `0.25` in production.
 - **Resource.** `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, and `ENVIRONMENT` as `deployment.environment`.
 - **Propagation.** W3C Trace Context and Baggage.
 
 Instrumentation comes from four places:
 
-1. HTTP middleware wraps every request with `otelhttp` and flags requests slower than `SLOW_REQUEST_THRESHOLD_MS`.
+1. HTTP middleware wraps every request with `otelhttp` and flags requests slower than `SLOW_REQUEST_THRESHOLD_MS`. Span names and the `http.route` label use the raw URL path, and Yelo's custom request attributes never reach the server span. See [Metrics](/reference/metrics#spans).
 2. `PgxTracer` creates a span per query with sanitized SQL and warns about queries slower than `SLOW_QUERY_THRESHOLD_MS`. `DISABLE_SLOW_QUERY_WARNINGS` turns the warnings off.
 3. `NewInstrumentedHTTPClient` traces outbound provider calls.
 4. Service methods open spans with `otel.CustomSpan(ctx, "<domain>", "<Method>")` and defer the returned function, which records the error automatically. Use the `AttrKey*` constants in `helpers.go` (`ride.id`, `community.id`, `fleet.id`, and so on) for business attributes.
@@ -54,10 +54,10 @@ Sentry on the API runs with `TracesSampleRate: 0`. OpenTelemetry owns tracing.
 
 When OpenTelemetry is enabled, the API registers a `MultiMetricsProvider` that fans out to two backends:
 
-- **OpenTelemetry**, exported in Prometheus format at `GET /metrics`. This covers HTTP requests, durations, sizes, and in-flight counts, database query counts and durations, connection pool stats, Redis operations and cache hit rate, circuit breaker state, rate limiter rejections, external call latency, notification delivery, and OTP delivery status. Go runtime metrics are included.
+- **OpenTelemetry**, exported in Prometheus format at `GET /metrics`. This covers HTTP request latency and body sizes from `otelhttp`, Yelo's HTTP error, size, slow-request, and in-flight metrics, connection pool stats, Redis operations and cache hit rate, circuit breaker state for the `google-maps` and `redis` breakers, rate limiter rejections, notification delivery, and OTP delivery status. Go runtime metrics are included. The instruments for Yelo's own request count and duration, per-query database metrics, and external call metrics are registered but never recorded. See [Metrics](/reference/metrics#metric-catalog).
 - **PostHog**, which receives only business counters. Any metric whose name starts with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` is dropped. Events without an authenticated user use the distinct ID `yelo-api` and do not create a person profile.
 
-`/metrics` requires a bearer token when `METRICS_AUTH_TOKEN` is set. `PPROF_ENABLED=true` also mounts `/debug/pprof/` behind the same check, with `PPROF_BLOCK_RATE` and `PPROF_MUTEX_RATE` controlling profiling rates.
+`mountObservability` (`internal/server/http/middleware_metrics_auth.go`) mounts `/metrics` only when `METRICS_AUTH_TOKEN` is set, and every request needs `Authorization: Bearer <token>`. When the token is empty, neither `/metrics` nor `/debug/pprof/` exists, and the API logs `metrics and pprof endpoints disabled: METRICS_AUTH_TOKEN is not set`. `PPROF_ENABLED` defaults to `false`. When you set it to `true`, `/debug/pprof/` is mounted behind the same token check, with `PPROF_BLOCK_RATE` and `PPROF_MUTEX_RATE` controlling profiling rates. Production reads the token from the `yelo-api-metrics-auth-token` secret.
 
 ### Health and job visibility
 
@@ -79,7 +79,7 @@ make rund
 | Grafana | `http://localhost:3000` | Provisioned dashboards: API performance, database health, external dependencies, Redis caching, request deep dive, system health |
 | Jaeger | `http://localhost:16686` | OTLP gRPC on port 4317 |
 
-To send traces to Jaeger from `make run`, set `OTEL_OTLP_ENDPOINT=localhost:4317` in `.env`. The alert rules (high error rate, API down, pool exhaustion, open circuit breaker, slow queries, and more) are a reference for local testing.
+To send traces to Jaeger from `make run`, set `OTEL_OTLP_ENDPOINT=localhost:4317` in `.env`. The alert rules (high error rate, API down, pool exhaustion, open circuit breaker, slow queries, and more) are a reference for local testing. Many of them query series the API never exports, such as `http_server_requests_total` and `db_query_duration_bucket`, so they can't fire. See [Local alert rules and dashboards](/reference/metrics#local-alert-rules-and-dashboards).
 
 ## Web
 

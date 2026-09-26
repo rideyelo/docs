@@ -53,7 +53,13 @@ Retirement keeps the fleet's price rows open (`end_time` stays `NULL`) so a rest
 
 ### Community archival
 
-Archiving a community (the `ArchiveCommunity` query, or any direct `UPDATE` of `archived_at`) fires `retire_archived_community_services`. It retires every enabled service in the community with `updated_by = 'community_archive'` and sets `end_time = NOW()` on every open price row in the community. Archival is the only lifecycle event that ends fleet prices automatically. An archived community's services can't be restored, because the parent lock rejects archived communities.
+Archiving a community (the `ArchiveCommunity` query, or any direct `UPDATE` of `archived_at`) fires `retire_archived_community_services`. It retires every enabled service in the community with `updated_by = 'community_archive'` and sets `end_time = NOW()` on every open price row in the community. An archived community's services can't be restored, because the parent lock rejects archived communities.
+
+### Fleet archival
+
+Archiving a fleet (`DELETE /dashboard/communities/{id}/fleets/{fleet_id}`) runs `RetireArchivedFleetServices` in the same transaction as the archive. It retires every enabled service for the fleet with `updated_by = 'fleet_archive'`. `EndArchivedFleetPricing` then ends every current and future price row for the fleet, in every community, at `GREATEST(NOW(), start_time)`. An archived fleet's services can't be restored, because the parent lock rejects archived fleets. See [Archive](/engineering/fleets/stripe-and-lifecycle#archive).
+
+Community archival and fleet archival are the only lifecycle events that end fleet prices automatically.
 
 Temporarily deactivating a community (`is_active = FALSE`) or a fleet only hides rows from `ActiveFleetCommunityServices`. It doesn't retire or end anything.
 
@@ -72,7 +78,7 @@ Temporarily deactivating a community (`is_active = FALSE`) or a fleet only hides
 | Matching, ride board, accept | No |
 
 <Warning>
-  Coverage is a dashboard and calendar concept. Rider pricing reads every open `per_ride` price row in the community. A retired service's prices stay open by design, so they stay visible to riders whenever the fleet also has a featured price row or a live session there. The existing [Fleets concept page](/concepts/fleets#service-communities) describes coverage as gating riders. The code on `main` doesn't do that.
+  Coverage is a dashboard and calendar concept. Rider pricing reads every open `per_ride` price row in the community. A retired service's prices stay open by design, so they stay visible to riders whenever the fleet also has a featured price row or a live session there. The same applies to an inactive fleet, for example one whose Stripe account was unlinked. Archiving a fleet or community ends its prices, which removes it from riders.
 </Warning>
 
 ## Operating calendars
@@ -178,7 +184,7 @@ Only the primary fleet's calendar reaches riders. Other fleets' calendars are vi
 
 ## Gotchas and edge cases
 
-- **Deleting a fleet doesn't retire its services.** The rows stay `enabled` with no `retired_at`. The view hides them only because the fleet is deleted, and `GetFleetCommunityServices` returns 404 for a deleted fleet, so the dashboard can't show or change them.
+- **Archived fleets' services are frozen.** Archive retires them, and `GetFleetCommunityServices` returns 404 for an archived fleet, so the dashboard can't show or restore them. Fleets deleted before migration `000346` may still have enabled rows, hidden only by the view.
 - **You can't create a disabled service.** Sending `enabled: false` with `expected_revision: 0` for a missing row returns 409, not a no-op.
 - **Fleet deactivation pauses calendars.** `ListDueCalendarSyncs` and `ClaimCalendarSync` require an active service, so unlinking Stripe stops imports. `GetPublishedCalendarSnapshot` also joins the view, so the dashboard and rider projection stop showing hours until the fleet is reactivated.
 - **Geography edits invalidate published hours.** A published snapshot is used only while its `geography_revision` and `time_zone` match the community. Editing zones or the timezone hides hours until the next import succeeds.

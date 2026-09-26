@@ -1,13 +1,13 @@
 ---
 title: "Fleet Stripe accounts and lifecycle operations"
-description: "How fleets are created, cloned, updated, deleted, and unlinked from Stripe, how fleet Stripe status and activation are driven by webhooks and reconciliation, and what each operation cascades to."
+description: "How fleets are created, cloned, updated, archived, and unlinked from Stripe, how fleet Stripe status and activation are driven by webhooks and reconciliation, and what each operation cascades to."
 ---
 
-This page follows a fleet from creation to deletion, with the Stripe side of each step. For payout routing on rides, see [Membership and payout routing](/engineering/fleets/membership-and-payout-routing). For the admin UI, see [Fleets](/dashboard/fleets).
+This page follows a fleet from creation to archival, with the Stripe side of each step. For payout routing on rides, see [Membership and payout routing](/engineering/fleets/membership-and-payout-routing). For the admin UI, see [Fleets](/dashboard/fleets).
 
 ## State model
 
-A fleet-merchant fleet moves through these combinations of `is_active`, `stripe_status`, and `deleted_at`. Owner-operator fleets are created as `is_active = TRUE`, `stripe_status = 'not_required'`, and only leave that state on delete.
+A fleet-merchant fleet moves through these combinations of `is_active`, `stripe_status`, and `deleted_at`. Owner-operator fleets are created as `is_active = TRUE`, `stripe_status = 'not_required'`, and only leave that state on archive.
 
 ```mermaid
 stateDiagram-v2
@@ -21,10 +21,10 @@ stateDiagram-v2
   Ready --> Restricted: account.updated -> restricted (is_active stays TRUE)
   Ready --> Pending: unlink (new account, is_active FALSE)
   Restricted --> Pending: unlink
-  Pending --> Deleted: delete
-  Ready --> Deleted: delete
-  Restricted --> Deleted: delete
-  Deleted --> [*]
+  Pending --> Archived: archive
+  Ready --> Archived: archive
+  Restricted --> Archived: archive
+  Archived --> [*]
 ```
 
 | State | `is_active` | `stripe_status` | Payout-ready |
@@ -32,9 +32,9 @@ stateDiagram-v2
 | Pending | `FALSE` | `pending` | No |
 | Ready | `TRUE` | `complete` | Yes, if `has_custom_payouts` |
 | Restricted | Unchanged, usually `TRUE` | `restricted` | No |
-| Deleted | `FALSE` | Unchanged | No |
+| Archived | `FALSE` | Unchanged | No |
 
-The dashboard list derives its badge in `StatusBadge` (`yelo-web/src/sites/dashboard/pages/ManageFleetsPage.tsx`) in this priority: deleted, `restricted`, `pending`, `is_active`, otherwise inactive.
+The dashboard list derives its badge in `StatusBadge` (`yelo-web/src/sites/dashboard/pages/ManageFleetsPage.tsx`) in this priority: deleted, `restricted`, `pending`, `is_active`, otherwise inactive. The list query excludes archived fleets, so the **Deleted** branch never renders.
 
 ## Create
 
@@ -82,15 +82,15 @@ Effects of the toggles:
 | --- | --- |
 | `has_custom_payouts` | Changes payout readiness, joinability, and routing for the next authorization. Turning it off on a fleet-merchant fleet makes its fleet-managed drivers read as `pending` and blocks them from going online. Turning it on for an owner-operator fleet disables invitations. |
 | `requires_confirmation_code` | Applies to rides confirmed afterwards. Existing rides keep their code. |
-| `is_student_only` | Applies to the next rider options request. |
-| `name` | Changes derived `Fleet: <name>` tags immediately. Renaming the `Yelo` fleet changes badges and T0 targeting. |
+| `is_student_only` | Applies to the next rider options request, including the verified-student badge. |
+| `name` | Changes derived `Fleet: <name>` tags immediately. Renaming the `Yelo` fleet changes T0 targeting. |
 
 ## Stripe status sources
 
 | Source | Code | Effect |
 | --- | --- | --- |
-| `account.updated` webhook | `PaymentService.AccountUpdated` → `handleFleetAccountUpdated` in `internal/service/payment/payment.go` | Matches every non-deleted fleet with this `stripe_merchant_id`. Past-due or currently-due requirements set `restricted`. Payouts disabled sets `pending`. Otherwise `complete`. |
-| Daily reconciliation | `reconciliation_jobs.go`, `queries/stripe_reconciliation.sql` | Discovers every non-deleted fleet account and re-runs `AccountUpdated` about every 24 hours per account. |
+| `account.updated` webhook | `PaymentService.AccountUpdated` → `handleFleetAccountUpdated` in `internal/service/payment/payment.go` | Matches every non-archived fleet with this `stripe_merchant_id`. Past-due or currently-due requirements set `restricted`. Payouts disabled sets `pending`. Otherwise `complete`. |
+| Daily reconciliation | `reconciliation_jobs.go`, `queries/stripe_reconciliation.sql` | Discovers every non-archived fleet account and re-runs `AccountUpdated` about every 24 hours per account. Accounts Stripe rejects as invalid are rechecked weekly. |
 | Refresh link | `RefreshStripeOnboardingLink` | Mints a new Account Link and stores it, keeping the current status. Admin only. |
 | Unlink | `UnlinkStripe` | Sets `pending` with a new account. |
 
@@ -119,31 +119,46 @@ If a connected account matches any fleet, the webhook takes the fleet branch and
 
 None of these steps are in a database transaction.
 
-## Delete
+## Archive
 
-`DELETE /dashboard/communities/{id}/fleets/{fleet_id}` is allowed for admins and the fleet's managers. `DeactivateDashboardFleet` runs one statement:
+`DELETE /dashboard/communities/{id}/fleets/{fleet_id}` is allowed for admins and the fleet's managers. The dashboard labels it **Archive fleet**. `sqlDashboardRepository.DeleteFleet` runs one transaction:
 
-```sql
-UPDATE "Fleets" SET is_active = FALSE, deleted_at = NOW(),
-    stripe_merchant_id = NULL, updated_at = NOW()
-WHERE id = $1 AND deleted_at IS NULL;
-```
+<Steps>
+  <Step title="Lock the fleet">
+    `LockFleetServiceFleet` locks the non-archived fleet row. A missing or already archived fleet returns 404 **fleet not found**.
+  </Step>
+  <Step title="Check blockers">
+    `GetFleetArchiveBlockers` (`queries/fleet_archive.sql`) checks seven conditions. Any hit returns 400 **Cannot archive fleet:** followed by every matching reason.
+  </Step>
+  <Step title="Archive">
+    `DeactivateDashboardFleet` sets `is_active = FALSE`, `deleted_at = NOW()`, `driver_join_code = NULL`, and `driver_join_code_rotated_at = NOW()`. It keeps `stripe_merchant_id`.
+  </Step>
+  <Step title="Retire dependents">
+    `RetireArchivedFleetServices` retires enabled services (`updated_by = 'fleet_archive'`). `EndArchivedFleetPricing` ends current and future price rows at `GREATEST(NOW(), start_time)`. `DisableArchivedFleetWhitelist` deactivates whitelist entries.
+  </Step>
+</Steps>
 
-What happens to everything else:
+| Blocker | Reason text | Resolve by |
+| --- | --- | --- |
+| Any `FleetDrivers` row with `is_active` | switch drivers who still have this fleet active | Move each driver's active fleet with the membership editor |
+| Any `DriverApplications.payout_fleet_id` for the fleet | move remaining driver payout assignments | Select another active fleet for those drivers |
+| Any open `DriverSessions` row | end open driver sessions | Drivers go offline, or an admin membership edit takes them offline |
+| Any ride not `complete`, `pending_rider_rating`, or `no_drivers_available` | finish or cancel outstanding rides | Finish or cancel the rides |
+| Any `Communities.primary_fleet_id` reference | replace community primary-fleet references | Change the community's **Primary Fleet** |
+| Any unarchived `FleetVehicles` vehicle, or an archived one still selected in `Users.vehicle_id` | archive or reassign fleet vehicles and clear their selections | Archive or reassign the vehicles |
+| Any active `QrPaymentConfigs` row | deactivate fleet QR payment links | Deactivate the payment links |
 
-| Object | After delete |
+After archive:
+
+| Object | State |
 | --- | --- |
-| Stripe account | Not deleted. Only the reference is cleared. |
-| `FleetDrivers` | Unchanged, including `is_active = TRUE`. Members' `ActiveFleetId` still points here. |
-| `DriverApplications.payout_fleet_id` | Unchanged. Fleet-managed members read as `pending` and can't go online. |
-| Open `RidePriceParameters` | Unchanged. The trigger blocks new open rows for the fleet. |
-| `FleetCommunityServices` | Unchanged and still enabled, hidden by the view. |
-| `CalendarConnections` | Unchanged. Sync stops because the service isn't active. |
-| `FleetVehicles` | Unchanged. The inventory disappears from `AvailableDriverVehicles`. Admin writes fail with **fleet not found**. |
-| `driver_join_code` | Unchanged. Preview returns `available: false`. |
-| `QrPaymentConfigs` | Unchanged. `DeactivateConfig` skips the Stripe call because the account ID is now `NULL`. |
-| Rides in progress | Continue. Completion recomputes the Stripe account and falls back to the driver's account because `stripe_merchant_id` is `NULL`. |
-| `Communities.primary_fleet_id` | Unchanged. The community keeps a deleted primary fleet. |
+| Stripe account | Not deleted. The reference stays on the fleet row for history, but webhooks and reconciliation ignore archived fleets. |
+| Inactive `FleetDrivers` rows | Kept. The membership editor lists them as archived. They grant no shared-vehicle access and can't be selected. |
+| `FleetCommunityServices` | Retired. `CalendarConnections` stop syncing. |
+| `RidePriceParameters` | Ended. |
+| `driver_join_code` | Cleared. The Dub short link isn't touched and previews as 404. |
+| `FleetDriverWhitelist` | Deactivated. |
+| New references | Rejected by the [archive guards](/engineering/fleets/data-model#archive-guards). |
 
 ## Where this lives in code
 
@@ -151,6 +166,7 @@ What happens to everything else:
 | --- | --- |
 | Lifecycle service | `yelo-api/internal/service/dashboard/fleet.go` |
 | Lifecycle SQL | `CreateDashboardFleet`, `UpdateDashboardFleet`, `DeactivateDashboardFleet`, `SetDashboardFleetStripeStatus`, `ActivateDashboardFleet`, `SetDashboardFleetStripeMerchantID` in `yelo-api/internal/data/repository/queries/driver_fleet_primitives.sql` |
+| Archive checks | `checkFleetArchiveBlockers` in `yelo-api/internal/data/repository/fleet_archive.go`, `queries/fleet_archive.sql`, `migrations/000346_fleet_archive_reference_guards.up.sql` |
 | Repository | `yelo-api/internal/data/repository/dashboard.go` |
 | Handlers | `yelo-api/internal/server/http/community/community_handler.go`; routes in `community_router.go` (`registerFleetRoutes`) |
 | Request validation | `yelo-api/internal/server/http/community/requests/fleet.go` |
@@ -167,5 +183,8 @@ What happens to everything else:
 - **Price copy and expiry only see active coverage.** `copyPricingToFleet`, `copyPricingFromSourceFleet`, and `expirePricingForFleet` read `GetAllRidePriceParameters`, which joins `ActiveFleetCommunityServices`. A source fleet that is inactive or pending Stripe contributes nothing, and removing a vehicle type from an inactive fleet doesn't end its price row.
 - **Pricing tie-breaks are alphabetical.** `copyPricingToFleet` takes the first matching row from `ListDashboardRidePriceParameters`, ordered by fleet name, then vehicle type, then newest start time. A new fleet inherits prices from the alphabetically first fleet that prices the type.
 - **Fleet-merchant fleets without custom payouts are never ready.** Creating one with `has_custom_payouts = false` still creates a Stripe account, and the webhook will activate the fleet, but it can't accept joins and its drivers can't use fleet-managed payouts.
-- **The Deleted badge is unreachable.** `ListDashboardFleets` filters `deleted_at IS NULL`, so the list never contains a deleted fleet.
-- **Delete isn't reversible through the API.** Every write query filters `deleted_at IS NULL`, and there is no restore endpoint.
+- **The Deleted badge is unreachable.** `ListDashboardFleets` filters `deleted_at IS NULL`, so the list never contains an archived fleet.
+- **Archive isn't reversible through the API.** Every write query filters `deleted_at IS NULL`, and there is no restore endpoint.
+- **Managers can archive their own fleet.** `DeleteFleet` uses `assertFleetAccess`, so the blockers are the only safeguard. See [Manager authorization](/engineering/fleets/dashboard-authorization).
+- **Unlink can delete an account an archived fleet still references.** `cleanupOrphanedStripeAccount` counts only non-archived fleets on the account. If the only other fleet sharing it is archived, unlinking deletes the account at Stripe.
+- **Webhook activation stops at the first driver error.** `handleFleetAccountUpdated` returns on the first `ReconcileDriverActivation` error, skipping the remaining drivers and fleets on the account until the next webhook or reconciliation.

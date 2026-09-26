@@ -1,0 +1,158 @@
+---
+title: "Mobile tests"
+description: "Jest with jest-expo in yelo-frontend: what the unit suite covers, how tests mock native modules and render providers and hooks, the node --test script suites, CI gates, and manual device testing"
+---
+
+`yelo-frontend` has two test layers. Jest runs fast, backend-free unit tests on every pull request. Device behavior is covered by the agent-device suites described in [E2E environment](/engineering/qa/e2e), which run only on demand. This page covers the Jest layer, the script tests, CI, and manual device runs.
+
+## Jest setup
+
+`jest.config.js` is the whole configuration:
+
+```js
+module.exports = {
+  preset: 'jest-expo',
+  testMatch: ['**/*.test.ts', '**/*.test.tsx'],
+};
+```
+
+- The `jest-expo` preset (`~57.0.5`) supplies the Babel transform for React Native and Expo modules and the native module stubs.
+- There's no `setupFiles`, no global `__mocks__` directory, and no custom environment. Every test declares its own mocks.
+- The only Jest-related dependencies are `jest-expo` and `@types/jest`. Jest itself comes in through `jest-expo`. There's no Testing Library.
+- Tests sit beside their source as `*.test.ts` or `*.test.tsx` and import through the `@/` alias from `tsconfig.json`.
+
+### Rendering components, providers, and hooks
+
+Tests that need React rendering load `react-test-renderer` through `jest-expo`'s own dependency tree rather than a direct dependency:
+
+```ts
+const { create } = require(
+  require.resolve('react-test-renderer', { paths: [require.resolve('jest-expo/package.json')] }),
+) as { create: (element: ReactNode) => { unmount: () => void } };
+```
+
+33 test files use this pattern. They typically:
+
+1. Set `IS_REACT_ACT_ENVIRONMENT = true` on `globalThis` (30 files) so `act` from `react` flushes effects.
+2. Build a `QueryClient` with `retry: false` and, when they seed data with `setQueryData`, infinite `gcTime` and `staleTime` (13 files wrap a `QueryClientProvider`).
+3. Render a small `Harness` component that calls the hook or reads the provider's context and copies the value into a test variable.
+4. Drive time with `jest.useFakeTimers()` (21 files) for polling, countdowns, and debounced effects.
+
+`providers/SessionProvider.test.tsx` is a complete example. It mocks storage, the current-user query, routing, analytics, and stores, then checks that the auth gate stays closed until the new token's profile request succeeds.
+
+### Mocking conventions
+
+Each file mocks what it touches with `jest.mock` at the top. The most common targets across the suite:
+
+| Module | Files | Why |
+| --- | --- | --- |
+| `@/lib/observability/logger` | 29 | Keeps Sentry and console quiet, and lets tests assert error logs |
+| `expo-router` | 15 | Provides `useRouter`, `usePathname`, `useRootNavigationState`, and `useGlobalSearchParams` |
+| `@/providers/SessionProvider` | 13 | Supplies a fixed session |
+| `@/lib/theme` | 13 | Avoids loading the full theme |
+| `@/api/helpers/authUser` | 12 | Controls `useCurrentUser` |
+| `@/components/design-system` | 10 | Replaces glass and native-backed components with plain views |
+| `@/api/axios` | 10 | Replaces `customInstance`, the transport every generated hook uses |
+| `@react-native-async-storage/async-storage` | 9 | Usually backed by an in-memory `Map` in `beforeEach` |
+| `@/lib/platform/haptics` | 9 | No native haptics in Jest |
+| `@/api/generated/endpoints/*` | varies | Mock the specific generated hooks a component calls |
+
+Typed helpers keep mocks honest: `jest.mocked(fn).mockImplementation(...)`, and `jest.requireActual<typeof Module>('module')` inside a factory when you need part of the real module. Name factory-referenced variables with a `mock` prefix, such as `mockRouter`. Jest hoists `jest.mock` calls and allows only `mock`-prefixed outer variables inside the factory.
+
+Shared test data builders live in `lib/ride/testing/`. `rideOptions.ts` exports `makeOption`, a `VehicleOptionV2` with sensible defaults and overrides.
+
+## What's covered
+
+161 Jest files on `main`:
+
+| Directory | Files | Focus |
+| --- | --- | --- |
+| `lib/` | 89 | Pure logic: map geometry and label placement (22), ride presentation, command identity, and lifecycle navigation (14), contacts (9), auth (8), messaging (7), platform, formatting, storage, query, notifications, payments, config, and the update gate |
+| `components/` | 39 | Request sheet snaps, stop seeding, ride option groups, `StripePaymentScreen`, `CurrentRideBottomSheet`, queued rider screen, fleet join, error boundaries, search, bump sheet, invite screen |
+| `hooks/` | 11 | `usePreRideRequest`, `useRideLifecycleNavigation`, driver ride details, queue details, search suggestions, countdown, identity linking |
+| `providers/` | 11 | `SessionProvider`, `AuthV3Provider`, `AxiosProvider`, `RideProvider`, `RideMatchingProvider`, `PushNotificationProvider`, `StartupPhaseProvider`, `EasUpdateObserver`, map top bar slots, drive ride selection |
+| `api/` | 6 | Axios interceptors, the ride status protocol, and `api/helpers` for auth user, community, and bump |
+| `stores/` | 4 | Contact match, account status, map tutorial, and map startup stores |
+| `tasks/` | 1 | `DriverLocationTask` |
+
+<Note>
+Keep Jest tests deterministic and backend-free. Anything that needs a real simulator, native module, OS permission, push, or the API belongs in an E2E suite. Component tests don't make device regressions green: `yelo-frontend/E2E.md` says so explicitly for the ride notification regressions.
+</Note>
+
+## Script tests
+
+`make test` also runs Node's built-in test runner on build and runner scripts:
+
+| Command | What it checks |
+| --- | --- |
+| `node scripts/vehicle-catalog.mjs check` | The generated vehicle image catalog matches its source. `make fix` regenerates it. |
+| `node --test scripts/vehicle-catalog.test.mjs` | Catalog validation rules |
+| `node --test scripts/e2e-resource-queue.test.mjs` and eight other `scripts/e2e-*.test.mjs` files | Scheduler admission, local CA, coverage, local wrapper, ride assertions and transitions, app target preflight, build provenance, artifacts |
+| `node --test scripts/dev.test.mjs scripts/prepare-google-services.test.mjs` | Dev runtime and Google services preparation |
+
+<Warning>
+`scripts/e2e-suite-lock.test.mjs` exists but isn't listed in the `test` target, so it never runs in CI. Add it to the `node --test` line in the `Makefile` if you change the suite lock.
+</Warning>
+
+## Run tests
+
+```bash
+make test                                  # Jest plus every script test, as CI runs it
+npx jest                                   # Jest only
+npx jest providers/SessionProvider.test.tsx
+npx jest -t 'keeps the auth gate closed'   # by test name
+npx jest --watch lib/ride
+node --test scripts/e2e-resource-queue.test.mjs
+```
+
+## CI gates
+
+`ci.yml` runs one **Checks** job on non-draft pull requests (`blacksmith-2vcpu-ubuntu-2404`, 15-minute timeout, Node 22). Every step after the install runs even if an earlier one failed, so a pull request sees all its problems at once.
+
+| Step | Command | Details |
+| --- | --- | --- |
+| API contract | `make api-check` | `openapi.json` matches `openapi.lock.json`, and Orval output is current. See [OpenAPI and generated clients](/engineering/openapi-and-clients). |
+| Format | `make fmt-check` | `oxfmt --check` |
+| Typecheck | `make typecheck` | `tsgo --noEmit` |
+| Lint | `make lint` | `oxlint` with `correctness`, `suspicious`, `pedantic`, `perf`, and `style` all at `error`, then ESLint for React Hooks and `@react-native/platform-colors` and `no-deep-imports` |
+| Type-aware lint | `make lint-types` | `oxlint --type-aware -c .oxlintrc.typeaware.json` |
+| Unit tests | `make test` | Jest and the script tests above |
+
+`make check` runs the same six steps locally. `fingerprint.yml` runs separately and comments when a change isn't OTA-safe. See [Mobile releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
+## Device testing
+
+Manual device runs use the worktree dev runtime. Each worktree gets its own ports and Metro, and simulators come from a shared pool.
+
+| Command | API | Use |
+| --- | --- | --- |
+| `make sims` | Production | Metro plus the configured iOS simulators |
+| `make sims-local` | Local API (`SIM_API_ENV=dev`) | Test API changes, or use Stripe test keys |
+| `make sims-rebuild` | Production | Rebuild the native app first |
+| `make asims AVD=<name>`, `asims-local`, `asims-rebuild` | As above | Android emulator |
+| `make asims-list`, `make asims-stop AVD=<name>` | n/a | List or stop Android emulators |
+| `make pool-status`, `pool-create`, `pool-add`, `pool-clean`, `pool-reset` | n/a | Inspect and manage the shared simulator pool |
+
+<Warning>
+`make sims`, `make asims`, staging builds, and staged OTA updates all talk to the production API. Use reserved `+1555` numbers with code `12345` to sign in there. Don't try Stripe test cards against production: its keys are live. Use `make sims-local` with a local API configured with `sk_test_` and `pk_test_` keys instead.
+</Warning>
+
+For a release pass on a device, follow [Manual QA checklists](/engineering/qa/manual-qa-checklists).
+
+## Gotchas and edge cases
+
+- **No global setup means no global cleanup.** A test that switches to fake timers or sets `IS_REACT_ACT_ENVIRONMENT` must restore state itself. Jest isolates modules per file, but not per test inside a file.
+- **`react-test-renderer` tracks `jest-expo`.** An Expo SDK upgrade can change the renderer version under you, because it's resolved from `jest-expo`'s dependencies.
+- **Mocks of generated hooks drift silently.** A `jest.mock` factory for `@/api/generated/endpoints/...` doesn't type-check against the real module unless you type it. Regenerate the client and rerun the tests after an API change.
+- **Simulators skip push registration.** `PushNotificationProvider` never gets an Expo push token on a simulator. Notification taps in E2E are injected payloads, not APNs deliveries.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Jest config | `yelo-frontend/jest.config.js` |
+| Make targets | `yelo-frontend/Makefile` (`test`, `check`, `sims*`, `asims*`, `pool-*`) |
+| CI | `yelo-frontend/.github/workflows/ci.yml`, `fingerprint.yml` |
+| Lint config | `yelo-frontend/.oxlintrc.json`, `.oxlintrc.typeaware.json`, `eslint.config.js` |
+| Test data builders | `yelo-frontend/lib/ride/testing/` |
+| Script tests | `yelo-frontend/scripts/*.test.mjs` |

@@ -93,12 +93,11 @@ The advisory lock is released with `context.WithoutCancel`, so a cancelled reque
 
 ### Stranded queues
 
-`PromoteAutoQueuedRide` refuses to promote when the driver's session doesn't match the ride's `driver_vehicle_id` and `fleet_id`, or when the driver has zero or several open sessions. Nothing else moves such a ride:
+`PromoteAutoQueuedRide` refuses to promote when the driver isn't online, hasn't pinged in 5 minutes, has zero or several open sessions, or has a session that doesn't match the ride's `driver_vehicle_id` and `fleet_id`.
 
-- The expiry sweep only touches `confirmed` rides.
-- Offline unqueue only runs when the driver has no presence and hasn't pinged for 5 minutes.
+The session guard rarely trips in practice. `RefreshDriverSession` refuses to replace a driver's session while they have any ride that isn't `complete` or `pending_rider_rating`, including `queued` ones (`refreshSessionOwnership` in `internal/data/repository/driver_availability.go`). Fleet membership edits are refused under the same condition.
 
-A driver who is online but switched vehicle or fleet keeps a stranded queued ride until they go offline long enough to be unqueued, or until the rider cancels.
+The common stranded case is a stale ping. Recovery skips the driver on every 3-minute pass until [offline unqueue](#offline-unqueue) returns the ride to `confirmed`, which needs no presence and no ping for 5 minutes. The expiry sweep only touches `confirmed` rides, so a queued ride never expires on its own.
 
 ## Offline unqueue
 
@@ -176,7 +175,7 @@ TotalMinutes = sum(rideMinutes) + sum(deadhead) + 2 * rideCount
 
 ## Gotchas and edge cases
 
-- **Two promotion paths, two rule sets.** A queue advanced by completing a ride promotes even if the driver's session changed. A queue advanced by recovery refuses.
+- **Two promotion paths, two rule sets.** A queue advanced by completing or cancelling a ride promotes without checking presence, ping freshness, or session. A queue advanced by recovery checks all three.
 - **Promoted before prepared.** After complete or cancel, the rider sees `driver_en_route` before the pickup route and payment authorization exist. A crash in the goroutine leaves the ride active with stale pickup fields.
 - **Recovery is silent on guard failures.** When a guard fails, the preflight returns an input error and recovery returns `nil`. The only signal is that the ride stays `queued`.
 - **Advisory lock collisions share a lock.** Two rides whose UUIDs share the first 8 bytes serialize against each other. With random v4 UUIDs this is negligible.

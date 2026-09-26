@@ -1,0 +1,230 @@
+---
+title: "Mobile app changelog"
+description: "Merged yelo-frontend pull requests since August 25, 2026, grouped by week, with store build and OTA notes."
+---
+
+This page tracks merged pull requests in `rideyelo/yelo-frontend`, newest week first. Weeks start on Monday.
+
+Each change ships one of two ways:
+
+- **OTA**: JavaScript-only. It reaches installed binaries through EAS Update once staged and promoted.
+- **Native**: It changes a native input (`package.json`, the lockfile, `app.json`, `app.config.ts`, `patches/`, or native config). It needs a new store build.
+
+Unmarked product changes are OTA. For how this is decided, see [Mobile releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
+## Store versions in this period
+
+| Version | Build tag | Date | Notes |
+| --- | --- | --- | --- |
+| 5.7.1 | `v5.7.1-266` | Aug 25 | Built from the `5.7.1` release branch. Dependency bumps and Lyft/Waymo URL scheme visibility. |
+| 5.7.2 | `v5.7.2-267` | Sep 1 | Expo SDK 57 patch updates and ride-provider URL visibility. |
+| 5.7.3 | `v5.7.3-268`, `v5.7.3-269` | Sep 11 | Android background location, app links, Firebase, native glass hit testing, Uber callback on Android. Build 269 compiles `expo-contacts` from source. |
+| 5.7.4 | not yet tagged | in development | `main` moved to 5.7.4 on Sep 15. |
+
+OpenAPI contract syncs (`chore(api): update OpenAPI contract to ...`) and rolling backport PRs into release branches are left out of the weekly lists below.
+
+<Update label="Week of September 21, 2026" description="Coordinate-only ride stops, seat minimums from vehicle types, and top-location cleanup">
+  **Rides**
+
+  - Ride stops now need only coordinates. Pins without an address or name reach ride options, and the API resolves the address. [#641](https://github.com/rideyelo/yelo-frontend/pull/641). See [Rider experience](/engineering/mobile/rider-experience#draft-creation).
+  - "Current location" stays in the rider's own UI and is no longer sent as a stop label. Unresolved GPS stops go as coordinates. If the API can't resolve an address, the stop picker opens. [#638](https://github.com/rideyelo/yelo-frontend/pull/638)
+  - End-to-end coverage for idle auto-assignment, stranded queue recovery, arrival, and restart. [#634](https://github.com/rideyelo/yelo-frontend/pull/634). See [Testing](/engineering/testing).
+
+  **Drivers**
+
+  - The vehicle seat picker reads its minimum from the vehicle type's `min_seats` instead of a hard-coded 3, so drivers can't pick a count the API rejects. [#636](https://github.com/rideyelo/yelo-frontend/pull/636). See [Vehicle types and catalog](/engineering/domains/vehicle-types-and-catalog).
+
+  **Search and map**
+
+  - Top locations are deduplicated by canonical Yelo place, unverified entries are hidden, and empty browse sections are omitted. Community-content pushes refresh only that community's search context. [#635](https://github.com/rideyelo/yelo-frontend/pull/635). See [Community top locations](/guides/community-top-locations).
+  - Removed the "coming" tag from the map search bar. [#631](https://github.com/rideyelo/yelo-frontend/pull/631)
+
+  **Tooling**
+
+  - Every event now records the loaded OTA update id and runtime. [#641](https://github.com/rideyelo/yelo-frontend/pull/641)
+  - The backport workflow triggers only on PRs merged into `main`. [#642](https://github.com/rideyelo/yelo-frontend/pull/642). See [Backports](/engineering/mobile/releases#backports).
+</Update>
+
+<Update label="Week of September 14, 2026" description="5.7.4 started, POI sheet reliability, calendar-based zone hours, auth recovery, and fleet vehicles">
+  **Release**
+
+  - **Native.** Started 5.7.4 with dependency updates (PostHog, Zod, Orval, and lint tooling). Needs new iOS and Android builds. It isn't eligible for OTA or backport to 5.7.3. [#599](https://github.com/rideyelo/yelo-frontend/pull/599)
+
+  **Rides**
+
+  - Rider and driver screens recover waiting, assigned, and queued states from the server's authoritative ride state after stale data, cancellation pushes, or a restart. The blocking ride loader is gone. New ride and drive entry requires 5.7.3. [#628](https://github.com/rideyelo/yelo-frontend/pull/628). See [Rider and driver flows](/engineering/mobile/rider-and-driver-flows).
+  - The pickup recovery panel and location-error dialog are removed. Pickup coordinates are prepared ahead of time on ride-planning screens. [#604](https://github.com/rideyelo/yelo-frontend/pull/604)
+  - The request sheet waits for the keyboard to close before snapping or expanding. [#603](https://github.com/rideyelo/yelo-frontend/pull/603)
+
+  **Map and places**
+
+  - POI sheets open from saved snapshots, keep place identity through search, saves, recents, and ride navigation, and use verified Google profiles when available. [#614](https://github.com/rideyelo/yelo-frontend/pull/614), [#618](https://github.com/rideyelo/yelo-frontend/pull/618), [#619](https://github.com/rideyelo/yelo-frontend/pull/619), [#623](https://github.com/rideyelo/yelo-frontend/pull/623), [#627](https://github.com/rideyelo/yelo-frontend/pull/627)
+  - When enrichment is unavailable, optional POI details stay empty instead of showing error or retry messages. Reopening the place retries. [#625](https://github.com/rideyelo/yelo-frontend/pull/625). See [Search and places](/engineering/location/search-and-places).
+  - The off-peak preview shows the primary fleet's calendar hours, grouped by day and zone, for the next seven days. Zone names no longer carry the `(free)` suffix. [#605](https://github.com/rideyelo/yelo-frontend/pull/605), [#607](https://github.com/rideyelo/yelo-frontend/pull/607), [#608](https://github.com/rideyelo/yelo-frontend/pull/608). See [Service communities and calendars](/engineering/fleets/service-communities-and-calendars).
+  - Fixed search results alignment and clipping. [#597](https://github.com/rideyelo/yelo-frontend/pull/597)
+
+  **Sign-in and invites**
+
+  - After one hosted-browser cancellation, the entry screen offers **Having trouble? Continue in app**. After two, the app recovers into the native phone flow automatically. [#595](https://github.com/rideyelo/yelo-frontend/pull/595), [#612](https://github.com/rideyelo/yelo-frontend/pull/612)
+  - Hosted-auth callbacks recover with the original transaction proof after a cold launch or transient failure. [#613](https://github.com/rideyelo/yelo-frontend/pull/613). See [Auth v3 transactions](/engineering/identity/auth-v3-transactions).
+  - Invite deep links resolve to canonical codes and keep referral attribution through native and hosted sign-in. [#594](https://github.com/rideyelo/yelo-frontend/pull/594). See [Referrals and links](/engineering/domains/referrals-and-links).
+
+  **Drivers and fleets**
+
+  - Fleet invite codes survive sign-in and enrollment failures. Previews work before sign-in and distinguish unavailable, missing, and failed invites. [#596](https://github.com/rideyelo/yelo-frontend/pull/596)
+  - Fleet invitation and confirmation screens show whether payouts are personal (Stripe) or fleet-managed. [#621](https://github.com/rideyelo/yelo-frontend/pull/621). See [Fleet joins and invitations](/engineering/fleets/joins-and-invitations).
+  - Drivers use approved fleet vehicles before personal ones. Go-online warns when another driver has the selected fleet vehicle open. Vehicle artwork comes from `assets/vehicles/catalog.json`. [#616](https://github.com/rideyelo/yelo-frontend/pull/616). See [Fleet vehicles](/engineering/fleets/vehicles).
+  - Driver signup uses the server's photo review status, so rejected profile photos can be resubmitted. [#609](https://github.com/rideyelo/yelo-frontend/pull/609)
+  - The driver profile photo flow asks for camera permission first and offers **Open settings** when blocked. [#611](https://github.com/rideyelo/yelo-frontend/pull/611). See [Driver experience](/engineering/mobile/driver-experience).
+
+  **Polish**
+
+  - Removed pencil icons from the bump template. [#598](https://github.com/rideyelo/yelo-frontend/pull/598)
+  - Adjusted **Show more** sizing on the price aggregator and fixed the Yelo Lottie animation turning yellow. [#592](https://github.com/rideyelo/yelo-frontend/pull/592), [#593](https://github.com/rideyelo/yelo-frontend/pull/593)
+</Update>
+
+<Update label="Week of September 7, 2026" description="5.7.3 native build, bump editing and send animation, synced recents, and ride pricing artwork">
+  **Release (5.7.3)**
+
+  - **Native.** 5.7.3 dependency rebuild: removed unused native packages, tightened iOS background modes, and added NetInfo so queries pause offline. [#546](https://github.com/rideyelo/yelo-frontend/pull/546)
+  - **Native.** App links claim `joinyelo.com` and `www.joinyelo.com` and drop stale hosts. [#547](https://github.com/rideyelo/yelo-frontend/pull/547). See [Deep links and URLs](/reference/deep-links-and-urls).
+  - **Native.** Android registers the `uberauth://` callback so Uber sign-in can return to Yelo. [#551](https://github.com/rideyelo/yelo-frontend/pull/551)
+  - **Native.** Patched Expo glass views so near-edge taps on glass controls reach the button, not the map. [#570](https://github.com/rideyelo/yelo-frontend/pull/570)
+  - **Native.** Finalized 5.7.3: full Expo SDK 57 patch train, no implicit background location request, Android notification channels before push registration, and removed microphone entitlements. [#574](https://github.com/rideyelo/yelo-frontend/pull/574). See [Permissions and device](/engineering/mobile/permissions-and-device).
+  - **Native (iOS).** `expo-contacts` builds from source to avoid a missing framework link. Shipped as build 269. [#584](https://github.com/rideyelo/yelo-frontend/pull/584)
+  - Build and OTA workflow hardening, including separate iOS and Android auto-submit switches and Firebase config in Android fingerprints. [#575](https://github.com/rideyelo/yelo-frontend/pull/575), [#585](https://github.com/rideyelo/yelo-frontend/pull/585), [#587](https://github.com/rideyelo/yelo-frontend/pull/587), [#538](https://github.com/rideyelo/yelo-frontend/pull/538), [#553](https://github.com/rideyelo/yelo-frontend/pull/553). See [Mobile releases](/engineering/mobile/releases).
+
+  **Bump**
+
+  - The bump sheet plays a send animation and closes only after the server accepts. [#544](https://github.com/rideyelo/yelo-frontend/pull/544)
+  - Senders can edit the arrival time and destination. [#577](https://github.com/rideyelo/yelo-frontend/pull/577)
+  - Contact invites use the sender's referral link again. SMS previews are cached, and the copy shows an exact arrival time. [#548](https://github.com/rideyelo/yelo-frontend/pull/548), [#586](https://github.com/rideyelo/yelo-frontend/pull/586)
+  - The keyboard closes before the bump flow continues. [#558](https://github.com/rideyelo/yelo-frontend/pull/558). See [Social and contacts](/engineering/mobile/social-and-contacts).
+
+  **Rides**
+
+  - Ride options show bundled vehicle artwork from the pricing `image_asset` and render server fleet groups. [#580](https://github.com/rideyelo/yelo-frontend/pull/580). See [Rider experience](/engineering/mobile/rider-experience#vehicle-options).
+  - Delayed GPS no longer leaves ride search without a pickup or the map at fallback zoom. [#542](https://github.com/rideyelo/yelo-frontend/pull/542)
+  - **Cheapest** and **Fastest** badges compare across all options. The sheet grows to fit a "nearest" option. [#559](https://github.com/rideyelo/yelo-frontend/pull/559), [#552](https://github.com/rideyelo/yelo-frontend/pull/552)
+  - Rotating waiting messages and matching card fixes. [#556](https://github.com/rideyelo/yelo-frontend/pull/556), [#557](https://github.com/rideyelo/yelo-frontend/pull/557)
+
+  **Map and search**
+
+  - Search shows personal recents synced to the account. [#572](https://github.com/rideyelo/yelo-frontend/pull/572)
+  - Search results show on focus, and selecting a location closes the keyboard. [#564](https://github.com/rideyelo/yelo-frontend/pull/564), [#550](https://github.com/rideyelo/yelo-frontend/pull/550)
+  - Ride search cards show addresses. [#571](https://github.com/rideyelo/yelo-frontend/pull/571)
+  - Zone labels are collision-aware Mapbox symbols that don't cover POI icons. The question mark is gone from zone labels. [#566](https://github.com/rideyelo/yelo-frontend/pull/566), [#554](https://github.com/rideyelo/yelo-frontend/pull/554). See [Map rendering](/engineering/location/map-rendering).
+  - Deleted POIs and friend-liked spots refresh on map entry, foreground, reconnect, and map-change pushes. [#569](https://github.com/rideyelo/yelo-frontend/pull/569)
+  - Community data (search, feeds, events, coupons, driver queries) clears after community reassignment. [#567](https://github.com/rideyelo/yelo-frontend/pull/567). See [Community assignment](/engineering/location/community-assignment).
+  - Map top-bar controls stay visible during sheet transitions. [#563](https://github.com/rideyelo/yelo-frontend/pull/563), [#562](https://github.com/rideyelo/yelo-frontend/pull/562)
+  - Removed the "building your city" popup. [#588](https://github.com/rideyelo/yelo-frontend/pull/588)
+  - Reduced idle rendering, bounded camera work, and replaced chat history polling with push-invalidated sync. [#536](https://github.com/rideyelo/yelo-frontend/pull/536). See [Ride messaging](/engineering/domains/ride-messaging).
+
+  **Accounts and providers**
+
+  - Phone verification recovers when the OTP response is lost. OTP autofill and refocus are restored. [#560](https://github.com/rideyelo/yelo-frontend/pull/560), [#573](https://github.com/rideyelo/yelo-frontend/pull/573)
+  - Empower shows in the providers list only after its account is connected. [#565](https://github.com/rideyelo/yelo-frontend/pull/565)
+  - Uber sign-in retries with an ephemeral session on iOS. The price aggregator requires accepting the updated disclaimer. [#568](https://github.com/rideyelo/yelo-frontend/pull/568)
+  - Lyft sign-in screen clarity and shading fixes. [#578](https://github.com/rideyelo/yelo-frontend/pull/578), [#581](https://github.com/rideyelo/yelo-frontend/pull/581)
+  - Contacts access can be recovered from home, Friends Hub, bump, and settings. Sync retries on failure. [#583](https://github.com/rideyelo/yelo-frontend/pull/583). See [Contact sync](/engineering/domains/contact-sync).
+
+  **Onboarding**
+
+  - **Skip** and **Skip all** in the map tutorial opt out permanently. [#541](https://github.com/rideyelo/yelo-frontend/pull/541)
+</Update>
+
+<Update label="Week of August 31, 2026" description="5.7.2 native build, fleet invitation onboarding, connected accounts, and the auth v3 rebuild">
+  **Release (5.7.2)**
+
+  - **Native.** 5.7.2 build: Expo SDK 57 patch releases, `expo-notifications` patch migrated, and ride-provider URL visibility restored. [#475](https://github.com/rideyelo/yelo-frontend/pull/475)
+  - **Native (next build).** Started 5.7.3: Android background location and foreground-location service, Android App Links for every Yelo link host, Android Firebase via EAS file variables, and removed unused permissions. [#522](https://github.com/rideyelo/yelo-frontend/pull/522)
+  - OTA staging no longer bundles web assets. [#463](https://github.com/rideyelo/yelo-frontend/pull/463)
+  - OTA and release automation now uses split iOS and Android update groups, promotes from one staged source commit, and batches backports into one rolling PR per release branch. [#486](https://github.com/rideyelo/yelo-frontend/pull/486), [#487](https://github.com/rideyelo/yelo-frontend/pull/487), [#488](https://github.com/rideyelo/yelo-frontend/pull/488), [#489](https://github.com/rideyelo/yelo-frontend/pull/489), [#490](https://github.com/rideyelo/yelo-frontend/pull/490), [#491](https://github.com/rideyelo/yelo-frontend/pull/491), [#494](https://github.com/rideyelo/yelo-frontend/pull/494)
+  - iOS staging builds post an install QR code to Slack. CI runs as one **Checks** job. [#476](https://github.com/rideyelo/yelo-frontend/pull/476), [#523](https://github.com/rideyelo/yelo-frontend/pull/523)
+  - The required-update gate uses the native app version and reads the app link from the `426` response. [#520](https://github.com/rideyelo/yelo-frontend/pull/520). See [Update-required gate](/engineering/mobile/releases#update-required-gate).
+
+  **App-wide cleanup**
+
+  - Large debt sweep: `lib/` consolidated by domain, auth v2 removed, a shared design-system kit, single-owner polling with push-driven cache invalidation, and auth v3 rebuilt as hosted-web-first with native screens as the fallback. OTA-eligible. [#496](https://github.com/rideyelo/yelo-frontend/pull/496). See [Mobile architecture](/engineering/mobile/architecture) and [UI system](/engineering/mobile/ui-system).
+  - Onboarding telemetry is correlated across native, web, API, and replay with one attempt id. [#479](https://github.com/rideyelo/yelo-frontend/pull/479)
+  - Deleted accounts sign out immediately, and 401 and 403 queries no longer retry. [#470](https://github.com/rideyelo/yelo-frontend/pull/470). See [Account deletion](/engineering/identity/account-deletion).
+
+  **Drivers and fleets**
+
+  - Fleet invitation onboarding: invites survive sign-in, drivers confirm the join, and onboarding and earnings reflect fleet-managed payouts. [#519](https://github.com/rideyelo/yelo-frontend/pull/519)
+  - Handled fleet invitations don't reopen. [#535](https://github.com/rideyelo/yelo-frontend/pull/535). See [Fleet joins and invitations](/engineering/fleets/joins-and-invitations#mobile-deep-link-handling).
+  - Manual ride-card selection respects declines, so declined requests stop looping. [#481](https://github.com/rideyelo/yelo-frontend/pull/481). See [Driver experience](/engineering/mobile/driver-experience).
+  - Smart label placement on the driver map. [#474](https://github.com/rideyelo/yelo-frontend/pull/474), [#478](https://github.com/rideyelo/yelo-frontend/pull/478)
+
+  **Riders**
+
+  - The active-ride UI waits until the ride status and driver agree, which removes a phantom driver during loading. **Leave Queue** checks status before canceling. [#528](https://github.com/rideyelo/yelo-frontend/pull/528), [#531](https://github.com/rideyelo/yelo-frontend/pull/531)
+  - Stale chats are removed after cancellation or requeue, and message drafts persist until sent. [#465](https://github.com/rideyelo/yelo-frontend/pull/465). See [Ride messaging](/engineering/domains/ride-messaging).
+  - The route draws on the in-ride screen. Ride and vehicle screens got layout updates. [#482](https://github.com/rideyelo/yelo-frontend/pull/482), [#492](https://github.com/rideyelo/yelo-frontend/pull/492), [#533](https://github.com/rideyelo/yelo-frontend/pull/533), [#534](https://github.com/rideyelo/yelo-frontend/pull/534)
+  - Ride labels route around zone pills and the **FROM**/**TO** bar instead of hiding zones. [#529](https://github.com/rideyelo/yelo-frontend/pull/529)
+  - Per-passenger pricing UI for Tallahassee. The "cheaper" message hides when every option is free. Fixed a disabled top-level ride option. [#461](https://github.com/rideyelo/yelo-frontend/pull/461), [#467](https://github.com/rideyelo/yelo-frontend/pull/467), [#462](https://github.com/rideyelo/yelo-frontend/pull/462)
+  - Match screen copy change and a white animated route with labels on the driver sheet. [#485](https://github.com/rideyelo/yelo-frontend/pull/485), [#466](https://github.com/rideyelo/yelo-frontend/pull/466)
+  - Search lists are vertical. [#532](https://github.com/rideyelo/yelo-frontend/pull/532)
+
+  **Accounts and social**
+
+  - Connected Accounts shows Google and Apple sign-in methods, lets you add one, and lists each student verification method separately with brand marks. [#468](https://github.com/rideyelo/yelo-frontend/pull/468), [#473](https://github.com/rideyelo/yelo-frontend/pull/473). See [School verification](/engineering/identity/school-verification).
+  - The ride-request sign-in entry opens a rideshare-only Accounts screen. [#527](https://github.com/rideyelo/yelo-frontend/pull/527)
+  - `friends_changed` no longer forces a contact re-upload loop. [#530](https://github.com/rideyelo/yelo-frontend/pull/530). See [Contact sync](/engineering/domains/contact-sync).
+  - Empty bump slots open Friends Hub. [#472](https://github.com/rideyelo/yelo-frontend/pull/472)
+
+  **UI**
+
+  - Android gets a frosted glass fallback. The bottom sheet works when glass is unavailable. [#524](https://github.com/rideyelo/yelo-frontend/pull/524), [#483](https://github.com/rideyelo/yelo-frontend/pull/483)
+  - Font size caps for the profile initials circle, **Find Yelo** CTA copy, and an inline **Open settings** link. [#515](https://github.com/rideyelo/yelo-frontend/pull/515), [#516](https://github.com/rideyelo/yelo-frontend/pull/516), [#484](https://github.com/rideyelo/yelo-frontend/pull/484)
+
+  **Testing**
+
+  - Maestro was replaced with an agent-device E2E runner, with multi-device rider and driver rigs, a resource-aware simulator scheduler, and a local authoring loop (`make e2e-local`). The E2E build profile changes only affect the E2E simulator binary. [#498](https://github.com/rideyelo/yelo-frontend/pull/498), [#514](https://github.com/rideyelo/yelo-frontend/pull/514), [#517](https://github.com/rideyelo/yelo-frontend/pull/517), [#521](https://github.com/rideyelo/yelo-frontend/pull/521), [#525](https://github.com/rideyelo/yelo-frontend/pull/525), and follow-up fixes [#500](https://github.com/rideyelo/yelo-frontend/pull/500) through [#513](https://github.com/rideyelo/yelo-frontend/pull/513). See [Testing](/engineering/testing).
+</Update>
+
+<Update label="Week of August 24, 2026" description="5.7.1, price aggregator polish, community map layers, StudID, and the OTA stage-and-promote flow">
+  **Release (5.7.1)**
+
+  - **Native.** 5.7.1 dependency bumps and Lyft/Waymo URL scheme visibility, built from the `5.7.1` release branch. [#412](https://github.com/rideyelo/yelo-frontend/pull/412)
+  - Restored the 5.7.0 runtime fingerprint on `main` so JavaScript changes could keep shipping over the air. Native URL-query declarations were deferred to the next binary. [#404](https://github.com/rideyelo/yelo-frontend/pull/404)
+  - `main` moved to 5.7.2. [#439](https://github.com/rideyelo/yelo-frontend/pull/439)
+
+  **Release tooling**
+
+  - A Fingerprint check flags PRs that change the native fingerprint. It blocks drift on release branches. [#407](https://github.com/rideyelo/yelo-frontend/pull/407), [#444](https://github.com/rideyelo/yelo-frontend/pull/444)
+  - OTA became a two-step stage-and-promote flow. Staging checks for a compatible build, and promotion republishes the exact staged group. [#418](https://github.com/rideyelo/yelo-frontend/pull/418), [#419](https://github.com/rideyelo/yelo-frontend/pull/419), [#440](https://github.com/rideyelo/yelo-frontend/pull/440), [#446](https://github.com/rideyelo/yelo-frontend/pull/446), [#454](https://github.com/rideyelo/yelo-frontend/pull/454). See [OTA updates](/engineering/mobile/releases#ota-updates).
+  - Internal staging builds with install links. Production is the only store submission path, and each submission creates an immutable tag. [#441](https://github.com/rideyelo/yelo-frontend/pull/441), [#447](https://github.com/rideyelo/yelo-frontend/pull/447)
+  - Draft PRs skip CI until marked ready. [#442](https://github.com/rideyelo/yelo-frontend/pull/442)
+  - Settings shows the build number, channel, OTA source, and runtime for support. [#453](https://github.com/rideyelo/yelo-frontend/pull/453)
+  - Simulator make targets default to the production API. `make sims-local` and `make asims-local` start a local API. [#410](https://github.com/rideyelo/yelo-frontend/pull/410). See [Local development](/engineering/local-development).
+
+  **Price aggregator**
+
+  - Polished price aggregator UI, Empower as a provider, a reworked sign-in button, better error handling, a legal disclaimer modal, a first-view tooltip, and telemetry. The providers list hides when the experiment is off. [#402](https://github.com/rideyelo/yelo-frontend/pull/402), [#414](https://github.com/rideyelo/yelo-frontend/pull/414), [#428](https://github.com/rideyelo/yelo-frontend/pull/428), [#434](https://github.com/rideyelo/yelo-frontend/pull/434), [#435](https://github.com/rideyelo/yelo-frontend/pull/435), [#436](https://github.com/rideyelo/yelo-frontend/pull/436), [#437](https://github.com/rideyelo/yelo-frontend/pull/437), [#451](https://github.com/rideyelo/yelo-frontend/pull/451), [#455](https://github.com/rideyelo/yelo-frontend/pull/455), [#456](https://github.com/rideyelo/yelo-frontend/pull/456). See [Rider experience](/engineering/mobile/rider-experience#no-yelo-options).
+  - Search cards show distance. **Cheaper** and **Faster** icons stack vertically. [#448](https://github.com/rideyelo/yelo-frontend/pull/448), [#408](https://github.com/rideyelo/yelo-frontend/pull/408)
+
+  **Map**
+
+  - Community activity layers: heat haze, friend positions, community destinations, mobility vehicles, and location-sharing controls. [#430](https://github.com/rideyelo/yelo-frontend/pull/430). See [Map layers and mobility](/engineering/location/map-layers-and-mobility).
+  - Live vehicles are authoritative on the rider map. Going online sends an immediate heartbeat, and an offline driver on the Drive screen no longer shows a ghost vehicle. [#431](https://github.com/rideyelo/yelo-frontend/pull/431). See [Heartbeat and presence](/engineering/location/heartbeat-and-presence).
+  - Community assignment reconciles after startup using the server's exact boundaries. Heartbeats wait for a real location. [#452](https://github.com/rideyelo/yelo-frontend/pull/452). See [Community assignment](/engineering/location/community-assignment).
+  - Animated route line, pan-to-dismiss on map detail sheets, and tutorial fixes. [#424](https://github.com/rideyelo/yelo-frontend/pull/424), [#423](https://github.com/rideyelo/yelo-frontend/pull/423), [#422](https://github.com/rideyelo/yelo-frontend/pull/422), [#429](https://github.com/rideyelo/yelo-frontend/pull/429)
+
+  **Bump and social**
+
+  - The bump sheet uses the server friend list and sends through `POST /notification/bump` (push and SMS) instead of the device SMS composer. [#416](https://github.com/rideyelo/yelo-frontend/pull/416). See [SMS and friend bumps](/engineering/notifications/sms-and-friend-bumps).
+  - A bump button on the ride select screen. [#409](https://github.com/rideyelo/yelo-frontend/pull/409)
+  - Fixed an iOS stack overflow when scrolling bottom sheets. [#415](https://github.com/rideyelo/yelo-frontend/pull/415)
+
+  **Accounts**
+
+  - StudID student verification and education connections in **Connected Accounts**. [#450](https://github.com/rideyelo/yelo-frontend/pull/450). See [School verification](/engineering/identity/school-verification#studid).
+
+  **UI and settings**
+
+  - A settings page to control experiments, and an experiment-gated Glass Lab. [#397](https://github.com/rideyelo/yelo-frontend/pull/397), [#399](https://github.com/rideyelo/yelo-frontend/pull/399)
+  - Glass effects require both effect API probes. Glass tint, Lottie alpha, and font size caps were adjusted. [#398](https://github.com/rideyelo/yelo-frontend/pull/398), [#458](https://github.com/rideyelo/yelo-frontend/pull/458), [#457](https://github.com/rideyelo/yelo-frontend/pull/457), [#459](https://github.com/rideyelo/yelo-frontend/pull/459)
+  - The app blocks a ride request when a ride is already active, before calling the API. [#460](https://github.com/rideyelo/yelo-frontend/pull/460)
+  - Small Friends Hub, home action bar, and POI sheet fixes. [#406](https://github.com/rideyelo/yelo-frontend/pull/406)
+</Update>

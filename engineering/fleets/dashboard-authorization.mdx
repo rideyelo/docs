@@ -55,7 +55,7 @@ The middleware only proves the manager has some claim on the IDs in the path. Ha
 | `POST /dashboard/communities/{id}/fleets` | `assertAdmin` | Not applicable |
 | `GET /dashboard/communities/{id}/fleets/{fleet_id}` | `assertFleetAccess` | Path community must equal the fleet's home community, otherwise 404 |
 | `PATCH` same path | `assertFleetAccess` | Same. All `FleetUpdate` fields, including `has_custom_payouts`, `is_student_only`, and `requires_confirmation_code` |
-| `DELETE` same path | `assertFleetAccess` | Same. Soft delete |
+| `DELETE` same path | `assertFleetAccess` | Same. Archives the fleet, or returns 400 with the list of blockers. See [Archive](/engineering/fleets/stripe-and-lifecycle#archive) |
 | `POST .../stripe/refresh-link` | `assertAdmin`, because the link is a bearer credential for a possibly shared account | Home community match |
 | `POST .../stripe/unlink` | `assertFleetAccess` | Home community match, fleet-merchant only |
 | `GET .../stripe/status` | Admin or `HasFleetAccess` | Home community match |
@@ -66,14 +66,15 @@ The middleware only proves the manager has some claim on the IDs in the path. Ha
 | `DELETE .../price-parameters/{param_id}` | Admin only | Not applicable |
 | `GET /dashboard/fleet/{fleet_id}/kpis`, `/histogram` | Admin or `HasFleetAccess` | All communities |
 | `GET /dashboard/fleet/{fleet_id}/drivers` | Admin, or `HasFleetAccess` plus an exact assignment for `community_id` | Drivers in that community |
-| `POST /dashboard/fleet/{fleet_id}/drivers` | Admin or `HasFleetAccess` | Middleware blocks non-`GET` for managers, so admin only in practice |
+| `POST /dashboard/fleet/{fleet_id}/drivers` | Admin only, in the handler and again in `DashboardService.AddDriverToFleet` (`fleetServiceAdmin`) | Managers get 403 **Only admins can enroll drivers directly. Share the fleet join link instead.** |
 | Join link routes | `authorizeFleet`: admin, or `fleet` with `HasFleetAccess` | Not applicable |
 | Calendar routes | `CalendarAccess`: admin, or `fleet` or `operator` with a claim for the fleet and community (empty community in the claim matches any). Attach and prefix rename are admin only. | 404 to unauthorized non-admins |
 | `GET /dashboard/rides` | `fleet` needs at least one fleet in the requested community (`GetFleetIDsForCommunity`) | Rides filtered to those fleets |
 | QR config reads and mutations | Admin gets `AllFleets()`. Managers get `FleetsScope(assigned)`. Mutations load the config and 404 if its fleet isn't assigned. Creation is admin only. | Service rechecks `scope.Permits` |
 | `/dashboard/fleets/services/...` | `serviceAdmin` and `fleetServiceAdmin` | Admin only |
 | `/dashboard/vehicles...` | `Handler.authorize`: admin only | Not applicable |
-| `PUT /dashboard/users/detail/{id}/fleet` | `/users` group middleware: admin only | Not applicable |
+| `PUT /dashboard/users/detail/{id}/fleet` | Admin only | Not applicable |
+| `GET`, `PUT /dashboard/users/detail/{id}/fleets`, `PUT .../fleet-transfer` | `/users` group middleware, then `fleetServiceAdmin` in the service: admin only | Not applicable |
 
 ## Web dashboard
 
@@ -95,7 +96,7 @@ The web app hides pages by role (see [Dashboard roles and access](/administratio
 
 ## Gotchas and edge cases
 
-- **Managers can edit, delete, and unlink their own fleet through the API.** `UpdateFleet`, `DeleteFleet`, and `UnlinkStripe` use `assertFleetAccess`, and `community_authz_test.go` asserts this admin-or-own-fleet rule. Only the path community must be the fleet's home community. A manager can toggle `has_custom_payouts`, which changes where fares are paid, or soft-delete the fleet.
+- **Managers can edit, archive, and unlink their own fleet through the API.** `UpdateFleet`, `DeleteFleet`, and `UnlinkStripe` use `assertFleetAccess`, and `community_authz_test.go` asserts this admin-or-own-fleet rule. Only the path community must be the fleet's home community. A manager can toggle `has_custom_payouts`, which changes where fares are paid, or archive the fleet once it has no blockers.
 - **`HasFleetAccess` ignores community.** A manager with assignments (fleet A, community X) and (fleet B, community Y) passes the middleware for `/communities/Y/price-parameters/...` and can then `PATCH` a fleet A price row in community Y, because the handler checks only the fleet.
 - **Rejections at layer 1 return 401, not 403.** The payload-less 401 from the middleware is easy to confuse with an expired token.
 - **Legacy single-fleet claims still work everywhere.** They are converted into one assignment. `CalendarAccess` also falls back to the legacy fields if `FleetAssignments` is empty.

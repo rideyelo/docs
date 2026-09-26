@@ -75,6 +75,7 @@ stateDiagram-v2
 | Any active status → `complete` | Rider or driver | `POST /ride/i/{id}/cancel` | `RideService.Cancel` |
 | `queued`, `driver_en_route`, `driver_waiting` → `confirmed` | Driver | `POST /ride/i/{id}/cancel` | `RideService.requeueAfterDriverCancel` |
 | `confirmed` → `complete` | System | Operational loop, every 30 seconds | `RideService.CancelUnmatchedRides` |
+| `driver_en_route`, `driver_waiting`, `in_progress` → `complete` | Admin | `POST /dashboard/rides/{id}/silent-cancel` (free rides only, no notifications) | `DashboardService.SilentCancelRide` → `SilentCancel` (`internal/data/repository/ride_admin_cancel.go`). See [Admin silent cancellation](/concepts/cancellations#admin-silent-cancellation) |
 
 Every lifecycle write runs through a locked "ride command" transaction in `internal/data/repository/ride_command.go`. The transaction locks participant users in UUID order, then the ride row, and rechecks the expected status before writing. A stale request fails instead of overwriting a newer state.
 
@@ -142,6 +143,10 @@ The service then re-adds the ride to the board, re-runs the immediate driver not
 ## Offline drivers and queued rides
 
 If a driver with queued rides drops offline, `PurgeOfflineDrivers` gives them a 5-minute grace period (`OfflineGraceInterval`). After that, `UnqueueDriverRides` returns their `queued` rides to `confirmed` and puts them back on the board. Active rides aren't touched.
+
+<Warning>
+`UnqueueDriverRides` also sets `fleet_id` to null and keeps the original `confirm_time`. Drivers only see board rides for their session fleet, so an unqueued ride is invisible to every driver, and it expires on the next sweep if it was confirmed more than 10 minutes ago. The rider gets no push when this happens. See [Queue promotion and recovery](/engineering/matching/queue-promotion#offline-unqueue).
+</Warning>
 
 ## Audit trail
 

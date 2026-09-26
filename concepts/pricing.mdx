@@ -84,9 +84,9 @@ The default global settings (`DefaultPricingJitterSettings` in `internal/models/
 Surge is a single multiplier per community. It applies to the whole raw fare, including base, distance, time, and zone flat fees.
 
 - A surge is active only when `surge_multiplier` is greater than 1.0 and `surge_expires_at` is in the future. Otherwise the multiplier is 1.0.
-- Set it with `POST /dashboard/supply-demand/markets/{id}/surge`. The body takes `multiplier` (1 to 9.99) and `expires_in_hours` (1 to 168). A multiplier of `1.0` clears the surge.
+- Set it with `POST /dashboard/live/markets/{id}/surge` (admin only). The body takes `multiplier` (1 to 9.99) and `expires_in_hours` (1 to 168). A multiplier of `1.0` clears the surge.
 - Each change closes the previous row in the surge history, records who set the new surge, and invalidates the quote cache.
-- The dashboard's **Pricing Management** page shows the current surge per community but doesn't set it.
+- In the dashboard, admins set it with the surge slider on the **Pricing** card of [Live operations](/dashboard/live) or on a community's pricing card on **Pricing Management**.
 
 When a quote is built under an active surge, the ride event log records `surge_pricing_applied`.
 
@@ -119,7 +119,7 @@ When a community has no live per-ride configs, or none match the ride types curr
 ## Quote caching and confirm-time pricing
 
 - **Quote cache**: `buildVehicleOptions` caches the pre-discount prices in Redis under `price:` plus the community and rounded pickup and dropoff coordinates, for 5 minutes (`internal/data/redis/price_cache.go`). A repeat quote for the same trip within that window reuses the cached fares, including the same jitter draw.
-- **Confirm**: `ConfirmRide` doesn't read the quote cache and doesn't accept a price from the client. `determineRidePriceAndFleet` reruns `GetRidePrice` against the current config, surge, zones, and discount. It then selects the price matching the requested vehicle type **and** fleet, so another fleet's pricing for the same vehicle type can't shadow the rider's choice.
+- **Confirm**: `ConfirmRide` doesn't read the quote cache and doesn't accept a price from the client. `determineRidePriceAndFleet` reruns `GetRidePrice` against the current config, surge, zones, and discount. It then selects the price matching the requested vehicle type **and** fleet. If the requested fleet has no live config for that vehicle type, it takes the first price for the vehicle type from any fleet, and the ride stores that fleet. See [Pricing engine internals](/engineering/domains/pricing-engine#repricing-on-confirm).
 
 <Note>
 Because confirm reruns the pipeline, a jitter-mode fare stored at confirm can differ slightly from the quoted fare. Config or surge changes between quote and confirm also apply.
