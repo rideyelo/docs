@@ -115,6 +115,13 @@ A manual tag that starts with `Fleet: ` survives only if it equals a tag the use
 
 `GetUserDetail` loads the detail row, then `GetRecentRides` and `GetRecentDrives` with limit 10 each. Ride history failures are logged and replaced with empty lists. `resolveLastSeen` reads `presence:{userId}.ts` and uses it when it is later than the stored value, so an offline user keeps their durable last seen.
 
+Detail counts and history:
+
+- `ride_count` and `drive_count` count uncanceled rides in `complete` or `pending_rider_rating`.
+- `awaiting_rating_earnings` sums `driver_payout`, in dollars, for the driver's uncanceled `pending_rider_rating` rides. It's an expected payout, not a Stripe balance.
+- `driver_cancels` counts distinct rides where the driver is `driver_id` with `cancel_user = 'driver'`, plus rides with a `RideEvents` row from this driver (`actor_type = 'driver'`) of type `ride_canceled` or `auto_requeued`. A requeued ride can move to another driver on `Rides`, so the events keep the canceling driver's history.
+- `recent_drives` (`ListDashboardRecentDrives`) unions the same two sources. A ride this driver canceled uses the latest cancel event's time as `created_at`, sets `is_canceled: true`, and sets `cancel_user: "driver"`, even if another driver later completed it. `recent_rides` and `recent_drives` items both carry `is_canceled` and `cancel_user`.
+
 | Edit | Behavior |
 | --- | --- |
 | Tags | `SetDashboardUserTags` replaces `Users.tags` for a non-deleted user. 404 when no row changes. The response returns the stripped manual tags, not the derived list. |
