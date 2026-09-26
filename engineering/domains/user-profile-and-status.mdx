@@ -1,6 +1,6 @@
 ---
 title: "User profile, status, and account lifecycle"
-description: "How the /user endpoints read and update the profile, what the /user/status poll computes and from which queries, the ride-state snapshot, shared user requirements, profile photos, history, drive fee repair, and account deletion."
+description: "How the /user endpoints read and update the profile, what the /user/status poll computes and from which queries, the ride-state snapshot, shared user requirements, profile photos and avatar resolution, history, drive fee repair, and account deletion."
 ---
 
 The `user` HTTP package serves the signed-in mobile user: their profile, the status poll that drives the app's home screen, ride and drive history, profile photos, and account deletion. Sign-in, tokens, and identity linking live elsewhere. See [Identity overview](/engineering/identity/overview) and [Tokens and sessions](/engineering/identity/tokens-and-sessions).
@@ -189,7 +189,60 @@ Zero rows returns 400 **community is unavailable for this user**. On success, th
 
 A 1200 × 800 upload scales by `min(512/1200, 512/800) = 0.4267` to 512 × 341. A 400 × 300 upload is re-encoded at its original size.
 
-`GET /user/profile-picture/thumbnail` returns the stored `photo_thumbnail_url` when present. If only `photo_url` is set, it downloads the original with a plain HTTP GET (30-second client timeout), generates and uploads the thumbnail, saves it, and invalidates the profile cache. If `photo_url` is empty, the handler returns 404 **no profile picture found**. The download bypasses the storage SDK on purpose, because stored URLs point at several historical Supabase projects.
+`GET /user/profile-picture/thumbnail` returns the stored `photo_thumbnail_url` when present. If only `photo_url` is set, it downloads the original with a plain HTTP GET (30-second client timeout), generates and uploads the thumbnail, saves it, and invalidates the profile cache. If `photo_url` is empty, the handler returns 404 **no profile picture found**. The download bypasses the storage SDK on purpose, because stored URLs point at several historical Supabase projects. When the account has no `photo_url`, the endpoint returns the driver photo thumbnail, or the driver photo when no driver thumbnail exists.
+
+### Stale thumbnails on profile writes
+
+Two other writers set `photo_url` and now clear a stale thumbnail:
+
+- `InitializeUserProfile` (profile init) sets `photo_thumbnail_url` to an empty string when the new `photo_url` differs from the stored one.
+- Auth v3 profile completion does the same when it receives a non-empty `photo_url` that differs from the stored one. An empty `photo_url` keeps both the stored photo and its thumbnail.
+
+The next thumbnail read or ride-options self-heal regenerates the thumbnail from the new photo.
+
+## Avatar resolution in responses
+
+Responses that only render an avatar return the 512 px thumbnail in `photo_url`. Each field falls back to the full photo when the thumbnail is empty, because thumbnails are generated lazily and an ungenerated thumbnail is stored as `''`. The stored columns are never rewritten. Resolution happens only when the response is built.
+
+Two orders apply, depending on whose photo the screen should show.
+
+| Order | Resolution (first non-empty wins) | Used by |
+| --- | --- | --- |
+| Driver avatar | `driver_profile_picture_thumbnail_url` → `driver_profile_picture_url` → `photo_thumbnail_url` → `photo_url` | Driver in public ride details, dashboard driver and fleet lists, driver leads, live market drivers, tip page |
+| Account avatar | `photo_thumbnail_url` → `photo_url` → `driver_profile_picture_thumbnail_url` → `driver_profile_picture_url` | Riders in ride details and the ride board, dashboard user list and user detail, presence, friends, map friends, event attendees, invite and referral previews, auth v3 user reads |
+
+The account order falls back to the driver application photo. A driver who uploaded a photo only during the driver application no longer renders blank in friend lists or rider views.
+
+### `models.User` JSON
+
+`models.User` applies the account order in `MarshalJSON`. Both `photo_url` and `photo_thumbnail_url` in the JSON carry the same resolved URL. For example, a user with `photo_url` set and no thumbnail yet, plus a driver thumbnail, serializes as:
+
+```json
+{
+  "photo_url": "https://.../profile_pictures/{userID}/{uuid}.jpg",
+  "photo_thumbnail_url": "https://.../profile_pictures/{userID}/{uuid}.jpg",
+  "driver_profile_picture_url": "https://.../driver.jpg",
+  "driver_profile_picture_thumbnail_url": "https://.../driver_thumb.jpg"
+}
+```
+
+`models.Driver` embeds `User` and has its own `MarshalJSON`, so `application` and `statistics` still serialize alongside the resolved photo. `driver_profile_picture_url` is not rewritten. Driver application review keeps reading the full-size driver photo.
+
+### Ride options
+
+`ListDriverOptionProfiles` shows the driver photo when one is set, else the account photo. It pairs each with the matching thumbnail: the driver-photo thumbnail for a driver photo, the account thumbnail otherwise.
+
+When a ride option has no thumbnail, `RideService.maybeBackfillProfileThumbnail` self-heals it asynchronously, one generation per user at a time. It first calls the driver service's `GetProfilePhotoThumbnail` to generate the driver-photo thumbnail. It generates the account thumbnail only when the driver has no driver photo. Failures are logged and never returned.
+
+### Mobile client
+
+The app reads thumbnail fields first for the profile tab, home drive bubble, profile edit sheet, and driver hub. It uses `||` rather than `??`, so an empty-string thumbnail falls back to the full photo:
+
+```tsx
+const image = user?.photo_thumbnail_url || user?.photo_url;
+```
+
+The auto-queue explainer uses the driver order: `driver_profile_picture_thumbnail_url`, `driver_profile_picture_url`, `photo_thumbnail_url`, then `photo_url`.
 
 ## History
 
@@ -267,6 +320,7 @@ Database triggers finish the cleanup. `clear_recent_locations_on_user_deletion` 
 | Storage | `internal/data/supabasestorage/storage.go` | `UploadProfilePicture`, `DownloadProfilePicture`, `deriveThumbPath` |
 | Drive fee jobs | `internal/service/user/drive_fee_jobs.go` | `driveFeeScanWorker`, `driveFeeRepairWorker` |
 | Models | `internal/models/user.go`, `photo.go` | `User`, `UserStatusDetails`, `SignupStatus`, `Photo` |
+| Avatar resolution | `internal/models/user_photo.go` | `User.ProfilePhotoURL`, `User.MarshalJSON`, `Driver.MarshalJSON` |
 
 ## Gotchas and edge cases
 
