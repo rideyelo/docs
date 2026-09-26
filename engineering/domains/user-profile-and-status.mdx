@@ -270,15 +270,15 @@ Database triggers finish the cleanup. `clear_recent_locations_on_user_deletion` 
 
 ## Gotchas and edge cases
 
-- `DELETE /user/i/{id}` ignores `{id}`. The handler always deletes the token's user, so the path value is decorative.
-- Photo deletion on account delete doesn't remove the file. `RemoveFile` in storage-go treats each array element as a full object path, so it receives three paths (`profile_pictures`, the user ID, and the bare filename) instead of one joined path. The thumbnail is never targeted either.
-- Stripe customer deletion runs before the identity lifecycle. If Apple revocation fails with 503, the user keeps their account but has lost their Stripe customer. A retry calls `DeleteCustomer` again on the same ID.
+- `DELETE /user/i/{id}` ignores `{id}`. The handler always deletes the token's user, so the path value is decorative. The route description that mentions admins is wrong.
+- Photo deletion on account delete doesn't remove the file. `SupabaseStorage.DeleteFile` passes the parts to storage-go `RemoveFile` without joining them, and `RemoveFile` treats each array element as a full object path. It receives three paths (`profile_pictures`, the user ID, and the bare filename) instead of one joined path, matches nothing, and returns no error. The thumbnail is never targeted either.
+- Stripe customer deletion runs before the identity lifecycle. If Apple revocation fails with 503, the user keeps their account but has lost their Stripe customer. A retry calls `DeleteCustomer` again on the same ID, and `DeleteCustomer` doesn't tolerate an already-deleted customer.
 - The legacy `current_ride` picks the oldest non-complete rider ride, including `requested` and `no_drivers_available` rows. If a stale row of that kind is older than a live booking, `user_status` reports `home`. The snapshot query excludes those statuses for exactly this reason.
 - `/user/status` reports `pending_rider_rating` as `riding` in both the legacy and snapshot paths.
 - Content types are built as `"image/" + extension`, and the extension includes the dot, so originals upload as `image/.jpg`. Thumbnails correctly use `image/jpeg`.
 - The extension comes from the client filename with no allow-list. A HEIC or WebP upload succeeds, but thumbnail decoding fails. Every later `GET /user/profile-picture/thumbnail` then retries the download and fails with 500.
 - Uploading a new photo doesn't delete the previous original or thumbnail from storage.
 - `PUT /user/name` validates trimmed length but stores untrimmed input, so leading and trailing spaces persist.
-- `GET /user/current-user` tolerates an `ErrorTypeMissingFields` error from the profile read and can return `user: null` with a valid `signup_status`.
+- `GetCurrentUser` still has a branch that tolerates `ErrorTypeMissingFields` and returns `user: null`, but nothing creates that error type anymore, so the branch is unreachable.
 - The profile cache TTL is 5 minutes. Writers that skip `invalidateProfileCache` serve stale profiles until then.
-- `ScrubUserPersonalDetails` leaves `referral_code`, `stripe_merchant_id`, `push_notification_token`, and last location in place.
+- `ScrubUserPersonalDetails` leaves `referral_code`, `old_referral_code`, `stripe_customer_id`, `stripe_merchant_id`, `push_notification_token`, last location, and the license photo URLs in place.

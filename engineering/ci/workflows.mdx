@@ -1,0 +1,290 @@
+---
+title: "GitHub Actions workflows"
+description: "Every GitHub Actions workflow in yelo-api, yelo-web, and yelo-frontend: triggers, jobs, runners, secrets and variables, concurrency, artifacts, and required checks"
+---
+
+This page is the inventory of every workflow under `.github/workflows/` in the three application repositories. For how the release workflows fit together end to end, see [Release pipelines](/engineering/ci/release-pipelines). For the bots and scheduled automation, see [Bots and automation](/engineering/ci/bots-and-automation). For the short overview, see [Deployment](/engineering/deployment) and [Testing](/engineering/testing).
+
+## At a glance
+
+| Repository | Workflow file | Name in the Actions tab | Trigger | Purpose |
+| --- | --- | --- | --- | --- |
+| `yelo-api` | `ci.yml` | **CI** | Pull request, manual | Merge gates |
+| `yelo-api` | `release-api.yml` | **Release API** | Push to `main`, manual | Production API release |
+| `yelo-api` | `release-e2e.yml` | **Converge E2E API** | After **Release API**, hourly, manual | Keep `yelo-api-e2e` identical to production |
+| `yelo-api` | `propagate-openapi.yml` | **Propagate OpenAPI contract** | Push to `main` touching `openapi.json`, hourly, dispatch, manual | Open client-update PRs in the consumers |
+| `yelo-api` | `sync-frontend-release.yml` | **Sync frontend release branch** | Hourly, manual | Disabled in GitHub. See [Gotchas](#gotchas-and-edge-cases) |
+| `yelo-web` | `ci.yml` | **CI** | Pull request, manual | Quality gate, affected builds, `home` preview |
+| `yelo-web` | `firebase.yml` | **Firebase** | Push to `main` | Deploy affected Firebase Hosting sites |
+| `yelo-frontend` | `ci.yml` | **CI** | Pull request | Merge gates |
+| `yelo-frontend` | `fingerprint.yml` | **Fingerprint** | Pull request | OTA-ability report and release-branch guard |
+| `yelo-frontend` | `build.yml` | **EAS Build** | Manual | Queue the EAS build-and-submit workflow |
+| `yelo-frontend` | `staging-build-slack.yml` | **Staging Build Slack** | `repository_dispatch` | Post an iOS staging install link |
+| `yelo-frontend` | `finalize-app-store-release.yml` | **Finalize App Store release** | Manual | Cut the release branch and publish the GitHub release |
+| `yelo-frontend` | `ota-stage.yml` | **OTA Stage** | Nightly, manual | Publish an update to the `staging` EAS branch |
+| `yelo-frontend` | `ota-promote.yml` | **OTA Promote** | Manual | Republish staged groups to `production`, or roll back |
+| `yelo-frontend` | `backport-supported-release.yml` | **Backport to supported release** | PR merged into `main`, manual | Rolling OTA-safe backport PR |
+| `yelo-frontend` | `e2e-agent-device.yml` | **Mobile E2E** | Manual | agent-device simulator suite |
+
+## Runners
+
+| Label | Used by | Notes |
+| --- | --- | --- |
+| `ubuntu-latest` | Lightweight jobs: API **Migration Policy** and **Coverage**, all API release and bot workflows, frontend backport and finalize, E2E `resolve-app` | GitHub-hosted |
+| `blacksmith-2vcpu-ubuntu-2404` | Web CI and deploy, frontend CI, Fingerprint, EAS Build, OTA Promote | Blacksmith-hosted. Frontend CI measured cheaper on 2 vCPU x64 than on arm |
+| `blacksmith-4vcpu-ubuntu-2404` | API **Generated Code**, **Lint**, **Unit Tests**, **Integration Tests**, and **OTA Stage** | OTA Stage stays on x64 because `hermesc` ships for linux-x64 only |
+| `self-hosted`, `macOS`, `ARM64`, `yelo-e2e` | **Mobile E2E** (default) | The team's Mac. Keeps its pnpm store and a build cache in `~/.cache/yelo-e2e-builds` between runs |
+| `macos-15` | **Mobile E2E** with `runner: github-hosted` | Paid fallback |
+
+`yelo-api/.github/actionlint.yaml` and `yelo-web/.github/actionlint.yaml` register the Blacksmith labels for actionlint. No CI job runs actionlint.
+
+## yelo-api
+
+### CI (`ci.yml`)
+
+- **Triggers:** every `pull_request` event, and `workflow_dispatch`.
+- **Concurrency:** `ci-<PR number or ref>`, cancel in progress.
+- **Permissions:** default token permissions.
+
+| Job (check name) | Runner | Runs | Artifacts |
+| --- | --- | --- | --- |
+| **Migration Policy** | `ubuntu-latest` | `make check-migration-policy` with `BASE_REF` set to the PR base SHA. Full history checkout | |
+| **Generated Code** | Blacksmith 4 vCPU | `make check-generated` (OpenAPI, sqlc, mocks, generator script tests) | |
+| **Lint** | Blacksmith 4 vCPU | `make lint` | |
+| **Unit Tests** | Blacksmith 4 vCPU | `make cover-unit-profile` | Uploads `coverage-unit` (`coverage-unit.out`, 1 day) |
+| **Integration Tests** | Blacksmith 4 vCPU | `make cover-integration-profile` (testcontainers) | Uploads `coverage-integration` (`coverage-int.out`, 1 day) |
+| **Coverage** | `ubuntu-latest` | Needs both test jobs. Downloads both profiles and runs `make coverage-merge coverage-floor` | |
+
+The **Coverage** job sets `cache: false` on `setup-go`. It only runs `go tool cover`, and caching modules there once filled most of the repository's Actions cache.
+
+### Release API (`release-api.yml`)
+
+- **Triggers:** `push` to `main`. `workflow_dispatch` with optional input `sha` (full Git SHA, defaults to the selected branch head).
+- **Concurrency:** `production-api`, `cancel-in-progress: false`. GitHub keeps one run active and one pending, so extra pushes collapse into the newest SHA.
+- **Environment:** `production`, URL `https://api.rideyelo.com`. The environment has no protection rules.
+- **Permissions:** `contents: read`, `pull-requests: read`, `id-token: write`.
+- **Variables:** `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_RELEASE_SERVICE_ACCOUNT`. No GitHub secret is used. The failure webhook comes from Secret Manager.
+
+One job, **Production**, on `ubuntu-latest`:
+
+1. **Resolve release metadata.** Resolves the SHA, finds the merged PR through `repos/<repo>/commits/<sha>/pulls`, and writes title, author, and merger to the job summary.
+2. **Authenticate to Google Cloud** with Workload Identity Federation, then set up `gcloud` for `prod-yelo`.
+3. **Check release order.** Reads the `commit-sha` label of the revision serving 100% of `yelo-api-testflight` and runs `scripts/release/release-required.sh`.
+4. **Build, migrate, smoke, and promote.** Runs `resolve-release-build.sh` to start the Cloud Build trigger, then `wait-release-build.sh` to poll it.
+5. **Resolve promoted revision.** Confirms the 100% revision carries the release SHA and records the startup time in the summary.
+6. **Notify Slack on release failure.** Runs on failure after auth succeeded. Formats with `format-release-failure-slack.sh`.
+
+See [Release pipelines](/engineering/ci/release-pipelines#api) for what Cloud Build does.
+
+### Converge E2E API (`release-e2e.yml`)
+
+- **Triggers:** `workflow_run` on **Release API** `completed`, `schedule` at minute 17 of every hour, and `workflow_dispatch` with no inputs.
+- **Gate:** the job runs only when the variable `E2E_RELEASE_ENABLED` is `true`, and for `workflow_run` only when the release succeeded.
+- **Concurrency:** `e2e-api-convergence`, cancel in progress.
+- **Permissions:** `contents: read`, `id-token: write`.
+- **Variables:** `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_RELEASE_SERVICE_ACCOUNT`, `E2E_DATABASE_PROJECT_REF`, `E2E_SERVICE_ACCOUNT`, `PRODUCTION_DATABASE_PROJECT_REF`.
+
+One job, **Match production**. It reads the production revision's commit, image digest, and `migration-version`, compares them with `yelo-api-e2e`, and runs `gcloud builds submit --config=cloudbuild.e2e.yaml` only on drift. A healthy run stops before checkout. See [Release pipelines](/engineering/ci/release-pipelines#e2e-convergence).
+
+### Propagate OpenAPI contract (`propagate-openapi.yml`)
+
+- **Triggers:** `push` to `main` with `paths: [openapi.json]`, `repository_dispatch` type `reconcile-openapi-consumers`, `schedule` at minute 17 of every hour, and `workflow_dispatch`.
+- **Concurrency:** `propagate-openapi-<ref>`, cancel in progress.
+- **Matrix:** `yelo-frontend` and `yelo-web`, `fail-fast: false`. The job name is `Update <repository>`.
+- **Credentials:** variable `OPENAPI_BOT_CLIENT_ID` and secret `OPENAPI_BOT_PRIVATE_KEY`, exchanged for a GitHub App token scoped to both consumers.
+
+See [Bots and automation](/engineering/ci/bots-and-automation#openapi-propagation-bot).
+
+### Sync frontend release branch (`sync-frontend-release.yml`)
+
+- **Triggers:** `schedule` at minute 37 of every hour, and `workflow_dispatch`.
+- **Concurrency:** `sync-frontend-release`, not cancelled.
+- **Variables and secrets:** `PREVIOUS_RELEASE_BRANCH`, `OPENAPI_BOT_CLIENT_ID`, `OPENAPI_BOT_PRIVATE_KEY`.
+- **State:** disabled manually in GitHub. The frontend's own `backport-supported-release.yml` replaced it.
+
+## yelo-web
+
+Both workflows set `permissions: {}` at the top and grant permissions per job. Both export the same `VITE_*` values from repository variables: `VITE_API_URL`, `VITE_E2E_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_SENTRY_DSN`, `VITE_MAPBOX_API_KEY`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`, `VITE_APPLE_REDIRECT_URI`, `VITE_SUPABASE_URL`, `VITE_SIGNUP_URL`, `VITE_APP_ENV`, and `VITE_POSTHOG_KEY`.
+
+### CI (`ci.yml`)
+
+- **Triggers:** `pull_request` types `opened`, `synchronize`, `reopened`, `ready_for_review`, `converted_to_draft`, `closed`, and `workflow_dispatch`.
+- **Run name:** `CI · PR #<number> · <action>`.
+- **Concurrency:** `ci-<PR number or ref>`, cancel in progress. The `closed` and `converted_to_draft` events exist only to cancel paid work already running for that PR.
+
+| Job (check name) | Runs when | Runner | What it does |
+| --- | --- | --- | --- |
+| **Quality and affected builds** (`verify`) | Manual dispatch, or a non-draft PR that isn't closing | Blacksmith 2 vCPU, 20-minute timeout | Restores `.nx/cache`, resolves the Nx range with `nrwl/nx-set-shas`, lists affected `tag:firebase-site` projects, checks them against `sites.config.json`, runs `pnpm nx run workspace-quality:ci --parallel=2`, runs `scripts/require-site-env.mjs` for affected sites, and builds them once. Uploads `home-preview` (`dist/home`, 1 day) when `home` is affected and the PR is from this repository |
+| `home-preview` | `verify` succeeded, `home` affected, same-repository PR | Blacksmith 2 vCPU | Downloads the build, checks that `.well-known/apple-app-site-association` and `assetlinks.json` are valid JSON, authenticates to `yelo-dashboard-v2` with Workload Identity Federation, deploys the `pr-<number>` preview channel with `--expires 7d`, and edits one PR comment with the URL |
+
+### Firebase (`firebase.yml`)
+
+- **Trigger:** `push` to `main`.
+- **Run name:** `Firebase · deploy <sha>`.
+- **Concurrency:** `firebase-<ref>`, not cancelled.
+- **Secrets:** `SLACK_WEBHOOK_URL`. Google auth uses Workload Identity Federation with a fixed provider and service account in the workflow file.
+
+One job, `deploy`, on Blacksmith 2 vCPU. It computes the affected range from the last successful `main` run, builds affected sites, runs `pnpm firebase:config:check`, and runs one `firebase deploy --only hosting:<site>,...` with the message `<sha7>: <commit subject>`. The Slack step is `continue-on-error`. See [Release pipelines](/engineering/ci/release-pipelines#web).
+
+## yelo-frontend
+
+### CI (`ci.yml`)
+
+- **Triggers:** `pull_request` types `opened`, `synchronize`, `reopened`, `ready_for_review`, `converted_to_draft`.
+- **Concurrency:** `ci-<PR number>`, cancel in progress.
+
+One job, **Checks**, on non-draft PRs only, Blacksmith 2 vCPU, 15-minute timeout. It installs once and runs `make api-check`, `make fmt-check`, `make typecheck`, `make lint`, `make lint-types`, and `make test`. Every step after the first uses `if: !cancelled()`, so one PR run reports all failures at once.
+
+### Fingerprint (`fingerprint.yml`)
+
+- **Triggers:** the same PR types as CI.
+- **Concurrency:** `fingerprint-<PR number>`, cancel in progress.
+- **Permissions:** `contents: read`, `pull-requests: write`.
+- **Secrets:** `EXPO_TOKEN`.
+
+One job, **OTA-ability**, on non-draft PRs from this repository, Blacksmith 2 vCPU, 30-minute timeout:
+
+1. For PRs into a version branch (`^[0-9]+\.[0-9]+\.[0-9]+$`), fails if the diff touches a path that `scripts/release-policy.mjs blocked-paths` rejects.
+2. Pulls the production EAS environment with `eas env:pull` and prepares `google-services.json` with `scripts/prepare-google-services.mjs`.
+3. Does a clean `pnpm install` and runs `expo-updates fingerprint:generate` for iOS and Android on the PR head, then on the base SHA.
+4. Writes `scripts/fingerprint-report.mjs` output to the job summary and to one sticky PR comment marked `<!-- fingerprint-report -->`.
+5. Emits a warning when the fingerprint changed, and fails if the PR targets a version branch.
+
+### EAS Build (`build.yml`)
+
+- **Trigger:** `workflow_dispatch`.
+- **Environment:** `ota-production` if any production target is selected, otherwise `ota-preview`.
+- **Secrets and variables:** `EXPO_TOKEN`, `SLACK_WEBHOOK_URL`, `RELEASE_ADMINS`.
+
+| Input | Type | Default |
+| --- | --- | --- |
+| `ios_staging` | boolean | `true` |
+| `refresh_ios_staging_profile` | boolean | `false` |
+| `ios_production` | boolean | `false` |
+| `android_staging` | boolean | `false` |
+| `android_production` | boolean | `false` |
+| `submit_ios` | boolean | `true` |
+| `submit_android` | boolean | `false` |
+| `allow_non_main` | boolean | `false` |
+
+One job, **Queue selected EAS builds**, on Blacksmith 2 vCPU, 10-minute timeout. It requires at least one target, applies the release guard for production targets, runs `eas workflow:run .eas/workflows/build-and-submit.yml --no-wait` pinned to `GITHUB_SHA`, and posts a Slack message. It doesn't wait for the builds.
+
+### Staging Build Slack (`staging-build-slack.yml`)
+
+- **Trigger:** `repository_dispatch` type `ios-staging-built`, sent by the EAS workflow.
+- **Environment:** `ota-preview`.
+- **Secrets:** `SLACK_WEBHOOK_URL`.
+
+One job, **Share iOS staging install**, on `ubuntu-latest`. It validates the payload (a UUID build ID, 40-hex source SHA and runtime), then posts a Slack Block Kit message with an **Install build** button and a QR code from `quickchart.io`.
+
+### Finalize App Store release (`finalize-app-store-release.yml`)
+
+- **Trigger:** `workflow_dispatch` with `tag` (for example `v5.7.2-267`) and `storefronts` (comma-separated country codes, default `us`).
+- **Concurrency:** `ota-production`, not cancelled. It shares this group with **OTA Promote**.
+- **Environment:** `yelo-bot`.
+- **Permissions:** `contents: read`, `id-token: write`.
+- **Secrets and variables:** `YELO_BOT_CLIENT_ID`, `YELO_BOT_PRIVATE_KEY` (environment secret), `RELEASE_ADMINS`, `EXPO_TOKEN`.
+
+One job, **Verify live and rotate supported release**. See [Release pipelines](/engineering/ci/release-pipelines#finalize-the-store-release).
+
+### OTA Stage (`ota-stage.yml`)
+
+- **Triggers:** `schedule` at `0 9 * * *` (09:00 UTC), and `workflow_dispatch`.
+- **Concurrency:** `ota-stage`, not cancelled.
+- **Environment:** `ota-preview`.
+- **Secrets:** `EXPO_TOKEN`, `SLACK_WEBHOOK_URL`.
+
+| Input | Type | Default |
+| --- | --- | --- |
+| `source_ref` | string | The selected workflow ref. Scheduled runs use `main` |
+| `platforms` | choice `all`, `ios`, `android` | `all` |
+| `message` | string, required | Scheduled runs use `Nightly from main` |
+
+One job, `Stage (<platforms>)`, on Blacksmith 4 vCPU.
+
+### OTA Promote (`ota-promote.yml`)
+
+- **Trigger:** `workflow_dispatch`.
+- **Concurrency:** `ota-production`, not cancelled.
+- **Environment:** `ota-production`.
+- **Permissions:** `contents: read`, `id-token: write`.
+- **Secrets and variables:** `EXPO_TOKEN`, `SLACK_WEBHOOK_URL`, `RELEASE_ADMINS`.
+
+| Input | Type | Notes |
+| --- | --- | --- |
+| `action` | choice `promote`, `rollback` | Default `promote` |
+| `source_commit` | string | Promote only. The full 40-character SHA from the staging Slack alert |
+| `group_id` | string | Rollback, or advanced promote. Can't be combined with `source_commit` |
+| `second_group_id` | string | Only when iOS and Android runtimes differ |
+| `platforms` | choice `all`, `ios`, `android` | Default `all` |
+| `message` | string, required | Approval or rollback reason |
+
+One job on Blacksmith 2 vCPU, named after the action and the commit or group.
+
+### Backport to supported release (`backport-supported-release.yml`)
+
+- **Triggers:** `pull_request_target` type `closed` on base `main`, and `workflow_dispatch` with a required `pull_request` number.
+- **Concurrency:** `backport-supported-release`, not cancelled. All merges queue behind one another because they update one shared branch.
+- **Environment:** `yelo-bot`.
+- **Secrets and variables:** `YELO_BOT_CLIENT_ID`, `YELO_BOT_PRIVATE_KEY`.
+
+One job, **Backport OTA-safe pull request**, on `ubuntu-latest`, 10-minute timeout. It runs only for merged PRs without the `skip-supported-release-backport` label. See [Bots and automation](/engineering/ci/bots-and-automation#supported-release-backports).
+
+### Mobile E2E (`e2e-agent-device.yml`)
+
+- **Trigger:** `workflow_dispatch`.
+- **Concurrency:** `mobile-e2e-publish`, not cancelled.
+- **Secrets and variables:** `EXPO_TOKEN`, `E2E_CONTROL_API_KEY`, `E2E_ARTIFACT_SUPABASE_SECRET_KEY`, `E2E_API_URL`, `E2E_ARTIFACT_SUPABASE_URL`, `E2E_VIEWER_URL`.
+
+| Input | Options | Default |
+| --- | --- | --- |
+| `runner` | `self-hosted`, `github-hosted` | `self-hosted` |
+| `app_source` | `local`, `eas` | `local` |
+| `app_url` | EAS iOS simulator archive URL | Blank builds the current commit |
+| `flow` | Flow file or directory | `e2e/flows` |
+| `mode` | `flow`, `schedule` | `schedule` |
+| `suite` | Suite manifest | `e2e/suites/core-smoke.json` |
+| `max_devices` | `1` to `10` | `8` |
+
+| Job | Runner | What it does |
+| --- | --- | --- |
+| `resolve-app` | `ubuntu-latest`, only when `app_source` is `eas` | Reuses a finished `e2e-simulator` iOS build for `GITHUB_SHA`, or builds one with `eas build --wait` |
+| `ios` | Self-hosted Mac or `macos-15`, 45-minute timeout | Gets the app (EAS download, or `eas build --local` with a per-SHA archive cache), verifies the embedded API with `scripts/e2e-app-target.mjs`, prepares simulators, and runs `scripts/e2e-scheduler.mjs` or `scripts/e2e-run.sh`. Uploads `e2e-<run_id>` from `.artifacts/e2e` (14 days) |
+
+The local build reuses an older archive when the only changed paths are E2E runner files, such as `e2e/*`, `scripts/e2e-*`, the workflow itself, and top-level docs. Evidence is published only when `E2E_ARTIFACT_SUPABASE_SECRET_KEY` is set. See [Testing](/engineering/testing#mobile-e2e).
+
+## Required checks and branch rules
+
+Branch rules are configured as GitHub rulesets, not classic branch protection. Every rule below requires the status checks to pass on the latest base commit (strict).
+
+| Repository | Branches | Required checks | Reviews | Other rules | Bypass |
+| --- | --- | --- | --- | --- | --- |
+| `yelo-api` | `main` | **Migration Policy**, **Lint**, **Unit Tests**, **Integration Tests**, **Coverage**, **Generated Code** | Code owner review. No general approval count. One approval from the migration approvers team for `migrations/**`. Threads must be resolved | Signed commits, no deletion, no force push | Organization admins |
+| `yelo-web` | `main` | **Quality and affected builds** | One approval, code owner review, resolved threads | Signed commits, no deletion, no force push | A repository role (on the PR and CI ruleset only) |
+| `yelo-frontend` | `main`, `5.7.1` | **Checks**, **OTA-ability** | Code owner review, resolved threads. No approval count | Signed commits, no deletion, no force push | A repository role (on the PR and CI ruleset only) |
+
+Workflows that don't gate merges: **Release API**, **Firebase**, and every manual or scheduled workflow.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| API workflows | `yelo-api/.github/workflows/` |
+| API release scripts | `yelo-api/scripts/release/` |
+| Web workflows | `yelo-web/.github/workflows/` |
+| Web site registry | `yelo-web/sites.config.json`, `src/sites/<site>/project.json` (`metadata.requiredBuildEnv`) |
+| Mobile workflows | `yelo-frontend/.github/workflows/` |
+| EAS workflow | `yelo-frontend/.eas/workflows/build-and-submit.yml` |
+| Release path policy | `yelo-frontend/scripts/release-policy.mjs` |
+| OTA group validation | `yelo-frontend/scripts/ota-metadata.mjs` |
+
+## Gotchas and edge cases
+
+- **The frontend release-branch rules name `5.7.1` explicitly.** The supported release is currently `5.7.3` (latest release `v5.7.3-269`), and no ruleset applies to it. **OTA-ability** still runs and fails on native drift there, but GitHub doesn't require it before merge. Add each new release branch to both frontend rulesets, or switch the condition to a pattern.
+- **Draft PRs skip every gate.** Web **Quality and affected builds**, frontend **Checks**, and **OTA-ability** don't run on drafts. A skipped job counts as passing, so mark the PR ready before you trust a green status.
+- **Fork PRs never get OTA-ability.** The job condition requires the head repository to be `rideyelo/yelo-frontend`. A fork PR can't satisfy that required check.
+- **`allow_non_main` can't bypass the environment.** `build.yml` production runs use the `ota-production` environment, which only deploys from protected branches. The override works only for a protected branch other than `main`.
+- **Frontend workflows mix pinning styles.** `ci.yml`, `fingerprint.yml`, `build.yml`, and `ota-stage.yml` use tag refs like `actions/checkout@v4`. The release and backport workflows pin commit SHAs. The frontend Dependabot config doesn't track GitHub Actions.
+- **Unused repository settings.** `yelo-api` defines the variables `API_NATIVE_RELEASE_TRIGGER` and `API_RELEASE_ENABLED` and a `production` environment secret `SLACK_WEBHOOK_URL`. `yelo-web` defines the secret `FIREBASE_TOKEN`. No workflow on `main` reads any of them.
+- **Missing web variables.** `VITE_SENTRY_DSN`, `VITE_APPLE_REDIRECT_URI`, and `VITE_SIGNUP_URL` are referenced by both web workflows but are not defined as repository variables. They build as empty strings. The dashboard only calls `Sentry.init` when `VITE_SENTRY_DSN` is set, so CI-built dashboards ship without Sentry. The other two fall back to hard-coded defaults.
+- **`sync-frontend-release.yml` is disabled.** It still targets `PREVIOUS_RELEASE_BRANCH`, which is `5.7.1`. Don't re-enable it without updating that variable, or it syncs `main` into a retired branch.

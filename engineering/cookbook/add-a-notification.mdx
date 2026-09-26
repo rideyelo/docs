@@ -1,0 +1,143 @@
+---
+title: "Add a notification"
+description: "Recipe for a new push notification code: the TemplateCode and Vars struct, the seed template, orchestrator classification, emitting it transactionally, a deep link the app can open, and cache invalidation in the mobile app."
+---
+
+A notification is a `TemplateCode` in `yelo-api/internal/notify`, a seeded template row, and a call to `Emit`. The mobile app decides what the push refreshes and where a tap goes. This recipe walks through every place a new code must appear. For the pipeline itself, see [Send pipeline](/engineering/notifications/send-pipeline), [Templates and rendering](/engineering/notifications/templates-and-rendering), and [Mobile push handling](/engineering/notifications/mobile-push-handling).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#196](https://github.com/rideyelo/yelo-api/pull/196) | Adds `direct_request_fallback`: constant, `Vars` struct, `Registry` entry, seed with `ClientDataType: "ride_status_changed"`, both orchestrator switches, and a `NotificationService` wrapper. |
+| [yelo-api#186](https://github.com/rideyelo/yelo-api/pull/186) and [yelo-frontend#569](https://github.com/rideyelo/yelo-frontend/pull/569) | Adds the silent `map_content_changed` code with a `scope`, and the matching `invalidateForPush` branch in the app. |
+
+## Recipe
+
+<Steps>
+  <Step title="Declare the code and its variables">
+    In `internal/notify/codes.go`, add a constant, a `Vars` struct, and a `Registry` entry:
+
+    ```go
+    const CodeWidgetReady TemplateCode = "widget_ready"
+
+    type WidgetReadyVars struct {
+    	WidgetName string    `notify:"widget_name,required"`
+    	WidgetID   uuid.UUID `notify:"widget_id,required"`
+    }
+
+    func (WidgetReadyVars) TemplateCode() TemplateCode { return CodeWidgetReady }
+
+    var Registry = map[TemplateCode]reflect.Type{
+    	// ...
+    	CodeWidgetReady: reflect.TypeFor[WidgetReadyVars](),
+    }
+    ```
+
+    The `notify` tag names the placeholder and marks it required. `TestRegistry_AllCodesHaveVarsStruct` and `TestRegistry_NoOrphanCodes` in `codes_test.go` keep the constants, structs, and registry in step.
+  </Step>
+  <Step title="Seed the template">
+    Add a `TemplateSeed` to `Templates()` in `internal/notify/seed/templates.go`:
+
+    ```go
+    {
+    	Code:   notify.CodeWidgetReady,
+    	Locale: "en", Channel: "push", Deeplink: "/map",
+    	Variables: map[string]VarSchema{
+    		"widget_name": {Type: "string", Required: true},
+    		"widget_id":   {Type: "uuid", Required: true},
+    	},
+    	Haptic: "default", Sound: "default", AndroidChannel: "default", Priority: "high",
+    	Category: "transactional", MaxRecipients: new(1),
+    	Variants: []VariantSeed{{Label: "default", Title: "Your widget is ready", Body: "{{widget_name}} is ready.", Weight: 1}},
+    },
+    ```
+
+    - `Variables` is what the server validates against. It must list every placeholder used in the copy and deep link, with the same names as the `notify` tags.
+    - `ClientDataType` overrides the `data.type` the app receives. It defaults to the code. Set it only to reuse an existing app handler, as `direct_request_fallback` does with `ride_status_changed`.
+    - `Silent: true` sends a data-only push that wakes the app without an alert.
+    - `Category` controls quiet hours. The loader sets `quiet_hours_behavior` to `defer` for `marketing` templates and `community_broadcast`, and `bypass` for everything else.
+
+    `TestSeed_AllCodesCovered` fails if a registered code has no seed. The loader runs on every boot before River starts, and a seeding failure stops the instance, so the row exists before any emit.
+  </Step>
+  <Step title="Classify it in the orchestrator">
+    Add the code to both switches in `internal/notify/queue/orchestrate.go`:
+
+    - `orchestrationFreshnessForCode`: time-sensitive codes get the short freshness window. Durable codes get the long one.
+    - `bypassesCooldowns`: only data pings and chat bypass user cooldowns.
+
+    Both switches are on `notify.TemplateCode` and the `exhaustive` linter is on, so `make lint` fails until you place the new code. Update the lists in `orchestrate_freshness_unit_test.go` to match.
+  </Step>
+  <Step title="Emit it">
+    Prefer emitting inside the transaction that makes the state change, so the notification commits or rolls back with it:
+
+    ```go
+    err := notify.Emit(ctx, tx, notify.CodeWidgetReady,
+    	notify.WidgetReadyVars{WidgetName: w.Name, WidgetID: w.ID},
+    	notify.WithRecipient(w.OwnerID),
+    	notify.WithEventKey("widget_ready:"+w.ID.String()),
+    )
+    ```
+
+    `internal/service/ride/messaging.go` and `internal/data/repository/ride_revision.go` emit this way. When there's no ambient transaction, add a wrapper to `NotificationService` in `internal/service/notifications/notification.go`. It calls `notify.EmitNoTx` through the injected `Emitter`. If other services call it, add the method to the interface in `internal/service/notification/interface.go` and run `make mocks`.
+
+    Set `WithEventKey` whenever the default key, `{code}:{entity}:{5-minute bucket}`, would drop a legitimate repeat or allow a duplicate. Use `WithData` for extra string keys the app reads, such as `status` for ride pushes.
+  </Step>
+  <Step title="Pick a deep link the app can open">
+    The tap handler passes the template's deep link straight to `router.push`. Nothing normalizes it. Before you seed it:
+
+    - Use an absolute path that exists under `yelo-frontend/app/`, such as `/map`. A relative path like `ride/4-ride` resolves against whatever screen is open.
+    - Check the file exists. Route groups such as `(app)` and `(tabs)` don't appear in the URL.
+    - Check that the screen reads any query parameters you add. The table in [Deep link resolution](/engineering/notifications/mobile-push-handling#deep-link-resolution) lists seeded links that fall through to `+not-found` today.
+
+    If the target screen is new, ship it in a mobile build or OTA update before the API starts sending the code.
+  </Step>
+  <Step title="Refresh app data on receipt">
+    If the push means cached data is stale, handle its `data.type` in `invalidateForPush` in `yelo-frontend/lib/notifications/pushInvalidation.ts`:
+
+    - Add the type to `PushDataType`.
+    - Invalidate the Orval query roots it affects. Query keys are URL paths such as `/user/status`.
+    - Add cases to `pushInvalidation.test.ts`.
+
+    Otherwise the app shows the banner and refreshes nothing. It runs for both received pushes and taps, so a cold-start tap also refreshes.
+  </Step>
+  <Step title="Test and document">
+    - Service tests use a fake `Emitter` that records calls.
+    - Queue tests under `internal/notify/queue` cover orchestration. `silent_push_unit_test.go` is the model for data-only codes.
+    - After deploy, use **Send test** on the template in the dashboard's notification templates panel. It goes through the same orchestrator and send workers as real traffic. See [Notification templates](/dashboard/notification-templates).
+    - Add the code to [Notification catalog](/engineering/notifications/catalog) with its trigger, recipients, variables, deep link, and app handling.
+  </Step>
+</Steps>
+
+## Checklist
+
+- [ ] Constant, `Vars` struct with `notify` tags, and `Registry` entry in `codes.go`.
+- [ ] `TemplateSeed` whose `Variables` match the tags, and whose copy uses only those placeholders.
+- [ ] The code is in both orchestrator switches, and the unit test lists are updated.
+- [ ] The emit is inside the state-change transaction, or goes through `NotificationService` with a deliberate event key.
+- [ ] The deep link is absolute and resolves to a real route.
+- [ ] `invalidateForPush` handles the type if the app should refresh.
+- [ ] The catalog page is updated.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Seeds never update existing rows">
+    The loader inserts with `ON CONFLICT DO NOTHING` on `(code, locale)` for templates and `(code, locale, label)` for variants. Editing copy, variables, or settings in `templates.go` changes only fresh databases. To change an existing environment, edit it in the dashboard or write a migration.
+  </Accordion>
+  <Accordion title="New variables on an existing code">
+    Adding a field to the `Vars` struct shows it in the dashboard's insert buttons, but the stored `variables` schema doesn't gain it. Copy that uses it is rejected as `unknown template placeholder` until a migration updates `NotificationTemplates.variables`.
+  </Accordion>
+  <Accordion title="Empty required values cancel the send">
+    `ValidateVars` treats an empty string as missing. A required variable that's sometimes blank, such as a license plate, silently cancels those sends. Make it optional, or fill a fallback before emitting.
+  </Accordion>
+  <Accordion title="Renaming the seeded variant label">
+    If an admin renames the `default` variant, the next boot inserts a fresh `default` at weight 100. The active weights then exceed 100 and every emit of that code is canceled. Deactivate variants instead of renaming the seeded one.
+  </Accordion>
+  <Accordion title="Changing data.type later">
+    Operators can change `client_data_type` in the dashboard. Installed apps only understand the types they shipped with, so changing it can stop refreshes on older builds.
+  </Accordion>
+  <Accordion title="Old app versions">
+    An installed app that doesn't know your `data.type` shows the banner and ignores the payload. If the notification is useless without the new handler, ship the app change first and let it reach users before the API starts emitting. See [Mobile releases](/engineering/mobile/releases).
+  </Accordion>
+</AccordionGroup>

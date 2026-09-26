@@ -114,8 +114,8 @@ Writers: `internal/data/repository/ride*.go` through `queries/ride_lifecycle.sql
 | --- | --- | --- | --- | --- |
 | `cancel_phase` | `text` | Yes | | Status the ride was in when cancelled. Non-null means cancelled. |
 | `cancel_user` | `text` | Yes | | Who cancelled: `rider` or `driver` (`models.UserType`). `NULL` for automatic cancellation. |
-| `cancel_reason` | `text` | Yes | | Reason. The system writes `automatic` for unmatched confirmed rides and `superseded` when a new request replaces an older `requested` ride. A driver's requeue reason is also stored here. |
-| `cancel_comment` | `text` | Yes | | Free-text comment with the cancellation. |
+| `cancel_reason` | `text` | Yes | | Reason. The system writes `automatic` for unmatched confirmed rides, `superseded` when a new request replaces an older `requested` ride, and `admin_silent_cancellation` for a dashboard silent cancellation. A driver's requeue reason is also stored here. |
+| `cancel_comment` | `text` | Yes | | Free-text comment with the cancellation. A silent cancellation stores the admin's reason here. |
 | `driver_rating` | `integer` | Yes | | Rating the rider gave the driver (`RateRideDriver`). |
 | `rider_rating` | `integer` | Yes | | Rating the driver gave the rider (`RateRideRider`). |
 | `rider_feedback` | `text` | Yes | | Feedback written by the rider about the driver. |
@@ -165,6 +165,7 @@ No current query reads or writes these by name. They remain from earlier version
 - `rides_missing_fee_driver_idx` and `rides_missing_fee_payment_intent_idx` support the Stripe fee repair job.
 - Trigger `attach_yelo_pickup` and `attach_yelo_destination` (`BEFORE INSERT OR UPDATE`) run `attach_yelo_place` to resolve `*_place_id`.
 - Trigger `contact_sync_rides` (`AFTER INSERT OR UPDATE OR DELETE`) queues `ContactSyncRequests` for the rider and driver when a ride enters or leaves "completed and not cancelled".
+- Trigger `guard_fleet_ride_archive` (`BEFORE INSERT OR UPDATE OF fleet_id`) rejects a ride that references an archived fleet. See [Fleet archival](/reference/database/fleets-and-vehicles#fleet-archival).
 - Row level security is enabled with no policies, so Supabase client roles can't read the table. The API connects as the owner.
 
 ### Concurrency
@@ -172,6 +173,12 @@ No current query reads or writes these by name. They remain from earlier version
 Ride commands lock the ride row (`LockRideCommandState ... FOR UPDATE`) and then every participant's `Users` row in a stable order. After a command, `AdvanceRideCommandRevision` bumps `lifecycle_revision` and, if the assignee changed, `assignment_generation`. `AdvanceUserRideStateRevision` bumps `Users.ride_state_revision` for each affected user so clients can detect stale ride state. See [Rides implementation](/engineering/api/rides-implementation).
 
 Matching code also takes a Postgres advisory lock per ride (`AcquireRideAdvisoryLock` in `ride_driver.sql`).
+
+### Admin silent cancellation
+
+`POST /dashboard/rides/{id}/silent-cancel` runs `SilentCancel` in `internal/data/repository/ride_admin_cancel.go`, with queries in `queries/ride_admin_cancel.sql`. It takes the normal ride command locks, requires the caller's expected `lifecycle_revision`, and re-runs `GetRideSilentCancellation`. That query allows only `driver_en_route`, `driver_waiting`, and `in_progress` rides where `COALESCE(discounted_price, price) = 0`, `payment_intent_id` and `tip_payment_intent_id` are null, no `RideOperations` row is `pending` or `quarantined`, the driver has no other `queued` ride, and no `NotificationDeliveries` row for the ride's `Notifications` is `queued` or `sending`.
+
+`SilentlyCancelRide` sets `status = 'complete'`, `cancel_phase` to the prior status, `cancel_user = NULL`, `cancel_reason = 'admin_silent_cancellation'`, `cancel_comment` to the reason, and `complete_time = now()`. `driver_id` is kept. The same transaction advances ride and user revisions and inserts a `ride_canceled` `RideEvents` row directly, with `actor_type = 'system'` and metadata `admin_id` (a Clerk user ID, not a `Users` ID), `reason`, `source`, `notifications_suppressed`, and `cancellation_fee`. No payment, queue, or notification code runs.
 
 ### Gotchas
 
@@ -196,7 +203,7 @@ Append-only timeline of what happened to a ride. Created in `000186_ride_events`
 
 Indexes: `(ride_id, created_at)` and `(event_type, created_at)`.
 
-Writers: `rideevents.EventRecorder` in `internal/service/rideevents/recorder.go` buffers events in a 500-slot channel and inserts them from one goroutine. `InsertMessageTimeline` in `messaging.sql` writes `message_sent` events directly.
+Writers: `rideevents.EventRecorder` in `internal/service/rideevents/recorder.go` buffers events in a 500-slot channel and inserts them from one goroutine. `InsertMessageTimeline` in `messaging.sql` writes `message_sent` events directly. Admin silent cancellation writes its `ride_canceled` event with `InsertRideEvent` inside the cancellation transaction.
 
 <Note>
 Event recording is best effort. If the channel stays full for 100 ms, the event is dropped with a warning, and insert failures are only logged. Don't use `RideEvents` as an audit log of record.
@@ -391,10 +398,11 @@ One row per driver online session. Created in `000109_driver-sessions`. For how 
 | `vehicle_id` | `uuid` | Yes | | Vehicle for this session. FK to `Vehicles` with `ON DELETE SET NULL`. |
 
 - `idx_driver_sessions_open` on `driver_id` where `end_time IS NULL`. It isn't unique, so the schema doesn't prevent two open sessions. `PromoteAutoQueuedRide` requires exactly one.
+- Trigger `guard_fleet_session_archive` rejects a session that references an archived fleet.
 - Trigger `fleet_vehicle_session_guard` runs `guard_fleet_vehicle_session` on open sessions. When the fleet or vehicle is fleet-managed, it requires the vehicle to be approved (`application_status = 'complete'`) and available to the driver, and the driver to be an active member of the fleet. Otherwise it raises SQLSTATE `23514`.
 - `CloseDriverSessionsWithoutActiveRides` only closes a session if the driver has no unfinished ride.
 
-Writers: `user_driver.sql` and `fleet_vehicle.go`. Readers: ride acceptance, auto-queue promotion, supply and demand, notification recipient selection (`internal/notify/repository/recipients.go`).
+Writers: `user_driver.sql` and `fleet_vehicle.go`. Readers: ride acceptance, auto-queue promotion, the dashboard **Live** market queries (`queries/supply_demand.sql`), notification recipient selection (`internal/notify/repository/recipients.go`).
 
 ## DriverAutoQueueLog
 

@@ -56,7 +56,7 @@ All user and presignup tokens are HS256 with `iss` and `aud` set to `api.rideyel
 `Invalidate` is called by account deletion, community switches (`UserService.UpdateActiveCommunity`, `ActiveCommunityService`), `DriverService` at `driver.go:606`, and fleet joins (`fleet_join.go:97`).
 
 <Warning>
-There is no API or dashboard action that bans a user. Bans are set directly in the database, and nothing invalidates the cache. A newly banned user keeps working for up to 15 minutes, until their cache entry expires.
+There is no API or dashboard action that bans or unbans a user. The only API write to `is_banned` is the insert in `CreateUserProfile`, and the dashboard only filters on it. Bans are set directly in the database, and nothing invalidates the cache. A newly banned user keeps working for up to 15 minutes, until their cache entry expires. Web refresh is the exception: `RefreshWebSession` re-reads the user from Postgres and revokes the family as soon as the ban is set.
 </Warning>
 
 ## Lifecycles
@@ -117,7 +117,7 @@ There is no API or dashboard action that bans a user. Bans are set directly in t
     There's no legacy list. Rotating it invalidates onboarding tokens issued in the last 15 minutes (or 1 hour for web). Affected users see an error on **Finish profile** and restart sign-in.
   </Accordion>
   <Accordion title="AUTH_V3_STATE_HMAC_KEYS">
-    Comma-separated base64 keys, newest first. The first key seals new secrets and provider state. Every key verifies. Keep the old key for at least the transaction TTL. Changing the first key also changes nonces derived for attempt IDs, so an in-progress attempt's retry is rejected.
+    Comma-separated base64 keys, newest first. The first key seals new secrets and provider state. Every key verifies. Keep the old key for at least the transaction TTL. Changing the first key also changes nonces derived for attempt IDs. A pending attempt that retries authorize gets the new nonce, because the upsert overwrites the stored nonce hash.
   </Accordion>
   <Accordion title="AUTH_V3_REFRESH_TOKEN_KEYS">
     Comma-separated base64 keys of exactly 32 bytes, newest first. Ciphertexts start with `YRT1` and an 8-byte key ID derived from the key. Decryption picks the matching key. Apple refresh tokens and StudID verification secrets share this keyring. Never remove a key while any `AuthIdentities.apple_refresh_token_ciphertext` uses it, or deletion for those users fails with `ProviderUnavailable`.
@@ -146,10 +146,10 @@ There is no API or dashboard action that bans a user. Bans are set directly in t
 
 ## Gotchas and edge cases
 
-- **Two tabs, one family.** The web client deduplicates refresh within a tab only. Two tabs that refresh at the same moment race on the same refresh token. The loser sees `rotated_at` set, treats it as replay, and revokes the family, which signs out both tabs.
-- **Web refresh has no serialization retry.** Unlike exchange and resolution, `RefreshWebSession` runs its transaction once. A serialization failure surfaces as a 500 and clears the cookie.
-- **Web onboarding becomes a full token on refresh.** A web user with an incomplete profile gets a web session at exchange. The first refresh returns a full `user` token. See [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions#gotchas-and-edge-cases).
+- **Two tabs, one family.** The web client deduplicates refresh within a tab only (a module-level `refreshPromise` in `signupSession.ts`, with no `BroadcastChannel` or `navigator.locks`). Two tabs that refresh with the same token both lose the session. If the second refresh arrives after the first committed, it sees `rotated_at` set, treats it as replay, and revokes the family. If they overlap, the loser usually fails with a serialization error instead (next item). Either way both tabs are signed out.
+- **Web refresh has no serialization retry.** Unlike exchange, resume, and resolution, `RefreshWebSession` runs its serializable transaction once. A serialization failure surfaces as a 500, and the handler clears the cookie on any error.
+- **Web onboarding becomes a full token on refresh.** A web user with an incomplete profile gets a web session and refresh cookie at exchange. `RefreshWebSession` checks only deleted and banned state, so the first refresh returns a full `user` token. See [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions#gotchas-and-edge-cases).
 - **Finishing a profile on web yields a long-lived token.** `FinishProfile` always calls `IssueUserToken`, so a web client that calls it gets a 6,360-hour token in `sessionStorage`. The current web page never calls it.
-- **The Stripe reauth link carries a bearer token in a URL.** `GetOnboardingLink` embeds a 24-hour user token in the Stripe return URL query string. `ReauthOnboardingLink` accepts any parseable token there, including one with a `presignup` role, and doesn't check deleted or banned state.
-- **Presignup routes ignore bans.** A banned user's full token still passes `/authv2/status`. On mobile that is the `currentUser` query, so a banned user's profile loads while every other call returns 401. The app only signs out on `AccountDeletedError`, not `AccountBannedError`.
+- **The Stripe reauth link carries a bearer token in a URL.** `GetOnboardingLink` embeds a 24-hour user token in the Stripe return URL query string. The unauthenticated `/stripe-reauth/onboarding` route (`ReauthOnboardingLink`) accepts any token that `GetUserIDFromToken` parses, including a `presignup` token with a user ID. It checks no role and no deleted or banned state.
+- **Presignup routes ignore bans.** A banned user's full token still passes `/authv2/status`. `GetStatus` has no banned status, so it returns `authenticated` with `user.is_banned = true`. On mobile that is the `currentUser` query, so a banned user's profile loads while every other call returns 401 `AccountBannedError`. The app only signs out on `AccountDeletedError` or status `deleted`, so a banned user stays signed in.
 - **Tokens without `exp` never expire.** `parseToken` doesn't require `exp`. Every Yelo issuer sets it, but a hand-signed token with the production key and no `exp` would be accepted forever.

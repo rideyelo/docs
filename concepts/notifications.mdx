@@ -12,7 +12,7 @@ This page explains the model. To edit copy or review history in the dashboard, s
 | Channel | Provider | Used for |
 | --- | --- | --- |
 | Push | Expo Push Service (`https://exp.host`) | Every templated notification: ride lifecycle, dispatch, chat, payouts, broadcasts. |
-| SMS | Twilio | Friend bumps, and phone sign-in codes through Twilio Verify. |
+| SMS | Twilio, or Photon for friend bumps when configured | Friend bumps, and phone sign-in codes through Twilio Verify. |
 | Email | Resend | Only the email verification code ("Your Yelo verification code"). |
 | Slack | Slack (internal) | Signup alerts and driver application step alerts to the team. Users never see these. |
 
@@ -110,13 +110,17 @@ The request goes to `POST /dashboard/notifications/send` and requires the `admin
   The **Link (optional)** field is saved but not sent. Broadcasts always open the template's default deep link.
 </Warning>
 
+<Warning>
+  A second broadcast to the same community in the same 5-minute window is dropped, even with a different recipient group or copy. The broadcast event key is the community plus a 5-minute time bucket, and the API still reports success.
+</Warning>
+
 ### Scheduled broadcasts
 
 A scheduled broadcast is stored in `ScheduledCommunityNotifications`. A background loop in the API checks every minute and sends due rows, then deletes them. You can list scheduled sends in the **Scheduled** tab and cancel one with `DELETE /dashboard/notifications/scheduled/{schedule_id}`.
 
-### Pings from Supply & Demand
+### Market notifications and pings
 
-The **Supply & Demand** page can notify a market or ping one driver or rider. These emit `community_broadcast`, `dashboard_ping_driver`, and `dashboard_ping_rider`.
+The API can also notify a whole market or ping one driver or rider. These emit `community_broadcast`, `dashboard_ping_driver`, and `dashboard_ping_rider`. The dashboard has no controls for them today, because the **Supply & Demand** page that hosted them was replaced by **Live**. See [Operator broadcasts](/engineering/notifications/broadcasts-and-scheduling).
 
 ## Limits, cooldowns, and quiet hours
 
@@ -140,7 +144,7 @@ A friend bump tells a friend where you are heading. `POST /notification/bump` se
 | Alert | When | Channel |
 | --- | --- | --- |
 | Signup alert | 90 seconds after a new account is created. Test accounts are skipped. | User updates |
-| Driver application | On the first upload of **Profile Photo**, **License Photos**, **Vehicle Created**, and on **Stripe Signup** completion. Includes a **View application** link. | Driver updates |
+| Driver application | On the first upload of **Profile Photo**, **License Photos**, and **Vehicle Created**. **Stripe Signup** posts on every Stripe `account.updated` event for a complete account, so it can repeat. Includes a **View application** link. | Driver updates |
 
 ## Opt-outs
 

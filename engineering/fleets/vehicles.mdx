@@ -37,7 +37,7 @@ JOIN "FleetDrivers" fd ON fd.fleet_id = f.id
 WHERE v.archived_at IS NULL;
 ```
 
-The shared branch joins every membership, active or not. An inactive membership means "selected another fleet", not "removed". Visibility and usability are separate: the other queries add approval and active-membership checks on top of this view.
+The shared branch joins every membership, active or not. An inactive membership means "selected another fleet", not "removed". Only deleting the membership, through the admin membership editor, revokes visibility. The editor then clears `Users.vehicle_id` if it points at a vehicle of a fleet the driver no longer belongs to (`ClearRevokedDriverFleetVehicle`). Visibility and usability are separate: the other queries add approval and active-membership checks on top of this view.
 
 The view and the two trigger functions are revoked from `PUBLIC`, `anon`, and `authenticated`, so only the API's database role reads them.
 
@@ -51,7 +51,7 @@ Runs `AFTER INSERT OR UPDATE OF is_active ON "FleetDrivers"`, only when `NEW.is_
 2. If one exists, sets `Users.vehicle_id` to it, replacing any personal selection.
 3. If none exists and the user's current `vehicle_id` is a shared vehicle of any fleet, clears it to `NULL`.
 
-This trigger fires on enrollment (`UpsertDriverFleetMembership`, even when the row was already active), on switching (`SetDriverActiveFleet`), and on `AddDriverToFleet`. It doesn't check whether the driver is online. The callers that check offline state are the join and switch paths only.
+This trigger fires on enrollment (`UpsertDriverFleetMembership`, even when the row was already active), on switching (`SetDriverActiveFleet`), and on default enrollment (`AddDriverToDefaultFleet`). Inserting an inactive membership through the admin membership editor doesn't fire it. The trigger doesn't check whether the driver is online. Its callers do: joins and switches refuse online drivers, and admin transfers and membership edits take the driver offline first.
 
 ### `guard_fleet_vehicle_session`
 
@@ -161,6 +161,7 @@ For personal vehicles, `savePersonalVehicleDefault` sets `Users.vehicle_id` only
 - **Unapproved inventory also blocks personal vehicles.** A fleet whose only vehicle is `pending` has inventory but no candidates.
 - **Editing can silently drop the default.** `Save` deletes and re-inserts the `FleetVehicles` row with the submitted `is_default`. A client that omits `is_default: true` when editing the default vehicle leaves the fleet without one.
 - **Moving a vehicle between owners is one save.** Changing `fleet_id` or switching to a `driver_id` rewrites ownership in place. The member-propagation and selection-clearing steps keep users consistent.
-- **Triggers ignore online state.** An admin `AddDriverToFleet` on an online driver fires `select_fleet_default_vehicle` and can change `Users.vehicle_id` mid-session. `RefreshDriverSession` then refuses to continue with a different vehicle until the driver goes offline.
+- **Triggers ignore online state.** `select_fleet_default_vehicle` can change `Users.vehicle_id` for any caller. Every current caller either refuses online drivers or takes them offline first, so this relies on the callers.
 - **Shared vehicles have no occupancy lock.** Two drivers can be online in one cart. Only the warning is new.
-- **Deleted or inactive fleets hide their inventory.** The view requires an active, non-deleted fleet, so members of a fleet whose Stripe account was just unlinked lose shared vehicles until the fleet is reactivated.
+- **Inactive fleets hide their inventory.** The view requires an active, non-archived fleet, so members of a fleet whose Stripe account was just unlinked lose shared vehicles until the fleet is reactivated.
+- **Fleet vehicles block fleet archive.** A fleet can't be archived while it has an unarchived vehicle, or an archived vehicle still selected by a user. Archive or reassign its inventory first. Trigger `guard_fleet_vehicle_archive` also rejects linking a vehicle to an archived fleet.

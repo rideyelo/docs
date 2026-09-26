@@ -1,0 +1,149 @@
+---
+title: "Add a migration"
+description: "Recipe for a yelo-api schema change: numbered golang-migrate pairs, the immutability and gap checks, sqlc regeneration, enum values in SQL and Go, backfills, and how releases apply migrations."
+---
+
+Schema changes live in `yelo-api/migrations/` as golang-migrate SQL pairs. This recipe covers the files you touch, the checks CI runs, and the release rules that decide what a migration may do. For background, see [Data layer](/engineering/api/data-layer#migrations) and [Deployment](/engineering/deployment#migrations-and-rollback).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#265](https://github.com/rideyelo/yelo-api/pull/265) | New tables plus an in-migration backfill (`000345_canonical_top_locations`). Keeps the old table as an archive. The down migration drops the new tables and says edits made under the new model are not copied back. |
+| [yelo-api#274](https://github.com/rideyelo/yelo-api/pull/274) | Idempotent, guarded constraint (`000347_restore_location_address_constraint`). It raises an exception instead of rewriting duplicate rows, and has a migration test in `internal/data/repository/location_constraint_migration_test.go`. |
+| [yelo-api#232](https://github.com/rideyelo/yelo-api/pull/232) | A `CHECK`-constrained JSONB enum (`000324`), a singleton settings table (`000325`), and an `sqlc.yaml` override that maps the column to a Go model type. |
+| [yelo-api#238](https://github.com/rideyelo/yelo-api/pull/238) | A large backfill moved out of the migration into a batched River job (`place_identity_backfill`). |
+
+## Recipe
+
+<Steps>
+  <Step title="Pick the next version">
+    List the latest pair and take the next six-digit number:
+
+    ```bash
+    ls migrations | tail -2
+    ```
+
+    Create both files with the same version and description:
+
+    ```text
+    migrations/000348_add_widget_state.up.sql
+    migrations/000348_add_widget_state.down.sql
+    ```
+
+    `scripts/release/check-migrations.sh` enforces the format `^[0-9]{6}_.+\.(up|down)\.sql$`. It requires exactly one up and one down per version, no gaps from `000001` to the latest, and no empty files.
+  </Step>
+  <Step title="Write the up migration">
+    Write plain SQL. Quote PascalCase table names (`"Rides"`, `"Communities"`). Use `text` columns with `CHECK` constraints for value sets, not new Postgres `ENUM` types. See [Enums and value sets](/reference/database/enums).
+
+    ```sql
+    -- Existing rows default to 'active'; no data rewrite is needed.
+    ALTER TABLE "Widgets"
+        ADD COLUMN state text NOT NULL DEFAULT 'active'
+        CHECK (state IN ('active', 'paused', 'retired'));
+    ```
+
+    Start the file with a comment that states the data impact: whether rows are rewritten, whether there is a backfill, and what rollback loses. Recent migrations do this, and reviewers read it.
+  </Step>
+  <Step title="Write the down migration">
+    Reverse the up migration as far as you safely can. If the down migration can't restore data written under the new schema, say so in a comment. The down file must not be empty.
+
+    ```sql
+    ALTER TABLE "Widgets" DROP COLUMN state;
+    ```
+
+    Down migrations never run in production releases. They exist for local `make migrate-down` and for a deliberate manual rollback.
+  </Step>
+  <Step title="Regenerate sqlc">
+    ```bash
+    make sqlc-generate
+    ```
+
+    This rebuilds `internal/data/sqlc/schema.sql` from every up migration (`scripts/sqlc/generate-schema.sh`), then runs `sqlc generate`. Commit `schema.sql`, `models.go`, and any changed `*.sql.go`. Stage new generated files before you run `make sqlc-check`, because it fails on untracked files.
+
+    If a column should decode into a domain type instead of a primitive, add an `overrides` entry in `sqlc.yaml`. `RidePriceParameters.adjustment` maps to `models.PricingAdjustment` this way.
+  </Step>
+  <Step title="Mirror value sets in Go">
+    For a new `CHECK` value set, add a named string type and constants in `internal/models`, plus a `Validate` method or a `validate:"oneof=..."` tag on the request field.
+
+    The generated contract only lists enum values in two cases. The type implements `OpenAPIEnum() []string` (see `internal/models/marketing_segment.go`), or a request field has a `oneof` tag. The `// openapi:enum` comments on types such as `RideStatus` are documentation only. Nothing reads them.
+  </Step>
+  <Step title="Apply it locally">
+    ```bash
+    make migrate
+    ```
+
+    It reads `DSN` from `.env`, prints the current version and pending files, and asks before applying. Run `make migrate-down` to test the down file, then `make migrate` again.
+  </Step>
+  <Step title="Add a test if the migration has logic">
+    Integration tests apply every migration to a fresh Postgres container, so a syntax error fails `make test-integration` without extra work. For conditional SQL, backfills, or guards, add an `//go:build integration` test that executes the up and down files. `location_constraint_migration_test.go` runs the up file twice to prove it's idempotent, and checks that the guard refuses bad data without rewriting it.
+  </Step>
+  <Step title="Run the policy gates">
+    ```bash
+    make check-migration-policy
+    make check
+    ```
+
+    `check-migration-policy` runs `check-migrations.sh` and `check-migration-immutability.sh`. The immutability check diffs `migrations/` against the merge base with `BASE_REF` (default `origin/main`) and fails on any status other than `A` (added). In CI, `BASE_REF` is the PR base SHA.
+  </Step>
+  <Step title="Describe it in the PR">
+    The PR description must say which migration numbers the PR adds, what schema changes and backfills they make, and what rollback does. Include any ordering requirement. `CODEOWNERS` routes `/migrations/` to `@rideyelo/migration-approvers`.
+  </Step>
+</Steps>
+
+## Backfills
+
+| Size | Pattern | Example |
+| --- | --- | --- |
+| Small, bounded, deterministic | `UPDATE` or `INSERT ... SELECT` in the up migration | `000345` copies top locations into the new slot table |
+| Large or provider-dependent | Ship the schema in a migration, then backfill in batches from a River job that commits each batch and stops when there's nothing left | `placeIdentityBackfillWorker` in `internal/notify/queue/place_identity.go` calls `BackfillPlaceIdentities` in batches of 500, up to 20 per run, every minute |
+| Needs review before writing | Raise an exception from a `DO $$ ... $$` block when the data isn't in the expected state | `000347` refuses to add a unique constraint over duplicate addresses |
+
+A long migration holds the release, because the `Migrate database` step must finish before the candidate revision deploys. Keep row rewrites in migrations small.
+
+## How releases apply it
+
+1. `cloudbuild.yaml` reads the latest version from `check-migrations.sh` and compares it with the `migration-version` label on the revision serving traffic.
+2. If the version changed, it builds `Dockerfile.migrate` and runs the Cloud Run Job `yelo-api-migrate`, which runs `scripts/release/run-migrations.sh`.
+3. Only then does it deploy the new revision with no traffic, smoke it, and promote it.
+
+The previous revision keeps serving against the new schema until promotion. Rollback routes traffic to an older revision and never runs down migrations. So every migration must be **expand-only** relative to the code that is live:
+
+- Add nullable columns, or columns with defaults, before code writes them.
+- Widen a `CHECK` set in the same release as the code that writes the new value. The migration lands first, so this is safe.
+- Narrow a `CHECK` set, drop a column, or rename anything only after no deployed revision reads or writes it. That usually takes a second release.
+
+See [Failed migration](/runbooks/failed-migration) if the job fails.
+
+## Checklist
+
+- [ ] One up and one down file with the next version, and neither is empty.
+- [ ] No existing file under `migrations/` is modified, renamed, or deleted.
+- [ ] `make sqlc-generate` output is committed, including `schema.sql`.
+- [ ] New value sets have Go constants and validation. Contract-facing enums implement `OpenAPIEnum()` or use `oneof`.
+- [ ] Logic-bearing migrations have an integration test.
+- [ ] The currently deployed revision still works against the new schema.
+- [ ] The PR description covers schema changes, backfills, rollback behavior, and any ordering.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Two open PRs take the same number">
+    The gap and duplicate checks only see your branch. If another migration merges first with your number, rebase and renumber your files before merging. Otherwise `main` ends up with a duplicate version and the next release fails `check-migrations.sh`.
+  </Accordion>
+  <Accordion title="Fixing a merged migration">
+    You can't edit it, even for a typo in a comment. The immutability check rejects any `M`, `R`, or `D` status under `migrations/`. Write a new migration that corrects the state, and make it idempotent if some environments may already be correct. `000347` restores a constraint that production had but the history never created.
+  </Accordion>
+  <Accordion title="Postgres ENUM values">
+    Most value sets are `CHECK` constraints on `text`, and only two `ENUM` types are attached to columns. If you must extend a real enum, `ALTER TYPE ... ADD VALUE` can't be undone. Postgres also won't let you use the new value in the same transaction that adds it, so put any statement that uses it in a later migration.
+  </Accordion>
+  <Accordion title="Row-level security is inconsistent">
+    Some recent migrations enable RLS on new tables (`000345`, `000318`), and many don't (`000339`, `000340`). Follow the convention of the tables your change sits next to.
+  </Accordion>
+  <Accordion title="Supabase-only statements">
+    Integration tests run on plain `postgres:15-alpine`. `internal/data/migrationprep` rewrites known Supabase-specific statements, and `generate-schema.sh` applies the same rewrites. A new Supabase-only construct may need a rewrite rule there, or the tests and `sqlc-generate` will fail.
+  </Accordion>
+  <Accordion title="E2E database">
+    `release-e2e.yml` replays migrations on the isolated `yelo_e2e` database after each production release. `run-migrations.sh` has a special bridge for the duplicate rename in `000082` and `000083`. A migration that assumes production-only data can fail there even if production succeeded.
+  </Accordion>
+</AccordionGroup>

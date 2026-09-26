@@ -1,0 +1,302 @@
+---
+title: "API tests"
+description: "How yelo-api tests are organized: build tags, testcontainers setup, testutils helpers, mockery mocks, per-layer patterns, the coverage gate, INTEGRATION_PKGS, and parallel-safety rules"
+---
+
+This page goes one level below [Testing](/engineering/testing). It explains how the Go test suites are wired, which helper to reach for in each layer, and the rules that keep parallel tests deterministic. For a worked endpoint example, see [Adding an endpoint](/engineering/api/adding-an-endpoint#tests).
+
+## Build tags decide the suite
+
+Every `_test.go` file in `yelo-api` falls into one of four groups by its first line.
+
+| Tag | Compiled into | Typical use | Count on `main` |
+| --- | --- | --- | --- |
+| none | Both unit and integration runs | Pure helpers, route tables | 207 files |
+| `//go:build !integration` | Unit run only | Handler and service tests with mocks and miniredis | 330 files |
+| `//go:build integration` | Integration run only | Repository, notify, Stripe, and fixture tests against real containers | 196 files |
+| `//go:build mobilitylive` | Only when you pass `-tags=mobilitylive` | `internal/data/mobility/live_smoke_test.go`, which calls third-party MobilityData feeds | 1 file |
+
+The `!integration` tag keeps mock-heavy unit files out of the integration build. Without it, those tests would run twice and the integration coverage run would take longer. No non-test source file is build-tag gated, which is why the unit and integration coverage profiles can be concatenated (see [Coverage gate](#coverage-gate)).
+
+<Note>
+`mobilitylive` tests are never run by any Make target or CI job. Their payloads and availability belong to third parties. Run them by hand when you change the mobility feed client.
+</Note>
+
+## Make targets
+
+| Target | What it runs | Docker |
+| --- | --- | --- |
+| `make test` | `go test -v ./...` without tags. Unit and untagged tests only. | No |
+| `make test-unit` | `gotestsum` over every package except `mocks`, `-p 8 -parallel 4 -count 1` | No |
+| `make test-integration` | `gotestsum` over `INTEGRATION_PKGS` with `-tags=integration -p 1 -count 1` | Yes |
+| `make tf` (`test-fast`) | Unit at `-p 16 -parallel 8` with the test cache, then integration sequentially | Yes |
+| `make tfc` | `go clean -testcache`, then `make tf` | Yes |
+| `make cover-unit` | Unit coverage only. Fast, but understates real coverage. Not the gate. | No |
+| `make cover-check` | Both coverage profiles, merged, compared with the floor | Yes |
+| `make check` | Everything CI runs, one after another. Also the pre-commit hook in `.pre-commit-config.yaml`. | Yes |
+
+Integration targets export `TESTCONTAINERS_RYUK_DISABLED=true` and `TESTCONTAINERS_WAIT_TIMEOUT=180s`. They run packages one at a time (`-p 1`) because each package starts its own containers.
+
+## `INTEGRATION_PKGS`
+
+`go list ./...` can't see files behind a build tag, so the `Makefile` lists integration packages by hand. On `main` the list is:
+
+```text
+./cmd/sync-school-catalog
+./internal/server/http/e2econtrol
+./internal/server/http/community
+./internal/service/payment
+./internal/service/contactsync
+./internal/service/toplocations
+./internal/data/redis
+./internal/data/repository
+./internal/data/stripe
+./internal/service/authv3/e2e
+./internal/server/http/authv3
+./internal/notify/admin
+./internal/notify/queue
+./internal/notify/repository
+./internal/notify/seed
+```
+
+`internal/data/twilio` also has an integration-tagged test but is deliberately absent. It calls the live Twilio API and skips itself unless `TWILIO_TEST_ACCOUNT_SID` and its auth token are set.
+
+When a package gets its first `//go:build integration` file, add it to `INTEGRATION_PKGS` in the same pull request. Otherwise CI never compiles the test and the coverage it adds never counts. This command lists every candidate:
+
+```bash
+grep -rln '^//go:build integration' --include='*_test.go' internal cmd \
+  | xargs -n1 dirname | sort -u
+```
+
+## Containers and fixtures
+
+### Postgres: `testutils.SetupTestDB`
+
+`internal/utilities/testutils/db.go` starts one `postgres:15-alpine` container per package and applies every migration.
+
+<Steps>
+  <Step title="Start the container">
+    Waits for the "ready to accept connections" log line twice, with a 120-second startup timeout.
+  </Step>
+  <Step title="Preprocess migrations">
+    Copies `migrations/` into a temp directory and runs each file through `migrationprep.Process(..., TargetTestDatabase)`. That creates the Supabase schemas (`pgsodium`, `graphql`, `extensions`, `vault`) and `uuid-ossp`, rewrites the initial migration, and comments out the duplicate migration `000083_car-size-to-vehicle-size.up.sql`.
+  </Step>
+  <Step title="Migrate">
+    Runs `golang-migrate` `Up`, retrying up to 3 times with a 2-second pause for transient startup errors.
+  </Step>
+  <Step title="Build the pool">
+    `MaxConns` is fixed at 16 so parallel tests that hold a transaction don't starve on CI's 4-CPU default. The pool uses `QueryExecModeExec` and registers the gofrs UUID codec and `_uuid` arrays, the same as the production pool, so encoding bugs reproduce in tests.
+  </Step>
+  <Step title="Patch drift">
+    Adds `ScheduledCommunityNotifications.send_timestamp` and `Communities.last_driver_offline_at` with `ADD COLUMN IF NOT EXISTS`. The migration history doesn't create them.
+  </Step>
+</Steps>
+
+Each integration package owns a `TestMain` that calls `SetupTestDB`, sets any env vars `config.Load()` needs (such as `DSN`, `KEY`, `STRIPE_API_KEY`), runs the tests, and calls `Teardown`. `internal/data/repository/main_test.go` also creates an enqueue-only River client and passes it to `notify.Init`, so repository code that emits notifications works. `internal/notify/queue/main_test.go` seeds the notification template catalog once, because its workers read committed rows through their own connections.
+
+### Isolation: `BeginTestTx` versus `TruncateTables`
+
+| Helper | Isolation | Use when |
+| --- | --- | --- |
+| `testDB.BeginTestTx(t)` | Opens a transaction and rolls it back in `t.Cleanup`. Returns `*TestDBTX`, which satisfies `repository.DBTX`. Nested `BeginTx` calls become savepoints. `Acquire` goes to the pool. | Default for repository tests. Safe with `t.Parallel()`. |
+| `testDB.TruncateTables(ctx)` | `TRUNCATE ... RESTART IDENTITY CASCADE` on every public table except `schema_migrations` | The code under test reads through separate pool connections and needs committed data |
+
+122 of the 165 repository test files use `BeginTestTx`, and most repository tests call `t.Parallel()`.
+
+### Fixture builders
+
+There is no shared factory package. Fixture builders live next to the tests.
+
+- `internal/data/repository/test_helpers_test.go` has `createTestCommunity`, `createTestCommunityWithID`, `createTestSchool`, `createTestUser`, `createTestFleet`, `createTestRide`, and `createTestVehicle`. Each takes a `DBTX`, so it works inside `BeginTestTx`.
+- `createTestUser` draws a unique phone from `fixturePhoneSequence`, a process-wide atomic counter. Driver-lead triggers link users by normalized phone, so a shared default phone would couple parallel transactions.
+- Feature files add their own builders, such as `calendarSyncFixture`, `contactSyncFixture`, and `setupAutoQueueLogTest`.
+- `*_sqlc_contract_test.go` files seed deliberately awkward rows (NULLs, cached versus managed projections) and assert the client-visible result and error shape of a query group.
+
+### Redis
+
+| Helper | Backing | Use |
+| --- | --- | --- |
+| `testutils.NewTestRedisClient(t)` | miniredis | Unit tests that need a working `*redis.Client`. Returns the client and a cleanup function. |
+| `testutils.NewDisabledRedisClient(t)` | none, `Redis.Enabled = false` | Tests of the Redis-disabled code path |
+| `newIntegrationTestClient` in `internal/data/redis/redis_integration_test.go` | miniredis | Cache and presence integration tests |
+| `TestMain` in `redis_circuit_breaker_integration_test.go` | `redis:7-alpine` through the testcontainers Redis module | Circuit breaker behavior against a real server. Skipped with `-short`. |
+
+### Stripe
+
+`internal/data/stripe/main_test.go` starts `stripe/stripe-mock:latest`, waits for `GET /v1/customers` on port 12111, and points a `stripe-go` client at it with the key `sk_test_123`. stripe-mock validates request shape and returns fixture objects. It doesn't model state, so tests that need a real lifecycle mock the `internal/data/stripe` interface instead.
+
+## Mocks
+
+Mocks come from mockery 3.7.0 with the testify template. `.mockery.yaml` lists the packages:
+
+| Package | Scope |
+| --- | --- |
+| `internal/data/repository` | All interfaces |
+| `internal/data/mapbox`, `googlemaps`, `googleplaces`, `twilio`, `stripe`, `supabasestorage` | All interfaces |
+| `internal/notify/repository` | All interfaces |
+| `internal/server/http` | All interfaces, recursive. Each handler package gets a `mocks/` with its service interface. |
+| `internal/utilities/mail`, `internal/utilities/metrics` | All interfaces |
+| `internal/service/ride` | All interfaces |
+| `internal/service/operatinghours` | `OwnerStore` and `OwnerOAuth` only |
+
+Every entry writes to `{{.InterfaceDir}}/mocks` with package name `mocks`, and file names are the snake-cased interface names.
+
+```bash
+make mocks        # regenerate and write
+make mocks-check  # fail on drift, obsolete mocks, or unstaged new files
+```
+
+Both run `scripts/mocks.py`. It generates into a temp directory, then compares every `internal/**/mocks/*.go`. `mocks-check` fails on a changed file, on an obsolete generated file, and on a new mock that isn't staged in Git. `make mocks` deletes obsolete files only if they start with `// Code generated by mockery;`. The script refuses any `dir:` value other than the standard one.
+
+<Tip>
+Use the generated constructor, such as `mocks.NewMockRideService(t)`. It registers `AssertExpectations` on cleanup, so an expectation you set but never hit fails the test. `new(mocks.MockRideService)` skips that check.
+</Tip>
+
+## Testing each layer
+
+<Tabs>
+  <Tab title="Handlers">
+    Handler tests are `!integration` and live in the handler package's `_test` package. Build the handler with a mock service and a fuego context from `testutils`:
+
+    | Helper | What it sets |
+    | --- | --- |
+    | `NewMockContext[B, R](body, params)` | Request and response recorder |
+    | `NewMockContextWithUserID` | Plus `RequestContext.UserID` |
+    | `NewMockContextWithUserAndCommunity` | Plus roles `["user"]` and community |
+    | `NewMockContextWithClerkUser(body, params, role)` | A Clerk context with `ClerkTestUserID` and the role |
+    | `NewMockContextWithClerkUserAndFleets` | Plus fleet assignments, for `HasFleetAccess` checks with non-admin roles |
+    | `SetMockContextPathParam`, `SetMockContextQueryParam`, `SetMockContextRequest` | Path params, query, or a whole request |
+    | `NewNetHTTPContextWithClerkUser[B](t, role, rawBody, pathParams)` | A real net/http fuego context over a raw body |
+
+    fuego's `MockContext.Body()` can't fail for a request type without `validate:` tags, so a handler's `if bodyErr != nil` branch is unreachable through a mock. Use `NewNetHTTPContextWithClerkUser` with malformed JSON or an unknown field to reach it. The real decoder uses `DisallowUnknownFields`.
+
+    The `MockContext` helpers set unexported fuego fields with `reflect` and `unsafe`. A fuego upgrade that renames those fields makes the helpers silently skip the assignment.
+  </Tab>
+  <Tab title="Dashboard route gates">
+    `internal/server/http/dashboard/dashboardtest` is a route-level harness. It mounts a package's `RegisterRoutes` on a real fuego server behind a forged Clerk session and asserts the exact status each route returns.
+
+    - `RouteGateCase` rows list method, path, optional template, body, and `WantStatus`. The exact status catches a method mutation, because Go's mux answers the wrong method with 405, not 404.
+    - `RegisteredRouteKeys` reads the routes back from fuego's OpenAPI description, so a new route that's missing from the table fails the test.
+    - `LeakProbePath` (`/__leak_probe`) is registered on the parent after the package group. It must still return 204, which proves a gate didn't leak out of its group.
+    - `Rewrite` derives the "admitted" table from the "refused" table so both stay pinned to the same paths.
+    - `HandlerMethodNames` combines reflection with `testutils.DeclaredMethodNames`, which parses the package source. Reflection alone can't see unexported handler methods, such as those on `kpi.KpiHandler` and `supply_demand.SupplyDemandHandler`. `RequireExactlyOneTable` then fails on any method that isn't in exactly one of the gate table or the ungated allowlist.
+
+    The harness lives under `internal/server/http` rather than `testutils` because it needs `httperrors`, and `testutils` importing `httperrors` would create a test import cycle.
+  </Tab>
+  <Tab title="Services">
+    Service tests are `!integration`. Construct the service with mocks from `internal/data/repository/mocks` and the provider `mocks/` packages, and put the caller in context with `testutils.SetRequestUserID`, `SetRequestUserCommunity`, or `SetTestUserContext`.
+
+    - Packages that depend on vehicle types call `models.SetVehicleTypeRegistry` in `TestMain`, as `internal/service/ride/test_main_test.go` does.
+    - Use miniredis for presence and queue state (`newPresenceCacheForTest` in the ride service tests).
+    - To test retries, wrap the repository with a fake that fails a set number of times. `deadlockingRepository` in `internal/service/authv3/service_test.go` and `failingProfileTransaction` in `onboarding_test.go` inject a deadlock or failure, then assert the attempt count.
+    - `testutils.QuoGate` admits Quo HTTP fixtures without production pacing. Its hooks let a test assert admission and cooldown calls.
+  </Tab>
+  <Tab title="Repositories">
+    Repository tests are `integration` and live in package `repository`, so they can use unexported helpers.
+
+    ```go
+    func TestThing(t *testing.T) {
+    	t.Parallel()
+
+    	ctx := context.Background()
+    	db := testDB.BeginTestTx(t)
+    	communityID, err := createTestCommunity(ctx, db)
+    	require.NoError(t, err)
+
+    	repo := NewThingRepository(db, testutils.NewTestLogger())
+    	// exercise repo, assert rows
+    }
+    ```
+
+    Add a `*_sqlc_contract_test.go` for a new query file. `make sqlc-check` also runs `go test ./internal/data/sqlc ./internal/data/repository` in unit mode, so untagged repository tests run there too.
+  </Tab>
+  <Tab title="Full stacks">
+    Two packages wire real storage into real services:
+
+    - `internal/service/authv3/e2e` runs the Auth v3 sign-in flow end to end against Postgres. It sits outside `internal/service/authv3` because only an external package can import both the service and `internal/data/repository`.
+    - `internal/server/http/authv3/flow_integration_test.go` drives the HTTP layer.
+
+    `internal/server/http/e2econtrol` has integration tests for the fixture control plane. They cover two coexisting fixtures, repeated cleanup, the queued pair, and the notification and assignment transitions. See [E2E environment](/engineering/qa/e2e#fixture-api).
+  </Tab>
+</Tabs>
+
+## Coverage gate
+
+CI runs **Unit Tests** and **Integration Tests** as separate jobs. Each uploads a profile, and **Coverage** merges them and enforces `COVERAGE_FLOOR` (77.8% on `main`).
+
+| Profile | Command | Packages |
+| --- | --- | --- |
+| `coverage-unit.out` | `go test $(COVER_PKGS) -p 8 -parallel 4 -count=1 -covermode=set`, then `go test ./cmd/... -count=1` without coverage | `COVER_PKGS` |
+| `coverage-int.out` | `go test -tags=integration -count=1 -covermode=set -p 1 -coverpkg=<every internal package except excluded>` | `INTEGRATION_PKGS` |
+
+`COVER_PKGS` excludes `/mocks`, `/testutils`, `/dashboardtest`, `/data/sqlc`, `cmd/`, and `scripts/`. `-coverpkg` lets an integration test in one package credit lines in another, such as a handler test that reaches repository code.
+
+`coverage-merge` writes `mode: set` and concatenates both profiles. `go tool cover` ORs duplicate blocks, so a line covered by either run counts. `coverage-floor` fails if the total is below the floor.
+
+- Raise `COVERAGE_FLOOR` in the same pull request that raises coverage. Never lower it.
+- Adding test infrastructure outside the excluded paths counts as untested production code. That's why `dashboardtest` is excluded.
+- `make cover-integration` is a narrower, older report for `data/repository`, `data/redis`, and `data/stripe`. It is not a gate.
+
+## Run a single test
+
+```bash
+# Unit test
+go test ./internal/service/ride -run 'TestAcceptRide$' -count=1 -v
+
+# Integration test (needs Docker)
+TESTCONTAINERS_RYUK_DISABLED=true TESTCONTAINERS_WAIT_TIMEOUT=180s \
+  go test -tags=integration ./internal/data/repository \
+  -run 'TestLocationSQLCReadContract$' -count=1 -v
+
+# Subtest
+go test ./internal/server/http/ride -run 'TestRideHandler_CreateRide/Success' -count=1
+
+# Opt-in live feeds
+go test -tags=mobilitylive ./internal/data/mobility -run TestLiveMobilityFeeds -v
+```
+
+`-count=1` bypasses the test cache. Every integration package run starts a fresh Postgres and applies every migration, so expect a fixed startup cost even for one test.
+
+## Parallel safety and flake patterns
+
+These patterns come from fixes and comments in the test code. Follow them in new tests.
+
+| Pattern | Rule |
+| --- | --- |
+| Shared logger globals | Use `testutils.NewTestLogger()`. `logger.New` mutates zerolog package globals and races when parallel tests build loggers. |
+| Unique-key collisions | Generate unique names, phones, and codes per test. `createTestUser` uses `fixturePhoneSequence`, and `internal/notify/repository/recipients_test.go` generates school names so parallel tests don't collide on `Schools_name_key`. |
+| Truncate versus parallel | Call `TruncateTables` only from a test that doesn't call `t.Parallel()`. Go runs sequential tests before it resumes parallel ones, so a truncate can't wipe a parallel test's data mid-run. |
+| Transaction before `t.Parallel()` | Call `t.Parallel()` before `BeginTestTx`. A paused parallel test that holds a transaction blocks a later `TRUNCATE` in a sequential test, and the two wait on each other. |
+| Pool exhaustion | The test pool is capped at 16 connections. Code under test that opens extra transactions while the test holds one needs headroom. Don't hold many transactions per test. |
+| Map iteration order | Sort before you assert on anything built from a Go map. |
+| Wall-clock sleeps | 10 test files use `time.Sleep` and 6 use `Eventually`. Prefer an injected clock or an explicit condition. |
+| Third-party services | Keep them behind a tag (`mobilitylive`) or an env-var skip (Twilio). Don't let them into `INTEGRATION_PKGS`. |
+| Floating image tags | `stripe/stripe-mock:latest` can change under you. If Stripe tests break without a code change, check the image first. |
+
+CI doesn't run with `-race`. Run `go test -race` on the package when you touch concurrency.
+
+## Gotchas and edge cases
+
+- **Ryuk is disabled.** Containers are removed only by each package's `TestMain` teardown. If you kill a run, stop leftover `postgres:15-alpine`, `redis:7-alpine`, and `stripe-mock` containers yourself with `docker ps` and `docker rm -f`.
+- **The test schema isn't the production schema.** Two columns are patched in by `setupPostgres`, and migration 83 is commented out. A query that depends on production-only drift can pass locally and fail in production, or the other way around.
+- **Untagged files run twice.** A test file with no build tag compiles into both runs. Tag it `!integration` if it only uses mocks.
+- **`make test` isn't the unit gate.** It runs with `-v` and no `-count`, so cached results are reused. CI uses `cover-unit-profile` with `-count=1`.
+- **A new mock must be staged.** `mocks-check` treats an untracked generated mock as drift, so `git add` it before you run `make check`.
+- **OpenAPI generation is a test.** `make openapi` runs `TestGenerateOpenAPIContract` in `internal/server/http`. A broken test setup in that package also breaks contract generation.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Targets, `INTEGRATION_PKGS`, `COVERAGE_FLOOR` | `yelo-api/Makefile` |
+| CI jobs | `yelo-api/.github/workflows/ci.yml` |
+| Pre-commit hook | `yelo-api/.pre-commit-config.yaml` |
+| Postgres container and migrations | `yelo-api/internal/utilities/testutils/db.go`, `internal/data/migrationprep/preprocess.go` |
+| Redis helpers | `yelo-api/internal/utilities/testutils/redis.go` |
+| fuego context helpers | `yelo-api/internal/utilities/testutils/testutils.go` |
+| Source method enumeration | `yelo-api/internal/utilities/testutils/declared_methods.go` |
+| Quo gate fake | `yelo-api/internal/utilities/testutils/quo.go` |
+| Dashboard route harness | `yelo-api/internal/server/http/dashboard/dashboardtest/` |
+| Repository fixtures | `yelo-api/internal/data/repository/test_helpers_test.go`, `main_test.go` |
+| Mock config and checker | `yelo-api/.mockery.yaml`, `yelo-api/scripts/mocks.py` |
+| Lint rules for tests | `yelo-api/.golangci.yml` (`tparallel` on, `paralleltest` off) |

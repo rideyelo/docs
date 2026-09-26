@@ -1,0 +1,177 @@
+---
+title: "Add a background job"
+description: "Recipe for recurring or deferred work in yelo-api: when to use an in-process ticker versus a River job, how to register workers and periodic jobs, how to add a disable switch, and how to observe the job in production."
+---
+
+`yelo-api` runs background work in two ways. **In-process tickers** in `cmd/api/main.go` run on every instance. **River jobs** are stored in Postgres, retried, and run once across instances. This recipe helps you choose between them and wire either one. For the full list of existing jobs, see [Background jobs](/engineering/api/background-jobs).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#265](https://github.com/rideyelo/yelo-api/pull/265) | A dispatch job that fans out per-community refresh jobs, a dedicated queue with 2 workers, a longer `Timeout`, and an on-demand enqueue from a dashboard action (`internal/notify/queue/top_locations.go`). |
+| [yelo-api#173](https://github.com/rideyelo/yelo-api/pull/173) | Replaces a timeout-prone ticker sweep with durable per-account River jobs, adds the `STRIPE_RECONCILIATION_ENABLED` switch, and moves the GTM refresh into River (`gtm.go`). |
+| [yelo-api#238](https://github.com/rideyelo/yelo-api/pull/238) | A batched backfill as a periodic River job (`place_identity.go`). |
+
+## Choose the mechanism
+
+| Question | Ticker (`backgroundCleanup`) | River job |
+| --- | --- | --- |
+| Is it safe for every instance to run it at the same time? | Required | Not needed. Periodic jobs are enqueued by the elected leader only. |
+| Must it survive a restart or deploy mid-run? | No | Yes |
+| Does it need retries with backoff? | No. A failure is logged and the next tick tries again. | Yes |
+| Does it call a rate-limited third party per item? | Avoid | Yes. Use a dedicated queue with a small `MaxWorkers`. |
+| Is it triggered by a request, not a clock? | No | Yes. Insert from the request path. |
+| Typical interval | Seconds to minutes | Seconds to hours |
+
+Use a ticker for short, idempotent sweeps over local state, such as expiring rides or setting stale drivers offline. Use River for everything else.
+
+## Recipe: in-process ticker
+
+<Steps>
+  <Step title="Write the task as a service method">
+    The signature must match `CleanupFunction`:
+
+    ```go
+    func (s *WidgetService) ExpireStaleWidgets(ctx context.Context) (err errors.Error) {
+    	ctx, end := otel.CustomSpan(ctx, "widget-service", "WidgetService.ExpireStaleWidgets")
+    	defer end(&err)
+
+    	_, err = s.repository.Widget.ExpireStale(ctx)
+    	return err
+    }
+    ```
+
+    Each run gets a context with a 2-minute timeout (`backgroundTaskTimeout`). Keep the work well under that, and make it idempotent.
+  </Step>
+  <Step title="Register it in startBackgroundTasks">
+    In `cmd/api/main.go`, add the method to an existing group with the same interval, or start a new group:
+
+    ```go
+    go backgroundCleanup(ctx, l, "Widgets", 5*time.Minute, service.WidgetService.ExpireStaleWidgets)
+    ```
+
+    Use `backgroundCleanupImmediately` only for cache producers that readers depend on right after startup. It runs once before the first tick.
+  </Step>
+  <Step title="Test the method, not the loop">
+    Unit-test the service method with repository mocks, and add an integration test for its query. The loop in `cmd/api/background_cleanup.go` already has its own tests.
+  </Step>
+</Steps>
+
+## Recipe: River job
+
+<Steps>
+  <Step title="Define the args and worker">
+    Put the job next to its peers in `internal/notify/queue/`, or in the owning service package with a `Register...Workers` function, as `contactsync`, `quo`, `payment`, and `user` do.
+
+    ```go
+    type widgetRefreshArgs struct {
+    	WidgetID uuid.UUID `json:"widget_id"`
+    }
+
+    func (widgetRefreshArgs) Kind() string { return "widget_refresh" }
+
+    type widgetRefreshWorker struct {
+    	river.WorkerDefaults[widgetRefreshArgs]
+    	service WidgetRefresher
+    }
+
+    func (w *widgetRefreshWorker) Work(ctx context.Context, job *river.Job[widgetRefreshArgs]) error {
+    	if w.service == nil {
+    		return nil
+    	}
+    	return w.service.Refresh(ctx, job.Args.WidgetID)
+    }
+
+    func (*widgetRefreshWorker) Timeout(*river.Job[widgetRefreshArgs]) time.Duration {
+    	return 2 * time.Minute
+    }
+    ```
+
+    Depend on a small interface, not the concrete service, so tests can pass a fake. The nil check lets `Deps` omit the service in tests and in partial configurations.
+  </Step>
+  <Step title="Register the worker and the queue">
+    In `notifyqueue.New` (`internal/notify/queue/queue.go`), add the dependency to `Deps` and register the worker:
+
+    ```go
+    river.AddWorker(workers, &widgetRefreshWorker{service: deps.Widgets})
+    ```
+
+    Jobs go to `river.QueueDefault` (10 workers) unless `InsertOpts.Queue` names another queue. For work that calls a rate-limited provider, add a queue to `queueConfigs` with a small `MaxWorkers`, as `gtm` and `stripe` do. Then set `Queue` in the insert options.
+
+    Wire the dependency in `cmd/api/main.go` where `notifyqueue.New(notifyqueue.Deps{...})` is built.
+  </Step>
+  <Step title="Schedule it, if it's periodic">
+    Add a `river.NewPeriodicJob` to `PeriodicJobs`. Every existing periodic job uses `RunOnStart: true` and unique options, so a restart or leader change can't stack duplicates:
+
+    ```go
+    river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
+    	if deps.Widgets == nil || !deps.WidgetsEnabled {
+    		return nil, nil
+    	}
+    	return widgetDispatchArgs{}, &river.InsertOpts{UniqueOpts: river.UniqueOpts{ByPeriod: 4 * time.Minute}}
+    }, &river.PeriodicJobOpts{RunOnStart: true}),
+    ```
+
+    Returning `nil, nil` skips that tick. This is how the Stripe reconciliation, Google Play, and calendar jobs honor their switches.
+  </Step>
+  <Step title="Enqueue it on demand, if it's triggered">
+    Insert from the code path that creates the work. Prefer `InsertTx` on the same transaction as the state change, so the job exists only if the change commits. For a fan-out, have a small dispatch job list the due items and insert one job per item, as `topLocationDispatchWorker` does with `river.ClientFromContext`.
+  </Step>
+  <Step title="Test it">
+    Unit-test `Work` with a fake dependency. For behavior that depends on River semantics, such as uniqueness or snoozing, follow the integration tests in `internal/notify/queue` (`contact_sync_integration_test.go`, `calendar_sync_integration_test.go`). They run against the testcontainers Postgres, which has River's tables from migrations.
+  </Step>
+</Steps>
+
+## Add a disable switch
+
+Anything that calls third parties or mutates data at scale should have a way to turn it off without a code change.
+
+1. Add a boolean to the config struct in `internal/utilities/config/config.go`, for example `getEnvBool("WIDGET_REFRESH_ENABLED", false)`, and document it in `.env.example`. See [Add a feature flag or config value](/engineering/cookbook/add-a-feature-flag-or-config).
+2. Pass it through `Deps`, and return `nil, nil` from the periodic constructor when it's off.
+3. If the job could contact real people or providers, add a check in `validateE2EIntegrations` so E2E refuses to start with it enabled.
+
+These switches already exist:
+
+| Setting | Effect |
+| --- | --- |
+| `BACKGROUND_TASKS_ENABLED=false` | Every ticker loop returns at startup. River still runs. |
+| `E2E_ENABLED=true` with `E2E_BACKGROUND_JOBS_ENABLED=false` | Skips River workers, River UI, and all tickers |
+| `DASHBOARD_PREVIEW=true` | Same as the E2E case, for local dashboard previews |
+| Per-job flags such as `STRIPE_RECONCILIATION_ENABLED` and `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` | Skip one periodic job |
+
+## Observability
+
+- **Tickers** log `starting background task`, `background task completed successfully` with `duration`, or `background task failed` with `group` and `task`. A run that is still going at the next tick logs `skipping background task: previous run still in progress`. After 5 minutes the entry is evicted with an error log.
+- **River** logs through `logger.NewSlogHandler` at info level, so retries appear in Cloud Logging. Job state, attempts, and per-attempt errors are in River UI, on the dashboard's **Jobs** page.
+- Wrap the service method in `otel.CustomSpan` so each run is traced. See [Observability](/engineering/observability).
+- The [River job failures](/runbooks/river-jobs) runbook has SQL for summarizing jobs by kind and state.
+
+## Checklist
+
+- [ ] The mechanism matches the work: ticker for idempotent local sweeps, River for everything else.
+- [ ] The work is idempotent and fits its timeout.
+- [ ] River jobs have a unique `Kind()`, a registered worker, and a queue sized for their provider.
+- [ ] Periodic jobs use unique options and `RunOnStart`.
+- [ ] Jobs that touch providers have a config switch, and E2E refuses to enable them.
+- [ ] [Background jobs](/engineering/api/background-jobs) lists the new job, its interval, and its switch.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Tickers run on every instance">
+    Two instances run the same ticker task at the same moment. The overlap guard in `backgroundCleanupLoop` only covers one process. If the work isn't safe to run concurrently, use River or a database lock.
+  </Accordion>
+  <Accordion title="Removing or renaming a job kind">
+    Rows already in `river_job` keep the old `Kind()`. If no worker is registered for it, River can't run them. Keep the old worker until queued jobs of that kind finish or are canceled, then remove it in a later release.
+  </Accordion>
+  <Accordion title="Rolling deploys run old and new workers together">
+    During a release, the previous revision keeps working jobs. New args fields must be optional for old workers, and new job kinds are ignored by the old revision until it drains. `queueConfigs` only consumes contact sync queues a replica has credentials for, for the same reason.
+  </Accordion>
+  <Accordion title="Retries amplify provider failures">
+    River retries a failed job with backoff. A job that loops over many items and fails partway through repeats the finished items on retry. Record progress durably, as the place identity backfill does per batch, or split the work into one job per item.
+  </Accordion>
+  <Accordion title="Disabling tickers has side effects">
+    With `BACKGROUND_TASKS_ENABLED=false`, rides never expire, drivers never go offline, and tip windows never capture. Use it for local debugging only.
+  </Accordion>
+</AccordionGroup>

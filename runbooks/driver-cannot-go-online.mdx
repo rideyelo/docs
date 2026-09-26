@@ -3,11 +3,11 @@ title: "Driver can't go online"
 description: "Map go-online errors to their cause, and find out why an online driver isn't receiving ride requests"
 ---
 
-Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineStatus`). It checks the driver's phone, application, payout setup, fleet, vehicle, and location, then opens a `DriverSessions` row and sets `Users.is_online_driver`. Each check returns a specific error that the app shows as a popup title and message.
+Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineStatus`). It checks the driver's phone, application, payout setup, fleet, vehicle, and location, then opens a `DriverSessions` row and sets `Users.is_online_driver`. Each check returns a specific error title and message. The app doesn't show them: any failure except an update prompt shows a generic **Error** alert, "Failed to update online status. Please try again." (`setOnline` in `yelo-frontend/providers/DriveProvider.tsx`). Use the API logs to find the real cause.
 
 ## Symptoms
 
-- The driver taps go online and sees an error popup.
+- The driver taps go online and sees "Failed to update online status. Please try again."
 - The app shows an update prompt before going online.
 - The driver is online but no ride requests arrive, or other drivers get rides first.
 
@@ -15,7 +15,7 @@ Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineSt
 
 <Steps>
   <Step title="Get the exact error">
-    Ask for the popup title. Then search Cloud Logging for the driver's `refresh-online` lines:
+    The app's alert is generic, so get the driver ID and search Cloud Logging for the driver's `refresh-online` lines:
 
     ```text
     resource.labels.service_name="yelo-api-testflight"
@@ -26,7 +26,7 @@ Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineSt
     Blocked attempts log a reason such as `refresh-online: blocked, application not active`, `refresh-online: blocked, stripe not complete`, `refresh-online: blocked, location not set`, `refresh-online: blocked, outside community bounds`, or `refresh-online: blocked, vehicle fleet mismatch`.
   </Step>
   <Step title="Read the driver's state">
-    Open the user detail sheet. **Driver Info** shows **Payout fleet**, **Active fleet**, and **Online**. **View application and evidence** shows each step. You can also call `GET /internal/context/user?user_id=<driver-id>` with the internal key. Its `driver` block lists `status`, each step's status, and `is_online`.
+    Open the user detail sheet. **Driver Info** shows **Payout fleet**, **Active fleet**, and **Online**. **Fleet membership** lists every enrollment with **Active** and **Archived** badges. **View application and evidence** shows each step. You can also call `GET /internal/context/user?user_id=<driver-id>` with the internal key. Its `driver` block lists `status`, each step's status, and `is_online`.
   </Step>
   <Step title="Check eligibility in the database">
     **Read-only.** These mirror the checks in `RefreshOnlineStatus` and the `SetEligibleDriverOnline` query:
@@ -44,6 +44,7 @@ Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineSt
     WHERE u.id = '<driver-id>';
 
     -- Fleet memberships. The row with fd.is_active = true is the active fleet.
+    -- deleted_at is set on archived fleets.
     SELECT fd.fleet_id, fd.is_active, f.name, f.payment_model, f.has_custom_payouts,
            f.stripe_status, f.is_active AS fleet_is_active, f.deleted_at
     FROM "FleetDrivers" fd JOIN "Fleets" f ON f.id = fd.fleet_id
@@ -63,12 +64,14 @@ Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineSt
 
 ### Error reference
 
-| Popup title | Cause in code | Fix |
+The API returns these titles, and the blocked reason appears in the logs. The app shows none of them.
+
+| API error title | Cause in code | Fix |
 | --- | --- | --- |
 | **Phone Number Required** | `DRIVER_VERIFIED_PHONE_REQUIRED` is on and `Users.phone_number` is empty | The driver verifies a phone in the app. An admin can correct a wrong number with **Edit profile**. |
 | **Application Incomplete** | `DriverApplications.is_active` is false | Review the steps on **Drivers**, then **Activate driver** on **Drivers** → **Pipeline** after the background check. See [Activate a driver](/dashboard/driver-leads#activate-a-driver). |
 | **Payment Setup Required** | Payout status isn't `complete`. For owner-operators that's `stripe_status`. For fleet-paid drivers, the payout fleet must be payout-ready | See [Payout issues](/runbooks/payout-issues). |
-| **Fleet Not Found** | No active fleet, and automatic assignment found no fleet membership, no whitelist entry for the driver's email, and no community **Primary Fleet** | **Assign active payout fleet**, a fleet join link, or set the community's **Primary Fleet**. See [Option 2](#fix). |
+| **Fleet Not Found** | No active fleet, no existing membership to activate, and automatic enrollment into the default community's primary fleet didn't happen | Add a membership and set it active in **Fleet membership**, use **Assign active payout fleet**, or send a fleet join link. See [Option 2](#fix). |
 | **No Vehicle** | The driver has no vehicle | The driver adds a vehicle, or the fleet assigns one. See [Fleet vehicles](/dashboard/fleet-vehicles). |
 | **Location Not Found** | `Users.latitude` or `longitude` is null | The driver turns on location services. |
 | **Outside Service Area** | The driver's location is outside the bounding box of `Users.community_id` | The driver moves into the area. If the community is wrong, correct **Active community** with **Edit profile**. |
@@ -89,15 +92,16 @@ Going online calls `POST /driver/refresh-online` (`DriverService.RefreshOnlineSt
   <Accordion title="Option 2: Give the driver an active fleet">
     Pick one:
 
-    - **Fleet-paid driver.** On the user detail sheet, open **Driver fleet enrollment**, choose a fleet under **Select a payout-ready fleet**, and select **Assign active payout fleet**. The list only offers `fleet_merchant` fleets that are payout-ready. The driver must be offline with no ride or open session.
+    - **Existing or new membership.** On the user detail sheet, open **Fleet membership**. Add a fleet with **Find a fleet to add…**, pick the active fleet, then select **Review membership changes** and **Confirm changes**. This calls `PUT /dashboard/users/detail/{id}/fleets` (admin only). Adding a membership doesn't change the active fleet. Selecting an active fleet updates payout routing and selects the fleet's approved default vehicle, or clears an incompatible fleet vehicle. Confirmed edits take an idle driver offline and close their sessions. An active ride blocks the whole change. A stale sheet is rejected, so use **Reload memberships** and try again.
+    - **Fleet-paid driver.** Open **Driver fleet enrollment**, choose a fleet under **Select a payout-ready fleet**, and select **Assign active payout fleet**. The list only offers `fleet_merchant` fleets that are payout-ready. The driver must be offline with no ride or open session.
     - **Owner-operator or fleet join.** Send the fleet's driver invitation link. See [Fleet driver invitations](/fleets/driver-invitations).
-    - **Community default.** Set **Primary Fleet** in the community workspace. On the next go-online attempt, drivers with no fleet are added to it.
+    - **Automatic default.** A driver with no membership is enrolled on the next go-online attempt in the primary fleet of the default community (`Communities.is_default`, not test, not archived). That fleet must be active and **Owner Operator** without custom payouts. Otherwise enrollment fails and logs `fleet assignment failed`. A market community's **Primary Fleet** and email whitelist entries don't enroll drivers.
   </Accordion>
   <Accordion title="Option 3: Bulk repair of activated drivers without a fleet">
     `yelo-api/scripts/fix_driver_fleet_status.sql` has four read-only diagnostics followed by fixes.
 
     <Warning>
-    **FIX 1 in that file isn't commented out.** Running the whole file inserts a `FleetDrivers` row for every activated driver without one, into their community's primary fleet. Run the diagnostics on their own, review the output, then run FIX 1 deliberately if it's the repair you want. FIX 2 is commented out.
+    **FIX 1 in that file isn't commented out.** Running the whole file inserts a `FleetDrivers` row for every activated driver without one, into their community's primary fleet. That's not the fleet automatic enrollment uses, which is the default community's primary fleet. Run the diagnostics on their own, review the output, then run FIX 1 deliberately if it's the repair you want. FIX 2 is commented out.
     </Warning>
   </Accordion>
 </AccordionGroup>
@@ -111,26 +115,26 @@ A driver can be online and still never see a request. Check these conditions in 
     The board (`GET /ride/v2/board`) only shows `confirmed` rides in the driver's `Users.community_id`, for the fleet of the driver's open `DriverSessions` row. With no open session, the board is empty. A driver can accept a ride only when online under the ride's fleet.
   </Step>
   <Step title="Immediate pushes">
-    Immediate (T0) pushes need an active fleet membership, an active application, a completed vehicle of the right type and seats, payout readiness, and notifications allowed. For the fleet named `Yelo`, only drivers tagged `Founding Driver` get T0 pushes. See [Immediate notifications](/concepts/matching-and-auto-queue#immediate-t0-notifications).
+    Immediate (T0) pushes need an active fleet membership, an active application, a completed vehicle of the right type (seat count isn't checked), payout readiness, and notifications allowed. For the fleet named `Yelo`, only drivers tagged `Founding Driver` get T0 pushes. See [Immediate notifications](/concepts/matching-and-auto-queue#immediate-t0-notifications).
   </Step>
   <Step title="Auto-queue">
-    Auto-queue only assigns rides confirmed at least 2 minutes ago. It picks drivers with auto-queue on and not paused, online, with a current vehicle of the ride's type, and a session under the ride's fleet. The **AQ** badge on the **Driver Ops** card shows auto-queue. See [Auto-queue](/concepts/matching-and-auto-queue#auto-queue).
+    Auto-queue only assigns rides confirmed at least 2 minutes ago. It picks drivers with auto-queue on and not paused, online, with a current vehicle of the ride's type, and a session under the ride's fleet. `Users.auto_queue` and `auto_queue_paused_until` hold the driver's setting. See [Auto-queue](/concepts/matching-and-auto-queue#auto-queue).
   </Step>
   <Step title="Push delivery">
-    Send **Ping** from **Driver Ops**. If the driver doesn't get it, work through [Push notifications not delivered](/runbooks/push-notifications).
+    Use **Send test** on **Notifications** → **Templates** with the driver's phone. The dashboard has no ping control. The admin-only endpoint `POST /dashboard/live/drivers/{id}/ping` still sends one. If the driver doesn't get it, work through [Push notifications not delivered](/runbooks/push-notifications).
   </Step>
 </Steps>
 
 ## Verify
 
 - The driver goes online without an error. Logs show `refresh-online: success` for their `driver_id`.
-- **Driver Ops** shows **Online — no active ride**.
+- The **Live** drivers table shows the driver as **Idle** in their market.
 - `DriverSessions` has one open row for the driver, with the expected `fleet_id` and `vehicle_id`.
 
 ## Root causes seen in code
 
 - **Dashboard approval without a fleet.** The diagnostics in `fix_driver_fleet_status.sql` exist because drivers were activated without a whitelist match and ended up with no `FleetDrivers` row.
 - **Stale Stripe status.** Driver `stripe_status` updates from the `account.updated` webhook, from daily reconciliation, and when the driver opens the driver hub, which calls `GET /driver/signup-status`. Between those, the status can lag Stripe.
-- **Automatic fleet assignment is best effort.** `ensureFleetAssignment` tries existing memberships, then the whitelist by email, then the community's primary fleet. Failures only log `fleet assignment failed`.
+- **Automatic fleet assignment is best effort.** `ensureFleetAssignment` activates the first existing membership. With none, it enrolls the driver in the default community's primary fleet, and only if that fleet is an active, personal-payout **Owner Operator** fleet. Failures only log `fleet assignment failed`.
 - **The service area is the community bounding box**, not the drawn zones. A driver just outside the box can't go online.
 - **Offline sweep.** A driver without a heartbeat for 30 minutes and without an active or recent ride is set offline by `PurgeOfflineDrivers` and has to go online again.

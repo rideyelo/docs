@@ -42,12 +42,12 @@ All routes are declared in `src/sites/dashboard/App.tsx`. There is no file-based
 
 | Path | Page module | Allowed roles |
 | --- | --- | --- |
-| `/` | `OverviewPage` via `RootRoute` | `admin`, `intern` (fleet redirects to `/fleets`) |
+| `/` | `RootRoute` (redirect only) | `admin` → `/live`, `intern` → `/community`, `fleet` → `/fleets` |
 | `/kpi` | `KpiPage` | `admin` |
 | `/drivers` | `LeadsPage` | `admin`, `intern`, `fleet` |
 | `/users` | `UsersPage` | `admin`, `intern` |
 | `/rides` | `RidesShellPage` | `admin`, `intern`, `fleet` |
-| `/supply-demand` | `SupplyDemandPage` | `admin` |
+| `/live` | `LivePage` | `admin` |
 | `/map` | `CommunityMapPage` | `admin`, `intern` |
 | `/events` | `FeedPage` | `admin`, `intern` |
 | `/community` | `CommunityPage` | `admin`, `intern` |
@@ -75,11 +75,11 @@ Legacy paths redirect and preserve the query string where it matters:
 | `/settings` | `/access` |
 | `/feed` | `/community` |
 | `/feeds`, `/spot` | `/events` |
-| `/presence`, `/driver-ops` | `/supply-demand` |
+| `/presence`, `/driver-ops` | `/live` |
 | `/locations`, `/zones` | `/map` |
 
 <Note>
-`src/sites/dashboard/pages/` still contains modules for some retired routes, such as `CancellationsPage`, `PresencePage`, and `SettingsPage`. `SchoolsPage`, `VehiclesPage`, and `ActivationPage` remain in `routeImporters` so the search index can read their copy, but their routes are redirects. Check `App.tsx` before you assume a page file is reachable.
+`src/sites/dashboard/pages/` still contains modules with no route of their own, such as `OverviewPage`, `DriverOpsPage`, `SettingsPage`, and `ZonesPage`. `CancellationsPage` and `UncompletesPage` render inside `/rides`, and `SearchesPage` renders both there and at `/searches`. `SchoolsPage`, `VehiclesPage`, and `ActivationPage` remain in `routeImporters` so the search index can read their copy, but their routes are redirects. `routeImporters` still maps `/` to `OverviewPage`, and the search index gives `/` the roles `admin` and `intern`, so global search can return Overview sections that land on `/live` or `/community`. `/supply-demand` has no route and renders **Coming Soon**. Check `App.tsx` before you assume a page file is reachable.
 </Note>
 
 ## Role gating
@@ -102,15 +102,15 @@ The dashboard writes these fields through the Access page API (`src/hooks/useAcc
 
 ### ProtectedRoute and RootRoute
 
-`ProtectedRoute` in `App.tsx` takes an `allowedRoles` array. While roles load, it renders the skeleton `PageLoader`. If the role is not allowed, it redirects `fleet` users to `/fleets` and everyone else to `/`. `RootRoute` renders the overview for `admin` and `intern`, redirects `fleet` to `/fleets`, and shows an "Unauthorized — You do not have a valid role assigned" message for any other role.
+`ProtectedRoute` in `App.tsx` takes an `allowedRoles` array. While roles load, it renders the skeleton `PageLoader`. If the role is not allowed, it redirects `fleet` users to `/fleets` and everyone else to `/`. `RootRoute` redirects `admin` to `/live`, `intern` to `/community`, and `fleet` to `/fleets`, and shows an "Unauthorized — You do not have a valid role assigned" message for any other role.
 
 ### Sidebar
 
-`src/components/Sidebar.tsx` hardcodes `navGroups`:
+`src/components/Sidebar.tsx` hardcodes `navGroups`. The sidebar header holds the brand link, which opens the role's home page, and Clerk's `UserButton` account menu. `SidebarCommunityScope` sits below it; see [Community scope](#community-scope).
 
 | Group | Items |
 | --- | --- |
-| Global | KPI, Drivers, Users, Rides, Supply & Demand |
+| Global | KPI, Drivers, Users, Rides, Live |
 | Community | Map, Events, Community, Fleet (`/fleets`) |
 | Configuration | Pricing, Fleets (`/manage`), Notifications, Communities |
 | Administration | Access, Telemetry, Jobs, Contact sync (collapsed by default) |
@@ -135,7 +135,13 @@ Resolution rules:
 2. Otherwise the provider uses the last selection for the current path, then the value saved in `localStorage` under `selectedCommunityId`.
 3. Admins can select any community. Interns are pinned to their `community_id`. Fleet managers can choose only among their `fleet_assignments` communities. The setter ignores disallowed IDs.
 
-The `Topbar` loads all communities with `useCommunityGetAllCommunities`, filters them by role, and renders `CommunityDropdown`. The dropdown is disabled for interns and for fleet managers with a single assignment. On `/pricing`, `/communities`, and `/rides`, admins can choose **All markets**, and the selection is written to the URL. `/kpi` always shows **All markets**.
+`SidebarCommunityScope` (`src/components/SidebarCommunityScope.tsx`) renders the scope control at the top of the sidebar. It loads all communities with `useCommunityGetAllCommunities` and filters them by role:
+
+- **Admins** get `CommunityDropdown`. On `/pricing`, `/communities`, `/rides`, and `/drivers`, the page reads its market from `?community=`, and choosing a community writes it there and clears `scope`. Without `?community=`, `/pricing` and `/drivers` fall back to the remembered community, while `/communities` and `/rides` (unless `?scope=community`) show **All markets**. `/kpi` shows a static **All markets** label.
+- **Interns** see a read-only **Assigned community** card.
+- **Fleet managers** see a read-only card with the current fleet and community. There is no dropdown, so a fleet manager with assignments in several communities can only switch through a community result in global search.
+
+The `Topbar` holds only the sidebar toggle, `GlobalSearch`, and `RecentViews`. It also loads the community list, filtered by role, for search results.
 
 For pages that aggregate across communities by default, use `useGlobalCommunityFilter()` from `src/hooks/useGlobalCommunityFilter.ts` with `CommunityFilterDropdown` instead of the global context. Its `communityParam` is `undefined` when **All** is selected.
 
@@ -174,7 +180,7 @@ For pages that aggregate across communities by default, use `useGlobalCommunityF
 | Styling | Tailwind CSS v4 through `@tailwindcss/vite`; theme tokens in `src/shared/theme/index.css` |
 | Tables | TanStack Table v9 with the shared `appTableFeatures` set in `src/lib/table.ts` (sorting, pagination, column visibility and sizing, row selection); `@tanstack/react-virtual` for long lists |
 | Charts | Recharts through the shadcn `ChartContainer` in `src/components/ui/chart.tsx`; shared colors in `src/lib/chart-colors.ts` |
-| Maps | `mapbox-gl` with `VITE_MAPBOX_API_KEY`; `@mapbox/mapbox-gl-draw` for zone editing; dark-mode popup styles in `src/sites/dashboard/styles.css` |
+| Maps | `mapbox-gl` with `VITE_MAPBOX_API_KEY`; styles follow the theme through `mapboxStyleForTheme`; `@mapbox/mapbox-gl-draw` for zone editing; dark-mode popup styles in `src/sites/dashboard/styles.css` |
 | Forms | `react-hook-form` with `zod` resolvers, for example `PricingConfigSheet` and `SendNotificationSheet` |
 | Toasts | sonner through `ThemeToaster` |
 | Command palette | `cmdk` through `src/components/ui/command.tsx` |

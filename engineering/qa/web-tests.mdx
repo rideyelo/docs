@@ -1,0 +1,159 @@
+---
+title: "Web tests"
+description: "How yelo-web runs Vitest, node --test, worker, and shell tests, the oxlint and ESLint gates, API contract drift checks, per-site coverage, and the Nx CI pipeline"
+---
+
+`yelo-web` has no auto-discovering test runner. `pnpm test` chains named scripts, and each script lists its files or globs. CI runs those scripts through one Nx target, then builds every affected site. This page expands on [Testing](/engineering/testing#web) and [Web conventions](/engineering/web/conventions#tests).
+
+## Test runners
+
+| Runner | Environment | Used for | Scripts |
+| --- | --- | --- | --- |
+| Vitest 5 with `@testing-library/react` | Node by default. Files opt into jsdom with `// @vitest-environment jsdom` (48 files). | React components, pages, hooks, contexts | `test:components`, plus the Vitest halves of `test:notifications` and `test:auth-v3` |
+| Vitest with `workers/og/vitest.config.ts` | Node, with the `h` JSX factory | OG image worker | `test:og` |
+| `node --experimental-strip-types --test` | Node 22 | Pure TypeScript modules | `test:schools`, `test:auth-v3`, `test:delete-account`, `test:signup-shared`, `test:invite`, `test:notifications`, `test:experience-router`, `test:world-cup-router` |
+| Bash | n/a | Slack deploy message formatter | `test:deploy-slack` |
+
+The root Vitest runs use `--root .` and the site Vite config (`vite.config.ts` re-exports `tools/vite/base/config.ts`). That config has no `test` block, so there's no global setup file. Each test file mocks and cleans up on its own, usually with `afterEach(cleanup)`.
+
+`pnpm test` runs, in order: `test:components`, `test:schools`, `test:notifications`, `test:auth-v3`, `test:delete-account`, `test:signup-shared`, `test:invite`, `test:og`, `test:experience-router`, `test:world-cup-router`, and `test:deploy-slack`. The chain stops at the first failure.
+
+<Warning>
+A new test file doesn't run until you add it, or a glob that matches it, to the right script in `package.json`. On `main` every test file is covered by some script. After you add a file, run the script and confirm your test names appear in the output.
+</Warning>
+
+## Per-site coverage
+
+81 test files on `main`:
+
+| Area | What's tested | Runner |
+| --- | --- | --- |
+| Dashboard shell (`src/sites/dashboard`, 21 files) | `App.test.tsx` renders every route as `admin`, `intern`, and `fleet` and checks where each lands. `DashboardTitle`, `RecentViews`, search index, and pages: `FleetsPage`, `ManageFleetsPage`, `LeadsPage`, `UsersPage`, `CommunitiesPage`, `LocationsPage`, `ContactSyncPage`, `TelemetryPage`. Components: pricing sheets, `RidesExplorerMap`, `RidesKpisTab`, `ActivityTable`, `MarketingSegments`, ride map status. | Vitest |
+| Shared dashboard components (`src/components`) | Communities, schools, fleets, vehicles, calendars, users, leads, live map, community map, KPI helpers, zones, feed, notifications, silent ride cancel, route boundaries | Vitest, and `node --test` for `notification-utils` |
+| Hooks and contexts | `useDriverLeads`, `useIssueRows`, `useRides`, `CommunityProvider` | Vitest |
+| Library (`src/lib`) | API error mapping, table helpers, telemetry, school management | Vitest and `node --test` |
+| Signup (`src/sites/signup`) | Auth v3 state, request secret, web intent, and delete account with `node --test`. `authV3Client.spec.ts` and `AuthV3Page.spec.tsx` with Vitest. | Both |
+| Shared signup (`src/shared/signup`) | Deleted-account handling | `node --test` |
+| Invite (`src/sites/invite`) | App link building and referral hand-off | `node --test` |
+| E2E viewer (`src/sites/maestro`) | Evidence log parsing and the workflow coverage panel | Vitest |
+| Build tooling (`tools/vite/dashboard`) | Dashboard search index extraction | Vitest |
+| OG worker (`workers/og`) | URL signing, gallery links, and per-template SVG file snapshots in `src/templates/__snapshots__` | Vitest |
+| Router workers | `experience-router` and `world-cup-router` request handling | `node --test` |
+
+The home, event, and world-cup sites have no unit tests. Their build is their only CI check.
+
+### Patterns
+
+- **Mock by module.** Hoist shared state with `vi.hoisted`, then `vi.mock` the generated hooks under `@/generated/dashboard/endpoints/...`, `@/hooks/useRole`, `@/contexts/CommunityContext`, `@clerk/react`, and heavy layout components. `FleetsPage.test.tsx` and `App.test.tsx` show the pattern.
+- **Wrap providers.** Pages that use React Query get a fresh `QueryClient` and `QueryClientProvider`. Pages that route get a `MemoryRouter`.
+- **Assert behavior.** Use `screen` queries and `fireEvent`, and assert which generated hook was called with which arguments.
+- **Add new dashboard routes to the role matrix.** Add the path and its allowed roles to the `pages` map in `App.test.tsx`. See [Adding a dashboard page](/engineering/web/adding-a-dashboard-page).
+- **Update OG snapshots deliberately.** `templates.test.ts` uses `toMatchFileSnapshot`. Run `pnpm test:og -u` only for an intended layout change, and review the SVG diff.
+
+## Lint and type gates
+
+| Gate | Command | What it enforces |
+| --- | --- | --- |
+| Format | `pnpm format:check` | `oxfmt --check .` with `.oxfmtrc.json` |
+| Lint | `pnpm lint` | `oxlint --deny-warnings .`, then `eslint .` |
+| Type-aware lint | `pnpm lint:type-aware` | `oxlint --type-aware --type-check` with `.oxlintrc.typeaware.json` |
+| Typecheck | `pnpm typecheck` | `tsc -b` over `tsconfig.app.json` (`src/`) and `tsconfig.node.json` (Vite config and tools) |
+
+### oxlint
+
+`.oxlintrc.json` sets the `correctness`, `suspicious`, and `perf` categories to `error`, with the `react`, `react-perf`, `typescript`, `unicorn`, `jsx-a11y`, `import`, `promise`, `node`, and `oxc` plugins. `--deny-warnings` turns any remaining warning into a failure. It ignores `src/generated`, `dist`, and `node_modules`.
+
+The type-aware config turns on rules such as `await-thenable`, `no-misused-promises` (with `checksVoidReturn: false`), `no-base-to-string`, `restrict-template-expressions`, `unbound-method`, and `no-duplicate-type-constituents`. `no-floating-promises` is off here, unlike in `yelo-frontend`.
+
+### ESLint
+
+`eslint.config.js` loads `eslint-plugin-oxlint`'s recommended config so ESLint skips rules oxlint already covers. What remains:
+
+| Rule | Scope | Purpose |
+| --- | --- | --- |
+| `no-restricted-imports` on `@/lib/api-client` | `src/**` except a short allowlist | Call generated operations, not the raw transport |
+| `no-restricted-syntax` on `fetch(...)` | `src/components`, `src/hooks`, `src/sites/dashboard`, except `TopLocationsManager.tsx` and `JobsPage.tsx` | Same, for raw `fetch` |
+| `react-hooks/rules-of-hooks`, `exhaustive-deps`, `purity`, `static-components`, `preserve-manual-memoization`, `use-memo` | All TypeScript | React Compiler-era hook rules at `error` |
+| `react-hooks/set-state-in-effect`, `refs`, `incompatible-library`, `immutability` | All TypeScript | Off. The config notes these flag intentional patterns. |
+
+`workers/og` turns off `rules-of-hooks` because it renders satori templates with an `h` factory. `src/sites/home` also turns off `set-state-in-effect` and `refs` for its animation code.
+
+## API contract drift
+
+`make api-check` is the first gate, and every other quality target depends on it. It runs:
+
+<Steps>
+  <Step title="Lock check">
+    `scripts/check-openapi-lock.sh` validates `docs/openapi.json` as JSON, checks that `docs/openapi.lock.json` names `rideyelo/yelo-api` and `openapi.json`, compares the spec's SHA-256 with the lock, and compares the lock's Orval version with `devDependencies.orval`.
+  </Step>
+  <Step title="Regenerate">
+    `orval --config orval.config.ts --clean --fail-on-warnings`
+  </Step>
+  <Step title="Diff">
+    `git diff --exit-code -- docs/openapi.json docs/openapi.lock.json src/generated`. Any change means the committed client is stale.
+  </Step>
+</Steps>
+
+To fix drift, run `make openapi orval` against a `yelo-api` checkout and commit the result. See [OpenAPI and generated clients](/engineering/openapi-and-clients).
+
+## CI
+
+`ci.yml` has one job that matters for merging, **Quality and affected builds**. It runs on non-draft pull request events and on manual dispatch, on `blacksmith-2vcpu-ubuntu-2404` with a 20-minute timeout.
+
+<Steps>
+  <Step title="Install and restore cache">
+    `pnpm install --frozen-lockfile`, then restore `.nx/cache` keyed by the lockfile hash and commit.
+  </Step>
+  <Step title="Find affected sites">
+    `nrwl/nx-set-shas` sets the base and head. Nx lists affected projects tagged `firebase-site` with a `build` target. The step fails if the set of Nx site projects differs from `sites.config.json`.
+  </Step>
+  <Step title="Run quality gates">
+    `pnpm nx run workspace-quality:ci --parallel=2`. The `ci` target is a no-op that depends on `format`, `lint`, `lint-types`, `typecheck`, `test`, and `firebase-config`, each of which depends on `api-contract`. All are Nx-cached.
+  </Step>
+  <Step title="Check build variables">
+    `scripts/require-site-env.mjs` fails if any affected site's `metadata.requiredBuildEnv` names a repository variable that isn't set.
+  </Step>
+  <Step title="Build affected sites">
+    `pnpm nx run-many -t build --projects=<affected> --parallel=2`. A site that type-checks but fails to build blocks the pull request.
+  </Step>
+  <Step title="Preview home">
+    If `home` is affected and the branch is in this repository, a second job deploys a Firebase preview channel `pr-<number>` that expires in 7 days and comments the URL.
+  </Step>
+</Steps>
+
+The `workspace-quality` project's root is the whole repository, so its Nx cache key covers every file. A change anywhere reruns the gates. The cache still helps on reruns of the same commit.
+
+`firebase.yml` deploys affected sites on pushes to `main`. It checks the Firebase config and builds, but doesn't rerun tests or lint.
+
+## Run tests
+
+```bash
+pnpm nx run workspace-quality:ci   # exactly what CI runs
+pnpm test                          # every test script
+pnpm test:components               # all listed Vitest files
+pnpm exec vitest run --root . src/sites/dashboard/pages/FleetsPage.test.tsx
+pnpm exec vitest run --root . src/sites/dashboard/App.test.tsx -t 'fleet'
+node --experimental-strip-types --test src/sites/invite/appLink.test.ts
+pnpm test:og -u                    # accept intended OG snapshot changes
+```
+
+## Gotchas and edge cases
+
+- **The chain stops early.** `pnpm test` uses `&&`, so a failure in `test:components` hides failures in later scripts. Run the later script directly to see them.
+- **Worker checks aren't in CI.** `worker:og:check`, `worker:experience-router:check`, and `worker:world-cup:check` type-check and dry-run deploy the Cloudflare workers, but no workflow runs them. `tsc -b` doesn't include `workers/`. Run them by hand when you change a worker.
+- **`.spec` files count as production input.** Nx's `production` input excludes `*.test.ts` and `*.test.tsx` but not `*.spec.*`, so editing `authV3Client.spec.ts` or `AuthV3Page.spec.tsx` marks the signup site as affected and rebuilds it.
+- **jsdom is opt-in.** A component test without the `@vitest-environment jsdom` comment runs in Node and fails on the first DOM access.
+- **The ESLint `fetch` ban has an allowlist.** Code outside `src/components`, `src/hooks`, and `src/sites/dashboard` can still call `fetch`. The maestro viewer does, on purpose, to read public artifacts.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Test scripts | `yelo-web/package.json` (`scripts`) |
+| Vite and Vitest base config | `yelo-web/vite.config.ts`, `tools/vite/base/config.ts` |
+| OG worker tests | `yelo-web/workers/og/vitest.config.ts`, `workers/og/src/**/*.test.ts` |
+| Quality target | `yelo-web/project.json` (`workspace-quality`) |
+| Nx inputs | `yelo-web/nx.json` |
+| Lint config | `yelo-web/.oxlintrc.json`, `.oxlintrc.typeaware.json`, `eslint.config.js`, `.oxfmtrc.json` |
+| Contract check | `yelo-web/Makefile` (`api-check`), `scripts/check-openapi-lock.sh`, `docs/openapi.lock.json` |
+| CI | `yelo-web/.github/workflows/ci.yml`, `firebase.yml`, `scripts/require-site-env.mjs`, `sites.config.json` |

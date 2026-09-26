@@ -1,0 +1,143 @@
+---
+title: "Add a mobile screen"
+description: "Recipe for a new screen in yelo-frontend: the Expo Router file, stack options, route guards and deep links, data from the generated Orval client, analytics events, and whether the change ships over the air or needs a native build."
+---
+
+Screens in `yelo-frontend` are files under `app/`, routed by Expo Router. This recipe covers what a new screen needs beyond the component itself. For the route map and guard details, see [Navigation and routing](/engineering/mobile/navigation). For the list of existing screens, see [Screen catalog](/engineering/mobile/screen-catalog).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-frontend#519](https://github.com/rideyelo/yelo-frontend/pull/519) | A new top-level route (`app/fleet-join/[code].tsx`) with a `StatusGuard` exemption, a `+native-intent.tsx` rewrite for the deep link, and a regenerated client for a new API endpoint ([yelo-api#163](https://github.com/rideyelo/yelo-api/pull/163)). The PR notes it is JavaScript-only and OTA-compatible. |
+| [yelo-frontend#399](https://github.com/rideyelo/yelo-frontend/pull/399) | A settings sub-screen (`app/(app)/profile/glass-lab.tsx`) registered in `profile/_layout.tsx` and gated on an experiment at both the settings row and the route. |
+
+## Recipe
+
+<Steps>
+  <Step title="Choose where the route lives">
+    - Signed-in screens go under `app/(app)/`. They inherit the profile guard in `app/(app)/_layout.tsx`.
+    - Sign-in screens go under `app/(auth-v3)/`.
+    - Screens reachable from a public link before sign-in, like `fleet-join/[code]` and `tip/[slug]`, go directly under `app/`.
+
+    Group segments in parentheses don't appear in the URL. A multi-step flow gets a folder with numbered files (`1-hub.tsx`, `2-...`) and its own `_layout.tsx`.
+  </Step>
+  <Step title="Create the screen file">
+    Export the component as the default export:
+
+    ```tsx app/(app)/widgets/index.tsx
+    export default function WidgetsScreen() {
+      const { data, isPending, isError, refetch } = useWidgetList();
+      // ...
+    }
+    ```
+
+    Build the UI from `components/design-system` (`YeloText`, `YeloTileRow`, `YeloRoundedButton`, and so on) and theme tokens from `@/lib/theme`. See [UI system](/engineering/mobile/ui-system).
+  </Step>
+  <Step title="Register stack options">
+    If the route sits directly under a stack layout, add a `Stack.Screen` with its presentation options in that layout. For `app/(app)/`, that's `app/(app)/_layout.tsx`. For settings screens, it's `app/(app)/profile/_layout.tsx`:
+
+    ```tsx
+    <Stack.Screen name="widgets" options={{ headerShown: false }} />
+    ```
+  </Step>
+  <Step title="Get data from the generated client">
+    Use the Orval hook generated from the API operation. Hook names follow the operation ID, so `widget.ListWidgets` becomes `useWidgetListWidgets` in `@/api/generated/endpoints/widget/widget`.
+
+    If the endpoint is new, merge it in `yelo-api` first. Then regenerate against your API checkout:
+
+    ```bash
+    make api          # sync openapi.json + openapi.lock.json, then run Orval
+    make api-check    # verify the lock and generated output
+    ```
+
+    Wrap the generated hook in `api/helpers/` when several screens share it, or when you need derived data or stable invalidation. `useCurrentUser` in `api/helpers/authUser.ts` is the model. See [State and data](/engineering/mobile/state-and-data).
+  </Step>
+  <Step title="Check the route guards">
+    The guards can pull a user off your screen:
+
+    - `components/auth/StatusGuard.tsx` sends a driving user to `/(app)/drive` unless the path contains `/drive` or is exempt.
+    - `hooks/ride/useRideLifecycleNavigation.ts` moves riders based on ride status.
+
+    If the screen must stay open while the user is riding or driving, add an exemption to both, as `/scan-qr`, `/tip/`, and `/fleet-join/` have. Otherwise, confirm the redirect is the behavior you want.
+  </Step>
+  <Step title="Wire a deep link, if the screen has one">
+    - Links the OS delivers go through `app/+native-intent.tsx`, which rewrites legacy and web paths to app routes. Add a rewrite and a case in `lib/navigation/nativeIntent.test.ts`.
+    - Links in push notifications go straight to `router.push`. Use an absolute path. See [Add a notification](/engineering/cookbook/add-a-notification).
+    - A new universal-link path or domain changes associated domains or intent filters, which needs a native build.
+
+    Add the path to [Deep links and URLs](/reference/deep-links-and-urls).
+  </Step>
+  <Step title="Gate it, if it's experimental">
+    Add a key to `EXPERIMENTS` in `lib/experiments/index.ts`. Gate the entry point with `ExperimentGate` or `useExperimentEnabled`, and gate the route itself so a deep link can't bypass it. See [Add a feature flag or config value](/engineering/cookbook/add-a-feature-flag-or-config#recipe-mobile-experiment).
+  </Step>
+  <Step title="Track analytics events">
+    Put the screen's events in a hook under `lib/analytics/events/`, one file per feature:
+
+    ```ts lib/analytics/events/widgets.ts
+    import { useMemo } from 'react';
+    import { useAnalytics } from '../useAnalytics';
+
+    export function useWidgetAnalytics() {
+      const analytics = useAnalytics();
+      return useMemo(
+        () => ({
+          screenViewed: (p: { widget_count: number }) => analytics.track('widgets_screen_viewed', p),
+          widgetOpened: (p: { widget_id: string }) => analytics.track('widget_opened', p),
+        }),
+        [analytics],
+      );
+    }
+    ```
+
+    Event names are `snake_case` and properties are typed at the call site. There is no automatic screen tracking, so fire a `*_viewed` event on mount if you need one. Before sending contact details or coordinates, read [Redaction and exclusion](/reference/analytics-events#redaction-and-exclusion). Route coordinates, for example, are sent only with provider diagnostics consent. Add the events to [Analytics events](/reference/analytics-events#mobile).
+  </Step>
+  <Step title="Test and verify">
+    ```bash
+    make check        # lint, format, typecheck, type-aware lint, jest, api-check
+    make sims         # Metro + iOS simulators against the production API
+    ```
+
+    Unit tests cover pure logic in `lib/`, guards, and helpers. Run `make typecheck` after Metro has run once, so the typed routes in `.expo/types/router.d.ts` include the new path. For flows worth covering end to end, see [Testing](/engineering/testing).
+  </Step>
+</Steps>
+
+## OTA or native build
+
+A screen built from existing JavaScript dependencies ships as an OTA update. It also becomes a candidate for automatic backport to the supported release branch.
+
+| Change | Ships |
+| --- | --- |
+| New screen, components, hooks, analytics, regenerated Orval client | OTA |
+| New dependency in `package.json` or `pnpm-lock.yaml`, even pure JS | Native build. Put it in its own PR. |
+| New native module, permission, background mode, URL scheme, associated domain, or config plugin | Native build |
+
+The **Fingerprint** check comments on the PR when the native fingerprint changes. Add the `skip-supported-release-backport` label if the screen must not reach the current store release. For the full rules, see [Mobile releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
+## Checklist
+
+- [ ] The route is in the right group, with stack options registered.
+- [ ] Data comes from the generated client, with loading and error states.
+- [ ] Guards were checked, and exemptions added where the screen must survive status changes.
+- [ ] The deep link, if any, is rewritten in `+native-intent.tsx` and tested.
+- [ ] Experimental screens are gated at the entry point and the route.
+- [ ] Analytics events live in `lib/analytics/events/` and are documented.
+- [ ] The PR says whether it's OTA-safe, and native changes are in their own PR.
+- [ ] [Screen catalog](/engineering/mobile/screen-catalog) lists the new screen.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Redirecting before the experiment resolves">
+    `useExperimentEnabled` is `false` while the user and community queries load. A route that redirects on `false` bounces a cold deep link before the data arrives. `glass-lab.tsx` does this today. Use `useExperiment` and check `loading` before redirecting.
+  </Accordion>
+  <Accordion title="The API must ship first">
+    An OTA update reaches devices within minutes. If the screen calls an endpoint that isn't live in production, users get errors. Merge and release the API before you stage the OTA.
+  </Accordion>
+  <Accordion title="Relative router paths">
+    `router.push('widgets')` resolves against the current route. Use absolute paths such as `/(app)/widgets`, so typed routes check them and the result doesn't depend on where the user is.
+  </Accordion>
+  <Accordion title="Push data doesn't refresh your queries automatically">
+    Only the types handled in `lib/notifications/pushInvalidation.ts` invalidate queries. If the screen shows data that changes server-side, poll it or handle a push type there.
+  </Accordion>
+</AccordionGroup>

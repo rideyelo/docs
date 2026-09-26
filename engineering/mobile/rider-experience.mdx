@@ -46,7 +46,7 @@ The search bar carries a status chip from the current community:
 
 | Step | Endpoint | Notes |
 | --- | --- | --- |
-| Browse (empty query) | `GET /mapping/search-context` | Recents plus "Top locations" rails |
+| Browse (empty query) | `GET /mapping/search-context` | Recents plus "Top locations" rails. `buildBrowseSections` drops `needs_review` top locations, dedupes by `yelo_place_id` (then `mapbox_id`, then `id`), and omits empty sections. |
 | Suggest | `POST /mapping/search-suggestions` | Throttled to one call per 300 ms. Response carries a `session_token` that is copied onto every suggestion. |
 | Retrieve | `POST /mapping/search-result` | Only for live suggestions without coordinates. Recents and pinned spots already carry coordinates and skip it. |
 
@@ -65,7 +65,11 @@ A failed retrieve keeps search open and shows **Couldn't load this location** / 
 
 ## Request sheet
 
-`app/(app)/(tabs)/map/request.tsx` is the core rider screen. It takes `pickup`, `dropoff`, and `bump` as JSON route params.
+`app/(app)/(tabs)/map/request.tsx` is the core rider screen. It takes `pickup`, `dropoff`, and `bump` as route params. Callers build stops with `serializeRideStop`, and the screen reads them with `parseRideStop` (`lib/ride/stopData.ts`). The parser decodes once only for legacy callers that pass URI-encoded JSON.
+
+`RideRequestSession` (`components/map/request/RideRequestSession.tsx`) keys the screen body on the `pickup`, `dropoff`, and `bump` params. A deep link that updates the mounted route starts a fresh selection and draft. The draft write queue outlives that remount, so a request already in flight still finishes before the next one starts.
+
+A pickup with no name shows as **Pickup pin** (`resolvePickupDisplayName` in `lib/ride/stopDisplay.ts`).
 
 ### Entry guards
 
@@ -75,11 +79,11 @@ A failed retrieve keeps search open and shows **Couldn't load this location** / 
 
 ### Draft creation
 
-Whenever the stop identity changes (`rideStopsKey`: coordinates plus `mapbox_id`, `event_id`, `feature_type`), `usePreRideRequest.createRide` runs:
+Whenever the stop identity changes (`rideStopsKey`: coordinates plus `provider`, `yelo_place_id`, `mapbox_id`, `event_id`, `feature_type`), `usePreRideRequest.createRide` runs:
 
 <Steps>
   <Step title="Validate stops">
-    Missing names, addresses, or coordinates fail with "Pickup or dropoff details are incomplete. Choose your stops again."
+    Only coordinates are required. A stop without a name or address is sent as a coordinate stop. A missing pickup coordinate opens the change-stop sheet in pickup mode with "Choose where your driver should meet you." A missing dropoff coordinate opens it in destination mode with "Choose where you want to arrive."
   </Step>
   <Step title="Check the app version">
     `ensureRideEntryVersion()` calls `/update-required`. See [Releases](/engineering/mobile/releases#update-required-gate).
@@ -101,10 +105,10 @@ Error branches in the sheet:
 
 | Condition | UI |
 | --- | --- |
+| `pickup` or `dropoff` param that `parseRideStop` can't read | Change-stop sheet opens for that stop, as in [Validate stops](#draft-creation) |
+| Pickup or dropoff without coordinates | Change-stop sheet opens in pickup mode (**Confirm pickup**) or destination mode (**Confirm destination**) |
 | Session not ready (`isProfileReady` false) | "Your account is reconnecting. Retry to check your connection." |
-| 400 `PickupAddressRequired` | Change-stop sheet opens in pickup mode. Button reads **Confirm pickup**. |
-| 400 `DestinationAddressRequired` | Change-stop sheet opens in destination mode. Button reads **Confirm destination**. |
-| Other 4xx with a string `error.body` | That body text, with **Retry ride options** |
+| 4xx with a string `error.body` | That body text, with **Retry ride options** |
 | Anything else | "Could not load ride options. Check your connection and try again." |
 
 ### Vehicle options
@@ -113,7 +117,7 @@ Error branches in the sheet:
 
 - The vehicle image, or the driver's photo for a driver-specific option.
 - Title, seat count pill, and a description (fallback: "[Vehicle] just for your group!").
-- Badges from `badges`: `verified_student`, `fleet` (with `fleet_name`), `cheapest`, `fastest`.
+- Badges from `badges`: `verified_student`, `fleet` (with `fleet_name`), `cheapest`, `fastest`. The API sends at most one badge per option and omits `fleet` for the community's primary fleet. See [Rider option ordering and badges](/engineering/fleets/isolation#rider-option-ordering-and-badges).
 - Price: **Free** at 0, a strikethrough with a shiny tag when discounted, otherwise `$0.00` format.
 
 The floating `RideActionBar` has **Fastest** and **Cheapest** segments that jump the selection, plus a bump button. The CTA caption "You'll save about 30% on average vs. Uber & Lyft" hides when every option is free.
@@ -273,7 +277,7 @@ It shows **YOU PAID** (price plus tip), pickup and drop-off, a route map, **Base
 
 ## Gotchas and edge cases
 
-- **`no_drivers_available` riders can't leave the queue.** `leave-queue.tsx:51` captures the command target only for `confirmed` or `queued`. A rider in `no_drivers_available` sees the waiting screen and its **Leave queue** link, but submitting always yields "Your ride changed…".
+- **`no_drivers_available` riders can't leave the queue.** `leave-queue.tsx:51` captures the command target only for `confirmed` or `queued`. A rider in `no_drivers_available` would see the waiting screen and its **Leave queue** link, but submitting would always yield "Your ride changed…". No API code path on `main` writes that status (see [Ride lifecycle](/concepts/ride-lifecycle)), so this only matters for legacy rows.
 - **Receipt duration is wrong.** The history query returns `duration` in seconds (`complete_time - request_time`), but `ride-details.tsx:155` renders `` `${item.duration} min` ``. It also measures from request, not pickup.
 - **Receipts older than the list are "Ride not found".** The detail screen looks the id up in the 200-row history cache. There is no fetch by id.
 - **Stripe `returnURL` targets a missing route.** `lib/payments/paymentSheetConfig.ts:80` uses `createDeepLink('ride/2-select-ride')`, which has no file under `app/`. A bank-redirect payment method returning to the app would land on `+not-found`.
@@ -284,6 +288,6 @@ It shows **YOU PAID** (price plus tip), pickup and drop-off, a route map, **Base
 - **Tips require a rating.** **Done** is disabled without stars, and **Skip** sends `tip_amount: null`, so a rider can't tip without rating.
 - **Queue-leave analytics always report zero.** `leave-queue.tsx:88` sends `seconds_in_queue: 0`.
 - **Unreachable branches in `4-ride`.** `chatDisabled` and `callDisabled` check `queued`, and `mapFocusButton` handles `complete`, but the screen only renders for the three assigned statuses.
-- **Support SMS goes to `QUO_PHONE_NUMBER`** in `lib/constants.ts`, which is a `555` exchange number. Verify it routes before relying on **Report safety issue**.
+- **Support SMS goes to `QUO_PHONE_NUMBER`** in `lib/constants.ts`, `(203) 555-9356`. Only `555-0100` to `555-0199` is reserved for fiction, so this may be a real line, but confirm it routes before relying on **Report safety issue**. Driver signup's hub and submitted screens text the same number.
 - **Queued driver card passes the phone number as `driverId`** (`2-queued.tsx:185`).
 - **Legacy screens still mount.** `ride/pickup`, `ride/dropoff`, and `ride/3-ride-matching` are registered in the ride stack, and `ride/index` redirects to the map. The lifecycle router never targets them.

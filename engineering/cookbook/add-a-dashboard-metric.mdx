@@ -1,0 +1,133 @@
+---
+title: "Add a dashboard metric"
+description: "Recipe for a new KPI card on the Yelo dashboard: the SQL in analytics.sql, the raw and response models, the service's current and previous windows, the endpoint and contract, the generated hook, and the MetricCard."
+---
+
+A dashboard KPI runs through five layers. A sqlc query in `analytics.sql` returns raw counts for one window. The service calls it for the current and previous windows and turns each pair into a `KPIValue`. The handler returns the response model, and `yelo-web` renders it with `MetricCard`. This recipe adds a count to an existing KPI response, which is the most common case. For the definitions behind today's cards, see [Dashboard analytics internals](/engineering/domains/dashboard-analytics) and [Metrics](/reference/metrics#dashboard-kpi-definitions).
+
+## Worked examples
+
+| PR | What it shows |
+| --- | --- |
+| [yelo-api#255](https://github.com/rideyelo/yelo-api/pull/255) | Adds `confirmed_requests` to community and fleet KPIs: two `COUNT(*) FILTER` columns in `analytics.sql`, new fields on `RawMarketMetrics`, `RawFleetMetrics`, and both response models, `calculateKPI` calls in the service, a changed completion-rate formula, and an integration test with an adversarial ride cohort. |
+| [yelo-web#151](https://github.com/rideyelo/yelo-web/pull/151) | The paired dashboard change: synced contract, a `description` prop on `MetricCard`, and the new card on the overview, ride KPIs, and fleet pages. |
+| [yelo-api#254](https://github.com/rideyelo/yelo-api/pull/254) | Changes a category breakdown in `analytics.sql` only, with a `analytics_sqlc_contract_test.go` update and no client change. |
+
+## Recipe
+
+<Steps>
+  <Step title="Define the metric in words first">
+    Write down what counts, which timestamp puts a row in a window, and which rows are excluded. Reuse the shared predicates, so the new card agrees with the others:
+
+    | Concern | Existing rule |
+    | --- | --- |
+    | Counted user | `is_deleted = FALSE`, profile completed, not `auth_v3_provisional`, not `is_test` |
+    | Completed ride | `status IN ('complete', 'pending_rider_rating') AND cancel_phase IS NULL` |
+    | Superseded searches | `cancel_reason IS DISTINCT FROM 'superseded'` |
+    | Ride window | `request_time >= start_at AND request_time < end_at` |
+
+    The full list is in [Shared predicates](/reference/metrics#shared-predicates).
+  </Step>
+  <Step title="Add the SQL">
+    Add a column to the existing query in `internal/data/repository/queries/analytics.sql`, such as `GetDashboardMarketMetrics` or the fleet query. A filtered aggregate keeps it to one scan:
+
+    ```sql
+    COUNT(*) FILTER (WHERE request_time >= sqlc.arg(start_at)::timestamptz
+        AND request_time < sqlc.arg(end_at)::timestamptz
+        AND confirm_time IS NOT NULL
+        AND cancel_reason IS DISTINCT FROM 'superseded')::bigint AS confirmed_requests,
+    ```
+
+    Cast each column (`::bigint`, `::float8`) as the existing ones do, so sqlc infers a concrete Go type for subqueries and expressions. Then run:
+
+    ```bash
+    make sqlc-generate
+    ```
+  </Step>
+  <Step title="Map it in the repository">
+    Add the field to the raw model in `internal/models/dashboard.go` (`RawMarketMetrics`, `RawFleetMetrics`), and copy it from the sqlc row in `internal/data/repository/dashboard.go`. Repository reads run under `WithPostgresTimeout`, which is 5 seconds, and the dashboard KPIs aren't cached. A slow query fails the whole card group.
+  </Step>
+  <Step title="Compute the KPI in the service">
+    Add a `KPIValue` field to the response model with a `json` tag in `snake_case`. Then fill it in `GetMarketKPIs` or `GetFleetKPIs` in `internal/service/dashboard/dashboard.go`:
+
+    ```go
+    ConfirmedRequests: s.calculateKPI(float64(currentMetrics.ConfirmedRequests), float64(prevMetrics.ConfirmedRequests)),
+    ```
+
+    `calculateKPI` returns the current value, the delta, and the percentage change against the equally long previous window. For a rate, compute current and previous rates from the raw counts first, guarding against a zero denominator, then call `calculateKPI` on the two rates. That's how the completion rate works.
+  </Step>
+  <Step title="Expose it">
+    Adding a field to an existing response needs no route change. For a new endpoint, follow [Add an endpoint](/engineering/api/adding-an-endpoint) and register it in the dashboard group with the right scope and role gates.
+
+    Regenerate the contract and run the gates:
+
+    ```bash
+    make openapi
+    make check
+    ```
+  </Step>
+  <Step title="Test the SQL against real rows">
+    Add an integration test that inserts a cohort covering every edge of the definition, and asserts exact counts: rows inside and outside the window, test users, superseded and canceled rides, and legacy rows with missing timestamps. `TestDashboardRequestMetrics_ConfirmationCohort` in `dashboard_test.go` is the model. For changes to shared KPI queries, extend `TestAnalyticsSQLCContract` in `analytics_sqlc_contract_test.go`.
+
+    ```bash
+    make test-integration
+    ```
+  </Step>
+  <Step title="Sync the dashboard client">
+    After the API merges, in `yelo-web`:
+
+    ```bash
+    make openapi orval
+    make api-check
+    ```
+
+    The generated hook already returns the new field. For community KPIs it's `useCommunityGetMarketKPIs` from `@/generated/dashboard/endpoints/dashboard/dashboard`.
+  </Step>
+  <Step title="Render the card">
+    Add a `MetricCard` next to its peers. That's `src/sites/dashboard/pages/OverviewPage.tsx` for community KPIs, or `RidesKpisTab.tsx` and `FleetsPage.tsx` for the others:
+
+    ```tsx
+    <MetricCard
+      title="Confirmed Requests"
+      description="Rider-confirmed requests, excluding superseded searches."
+      value={kpis?.confirmed_requests?.value}
+      delta={kpis?.confirmed_requests?.delta}
+      percentage={kpis?.confirmed_requests?.percentage_change}
+      icon={MousePointerClick}
+      isLoading={isLoading}
+    />
+    ```
+
+    Use `description` to state the definition in one line. Format rates and currency in the `value` prop, as the completion rate card does with `toFixed(1)`. Add a component test next to the page, and add it to the `test:components` file list in `package.json`.
+  </Step>
+  <Step title="Document the definition">
+    Update the card's definition in [Metrics](/reference/metrics#dashboard-kpi-definitions), and the operator guide for the page, such as [Ride metrics](/dashboard/ride-metrics).
+  </Step>
+</Steps>
+
+## Checklist
+
+- [ ] The definition reuses the shared predicates and excludes test users and markets.
+- [ ] The SQL casts each new column, and `make sqlc-generate` output is committed.
+- [ ] Raw model, repository mapping, response model, and service all carry the field.
+- [ ] Rates guard against zero denominators in both windows.
+- [ ] An integration test pins exact counts for an adversarial cohort.
+- [ ] `openapi.json` is regenerated, and the web PR syncs the contract after the API is live.
+- [ ] The card has a one-line `description`, and the definition is documented.
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Three different delta functions">
+    Community and fleet KPIs use `calculateKPI`, which reports **100%** when the previous value is 0. Global KPIs use `kpiDelta`, and live analytics use `computeKPIValue`, which both report 0 in that case. Put the metric in the response family whose windows and delta math match what you want to show. See [Time windows and delta math](/engineering/domains/dashboard-analytics#time-windows-and-delta-math).
+  </Accordion>
+  <Accordion title="All-time has no comparison">
+    For `all_time`, the previous window ends on 2020-01-01, so previous values are 0 and every percentage change reads 100%. Consider hiding the percentage for that range.
+  </Accordion>
+  <Accordion title="Changing an existing definition">
+    Changing what a field counts changes history on every dashboard at once, with no version marker. [yelo-api#255](https://github.com/rideyelo/yelo-api/pull/255) kept `ride_requests` unchanged, added `confirmed_requests` beside it, and called out the completion-rate change as behavioral in the PR. Prefer adding a field over redefining one.
+  </Accordion>
+  <Accordion title="Web deploys before the API">
+    If the dashboard ships first, `kpis?.new_field` is `undefined` and the card renders empty. Merge the web PR only after the API release promotes.
+  </Accordion>
+</AccordionGroup>

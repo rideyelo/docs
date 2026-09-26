@@ -63,6 +63,8 @@ The app signs out automatically when:
 - `useCurrentUser` gets a 200 with `status: "deleted"`.
 - `useCurrentUser` gets a 401 and the JWT is expired, or a 401 that persists after one retry.
 
+A banned account isn't signed out. Other calls return 401 `AccountBannedError`, which nothing handles, and `/authv2/status` keeps succeeding because it doesn't check bans.
+
 ## Auth v3 transaction
 
 Auth v3 is an OAuth-style authorization code flow with PKCE. The app is the client, and the Yelo API is both the authorization server and the provider broker.
@@ -99,10 +101,12 @@ sequenceDiagram
 
 1. In production (`entryMode` is `hosted`), the app probes the hosted page with `isHostedWebReachable` (4-second timeout), then opens `web_url` in `WebBrowser.openAuthSessionAsync`. The hosted page owns attribution, cookies, and any saved web session. This transaction uses `native_phone_step: false`.
 2. If the page is unreachable or the browser cannot open, the app opens a fresh transaction with `native_phone_step: true` and routes to `/(auth-v3)/method`.
-3. If the user closes the browser, the entry screen shows **Having trouble? Continue in app**. After two cancellations, the third tap goes native automatically.
+3. If the user closes the browser, the entry screen shows **Having trouble? Continue in app**, which starts the native flow on a fresh attempt. After two cancellations, the next **Get Started** tap goes native automatically, and later taps stay native for the life of the provider.
 4. E2E builds (`EXPO_PUBLIC_APP_ENV=e2e`) skip the browser and use the native screens with the same APIs.
 
 `startWebFallback()` remains as a last resort. It is reachable from `(auth-v3)/error.tsx` when the native endpoints return 503.
+
+A callback that arrives when no browser session owns it (for example, after the app was killed) is routed by `app/+native-intent.tsx` to `/auth-return`. The app then resumes the hosted transaction with the persisted secret and PKCE verifier (`resumeHostedTransaction`).
 
 ### Transaction secret and draft
 
@@ -123,7 +127,7 @@ Each "Get Started" attempt carries an `attempt_id` (kept for 15 minutes). The se
 Every provider returns to `com.rideyelo://auth/v3/callback` with either `code` (exchange it) or `step=phone` (collect a phone on the same transaction). `parseAuthV3Redirect` validates `state` before anything else.
 
 <Note>
-Test accounts use phone numbers starting with `555` and accept OTP `12345`. E2E actors use reserved `+1555` numbers. See [Testing](/engineering/testing).
+Reserved test numbers use area code 555 (`+1555` plus seven digits) and accept OTP `12345` in every environment. This is intentional. E2E actors use the same reserved range. See [Test, E2E, and internal auth paths](/engineering/identity/test-and-internal-auth) and [Testing](/engineering/testing).
 </Note>
 
 ### Exchange, profile, permissions

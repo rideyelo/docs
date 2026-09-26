@@ -74,7 +74,7 @@ Mobile sends an `attempt_id` so that a retried **Get Started** tap doesn't creat
 - If the upsert returns an existing row whose purpose, channel, client, redirect, challenge, state hash, or nonce hash differs from the request, the API returns 400 `attempt_id is already bound to another or inactive authorization`.
 
 <Warning>
-Because accept sets `accepted_at`, an attempt can't be rotated after the user taps a method on the hosted page. Any retry after that point must use a new attempt ID.
+Because accept sets `accepted_at`, an attempt can't be rotated after the user taps a method on the hosted page. An expired attempt can't be rotated either. Any retry after that point must use a new attempt ID. Mobile already starts a fresh attempt ID when its draft is marked accepted or the attempt is older than 15 minutes, and retries with a fresh ID once on a 409.
 </Warning>
 
 ## Accept legal terms
@@ -165,7 +165,7 @@ Never retry `POST /token`. Its first response may have committed. Mobile uses `P
 | 410 | `completed`, `conflict`, `expired`, `cancelled`, or past expiry |
 
 <Warning>
-`AuthHandoffCodes.transaction_id` is unique, and `CreateAuthV3HandoffCode` has no `ON CONFLICT` clause. Resolution already created a handoff for almost every `verified` transaction, so the `handoff` branch of resume is likely to hit a unique violation and return a 500 instead of a fresh code. No integration test covers resume after a handoff exists. Treat this as a suspected bug when you debug a "lost callback" report.
+Known bug: `AuthHandoffCodes.transaction_id` is unique, and `CreateAuthV3HandoffCode` has no `ON CONFLICT` clause. Nothing deletes the existing code first. A transaction stays `verified` after resolution creates its handoff, so the `handoff` branch of resume hits a unique violation (`23505`), which isn't retryable and returns a 500 instead of a fresh code. `resume_test.go` doesn't catch it, because it sets `verified` without a prior handoff and the fake repository doesn't enforce uniqueness. Check for this when you debug a "lost callback" report.
 </Warning>
 
 ## Finish profile
@@ -212,9 +212,9 @@ All deletes use `FOR UPDATE SKIP LOCKED`, so the loop never blocks live sign-ins
 ## Gotchas and edge cases
 
 - **Changing legal versions mid-flight.** A deploy that changes `AUTH_V3_TERMS_VERSION` makes every accepted-but-unresolved transaction fail resolution with `current legal acceptance is required`. The user must restart.
-- **Rotating the first state HMAC key.** Derived nonces change, so a pending attempt that retries authorize with the same attempt ID gets 400 (nonce hash mismatch). Existing secrets still verify with the old key.
-- **Mobile and server TTLs differ.** Mobile keeps attempts and drafts for 15 minutes (`AUTH_V3_ATTEMPT_TTL_MS`, `AUTH_V3_TRANSACTION_TTL_MS`), but the server transaction TTL defaults to 10 minutes. Mobile reuses a draft only while it has more than 60 seconds left on the server `expires_at`.
+- **Rotating the first state HMAC key.** Derived nonces change. A pending attempt that retries authorize with the same attempt ID still succeeds, because the upsert overwrites `nonce_hash`, `state_hash`, and `code_challenge`, and the client receives the new nonce. Existing secrets still verify with the old key.
+- **Mobile follows the server expiry.** The mobile draft uses the server's `expires_at` (10 minutes by default). `AUTH_V3_TRANSACTION_TTL_MS` (15 minutes) is only a fallback when `expires_at` can't be parsed, and `AUTH_V3_ATTEMPT_TTL_MS` (15 minutes) only decides whether the local attempt ID is reused. Mobile reuses a draft only while it has more than 60 seconds left and the same `native_phone_step` value.
 - **Web onboarding tokens last an hour.** For web exchanges, `ExchangeToken` signs the onboarding token with `WebAccessTTL`, not `OnboardingTTL`.
 - **Web sessions start before the profile exists.** A web exchange that returns `needs_profile` still creates a web refresh session. Refreshing that session mints a full `user` token even though the profile isn't complete, because `RefreshWebSession` doesn't check `profile_completed`.
 - **Expired status is rarely written.** Most expired transactions stay in their last live status. `expired` is only written when resolution happens after expiry. Cleanup finds stale rows by `expires_at`, not by status.
-- **Accepting twice is safe, changing versions isn't.** Re-accepting with the same versions is idempotent. Re-accepting a `pending` transaction with different versions returns 401 `auth transaction could not be accepted`, because `AcceptAuthV3Transaction` refuses to rewrite existing acceptance.
+- **Accepting twice is safe, changing versions isn't.** Re-accepting with the same versions is idempotent. Request versions that differ from the current config fail validation with 400. A 401 `auth transaction could not be accepted` only happens when the config versions changed after the first accept, because `AcceptAuthV3Transaction` refuses to rewrite existing acceptance.

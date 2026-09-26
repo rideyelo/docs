@@ -8,7 +8,7 @@ Redis holds caches and short-lived matching state. Postgres is the source of tru
 ## Symptoms
 
 - Logs show `Redis circuit breaker opened` (`event: CIRCUIT_BREAKER_OPENED`, `component: redis`).
-- **Presence** and the market online-driver counts drop to zero, while drivers are clearly online.
+- The **Live** market online counts and drivers table drop to zero or show drivers as **Offline**, while drivers are clearly online.
 - Drivers get repeated activation pushes for the same ride.
 - Queued rides stay with a driver who went offline.
 - The mobility vehicles layer and heatmaps stop updating.
@@ -40,7 +40,7 @@ The breaker opens when at least 50 requests in a 120-second window fail at 80% o
 | Caches (auth, profiles, communities, prices, routes, places, earnings) | Fall back to Postgres or providers. Expect more load and slower responses. |
 | Ride board writes | Fall back to a per-instance in-memory board. The driver board read (`GET /ride/v2/board`) queries Postgres, so drivers still see confirmed rides. |
 | Activation dedup | "Failed to get notified drivers set, proceeding without dedup." Drivers can get the same ride alert more than once. |
-| Driver presence | The **Presence** page and the **Supply & Demand** driver lists read the presence cache, so they show few or no users. The **AQ** badge on **Driver Ops** also comes from presence. |
+| Driver presence | The **Live** page's online rider and driver counts and its drivers table read the presence cache, so they show few or no users. |
 | Offline grace for queued rides | `handleQueuedDriverOfflineGrace` skips drivers whose presence can't be read, so their queued rides aren't returned to the board. |
 | Queue summaries | Omitted from `GET /user/status`. The queue itself is in Postgres. |
 | Mobility feeds and heatmaps | Skipped. The map layers go stale. |
@@ -77,12 +77,12 @@ During a Redis outage, Cloud Run instances that scale up or restart can fail to 
 ## Verify
 
 - `circuit.breaker.state` for `redis` is 0, and logs show the breaker changed to closed.
-- **Presence** and **Supply & Demand** show online drivers again.
+- **Live** shows online drivers again.
 - `redis.cache.hit` returns to its usual rate.
 
 ## Root causes seen in code
 
 - **Startup requires Redis** unless it's disabled explicitly. Scaling events during an outage can reduce capacity.
-- **Presence lives only in Redis.** The dashboard presence views and queue grace logic have no Postgres fallback.
+- **Presence lives only in Redis.** The **Live** page's presence data (`/dashboard/live/markets`, `/dashboard/presence/map`) and queue grace logic have no Postgres fallback.
 - **Dedup lives only in Redis.** Activation proceeds without dedup instead of failing, trading duplicate pushes for coverage.
 - **The deep health check doesn't include Redis**, so releases and monitors that rely on it won't catch an outage.

@@ -11,7 +11,7 @@ Paths are relative to `yelo-api` unless they start with `yelo-web/`.
 
 ## How metrics are exported
 
-`otel.InitializeOTel` (`internal/utilities/otel/otel.go:79`) creates a `MeterProvider` with the OpenTelemetry Prometheus exporter (`go.opentelemetry.io/otel/exporters/prometheus` v0.68.0) whenever `OTEL_ENABLED` is true. `GET /metrics` serves `promhttp.Handler()` (`internal/server/http/router.go:201`), which reads the default Prometheus registry.
+`otel.InitializeOTel` (`internal/utilities/otel/otel.go:79`) creates a `MeterProvider` with the OpenTelemetry Prometheus exporter (`go.opentelemetry.io/otel/exporters/prometheus` v0.68.0) whenever `OTEL_ENABLED` is true. `GET /metrics` serves `promhttp.Handler()` (`mountObservability`, `internal/server/http/middleware_metrics_auth.go:22`), mounted only when `METRICS_AUTH_TOKEN` is set, which reads the default Prometheus registry.
 
 The exporter uses its default `UnderscoreEscapingWithSuffixes` strategy, so OpenTelemetry names change on export:
 
@@ -54,9 +54,11 @@ Recorded in `otelInstrumentation` (`internal/server/http/middleware_otel.go:48`)
 | `http.server.requests` | `http_server_requests_total` | Counter | `http.method`, `http.route`, `http.status_code` | Request count | Never. `RecordHTTPRequest` has no callers. |
 | `http.server.duration` | `http_server_duration_seconds` | Histogram, buckets 0.001 to 10 s | `http.method`, `http.route`, `http.status_code` | Request latency | Never. `RecordHTTPRequest` has no callers. |
 
-`http.route` is the Chi route pattern, or the raw path when no route matched (`middleware_otel.go:205`).
+`http.route` is always the raw URL path. `resolvedRoutePattern` (`middleware_otel.go:205`) reads Chi's route context, but Fuego registers routes on a standard `http.ServeMux`, so that context is never set. Every path that embeds an ID creates its own series.
 
 The size, inflight, and error metrics are recorded through the generic `RecordHistogram`, `SetGauge`, and `IncrementCounter` methods. Those create instruments on demand with no unit or custom buckets. The typed fields registered for the same names in `otel.go:222-266` are never used.
+
+`OtelMetricsProvider.SetGauge` caches instruments in a plain map with no lock (`otel.go:505`, `:514`). `http.server.inflight` is set on every request while the pool monitors set their own gauges, so the first write of a new gauge name can race with concurrent reads.
 
 </Accordion>
 <Accordion title="HTTP server and client (otelhttp)">
@@ -78,7 +80,7 @@ These are the only request-latency series the API exports today.
 
 | OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
 | --- | --- | --- | --- | --- | --- |
-| `pool.max` | `pool_max` | Gauge | `pool` (`postgres`, `redis`) | Configured pool size | Yes, every `POOL_STATS_INTERVAL_S` seconds (default 15), `cmd/api/main.go:453` |
+| `pool.max` | `pool_max` | Gauge | `pool` (`postgres`, `redis`) | Configured pool size | Yes, every `POOL_STATS_INTERVAL_S` seconds (default 15), `cmd/api/main.go:463` |
 | `pool.total` | `pool_total` | Gauge | `pool` | Open connections | Yes, same |
 | `pool.idle` | `pool_idle` | Gauge | `pool` | Idle connections | Yes, same |
 | `pool.acquired` | `pool_acquired` | Gauge | `pool` | Connections in use. For Redis this is total minus idle. | Yes, same |
@@ -87,8 +89,8 @@ These are the only request-latency series the API exports today.
 | `db.pool.acquired_conns` | `db_pool_acquired_conns` | Gauge | None | Postgres connections in use | Yes, `storage.go:535` |
 | `db.pool.max_conns` | `db_pool_max_conns` | Gauge | None | Postgres pool size | Yes, `storage.go:536` |
 | `db.pool.utilization` | `db_pool_utilization` | Gauge | None | Acquired divided by max | Yes, `storage.go:537` |
-| `db.pool.empty_acquire_count` | `db_pool_empty_acquire_count_total` | Counter | None | pgx `EmptyAcquireCount`, added on every tick | Yes, `storage.go:540` |
-| `db.pool.acquire_duration` | `db_pool_acquire_duration_bucket` | Histogram | None | pgx cumulative `AcquireDuration` in seconds, sampled every tick | Yes, `storage.go:541` |
+| `db.pool.empty_acquire_count` | `db_pool_empty_acquire_count_total` | Counter | None | pgx's cumulative `EmptyAcquireCount`, added in full on every tick, so the counter grows by the running total and its rate is not an acquire rate | Yes, `storage.go:540` |
+| `db.pool.acquire_duration` | `db_pool_acquire_duration_bucket` | Histogram | None | pgx's cumulative `AcquireDuration` in seconds, recorded as one sample every tick, so the buckets describe a growing total, not per-acquire waits | Yes, `storage.go:541` |
 | `db.pool.leaked_conns` | `db_pool_leaked_conns` | Gauge | None | Connections held longer than 5 minutes, set only when nonzero | Yes, `storage.go:581` |
 | `db.query.count` | `db_query_count_total` | Counter | `db.operation`, `db.table`, `status` | Query count | Never. `RecordDBQuery` has no callers. |
 | `db.query.duration` | `db_query_duration_seconds` | Histogram | `db.operation`, `db.table`, `status` | Query latency | Never |
@@ -181,7 +183,7 @@ The `resend`, `google-places`, `google-geocoding`, `twilio`, `photon`, `mapbox`,
 
 ### Label cardinality
 
-- `http.route` falls back to the raw URL path for unmatched requests, so scanners and 404s create a series per path.
+- `http.route` is always the raw URL path, so every ride, user, or community ID creates a new series. Requests that match no route are answered by `http.ServeMux` before any Fuego middleware runs, so they aren't recorded at all.
 - `error.fingerprint` on `error.count` is a hash of the message for non-server errors. Messages that embed IDs or wrapped causes create a new series per unique message.
 - `notification.type` is the template code, which admins create.
 
@@ -207,7 +209,7 @@ For request error rate and latency today, use `http_server_request_duration_seco
 
 | Source | Tracer | Span name | Kind |
 | --- | --- | --- | --- |
-| Every HTTP request (`middleware_otel.go:50`) | otelhttp | `METHOD /chi/route/pattern`, falling back to `METHOD /raw/path` | Server |
+| Every HTTP request (`middleware_otel.go:50`) | otelhttp | `METHOD /raw/path`. The formatter checks Chi's route context first, but Fuego's `http.ServeMux` never sets it | Server |
 | Every pgx query (`internal/utilities/otel/pgx_tracer.go:44`) | `pgx` | `db.query.postgres` | Client |
 | Mapbox and Quo HTTP calls (`internal/utilities/otel/http.go:17`) | otelhttp | `<service>.<METHOD> <host>`, for example `mapbox.GET api.mapbox.com` | Client |
 | Service methods (`otel.CustomSpan`, `otel.Span`) | Domain tracer (below) | `<Type>.<Method>`, for example `UserService.GetCurrentUser`, `Client.NewPaymentIntent` | Internal |
@@ -232,7 +234,7 @@ The span end function from `CustomSpan` records the returned `errors.Error` and 
 | `external_dependency` | `middleware_otel.go:94` | `true` for routes marked with `MarkExternalRoute`. No route is marked. |
 | Semantic-convention attributes | otelhttp | Method, URL, status, peer, user agent |
 
-Status is set to Error for 400 and above and for failed writes.
+The middleware reads the span with `trace.SpanFromContext` before `otelhttp` starts the server span (`middleware_otel.go:73`). At that point the context holds no span, because `otelhttp` extracts the trace context itself. Every attribute in this table except the semantic-convention ones, and the Error status for 4xx responses, is written to a no-op span and dropped. The server span's status comes from `otelhttp`, which marks only 5xx as Error.
 
 </Accordion>
 <Accordion title="Database span">

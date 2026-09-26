@@ -124,11 +124,17 @@ flowchart LR
 
 Every OTA-safe PR merged to `main` is considered for the supported release branch by `backport-supported-release.yml`. Add the `skip-supported-release-backport` label to opt out. PRs that touch native inputs are never auto-backported, and the Fingerprint check blocks native drift on release branches.
 
+- The workflow triggers only on PRs merged into `main`. Merging a rolling backport PR into a release branch does not re-trigger it. You can also run it manually with a merged `main` PR number.
+- The supported branch comes from the latest GitHub release tag (for example `v5.7.3-269` maps to `5.7.3`).
+- The yelo-bot app keeps one rolling draft PR per release branch, from `backport/<branch>/rolling`, titled `backport(<branch>): rolling OTA-safe changes`. Each eligible PR's commits are appended and listed under **Queued source PRs**.
+- Keep the rolling PR in draft while it collects changes. Mark it ready when you want CI and the release fingerprint gate to run for the batch, then merge it and stage the release branch.
+
 ### How devices pick up updates
 
 - `updates.checkAutomatically` is `ON_LOAD` with a 3-second `fallbackToCacheTimeout`. A cold launch checks for an update natively, which recovers even when JS cannot mount.
 - `providers/EasUpdateObserver.tsx` checks again when the app returns to the foreground, at most every 30 minutes, and only when `EXPO_PUBLIC_IS_PRODUCTION` is `true`. It downloads the update for the next restart. It does not reload the app.
 - After sign-in, the `(app)` layout reports `app_version` and `Updates.updateId` to the API with `useUserUpdateAppVersion`.
+- `lib/analytics/AnalyticsProvider.tsx` registers `ota_update_id` (`embedded` when running the binary's bundle), `ota_runtime_version`, and `ota_is_embedded` as PostHog super properties, so every event records which update was loaded.
 - Tapping repeatedly on the auth entry screen reveals the app version and the first 8 characters of the update id.
 
 ## Update-required gate

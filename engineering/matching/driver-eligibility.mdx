@@ -18,7 +18,7 @@ Legend: **Yes** means the path enforces the filter. **—** means it doesn't che
 | Online state | Needs an open session | `is_online_driver` | Offline, or online under the ride's fleet | Offline only | `is_online_driver` | `is_online_driver` | — |
 | Exactly one open session matching vehicle and fleet | — | Yes (`GetDriverSessionOwnership`) | — | — | — | Yes | — |
 | Vehicle type | — | — | Yes, session vehicle when online, else `Users.vehicle_id` | Yes, `Users.vehicle_id` | Yes, `Users.vehicle_id` | — | — |
-| Seats at least `num_riders` | — | — | Yes | — | — | — | — |
+| Seats at least `num_riders` | — | — | — | — | — | — | — |
 | Vehicle application `complete` and available to driver | — | — | Yes (`AvailableDriverVehicles`, `FleetVehicles`) | — | — | — | — |
 | Active `DriverApplications` row | — | — | Yes | Yes | Yes | — | — |
 | Payout ready | — | — | Yes | — | — | — | — |
@@ -97,7 +97,7 @@ AND (sqlc.narg(fleet_id)::uuid IS NULL
       WHERE fd.driver_id = u.id AND fd.is_active = TRUE)))
 ```
 
-`include_unaffiliated` comes from `rideFleetIsCommunityPrimary`, which compares the ride's fleet to `Communities.primary_fleet_id`. Drivers without any fleet default to the primary fleet when they go online, so they're notified for primary-fleet rides.
+`include_unaffiliated` comes from `rideFleetIsCommunityPrimary`, which compares the ride's fleet to `Communities.primary_fleet_id`. A driver with no fleet is enrolled when they go online (`reconcileFleetAssignmentForUser` in `internal/service/driver/driver.go`), but into the primary fleet of the core default community (`Community.GetDefault`), not their own community's primary fleet. The unaffiliated pass only lines up with where that driver will actually be online when the ride's community is the default community.
 
 ## Auto-queue candidates in detail
 
@@ -146,8 +146,8 @@ Work through the paths in the order a ride reaches them:
 
 ## Gotchas and edge cases
 
-- **Vehicle type comes from `Users.vehicle_id` in two paths.** Activation and auto-queue join the driver's profile vehicle, not the session vehicle. A driver whose session is on a different vehicle can be auto-queued for a type they aren't driving. Admission rechecks session ownership but not vehicle type.
-- **No path checks seats except T0.** Auto-queue and manual accept can assign a four-rider request to a smaller vehicle.
+- **Vehicle type comes from `Users.vehicle_id` in two paths.** Activation and auto-queue join the driver's profile vehicle, not the session vehicle. They normally agree: `RefreshDriverSession` (`internal/data/repository/driver_availability.go`) writes the session vehicle to `Users.vehicle_id` every time the driver goes online, and refuses to change the session while the driver has any non-terminal ride. Admission rechecks session ownership but not vehicle type.
+- **No path checks seats.** `Rides.num_riders` is only written by the driver's rating, so none of the queries compare it to `num_seats`. The board, T0, activation, auto-queue, and manual accept can all match a large party to a smaller vehicle.
 - **Activation's 50-row cap is taken before exclusions.** When more than 50 drivers are inside the box, Postgres picks an arbitrary 50. If those are all already notified or in cooldown, the tier notifies nobody even though other eligible drivers exist.
 - **Auto-queue doesn't check freshness.** `is_online_driver` stays true for up to 30 minutes without a ping (`DriverExpiryInterval`). A driver who closed the app 20 minutes ago can win auto-queue. Promotion later requires a ping in the last 5 minutes, so the ride sits `queued` until [offline unqueue](/engineering/matching/queue-promotion#offline-unqueue) returns it.
 - **Auto-queue doesn't check payout readiness, bans, or locks.** Going online enforces payout readiness. A driver banned while online stays eligible until their session ends.

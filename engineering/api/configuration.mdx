@@ -17,7 +17,7 @@ All runtime configuration comes from environment variables. This page lists vari
 Because `Load()` memoizes, changing an environment variable after startup has no effect. Tests that need a different value set it on the returned struct, for example `config.Load().Auth.AuthJwtKey = "..."`, or set the environment in `TestMain` before the first call.
 </Warning>
 
-A few values bypass the struct and read the environment directly: `PORT` (in `main.go`), `LOG_LEVEL` and `GOOGLE_CLOUD_PROJECT` (logger), `K_REVISION` (Postgres `application_name`), `BACKGROUND_TASKS_ENABLED` (background loops), and `CONTACT_HASH_PEPPER` (contact hashing, read on each use).
+A few values bypass the struct and read the environment directly: `PORT` (in `main.go`), `LOG_LEVEL` and `GOOGLE_CLOUD_PROJECT` (logger), `K_REVISION` (Postgres `application_name`), `BACKGROUND_TASKS_ENABLED` (background loops), `DASHBOARD_PREVIEW` (`main.go` and the feed cache), and `CONTACT_HASH_PEPPER` (contact hashing, read on each use). `Load()` also stores `CONTACT_HASH_PEPPER` in `Config.HashPepper`, but nothing reads that field.
 
 ## Startup validation
 
@@ -60,7 +60,7 @@ Calendar settings are validated separately when the calendar services are built.
   <Accordion title="App and server">
     | Variable | Default | Purpose |
     | --- | --- | --- |
-    | `ENVIRONMENT` | `dev` | `dev` disables CORS and enables dev-only behavior. Also `production`, `e2e`, and others |
+    | `ENVIRONMENT` | `dev` | `dev` disables CORS and enables dev-only behavior, including `DELETE /ride/`. Also `production`, `e2e`, and others. Production must set `production` explicitly |
     | `PORT` | `8080` | Listen port (Cloud Run sets it) |
     | `API_URL` | `http://localhost:8080` | Public API URL |
     | `API_VERSION` | `1.0.0` | Release name for Sentry |
@@ -76,6 +76,7 @@ Calendar settings are validated separately when the calendar services are built.
     | `SKIP_TEST_SCHOOL_NOTIFICATIONS` | `true` | Suppresses notifications for test schools |
     | `DRIVER_VERIFIED_PHONE_REQUIRED` | `false` | Requires a verified phone for driver flows |
     | `BACKGROUND_TASKS_ENABLED` | unset | `false` disables in-process ticker loops |
+    | `DASHBOARD_PREVIEW` | `false` | Local dashboard preview. Requires `ENVIRONMENT=dev` (panics otherwise) and skips the ride event recorder, template seeding, River workers, background tasks, the Play monitor, and feed cache warming |
   </Accordion>
   <Accordion title="Database and Redis">
     | Variable | Default | Purpose |
@@ -183,13 +184,14 @@ Calendar settings are validated separately when the calendar services are built.
     | --- | --- | --- |
     | `LOG_LEVEL` | logger default | zerolog level |
     | `POSTHOG_API_KEY` | none | PostHog project key |
+    | `POSTHOG_PERSONAL_API_KEY`, `POSTHOG_PROJECT_ID`, `POSTHOG_QUERY_HOST` | none, none, `https://us.posthog.com` | Server-side PostHog query access for observed competitor prices on the dashboard **Live** page. Grant query read access only |
     | `SENTRY_DSN` | none | Enables Sentry |
     | `OTEL_ENABLED` | `true` | Enables OTel metrics and the PostHog metrics provider |
     | `OTEL_OTLP_ENDPOINT`, `OTEL_OTLP_AUTH_HEADER` | none | OTLP exporter |
     | `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION` | `yelo-api`, `0.1.0` | Resource attributes. The name also fills `metadata.server` |
     | `OTEL_TRACE_SAMPLING_RATIO` | `0.1` | Trace sampling |
-    | `METRICS_AUTH_TOKEN` | none | Bearer token for `/metrics` and pprof |
-    | `PPROF_ENABLED`, `PPROF_BLOCK_RATE`, `PPROF_MUTEX_RATE` | `true`, `0`, `0` | pprof endpoints and profiling rates |
+    | `METRICS_AUTH_TOKEN` | none | Bearer token for `/metrics` and pprof. When empty, neither route is mounted |
+    | `PPROF_ENABLED`, `PPROF_BLOCK_RATE`, `PPROF_MUTEX_RATE` | `false`, `0`, `0` | pprof endpoints and profiling rates |
     | `SLOW_REQUEST_THRESHOLD_MS`, `SLOW_QUERY_THRESHOLD_MS` | `150`, `50` | Slow request and query thresholds |
     | `POOL_STATS_INTERVAL_S` | `15` | Pool gauge interval |
   </Accordion>
@@ -236,5 +238,6 @@ Calendar settings are validated separately when the calendar services are built.
 | `TimeAwayCancellationCutoff` | 300 seconds | Driver distance-from-pickup threshold for rider cancellation fees |
 | `DefaultBasePrice`, `DefaultPricePerMile`, `DefaultPricePerMinute` | 4.0, 2.0, 0.5 | Pricing fallbacks when no configured row exists |
 | `DefaultJwtDuration` | 6360 hours | Full app JWT lifetime |
+| `ApiVersion`, `ApiTitle`, `ApiDescription` | `1.0.0`, `Yelo API`, description text | Unused. The OpenAPI title and version are set in `router.go` |
 
 Other constants worth knowing live next to their code: the 24-hour tip window in `internal/service/ride/driver.go`, the 2-minute auto-queue minimum age in `internal/service/activation/activation.go`, pool sizes in `internal/data/repository/storage.go`, and cache TTLs in `internal/data/redis`. See [Pricing](/concepts/pricing) for how the pricing defaults are used, and [Timing and limits](/reference/timing-and-limits) for which timers are live.

@@ -1,0 +1,209 @@
+---
+title: "Deprecated and legacy code"
+description: "Legacy routes, tables, columns, compatibility shims, and dead code still present in yelo-api, yelo-web, and yelo-frontend, with their replacements, current callers, and whether removal is safe."
+---
+
+This page lists what is still in the codebase for compatibility or by accident, what replaced it, and what you need to check before removing it. Caller lists come from searching the current `main` of all three repositories, excluding tests and generated clients unless noted.
+
+## Before you remove anything
+
+<Steps>
+  <Step title="Search all three repositories">
+    Search yelo-api, yelo-frontend, and yelo-web. Generated Orval clients (`api/generated/` and `src/generated/`) list every operation, so a hit there alone doesn't mean anything calls it.
+  </Step>
+  <Step title="Check production traffic for routes">
+    Installed app builds can call routes that current source no longer uses. [ADR 1](/engineering/history/decisions#adr-1-remove-routes-only-with-traffic-evidence-and-deny-dashboard-access-by-default) set the standard: zero requests to the method and path across the 30-day Cloud Run log window. The global minimum app version (5.7.3, enforced by `/update-required`) bounds how old a client can be, but OTA bundles on that native version can still differ.
+  </Step>
+  <Step title="Use expand and contract for schema">
+    A release applies migrations before the new revision takes traffic, and a traffic rollback does not roll back Postgres. Stop reading and writing a column or table in one release, then drop it in a later one. See [Deployment](/engineering/deployment).
+  </Step>
+  <Step title="Export data before destructive migrations">
+    A down migration can recreate a dropped table's structure but not its rows. Migration `000264` is the precedent.
+  </Step>
+</Steps>
+
+## Summary
+
+| Item | Replaced by | Current callers | Safe to remove? |
+| --- | --- | --- | --- |
+| [Auth v1 no-op hook](#auth-v1) | Auth v2 and v3 | `router.go:134` only | Yes |
+| [Auth v2 routes](#auth-v2) | Auth v3 | Mobile and web, for 6 of 12 routes | No; 6 unused routes need log evidence |
+| [`EmailOTP` and `PhoneOTP` repositories](#retired-otp-tables-and-repositories) | Redis (v2) and `AuthPhoneAttempts` (v3) | None | Code yes; tables after export |
+| [v1 error envelope](#v1-error-envelope) | v2 envelope via `X-API-Version: v2` | Every client without the header | No |
+| [Clerk single-fleet metadata](#clerk-single-fleet-metadata) | `fleet_assignments` | Any Clerk user not yet migrated | Only after a Clerk metadata audit |
+| [Legacy `/user/status` response](#legacy-user-status-response) | Negotiated ride state snapshot | Clients without `X-Ride-State-Protocol: 1` | No |
+| [`no_drivers_available` ride status](#no_drivers_available-ride-status) | Unmatched request expiry and outcome categories | Readers of historical rows | Not without a data migration |
+| [Orphaned enum types](#orphaned-enum-types) | `text` columns | None | Yes |
+| [Legacy tables](#legacy-tables-with-no-code-references) | Various | None, or one-off tooling | Yes, after export |
+| [`TopLocations` archive](#toplocations-archive) | `CommunityTopLocations` and `PlaceProfiles` | Hourly legacy verification job | Not yet |
+| [Retired community fields](#retired-community-and-user-fields) | Calendars, derived timezones | Response shapes and one trigger | Columns no; request field after clients update |
+| [`DeviceTelemetry.push_notification_token`](#telemetry-push-token-shadow) | `Users.push_notification_token` | Current mobile app | No |
+| [Legacy Quo writer](#legacy-quo-writer) | Contact sync engine | Active while provider mode is `legacy` | After cutover to `generic` |
+| [`TextMessageRepository.AddText`](#dead-api-code) | Bump SMS pipeline | None | Yes |
+| [ClickHouse setup script](#dead-api-code) | Postgres analytics tables | None | Yes |
+| [`/fleet-transfer` route](#fleet-transfer-and-whitelist-management-routes) | `PUT /dashboard/users/detail/{id}/fleets` | No dashboard caller | After log check |
+| [Fleet whitelist management routes](#fleet-transfer-and-whitelist-management-routes) | Fleet join links | No dashboard caller | Routes after log check; table no |
+| [`GuestSignup` component](#dead-web-code) | Auth v3 signup flow | Type import only | Yes |
+| [Dashboard redirect routes](#dashboard-redirect-routes) | Consolidated pages | Old bookmarks | Keep; trim prefetch entries |
+
+## Authentication
+
+### Auth v1
+
+Auth v1 lived at `/auth/*` (`init-profile`, `request-phone-otp`, `verify-phone-otp`, `verify-oauth`, email OTP, `waitlist`, and more). Commit `e6d345b5` ("authv1 removal", 2026-06-16) deleted `internal/server/http/auth` and 4,032 lines.
+
+One empty hook remains. `user.RegisterUnauthenticatedRoutes` in `internal/server/http/user/user_routes.go:241` registers nothing, and `internal/server/http/router.go:134` still calls it. It has been empty since `76730a79` (2026-04-15). Removing the function and the call is safe.
+
+### Auth v2
+
+Auth v2 routes are registered in `internal/server/http/router.go:201-220` under `/authv2`, with handlers in `internal/server/http/authv2` and logic in `internal/service/authv2`. Auth v3 (`/authv3/*`) replaced it for sign-in and signup, but auth v2 still serves status, school email verification, and the web delete-account flow.
+
+| Route | Operation | Current callers | Removal |
+| --- | --- | --- | --- |
+| `GET /authv2/status` | `authv2.GetStatus` | Mobile `api/helpers/authUser.ts`, `hooks/drive/useShouldShowFirstDrivePromo.ts`, and three `app/(app)/drive/driver-hub/*` screens | No |
+| `POST /authv2/email/verify-oauth` | `authv2.VerifyEmailOauth` | Mobile `app/(app)/verify/1-oauth.tsx`, `app/(app)/driver-signup/verify/1-oauth.tsx` | No |
+| `POST /authv2/email/request-otp` | `authv2.RequestEmailOtp` | Mobile `verify/*` and `driver-signup/verify/*` screens | No |
+| `POST /authv2/email/verify-otp` | `authv2.VerifyEmailOtp` | Mobile `verify/3-email-confirm.tsx`, `driver-signup/verify/3-email-confirm.tsx` | No |
+| `POST /authv2/phone/request-otp` | `authv2.RequestPhoneOtp` | Web `src/sites/signup/delete-account/DeleteAccountPage.tsx` | No |
+| `POST /authv2/phone/verify-otp` | `authv2.VerifyPhoneOtp` | Web `DeleteAccountPage.tsx` | No |
+| `POST /authv2/community/verify-oauth` | `authv2.VerifyCommunityOauth` | Only the dead web `GuestSignup` component | After log check |
+| `POST /authv2/community/request-email-otp` | `authv2.RequestCommunityEmailOtp` | None | After log check |
+| `POST /authv2/community/verify-email-otp` | `authv2.VerifyCommunityEmailOtp` | None | After log check |
+| `POST /authv2/profile/setup` | `authv2.SetupProfile` | None | After log check |
+| `POST /authv2/profile/draft` | `authv2.SaveProfileDraft` | None | After log check |
+| `POST /authv2/referral-source` | `authv2.SaveReferralSource` | None | After log check |
+
+<Warning>
+In August 2026, production Apple sign-ins still reached `VerifyCommunityOauth` ([#45](https://github.com/rideyelo/yelo-api/pull/45)). Current source no longer calls it, but confirm zero traffic before you delete it.
+</Warning>
+
+The presignup token middleware (`getValidatePresignupTokenMiddleware`) also guards `/world-cup` and `/tips` routes (`router.go:286-296`), so it outlives auth v2. See [Identity overview](/engineering/identity/overview) for how the three generations fit together.
+
+### Retired OTP tables and repositories
+
+`EmailOTPs` and `PhoneOTPs` date from 2024. Auth v2 stores codes in Redis (`internal/service/authv2/phone.go`), and auth v3 uses `AuthPhoneAttempts`. The repositories are still wired:
+
+- `internal/data/repository/storage.go:254-255` constructs `EmailOTP` and `PhoneOTP` repositories.
+- `internal/data/repository/emailOTP.go` and `phoneOTP.go` implement them, with queries in `queries/account_utilities.sql`.
+- No service, job, or command references `Repository.EmailOTP` or `Repository.PhoneOTP`.
+
+Removing the repositories, interfaces, mocks, and queries is safe. Drop the tables in a later migration after exporting anything you need.
+
+### v1 error envelope
+
+`internal/server/http/httperrors/errors.go:54` writes the legacy `{error, title, body, code}` shape unless the request sends `X-API-Version: v2` (`ShouldUseV2Format` in `internal/utilities/json/json.go:105`). Only the auth v3 clients send that header (mobile `lib/auth/client.ts`, web `authV3Fetch.ts`). Every other client depends on v1, so it stays the default.
+
+### Clerk single-fleet metadata
+
+Dashboard users used to carry one `fleet_id` and `community_id` in Clerk metadata. The current shape is a `fleet_assignments` array. `internal/server/http/clerk_middleware.go:119-128` still accepts the old shape and wraps it into assignments, and `ClerkUserContext.FleetID` and `CommunityID` in `internal/utilities/context/context.go:70-71` are marked deprecated. `internal/service/dashboard/pricing_overview.go:111` keeps a fallback to the single `CommunityID` to avoid locking out roles such as interns. Remove these only after confirming in Clerk that no user still has the old metadata. See [Dashboard Clerk](/engineering/identity/dashboard-clerk).
+
+### Legacy API hostname
+
+The auth v3 web design keeps `api.rideyelo.com` as an alias of `api.joinyelo.com` "while installed app versions still use it" (`yelo-web/docs/authv3-web-native.md`). Don't retire the hostname without checking request logs by host.
+
+## Rides
+
+### Legacy user status response
+
+`GET /user/status` returns the legacy lifecycle fields unless the client sends `X-Ride-State-Protocol: 1` and `RIDE_STATE_SNAPSHOT_ENABLED` is on (`internal/server/http/user/user_handler.go:85`). Older clients depend on the legacy shape. See [ADR 13](/engineering/history/decisions#adr-13-make-ride-state-server-authoritative-with-revisioned-snapshots).
+
+### no_drivers_available ride status
+
+`models.RideStatusNoDriversAvailable` (`internal/models/ride.go:49`) is still an allowed status, and readers handle it (`internal/service/ride/ride.go:437`, `internal/data/repository/ride_snapshot.go:59`, dashboard analytics in `queries/analytics.sql`). No current query or service writes it. The fleet archive design treats such rows as terminal "legacy `no_drivers_available` requests". Keep the value while historical rows exist. Removing it needs a data migration that rewrites those rows to a supported terminal state.
+
+### Orphaned enum types
+
+`RidesStatus`, `CancelType`, and `DriverApplicationStatus` from `000001_init_db` no longer back any column: migration 033 converted `Rides.status` to `text`, 108 dropped `cancel_type`, and 030 dropped `driver_registration_status`. Dropping the types is safe. See [Enums](/reference/database/enums#postgres-enum-types).
+
+## Data
+
+### Legacy tables with no code references
+
+No repository query or Go code outside migrations references these tables. Columns and details are in the database reference.
+
+| Table | Created | Replaced by | Notes |
+| --- | --- | --- | --- |
+| `DashboardUsers` | 038 | Clerk | See [DashboardUsers](/reference/database/platform-and-admin#dashboardusers). |
+| `Messages` | 029 | `RideMessages` (180, 300) | See [Messages (legacy)](/reference/database/rides#messages-legacy). |
+| `RideIssues` | 071 | `Issues` (075) | See [Issues and RideIssues](/reference/database/rides#issues-and-rideissues). |
+| `FeaturedLocations` | 022 | No direct replacement | Last code reference removed in `0d1b6268` "remove hot locations" (2025-06-11). |
+| `LocationFollows`, `EventFollows` | 045, 046 | None | The `/user/followed-events` and `/user/followed-locations` routes were removed in `76730a79`. |
+| `PollQuestions`, `PollAnswers` | 079 | None | See [Polls](/reference/database/growth-events-and-social#polls). |
+| `ReferralLookup` | 146 | No direct replacement | Last code reference removed in [#62](https://github.com/rideyelo/yelo-api/pull/62). See [ReferralLookup](/reference/database/growth-and-engagement#referrallookup). |
+| `Waitlist` | 005, recreated 031 | None | Pre-launch signup list. Auth v1 `/auth/waitlist` wrote it until 2026-06-16, and [#197](https://github.com/rideyelo/yelo-api/pull/197) removed the last query. See [Waitlist](/reference/database/markets-communities-and-zones#waitlist). |
+| `SavedLocations` | 172 | `LikedLocations` (213), `RecentLocations` (309) | The `/user/saved-locations` routes were removed in [#62](https://github.com/rideyelo/yelo-api/pull/62). Only `cmd/backfill-categories/main.go:86` still reads it. |
+
+Dropping any of these is safe for application code. Export the rows first, and update `cmd/backfill-categories` before dropping `SavedLocations`.
+
+### TopLocations archive
+
+Migration `000345` moved public top locations to `CommunityTopLocations` and `PlaceProfiles`. The old `TopLocations` table stays as an archive "for verification and rollback, not a public read source" (`docs/top-locations.md`). An hourly River job still reads it: `VerifyLegacy` in `internal/service/toplocations/toplocations.go:476`, called from `internal/notify/queue/top_locations.go:85`. Keep it until every legacy slot is verified or replaced in the dashboard and a rollback to the pre-345 API is no longer needed.
+
+### Retired community and user fields
+
+- `Communities.banner_type`, `show_driver_banner`, `hourly_demand_graph_x`, and `hourly_demand_graph_y` have no readers in queries, models, or services. Demand curves live in `RideDemandCurves`.
+- `Communities.min_riders`, `min_drivers`, and `max_riders` are still selected in `queries/community.sql`. [#197](https://github.com/rideyelo/yelo-api/pull/197) removed the capacity and waitlist runtime paths "while retaining legacy database and response fields," and dashboard writes to retired capacity fields return validation errors.
+- `Users.is_waitlisted` is forced to `false` by the `retire_user_waitlisting` trigger from migration `000314`.
+- `time_zone` in community create and update requests is "Deprecated: accepted but ignored; derived from service area" (`internal/server/http/community/requests/community.go:14`, `:38`). Remove the field once the dashboard stops sending it.
+
+### Telemetry push token shadow
+
+`Users.push_notification_token` is the canonical push token. Migration `000286` copied tokens from `DeviceTelemetry` and added the `sync_legacy_telemetry_push_token` trigger, and the column comment calls the telemetry field a "Deprecated compatibility shadow... remove after the rollout window." `setCanonicalPushNotificationToken` in `internal/data/repository/user_profile.go:789` clears the shadow so it can't resurrect a stale token. The mobile app still sends `push_notification_token` in telemetry (`lib/observability/TelemetryService.ts:117`), so removal isn't safe until the app stops sending it and older builds age out.
+
+### Legacy Quo writer
+
+The Quo outbox (`QuoSyncOutbox`, `QuoSyncRequests`, and `internal/service/quo`) predates the generic contact sync engine. `cmd/api/main.go:219` registers Quo as a contact sync destination with `InitialMode: "legacy"`, and `internal/service/quo/contact_mode.go` keeps the legacy writer active while `ContactSyncProviders.mode` is `legacy`. Other modes pause it. Once Quo runs in `generic` mode and legacy bindings are imported, the legacy writer, its triggers, and its tables can go. See [Contact sync](/engineering/domains/contact-sync).
+
+### Dead API code
+
+- `TextMessageRepository.AddText` (`internal/data/repository/text_messages.go:19`) has no callers. It is constructed in `storage.go` like any other repository, so remove the interface method, mock, and `AddTextMessage` query together.
+- `scripts/setup_clickhouse_tables.sql` creates ClickHouse tables. Nothing references it, and the ClickHouse client left `go.mod` in `76730a79` (2026-04-15).
+
+## Fleets
+
+### Fleet transfer and whitelist management routes
+
+- `PUT /dashboard/users/detail/{id}/fleet-transfer` (`internal/server/http/dashboard/users/routes.go:20`) selects an active fleet without revoking memberships. The dashboard now uses `GET` and `PUT /dashboard/users/detail/{id}/fleets`, and no yelo-web source outside the generated client calls `TransferUserFleet`.
+- `GET` and `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist` and `PATCH .../whitelist/{entry_id}` (`internal/server/http/community/community_router.go:424-443`) manage the fleet email whitelist. [web #100](https://github.com/rideyelo/yelo-web/pull/100) replaced the dashboard whitelist UI with join links on 2026-09-04.
+
+Both sets of routes can go after a log check. Keep the `FleetDriverWhitelist` table: `queries/education_commerce.sql` still reads it during email verification, and fleet archive disables its entries. See [Joins and invitations](/engineering/fleets/joins-and-invitations).
+
+### Vehicle icon alias
+
+Migration `000200` seeded the `cart` vehicle type with icon `golf_cart`. The mobile app maps `golf_cart` to the cart artwork (`lib/ride/vehicleIcons.ts:31`). The fleet vehicles design keeps `cart` as the wire slug and `golf_cart` as a legacy icon alias. Keep both.
+
+## Web
+
+### Removed sites
+
+The `pay` and `drive` sites from the initial multisite commit were stubs. [web #93](https://github.com/rideyelo/yelo-web/pull/93) removed "the unused `drive` and `pay` stubs" on 2026-09-03. See [Sites](/engineering/web/sites).
+
+### Dead web code
+
+`GuestSignup` in `src/shared/signup/GuestSignup.tsx:28` is the pre-auth-v3 guest signup form. It calls auth v2 phone OTP and community OAuth. Nothing renders it. `src/shared/signup/steps/Handoff.tsx:3` imports only its `SignupIntent` type. Move that type and delete the component.
+
+### Dashboard redirect routes
+
+`src/sites/dashboard/App.tsx` keeps old paths working after navigation consolidation:
+
+| Old path | Goes to |
+| --- | --- |
+| `/leads` | `/drivers` |
+| `/cancels`, `/uncompletes` | `/rides` |
+| `/schools` | `/communities?tab=schools` |
+| `/qr-payments` | `/fleets` |
+| `/settings` | `/access` |
+| `/feed` | `/community` |
+| `/presence`, `/driver-ops` | `/live` |
+| `/spot`, `/feeds` | `/events` |
+| `/locations`, `/zones` | `/map` |
+| `/activation` | `/notifications?notification_tab=activation` |
+| `/vehicles` | `/manage?tab=vehicles` |
+
+Keep the redirects for bookmarks. `src/sites/dashboard/routeModules.ts:13`, `:23`, and `:24` still register prefetch importers for `/schools`, `/vehicles`, and `/activation`, which only redirect. Those three entries are safe to remove. The pages themselves are still rendered as tabs inside `CommunitiesPage`, `ManageFleetsPage`, and `NotificationsPage`.
+
+## Related pages
+
+- [Migrations log](/engineering/history/migrations-log) for when each table and column appeared or was dropped.
+- [Database overview](/reference/database/overview) for every table, including retired ones.
+- [Architecture decisions](/engineering/history/decisions) for why replacements were built.

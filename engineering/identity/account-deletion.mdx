@@ -12,7 +12,7 @@ Account deletion is a soft delete. The `Users` row stays, with personal fields b
 | Mobile account deletion modal (`components/modals/AccountDeletion.tsx`) | `DELETE /user/i/{id}` | Full user JWT |
 | Web `/delete-account` page | Auth v2 phone OTP, then `DELETE /user/i/{id}` | Full JWT from Auth v2 phone verification |
 
-`UserHandler.Delete` in `internal/server/http/user/user_handler.go` ignores the `{id}` path parameter. It always deletes the authenticated caller. No admin or dashboard deletion endpoint exists.
+`UserHandler.Delete` in `internal/server/http/user/user_handler.go` ignores the `{id}` path parameter. It always deletes the authenticated caller, even though the route description in `user_routes.go` says admins can call it. No admin or dashboard deletion endpoint exists.
 
 ## Order of operations
 
@@ -26,7 +26,7 @@ Account deletion is a soft delete. The `Users` row stays, with personal fields b
     If `stripe_customer_id` is set, call Stripe `Customers.Del`. The Connect Express account in `stripe_merchant_id` is not touched.
   </Step>
   <Step title="Delete the profile photo">
-    If `photo_url` is set, delete `profile_pictures/<user id>/<last path segment of photo_url>` from storage.
+    If `photo_url` is set, call `StorageClient.DeleteFile` with `["profile_pictures", <user id>, <last path segment of photo_url>]`. The storage wrapper passes those three strings to storage-go `RemoveFile` without joining them, and each element is treated as a full object path, so nothing matches and no file is removed. The thumbnail isn't targeted.
   </Step>
   <Step title="Revoke Apple and remove identities">
     `IdentityLifecycle.PrepareUserDeletion` in `internal/service/authv3/identity_lifecycle.go` lists the user's `AuthIdentities`. For each Apple identity with an encrypted refresh token, it decrypts the token and calls Apple's `/auth/revoke`. Any decrypt or revoke failure returns `ProviderUnavailable` (503) and stops before touching the database. Then `DeleteIdentitiesAndScrubUser` deletes every identity and scrubs the user in one transaction.
@@ -87,8 +87,9 @@ Blanking the email frees the `Users_email_key` unique index. Blanking the phone 
 
 | Data | Location | Notes |
 | --- | --- | --- |
-| The `Users` row | `Users` | ID, community, school, account type, referral code, Stripe IDs, `is_test`, timestamps |
+| The `Users` row | `Users` | ID, community, school, account type, `referral_code` and `old_referral_code`, `stripe_customer_id`, `stripe_merchant_id`, `push_notification_token`, last location, `is_test`, timestamps |
 | Driver's license photo URLs | `Users.drivers_license_front_url`, `drivers_license_back_url` | Not scrubbed, and the files aren't deleted |
+| Rider profile photo and thumbnail files | Storage | The delete call doesn't match any object. Only the URLs are blanked. |
 | Driver profile photo file | Storage | Only the URL is blanked |
 | Stripe Connect account | Stripe | Not deleted |
 | Rides, payments, tips, ratings | Ride and payment tables | Referenced by user ID |
@@ -149,10 +150,11 @@ The signup site's `/delete-account` flow (`yelo-web/src/sites/signup/delete-acco
 
 ## Gotchas and edge cases
 
-- **Retries can get stuck on Stripe.** Stripe deletion runs first and `stripe_customer_id` is never cleared. If a later step fails, a retry calls Stripe again for an already-deleted customer. Unless Stripe accepts that, the retry fails at step 2 every time.
-- **Native Apple grants are revoked with the web client ID.** `ExchangeNativeCode` obtains the refresh token as `AUTH_V3_APPLE_NATIVE_CLIENT_ID` (the bundle ID), but `RevokeRefreshToken` always sends `AUTH_V3_APPLE_SERVICES_ID`. When the two differ, Apple may reject the revocation, which blocks deletion with 503 for every user who signed in natively with an authorization code. Verify this against Apple before relying on it.
+- **Retries can get stuck on Stripe.** Stripe deletion runs first and `stripe_customer_id` is never cleared. `DeleteCustomer` wraps every Stripe error, including `resource_missing`, as a server error. If the photo step, Apple revocation, or the identity transaction fails, a retry calls Stripe again for the already-deleted customer and likely fails at step 2 every time. Once `is_deleted` commits, retries get 401 from the JWT middleware and never reach Stripe.
+- **Native Apple grants are revoked with the web client ID.** `ExchangeNativeCode` obtains the refresh token with `AUTH_V3_APPLE_NATIVE_CLIENT_ID` (the bundle ID), but `RevokeRefreshToken` always sends `AUTH_V3_APPLE_SERVICES_ID`, and `AuthIdentities` stores no client ID per identity. When the two IDs differ, Apple is likely to reject the revocation, which blocks deletion with 503 for every user who signed in natively with an authorization code. This hasn't been confirmed against Apple.
 - **Apple outages block deletion.** Revocation is fail-closed by design, so an Apple outage or a bad Apple key returns 503 and leaves the account fully intact.
 - **Web deletion excludes most Auth v3 accounts.** Auth v3 phone sign-ups have no email, and Google or Apple sign-ups may have no phone. Neither gets `authenticated` from Auth v2 phone verification, so the web page shows its fallback instead. Those users must delete from the app.
-- **Proofs block re-verification.** A retained `EducationVerifications` row keeps its unique provider subject. The same school Google account or StudID identity can't verify a new account later.
+- **Proofs block re-verification.** A retained `EducationVerifications` row keeps its unique provider subject. The same school Google account, Microsoft account, or StudID identity can't verify a new account later (`identity_conflict`). Email code proofs have no subject, so they don't block.
 - **License photos survive.** The license URL columns and files aren't removed. Treat this as a retention gap if you answer a data request.
+- **Profile photos survive.** The rider profile photo delete passes path segments instead of one joined path, so the original and thumbnail stay in storage.
 - **A partially deleted account looks deleted.** Once the identity transaction commits, the user is `is_deleted = true` even if the legacy scrub later fails. Clients must treat 401 `AccountDeletedError` as success.

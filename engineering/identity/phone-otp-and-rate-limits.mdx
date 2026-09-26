@@ -35,7 +35,7 @@ If the API sits behind a proxy or load balancer that isn't listed in `AUTH_V3_TR
 
 A denial returns 429 with a `Retry-After` HTTP date equal to the window's end. In E2E mode every max is multiplied by 100.
 
-Session refresh, logout, the onboarding routes, and the authenticated `/authv3/user` routes other than link authorize have no HTTP limit.
+Session refresh, logout, the onboarding routes, and the authenticated `/authv3/user` routes other than link authorize have no durable Auth v3 limit. They still pass through the API-wide in-memory per-IP token bucket (50 requests per second, burst 100, per instance) that applies to every route. `POST /user/link/authorize` shares the `authorize` bucket with `POST /authorize`.
 
 ## Auth v3 phone limits
 
@@ -186,6 +186,6 @@ The Auth v2 service adds its own rules in Redis (`internal/service/authv2/authv2
 - **Resends don't extend the attempt.** The attempt expires 10 minutes after the first send. A resend at minute 9 leaves one minute to verify.
 - **Provider failures still spend budget.** Counters are committed before Twilio is called. A Twilio outage burns per-number and per-requester budget.
 - **The global Auth v2 bucket is tiny.** 60 sends per hour across all users. The web `/delete-account` page uses this endpoint, so a burst of deletions or abuse there blocks every other Auth v2 SMS for up to an hour.
-- **Test numbers still consume counters.** `+1555` sends skip Twilio but go through every reservation.
-- **Fallback sends are never retried.** A failed toll-free send leaves the row claimed, so the user never gets a fallback. They must tap resend.
+- **Test numbers still consume counters.** Reserved `+1555` sends skip Twilio by design, but they go through every reservation.
+- **Fallback sends are never retried.** This is deliberate (`phone_fallback.go` says so). A failed toll-free send leaves the row claimed, so the user never gets a fallback. They must tap resend.
 - **Auth v2 cooldown is twice Auth v3's.** Auth v2 enforces 60 seconds between sends. Auth v3 enforces 30.

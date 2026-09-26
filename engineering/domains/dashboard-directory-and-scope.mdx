@@ -32,6 +32,9 @@ Paths are relative to `yelo-api/`.
 | PUT | `/dashboard/users/detail/{id}/test-status` | Admin | `SetUserTestStatus` |
 | POST | `/dashboard/users/detail/{id}/move-to-yelo` | Admin | `MoveUserToYelo` |
 | PUT | `/dashboard/users/detail/{id}/profile` | Admin (also checked in service) | `UpdateUserProfile` |
+| GET, PUT | `/dashboard/users/detail/{id}/fleets` | Admin (also checked in service) | `GetUserFleetMemberships`, `UpdateUserFleetMemberships`: driver memberships and active fleet |
+| PUT | `/dashboard/users/detail/{id}/fleet-transfer` | Admin (also checked in service) | `TransferUserFleet`: select the active fleet without revoking memberships |
+| PUT | `/dashboard/users/detail/{id}/fleet` | Admin | `AssignUserToFleet` (`server/http/fleetjoin/routes.go`): enroll in a payout-ready fleet |
 | GET | `/dashboard/users/detail/{id}/messages` | Admin (also checked in service) | `ListUserMessages`: last 20 Quo messages |
 | GET | `/dashboard/users/detail/{id}/notifications` | Admin (users group role gate) | `GetUserNotifications`: limit default 50, max 100 |
 | GET | `/dashboard/access/users?role=` | Admin (scope and handler) | `AccessHandler.ListUsers` |
@@ -118,8 +121,10 @@ A manual tag that starts with `Fleet: ` survives only if it equals a tag the use
 | Test status | `SetDashboardUserTestStatus` sets `is_test`. Test users are excluded from KPIs and receive free ride pricing. |
 | Move to Yelo | `MoveUserToYeloCommunity` sets `home_community_id` to the hardcoded Yelo community `87794dc9-7ef8-438c-b2e8-ba6fd77e66aa`. `community_id` is unchanged. The handler always answers `home_community_name: "Yelo"`. |
 | Profile | See below |
+| Fleet memberships | `FleetJoin.UpdateDriverMemberships` applies `fleet_ids` and `active_fleet_id` only if the stored memberships still match `expected_fleet_ids` and `expected_active_fleet_id`. The dashboard sends `confirm: true`. The service then calls `PresenceCache.GoOffline` for the driver, invalidates the profile cache, and logs the actor. |
+| Fleet transfer | `FleetJoin.TransferDriver` changes the active fleet, then takes the driver offline the same way. |
 
-All four invalidate the user profile cache on a best-effort basis.
+All of these invalidate the user profile cache on a best-effort basis.
 
 ### Profile update
 
@@ -164,7 +169,7 @@ Invitations and fleet assignment merging are covered in [Fleet manager authoriza
 | `/dashboard/fleet/{fleet_id}/kpis`, `/histogram` (GET) | Any fleet | 401 | Assigned fleet |
 | `GET /dashboard/rides` | Any community, or `all=true` | Own community | Assigned fleets in a resolved community |
 | `/dashboard/rides/{id}/events`, `/route` | Yes | 401 | 401 |
-| `/dashboard/kpi/*`, `/supply-demand/*`, `/driver-ops`, `/presence/*`, `/telemetry/*` | Yes | 401 | 401 |
+| `/dashboard/kpi/*`, `/live/*`, `/driver-ops`, `/presence/*`, `/telemetry/*` | Yes | 401 | 401 |
 | `/dashboard/users/*`, `/dashboard/notifications/*`, `/dashboard/access/*` | Yes | 401 | 401 |
 | `/dashboard/communities/{id}/locations/user-coords`, `/ride-destinations` | Yes | 403 from handler (own community passes scope) | 401 |
 
@@ -177,7 +182,7 @@ Several handlers resolve scope themselves as defense in depth, even though the m
 | Helper | Admin | Non-admin |
 | --- | --- | --- |
 | `CommunityHandler.resolveCommunityID` | Parses the path ID | `ResolveDashboardCommunity(pathID)` |
-| `SupplyDemandHandler.resolveCommunityScope` | Nil (all markets) unless `community_id` is given | Claim `community_id`, 403 when empty |
+| `SupplyDemandHandler.resolveCommunityScope` (`/live` aggregates) | Nil (all markets) unless `community_id` is given | Claim `community_id`, 403 when empty |
 | `SupplyDemandHandler.resolveCommunityID` | Path ID required | Claim `community_id`; the path ID is ignored |
 | `PresenceDashboardHandler.resolveCommunityScope` | `AllCommunities()` unless `community_id` is given | `OneCommunity(claim)` |
 | `LocationHandler.resolveCommunityID` | Path ID required | Claim `community_id`; the path ID is ignored |
@@ -217,5 +222,5 @@ Several handlers resolve scope themselves as defense in depth, even though the m
 - **Listing access users scans Clerk.** Each `GET /dashboard/access/users` pages through every Clerk account, including app users if they exist in the same instance.
 - **Profile edits lock the whole `Users` table.** `SHARE ROW EXCLUSIVE` blocks concurrent row writes to `Users` until the edit commits.
 - **Moving to Yelo only changes the home community.** The active `community_id` stays the same, so community-scoped analytics keep counting the user.
-- **User coordinates are an arbitrary 5000.** `LIMIT 5000` has no `ORDER BY`, so large communities return an unstable subset.
-- **Path IDs are ignored for some non-admin calls.** Supply and demand, location, and presence handlers use the claim community for non-admins, so a mismatched path ID silently returns the caller's own community rather than an error.
+- **User coordinates are an arbitrary 5000.** `LIMIT 5000` has no `ORDER BY`, so large communities return an unstable subset. The **Live** map polls this endpoint every 10 seconds whenever the market has an active rider, and uses it to place riders whose presence expired, so an active rider outside the subset can drop off the map.
+- **Path IDs are ignored for some non-admin calls.** Live operations, location, and presence handlers use the claim community for non-admins, so a mismatched path ID silently returns the caller's own community rather than an error.

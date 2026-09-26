@@ -12,7 +12,7 @@ This page is an index. It lists names, the repository that reads each one, wheth
 
 "Required" means the process fails fast without it. Required values are:
 
-- **Yes**: `Validate()` in `yelo-api` `internal/utilities/config/config.go:399-454`, or a site's `metadata.requiredBuildEnv` in `yelo-web`.
+- **Yes**: `Validate()` in `yelo-api` `internal/utilities/config/config.go:404-460`, or a site's `metadata.requiredBuildEnv` in `yelo-web`.
 - **E2E**: `validateE2E` requires it in E2E mode.
 - **Cond.**: required only when a related flag is on.
 
@@ -24,45 +24,47 @@ Every variable below is read in `internal/utilities/config/*.go` unless the **Wh
   <Accordion title="App, server, and feature toggles">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `ENVIRONMENT` | No | `dev`, `production`, `e2e`. Switches CORS, logging, and dev-only behavior | `config.go:246` |
+    | `ENVIRONMENT` | No | `dev`, `production`, `e2e`. Switches CORS, logging, and dev-only behavior | `config.go:249` |
     | `PORT` | No | Listen port. Read directly | `cmd/api/main.go:67` |
-    | `API_URL` | No | Public API base, used in Stripe reauth links | `config.go:254` |
-    | `API_VERSION` | No | Sentry release name | `config.go:259` |
-    | `APP_URL_SCHEME`, `APP_STORE_URL` | No | `/redirect` targets | `config.go:255-256` |
-    | `YELO_WEBSITE_URL`, `YELO_DASHBOARD_URL` | No | Links in emails and Stripe | `config.go:257-258` |
-    | `CORS_TRUSTED_ORIGINS` | No | Overrides the built-in CORS list | `config.go:723` |
-    | `SWAGGER_ENABLED` | No | Swagger in `dev` | `config.go:260` |
-    | `ACTIVATION_ENABLED` | No | Driver activation loop | `config.go:262` |
-    | `RIDE_STATE_SNAPSHOT_ENABLED` | No | Ride state protocol | `config.go:250` |
-    | `COMMUNITY_TIMEZONE_RECONCILIATION_ENABLED` | No | Time zone reconciliation job | `config.go:251` |
-    | `SKIP_TEST_SCHOOL_NOTIFICATIONS` | No | Suppresses notifications for test schools | `config.go:261` |
-    | `DRIVER_VERIFIED_PHONE_REQUIRED` | No | Requires a verified phone in driver flows | `config.go:394` |
+    | `API_URL` | No | Public API base, used in Stripe reauth links | `config.go:257` |
+    | `API_VERSION` | No | Sentry release name | `config.go:262` |
+    | `APP_URL_SCHEME`, `APP_STORE_URL` | No | `/redirect` targets | `config.go:258-259` |
+    | `YELO_WEBSITE_URL`, `YELO_DASHBOARD_URL` | No | Links in emails and Stripe | `config.go:260-261` |
+    | `CORS_TRUSTED_ORIGINS` | No | Overrides the built-in CORS list | `config.go:729` |
+    | `SWAGGER_ENABLED` | No | Swagger in `dev` | `config.go:263` |
+    | `ACTIVATION_ENABLED` | No | Driver activation loop | `config.go:265` |
+    | `RIDE_STATE_SNAPSHOT_ENABLED` | No | Ride state protocol | `config.go:253` |
+    | `COMMUNITY_TIMEZONE_RECONCILIATION_ENABLED` | No | Time zone reconciliation job | `config.go:254` |
+    | `SKIP_TEST_SCHOOL_NOTIFICATIONS` | No | Suppresses notifications for test schools | `config.go:264` |
+    | `DRIVER_VERIFIED_PHONE_REQUIRED` | No | Requires a verified phone in driver flows | `config.go:400` |
     | `BACKGROUND_TASKS_ENABLED` | No | `false` disables in-process tickers. Read directly | `cmd/api/background_cleanup.go:45` |
+    | `DASHBOARD_PREVIEW` | No | Dev-only local dashboard preview. Skips background writers and feed warming. Panics outside `dev`. Read directly | `cmd/api/main.go:240`, `internal/service/community/feed_cache_redis.go:282` |
   </Accordion>
   <Accordion title="Database, Redis, and telemetry">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `DSN` | Yes | Postgres connection string | `config.go:276` |
-    | `POSTGRES_POOL_LOG_INTERVAL` | No | Pool monitor log interval | `config.go:277` |
-    | `DISABLE_SLOW_QUERY_WARNINGS` | No | Silences slow query warnings | `config.go:278` |
+    | `DSN` | Yes | Postgres connection string | `config.go:279` |
+    | `POSTGRES_POOL_LOG_INTERVAL` | No | Pool monitor log interval | `config.go:280` |
+    | `DISABLE_SLOW_QUERY_WARNINGS` | No | Silences slow query warnings | `config.go:281` |
     | `K_REVISION` | No | Set by Cloud Run. Becomes Postgres `application_name` | `internal/data/repository/storage.go:486` |
-    | `REDIS_URL`, `REDIS_ENABLED`, `REDIS_STARTUP_TIMEOUT_SECONDS` | E2E | Redis connection and fallback | `config.go:341-343` |
+    | `REDIS_URL`, `REDIS_ENABLED`, `REDIS_STARTUP_TIMEOUT_SECONDS` | E2E | Redis connection and fallback | `config.go:347-349` |
     | `LOG_LEVEL`, `GOOGLE_CLOUD_PROJECT` | No | Logger level and Cloud Logging project | `internal/utilities/logger/logger.go:35,51` |
-    | `SENTRY_DSN`, `POSTHOG_API_KEY` | No | Error reporting and product analytics | `config.go:289,295` |
-    | `OTEL_ENABLED`, `OTEL_OTLP_ENDPOINT`, `OTEL_OTLP_AUTH_HEADER`, `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, `OTEL_TRACE_SAMPLING_RATIO` | No | OpenTelemetry export | `config.go:290-303` |
-    | `METRICS_AUTH_TOKEN` | No | Bearer token for `/metrics` and pprof | `config.go:296` |
-    | `PPROF_ENABLED`, `PPROF_BLOCK_RATE`, `PPROF_MUTEX_RATE` | No | pprof | `config.go:297-299` |
-    | `SLOW_REQUEST_THRESHOLD_MS`, `SLOW_QUERY_THRESHOLD_MS`, `POOL_STATS_INTERVAL_S` | No | Slow thresholds and pool gauge cadence | `config.go:300-302` |
+    | `SENTRY_DSN`, `POSTHOG_API_KEY` | No | Error reporting and product analytics | `config.go:292,301` |
+    | `POSTHOG_PERSONAL_API_KEY`, `POSTHOG_PROJECT_ID`, `POSTHOG_QUERY_HOST` | No | Server-side PostHog query access for the dashboard's observed competitor prices. Host defaults to `https://us.posthog.com` | `config.go:293-295` |
+    | `OTEL_ENABLED`, `OTEL_OTLP_ENDPOINT`, `OTEL_OTLP_AUTH_HEADER`, `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, `OTEL_TRACE_SAMPLING_RATIO` | No | OpenTelemetry export | `config.go:296-309` |
+    | `METRICS_AUTH_TOKEN` | No | Bearer token for `/metrics` and pprof. When empty, neither route is mounted | `config.go:302` |
+    | `PPROF_ENABLED`, `PPROF_BLOCK_RATE`, `PPROF_MUTEX_RATE` | No | pprof. `PPROF_ENABLED` defaults to `false` and needs `METRICS_AUTH_TOKEN` | `config.go:303-305` |
+    | `SLOW_REQUEST_THRESHOLD_MS`, `SLOW_QUERY_THRESHOLD_MS`, `POOL_STATS_INTERVAL_S` | No | Slow thresholds and pool gauge cadence | `config.go:306-308` |
   </Accordion>
   <Accordion title="Auth (JWT, Clerk, OAuth, Auth v3)">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `KEY` | Yes | App JWT signing key | `config.go:265` |
-    | `KEY_LEGACY` | No | Previous keys accepted during rotation | `config.go:266` |
-    | `CLERK_SECRET_KEY` | No | Dashboard sessions | `config.go:267` |
-    | `GOOGLE_ALLOWED_AUDIENCES` | Yes | Google ID token audiences | `config.go:269` |
-    | `APPLE_ALLOWED_AUDIENCES` | No | Apple ID token audiences | `config.go:268` |
-    | `INTERNAL_API_KEY` | No | `X-Internal-Key` for `/internal` | `config.go:372` |
+    | `KEY` | Yes | App JWT signing key | `config.go:268` |
+    | `KEY_LEGACY` | No | Previous keys accepted during rotation | `config.go:269` |
+    | `CLERK_SECRET_KEY` | No | Dashboard sessions | `config.go:270` |
+    | `GOOGLE_ALLOWED_AUDIENCES` | Yes | Google ID token audiences | `config.go:272` |
+    | `APPLE_ALLOWED_AUDIENCES` | No | Apple ID token audiences | `config.go:271` |
+    | `INTERNAL_API_KEY` | No | `X-Internal-Key` for `/internal` | `config.go:378` |
     | `AUTH_V3_ENABLED` | No | Enables `/authv3` | `authv3.go:105` |
     | `AUTH_V3_PUBLIC_WEB_ORIGIN`, `AUTH_V3_API_CALLBACK_ORIGIN`, `AUTH_V3_CORS_ORIGINS`, `AUTH_V3_CORS_ALLOW_CREDENTIALS` | Cond. | Web and callback origins, CORS | `authv3.go:106-113` |
     | `AUTH_V3_TERMS_VERSION`, `AUTH_V3_PRIVACY_VERSION` | Cond. | Accepted legal versions | `authv3.go:108-109` |
@@ -77,47 +79,47 @@ Every variable below is read in `internal/utilities/config/*.go` unless the **Wh
   <Accordion title="Payments, maps, messaging">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `STRIPE_API_KEY` | Yes | Stripe secret key. Also read by `scripts/create_payment_link/main.go:23` | `config.go:282` |
-    | `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_RETURN_URL`, `STRIPE_RECONCILIATION_ENABLED` | No | Stripe client key, webhooks, Connect return, reconciliation job | `config.go:281-285` |
-    | `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` | No | Non-production earnings override | `config.go:286` |
-    | `MAPBOX_API_KEY` | Yes | Mapbox. Also read by `cmd/sync-school-catalog/coordinates.go:112` | `config.go:306` |
-    | `GOOGLE_MAPS_API_KEY` | Yes | Google Routes, Places, Geocoding | `config.go:307` |
-    | `SEARCH_PROVIDER`, `GOOGLE_PLACES_BIAS_RADIUS_METERS` | No | Place search provider and bias radius | `config.go:308-309` |
-    | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` | Yes | Twilio SMS | `config.go:320-322` |
-    | `TWILIO_VERIFY_SERVICE_SID`, `TWILIO_OTP_FALLBACK_ENABLED`, `TWILIO_OTP_FALLBACK_DELAY`, `TWILIO_OTP_SWEEP_INTERVAL` | No | Twilio Verify and OTP fallback | `config.go:323-324,674,678` |
-    | `TWILIO_EVENTS_WEBHOOK_USER`, `TWILIO_EVENTS_WEBHOOK_PASSWORD` | No | Basic auth on `/twilio-verify-events` | `config.go:337-338` |
-    | `PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET`, `PHOTON_CLOUD_URL`, `PHOTON_IMESSAGE_ADDRESS` | No | Photon iMessage bump texts | `config.go:327-330` |
-    | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | No | Transactional email | `config.go:318-319` |
-    | `SLACK_WEBHOOK_URL`, `SLACK_USER_UPDATES_WEBHOOK_URL`, `SLACK_DRIVER_UPDATES_WEBHOOK_URL` | No | Slack channels | `config.go:333-335` |
-    | `APP_STORE_WEBHOOK_SECRET` | No | App Store webhook HMAC | `config.go:336` |
+    | `STRIPE_API_KEY` | Yes | Stripe secret key. Also read by `scripts/create_payment_link/main.go:23` | `config.go:285` |
+    | `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_RETURN_URL`, `STRIPE_RECONCILIATION_ENABLED` | No | Stripe client key, webhooks, Connect return, reconciliation job | `config.go:284-288` |
+    | `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` | No | Non-production earnings override | `config.go:289` |
+    | `MAPBOX_API_KEY` | Yes | Mapbox. Also read by `cmd/sync-school-catalog/coordinates.go:112` | `config.go:312` |
+    | `GOOGLE_MAPS_API_KEY` | Yes | Google Routes, Places, Geocoding | `config.go:313` |
+    | `SEARCH_PROVIDER`, `GOOGLE_PLACES_BIAS_RADIUS_METERS` | No | Place search provider and bias radius | `config.go:314-315` |
+    | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` | Yes | Twilio SMS | `config.go:326-328` |
+    | `TWILIO_VERIFY_SERVICE_SID`, `TWILIO_OTP_FALLBACK_ENABLED`, `TWILIO_OTP_FALLBACK_DELAY`, `TWILIO_OTP_SWEEP_INTERVAL` | No | Twilio Verify and OTP fallback | `config.go:329-330,680,684` |
+    | `TWILIO_EVENTS_WEBHOOK_USER`, `TWILIO_EVENTS_WEBHOOK_PASSWORD` | No | Basic auth on `/twilio-verify-events` | `config.go:343-344` |
+    | `PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET`, `PHOTON_CLOUD_URL`, `PHOTON_IMESSAGE_ADDRESS` | No | Photon iMessage bump texts | `config.go:333-336` |
+    | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | No | Transactional email | `config.go:324-325` |
+    | `SLACK_WEBHOOK_URL`, `SLACK_USER_UPDATES_WEBHOOK_URL`, `SLACK_DRIVER_UPDATES_WEBHOOK_URL` | No | Slack channels | `config.go:339-341` |
+    | `APP_STORE_WEBHOOK_SECRET` | No | App Store webhook HMAC | `config.go:342` |
   </Accordion>
   <Accordion title="Contact sync, links, storage, calendar, Play">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `QUO_API_KEY`, `QUO_DASHBOARD_API_KEY`, `QUO_BASE_URL`, `QUO_CONTACT_BASE_URL` | No | Quo (OpenPhone) | `config.go:364-369` |
-    | `QUO_REQUEST_INTERVAL_MS`, `QUO_REQUEST_INTERVAL_SECONDS` (legacy), `QUO_DASHBOARD_REQUEST_INTERVAL_MS` | No | Quo pacing | `quo.go:7-12`, `config.go:365` |
+    | `QUO_API_KEY`, `QUO_DASHBOARD_API_KEY`, `QUO_BASE_URL`, `QUO_CONTACT_BASE_URL` | No | Quo (OpenPhone) | `config.go:370-375` |
+    | `QUO_REQUEST_INTERVAL_MS`, `QUO_REQUEST_INTERVAL_SECONDS` (legacy), `QUO_DASHBOARD_REQUEST_INTERVAL_MS` | No | Quo pacing | `quo.go:7-12`, `config.go:371` |
     | `QUO_ACCOUNT_KEY`, `RESEND_ACCOUNT_KEY`, `RESEND_CONTACTS_API_KEY` | No | Contact sync accounts | `contact_sync.go:18-20` |
     | `RESEND_REQUEST_INTERVAL`, `RESEND_CONTACT_REQUEST_INTERVAL`, `CONTACT_SYNC_RECONCILE_INTERVAL`, `CONTACT_SYNC_RESEND_ENABLED` | No | Contact sync pacing and toggle | `contact_sync.go:21-24` |
-    | `CONTACT_HASH_PEPPER` | No | Contact hash pepper. Read on each use | `config.go:375`, `internal/service/user/contacts.go:176`, `internal/data/repository/dashboard.go:2073` |
-    | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID` | No | Dub short links | `config.go:352-354` |
-    | `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL` | No | Invite landing and OG worker bases | `config.go:355,359` |
-    | `OG_SIGNING_SECRET` | Yes | Signs OG card URLs. Must match the `og` Worker secret | `config.go:361` |
-    | `STORAGE_URL`, `STORAGE_TOKEN`, `STORAGE_PUBLIC_BUCKET_ID`, `STORAGE_PRIVATE_BUCKET_ID` | No | Supabase Storage | `config.go:312-315` |
+    | `CONTACT_HASH_PEPPER` | No | Contact hash pepper. Read with `os.Getenv` on each use. The loaded `Config.HashPepper` field is never read | `config.go:381`, `internal/service/user/contacts.go:176`, `internal/data/repository/dashboard.go:2103` |
+    | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID` | No | Dub short links | `config.go:358-360` |
+    | `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL` | No | Invite landing and OG worker bases | `config.go:361,365` |
+    | `OG_SIGNING_SECRET` | Yes | Signs OG card URLs. Must match the `og` Worker secret | `config.go:367` |
+    | `STORAGE_URL`, `STORAGE_TOKEN`, `STORAGE_PUBLIC_BUCKET_ID`, `STORAGE_PRIVATE_BUCKET_ID` | No | Supabase Storage | `config.go:318-321` |
     | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_SYNC_ENABLED`, `GOOGLE_CALENDAR_OWNER_EMAIL`, `GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET`, `GOOGLE_CALENDAR_CALLBACK_URL`, `GOOGLE_CALENDAR_DASHBOARD_URL`, `GOOGLE_CALENDAR_TOKEN_KEYS` | Cond. | Operating-hours calendar | `calendar.go:25-26` |
-    | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED`, `GOOGLE_PLAY_PACKAGE_NAME`, `GOOGLE_PLAY_TRACKS`, `GOOGLE_PLAY_CONSOLE_URL` | Cond. | Play release monitor. Package and tracks required when enabled | `config.go:346-349,714` |
+    | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED`, `GOOGLE_PLAY_PACKAGE_NAME`, `GOOGLE_PLAY_TRACKS`, `GOOGLE_PLAY_CONSOLE_URL` | Cond. | Play release monitor. Package and tracks required when enabled | `config.go:352-355,720` |
   </Accordion>
   <Accordion title="E2E mode">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `E2E_ENABLED` | E2E | Enables E2E mode | `config.go:378` |
-    | `E2E_CONTROL_API_KEY` | E2E | `X-E2e-Key` secret, at least 32 bytes | `config.go:379` |
-    | `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` | E2E | Database isolation checks | `config.go:380-382` |
-    | `E2E_FIXTURE_TTL`, `E2E_BACKGROUND_JOBS_ENABLED` | No | Fixture lifetime. Jobs must stay off | `config.go:383-384` |
+    | `E2E_ENABLED` | E2E | Enables E2E mode | `config.go:384` |
+    | `E2E_CONTROL_API_KEY` | E2E | `X-E2e-Key` secret, at least 32 bytes | `config.go:385` |
+    | `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` | E2E | Database isolation checks | `config.go:386-388` |
+    | `E2E_FIXTURE_TTL`, `E2E_BACKGROUND_JOBS_ENABLED` | No | Fixture lifetime. Jobs must stay off | `config.go:389-390` |
   </Accordion>
 </AccordionGroup>
 
 <Note>
-These variables are read in code but missing from `.env.example`: `APP_STORE_WEBHOOK_SECRET`, `CONTACT_HASH_PEPPER`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID`, `GOOGLE_PLACES_BIAS_RADIUS_METERS`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET`, `PHOTON_*`, `QUO_REQUEST_INTERVAL_SECONDS`, `RIDE_STATE_SNAPSHOT_ENABLED`, and `TWILIO_EVENTS_WEBHOOK_*`. `OG_SIGNING_SECRET` is required, so a fresh `.env` copied from the example fails `Validate()`.
+These variables are read in code but missing from `.env.example`: `APP_STORE_WEBHOOK_SECRET`, `CONTACT_HASH_PEPPER`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID`, `GOOGLE_PLACES_BIAS_RADIUS_METERS`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET`, `QUO_REQUEST_INTERVAL_SECONDS`, and `RIDE_STATE_SNAPSHOT_ENABLED`. `PHOTON_*` and `TWILIO_EVENTS_WEBHOOK_*` appear only as commented-out lines. `OG_SIGNING_SECRET` is required, so a fresh `.env` copied from the example fails `Validate()`.
 </Note>
 
 ## yelo-api deploy and CI

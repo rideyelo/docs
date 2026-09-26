@@ -1,0 +1,228 @@
+---
+title: "Manual QA checklists"
+description: "Release QA passes for the rider flow, driver flow, payments with Stripe test cards, fleet join, and a dashboard smoke test, written against the real screens and controls in the apps"
+---
+
+Use these checklists before a store build or a risky OTA, and for changes that E2E suites don't cover yet. Each step names a real screen, control label, or `testID` from the code, so a failed step points at a specific component. Screen and route details are in the [Screen catalog](/engineering/mobile/screen-catalog).
+
+<Note>
+The agent-device suites already cover sign-in, queue promotion, pickup PINs, cancellations, link recovery, and notification taps on every run you trigger. See [E2E environment](/engineering/qa/e2e#suites). Manual passes add payments, fleet join, driver onboarding, the dashboard, and real devices, which E2E doesn't reach.
+</Note>
+
+## Before you start
+
+### Pick an environment
+
+| Environment | How | Payments | Use for |
+| --- | --- | --- | --- |
+| Local API | `make sims-local` in `yelo-frontend`, with `yelo-api` running on a development database and `sk_test_`/`pk_test_` keys in `.env` | Stripe test mode | Payment and ride-flow passes |
+| Production | `make sims`, a staging build, or a staged OTA. All use the production API. | Live | Read-only smoke checks with reserved test accounts |
+
+<Warning>
+Stripe test cards never work against production, and a real card there creates a real charge. Run payment checklists only against an API with test keys. See [Local development](/engineering/local-development#choose-which-api-your-clients-call).
+</Warning>
+
+### Accounts
+
+- Sign in with a reserved number, such as `(555) 010-0001`, and code `12345`. No SMS is sent. Use a different number per role. See [Test, E2E, and internal auth paths](/engineering/identity/test-and-internal-auth#reserved-phone-numbers).
+- Mark accounts as test users from the dashboard user sheet if they need to join test communities.
+- For the driver flow, use an account whose driver application and Stripe status are complete. **Go Online** stays disabled otherwise. See [Driver onboarding](/concepts/driver-onboarding).
+- Use two devices or two simulators for rider and driver steps. Put both in the same community, and set simulator locations inside its service area.
+
+### Record results
+
+For each failed step, capture a screenshot or screen recording, the ride ID if one exists, the account phone, the app version from **Settings** build info, and the time. Use the [runbooks](/runbooks/index) for triage.
+
+## Rider flow
+
+<Steps>
+  <Step title="Sign in">
+    - On the entry screen, tap **Get Started**, then choose phone (`method-phone`).
+    - Enter the number in `phone-input`, tap **Continue**, and type `12345` in `otp-input`. The code submits on the fifth digit.
+    - For a new number, complete **finish-profile**, then accept the **Yelo needs some permissions** screen.
+    - Expect the map with the home action bar or **Where to** (`where-to`). If location is off, expect the location gate (`location-gate-enable`).
+  </Step>
+  <Step title="Request a ride">
+    - Tap **Where to** and search for a destination, or open a place and tap its ride button (`poi-get-ride-button`).
+    - Confirm the request sheet shows a pickup. If there's no fix, it shows **Choose pickup**.
+    - Check that vehicle options load, with prices (or **Free**), and that **Fastest** and **Cheapest** jump the selection.
+    - If a stop has no coordinates, expect the change-stop sheet with **Confirm pickup** or **Confirm destination**.
+  </Step>
+  <Step title="Confirm">
+    - For a paid option, open the payment row and pick a method. See [Payments](#payments).
+    - Tap **Confirm Yelo**. It stays disabled until an option is selected, the sheet is ready, and a paid ride has a payment method.
+    - Expect `ride-matching/1-waiting` with the **FINDING YOUR SPOT** chip, the route and fare card, and **Share ETA** and **Bump**.
+  </Step>
+  <Step title="Leave the queue">
+    - From the waiting screen, tap **Leave queue**.
+    - Expect **Leave the queue?** with five reasons. **Sacrifice my spot** (`continue`) stays disabled until you pick one.
+    - Pick **Changed my mind** and tap **Sacrifice my spot**. Expect the map, and no charge.
+  </Step>
+  <Step title="Get matched">
+    - Request again and have the driver accept (see [Driver flow](#driver-flow)).
+    - If the driver is busy, expect `ride-matching/2-queued` with **QUEUED** or **QUEUED · ~N MIN** and a position card.
+    - When the driver heads to you, expect `ride/4-ride` with the driver card and a 4-digit PIN.
+  </Step>
+  <Step title="Ride">
+    - Confirm the driver marker moves and the stage changes when the driver taps **I've arrived** and **Start ride**.
+    - Open the shield menu and check **Report safety issue** and **Call 911** are present. Don't call.
+    - Open the dots menu and check **Contact Yelo** and **Cancel ride**.
+  </Step>
+  <Step title="Rate and tip">
+    - After **Complete ride**, expect the rate screen with the driver card, **Rate your ride**, **Add a tip**, and **Leave a comment** (`ride-comment-input`).
+    - **Done** (`submit-review`) is disabled until you pick a star. Pick stars and a tip, then tap **Done**.
+    - Repeat on another ride with **Skip**.
+  </Step>
+  <Step title="Check history">
+    - On the profile, open the ride in history. Expect **YOU PAID**, **Base fare**, **Tip**, **Distance**, **Duration**, **Date**, and **Paid with** with the card brand.
+  </Step>
+</Steps>
+
+## Driver flow
+
+<Steps>
+  <Step title="Enter drive mode">
+    - Sign in as the driver. An active driver lands on `/drive`. From the rider profile, use **Drive Mode**.
+    - Expect **YOU'RE OFFLINE** and a **Go Online** button.
+  </Step>
+  <Step title="Go online">
+    - Tap **Go Online**. Grant background location if asked.
+    - In the confirmation sheet, check the vehicle and the auto-queue setting, then tap **Go Online**.
+    - Expect **ONLINE** and an auto-queue chip. Outside the community, expect **Outside Service Area** instead.
+  </Step>
+  <Step title="Receive and decline">
+    - Have the rider request. Expect a ride card with the rider's first name, price, **TO PICKUP** and **THE RIDE** legs, and an "Accepting in [N]s" countdown.
+    - Tap **Decline**, pick **Not enough money**, and submit. The card disappears for this session.
+  </Step>
+  <Step title="Accept">
+    - Have the rider request again. Tap the accept button, labeled "Accept ride for $X" for screen readers, or let the 30-second countdown accept.
+    - On first use, expect **Navigation app**. Pick an app and tap **Set as default**.
+    - Expect the current ride sheet in **EN ROUTE TO PICKUP**.
+  </Step>
+  <Step title="Pick up">
+    - Tap **I've arrived**. The sheet changes to **AT PICKUP**.
+    - Tap **Start ride**. Enter a wrong PIN and expect "Incorrect PIN. Ask the rider for their code." Then enter the rider's PIN.
+    - Expect **IN PROGRESS**.
+  </Step>
+  <Step title="Complete">
+    - Tap **Complete ride**. Expect the **Ride Complete** overlay with the fare, **Rate rider**, **Add Rider Count**, and **Add Comment**.
+    - Tap **Continue**, or **Next Ride →** when a queued ride is waiting.
+  </Step>
+  <Step title="Cancel as driver">
+    - On a new ride, open the cancel control on the status row. Pick **Accepted trip by accident** and tap **Cancel Ride**.
+    - Confirm the rider leaves the ride screen.
+  </Step>
+  <Step title="Go offline">
+    - Tap the hand button. Expect **End your shift?** with **Go offline** and **Stay online**.
+    - Tap **Go offline**. Expect **YOU'RE OFFLINE**.
+  </Step>
+  <Step title="Check the hub">
+    - Open the menu to **Driver Profile**. Check **Earnings & stats**, **Payouts**, and **Drive history** open and show the ride you just drove.
+  </Step>
+</Steps>
+
+## Payments
+
+Run this against an API with Stripe test keys. The app saves a card with a SetupIntent at confirm time. The charge is authorized when the driver accepts. See [Mobile PaymentSheet and wallets](/engineering/payments/mobile-payment-sheet) and [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
+
+| Card | Expected result |
+| --- | --- |
+| `4242 4242 4242 4242` | Saves, confirms, and authorizes at accept |
+| `4000 0027 6000 3184` | Asks for 3D Secure in the sheet. The later off-session authorization at accept fails. |
+| `4000 0000 0000 9995` | Declines with `insufficient_funds`, at SetupIntent confirmation or, if setup succeeds, at driver accept |
+
+Use any future expiry date, any CVC, and any postal code.
+
+<Steps>
+  <Step title="Add a card">
+    - On the request sheet, pick a paid option and open the payment row. PaymentSheet opens.
+    - Add `4242 4242 4242 4242`. The row shows the card, and **Confirm Yelo** enables.
+    - On an iOS simulator with test keys, Apple Pay also appears, with **Ride fare**, a pending **Tip authorization** of $5.00, and a pending **Yelo** total.
+  </Step>
+  <Step title="Complete a paid ride">
+    - Confirm, have the driver accept, and complete the ride with a tip.
+    - Check the receipt shows **Paid with** and the tip. In the Stripe test dashboard, find the ride's PaymentIntent and check its amount matches the fare.
+  </Step>
+  <Step title="Decline and authentication paths">
+    - Add `4000 0000 0000 9995` and tap **Confirm Yelo**. A decline at confirm shows "Could not confirm this request. Check your ride status before trying again." on the request sheet. If confirm succeeds, have the driver accept and expect the accept to fail.
+    - Add `4000 0027 6000 3184`, complete the 3D Secure prompt, and confirm. Have the driver accept. Expect the accept to fail and the ride to stay unassigned. See [Payment failure modes](/engineering/payments/failure-modes-and-invariants).
+  </Step>
+  <Step title="Free rides">
+    - Pick a **Free** option. No payment row is needed, and **Confirm Yelo** enables without a card.
+  </Step>
+  <Step title="Driver payouts">
+    - As a driver on personal Stripe, open **Earnings & stats**. When a balance is available, check the **Cash out $X now** button opens the cash-out sheet.
+    - A fleet-managed driver sees payouts managed by the fleet instead. See [Payouts and earnings](/engineering/payments/payouts-and-earnings).
+  </Step>
+</Steps>
+
+## Fleet join
+
+<Steps>
+  <Step title="Create the link">
+    - In the dashboard, open **Fleets**, then **Invite drivers** next to **Fleet Driver Directory**, or the **Invite drivers** tab in a fleet's detail panel.
+    - Expect a **Ready** badge. If the fleet can't accept drivers, expect **Invitations unavailable**.
+    - Click **Create driver join link** and copy it. See [Driver invitations](/fleets/driver-invitations).
+  </Step>
+  <Step title="Open it signed out">
+    - Open the link on a device without a session. The app opens `/fleet-join/[code]`.
+    - Expect the fleet preview and **Sign in or create account**. Tap it. The app saves the code and opens sign-in. Sign in with a new reserved number, then reopen the link if the join screen doesn't return.
+  </Step>
+  <Step title="Join">
+    - Tap **Join [fleet name]**. Expect "This fleet is now your active fleet." with a payout line: "The fleet manages your driver payouts." or "You use your own vehicle and receive payouts through your own Stripe account."
+    - Tap **Continue**. Expect `driver-signup/1-hub` if steps remain, else the driver hub.
+    - For a fleet-managed fleet, the Stripe step shows **PAYOUTS READY** and **Continue driver setup**.
+  </Step>
+  <Step title="Edge cases">
+    - Open the same link again as the joined driver. The screen exits to the home screen.
+    - Open a link after rotating or disabling it in the dashboard. Expect the invalid state and **Back to Yelo**.
+    - Check the driver now appears in the fleet's driver directory in the dashboard.
+  </Step>
+</Steps>
+
+## Dashboard smoke
+
+Sign in with Clerk as an admin, then repeat the role checks with an intern and a fleet account. See [Dashboard roles](/administration/dashboard-roles).
+
+<Steps>
+  <Step title="Shell">
+    - The sidebar shows **Global**, **Community**, **Configuration**, and **Administration** groups for an admin. Intern and fleet accounts see fewer pages.
+    - Change the community in the community dropdown. Community pages reload for the new community.
+    - Toggle theme between **Light**, **Dark**, and **System**.
+  </Step>
+  <Step title="Global pages">
+    - **KPI**, **Drivers**, **Users**, **Rides**, and **Live** each load without an error state.
+    - On **Users**, open a user sheet. On **Rides**, open a ride.
+  </Step>
+  <Step title="Community pages">
+    - **Map**, **Events**, **Community**, and **Fleet** load for the selected community.
+  </Step>
+  <Step title="Configuration and administration">
+    - **Pricing**, **Fleets**, **Notifications**, and **Communities** load. Don't save changes on production.
+    - **Access**, **Telemetry**, **Jobs**, and **Contact sync** load for an admin.
+  </Step>
+  <Step title="Role gates">
+    - As a fleet account, open `/users` directly. The dashboard redirects, because fleet accounts can't see it. `App.test.tsx` holds the full route-by-role matrix.
+  </Step>
+</Steps>
+
+## Gotchas and edge cases
+
+- **Reserved numbers work in production.** Any `+1555` number with `12345` signs in on production and creates a real, non-test account. Reuse the same numbers so you don't create extras.
+- **Accept auto-fires.** The ride card accepts itself after 30 seconds. Decline before then if the step needs an unaccepted ride.
+- **The Apple Pay sheet overstates the total.** It shows a pending $5.00 tip authorization on every ride. That's expected.
+- **3D Secure happens only at confirm.** A card that needs authentication for every charge fails later at accept, with no prompt to the rider.
+- **Background jobs affect timing.** Ride expiry and auto-queue depend on API workers. If your local API runs without them, unmatched rides never expire on their own.
+
+## Where this lives in code
+
+| Flow | Path |
+| --- | --- |
+| Sign-in screens | `yelo-frontend/app/(auth-v3)/` |
+| Request sheet and confirm button | `yelo-frontend/app/(app)/(tabs)/map/request.tsx`, `components/map/request/FindYeloButton.tsx` |
+| Matching and leave queue | `yelo-frontend/app/(app)/ride-matching/`, `components/ride-matching/RouteMatchingLayout.tsx` |
+| Active ride and rate | `yelo-frontend/app/(app)/ride/4-ride.tsx`, `app/(app)/ride-complete/index.tsx` |
+| Driver sheets | `yelo-frontend/components/drive/` (`OfflineSheetContent`, `GoOnlineConfirmationSheet`, `RideRequestCard`, `CurrentRideBottomSheet`, `SecurityPinBottomSheet`, `GoOfflineConfirmationSheet`), `components/driver-flow/DriverCancelPopup.tsx` |
+| Payment sheet | `yelo-frontend/components/ride/StripePaymentScreen.tsx`, `lib/payments/` |
+| Fleet join | `yelo-frontend/app/fleet-join/[code].tsx`, `yelo-web/src/components/FleetDriverJoinLinkCard.tsx` |
+| Dashboard navigation and role matrix | `yelo-web/src/components/Sidebar.tsx`, `src/sites/dashboard/App.test.tsx` |

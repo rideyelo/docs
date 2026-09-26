@@ -48,7 +48,7 @@ For environment variables that override some of these values, see [Environment v
     | ETA hard cutoff | 3600 s | `driver_options.go:136`, `service/ride/rider.go:550` | Drivers an hour or more away are dropped or flagged `eta_too_long` |
     | `avgSpeedKmPerMin` | 0.5 (about 30 km/h) | `driver_options.go:21` | Haversine ETA speed |
     | `etaBufferMinutes` | ±2 min, floor 1 | `driver_options.go:33,402` | Pickup time range width |
-    | `maxBadgesPerOption` | 2 | `service/ride/rider.go:1680` | Badges per ride option |
+    | `maxBadgesPerOption` | 1 | `service/ride/rider.go:1672` | Badges per ride option. `badgePriority` keeps verified student, then fleet, cheapest, fastest |
   </Accordion>
   <Accordion title="Cancellation (API)">
     | Name | Value | Where | Effect |
@@ -126,7 +126,7 @@ For environment variables that override some of these values, see [Environment v
     | `rideNotifiedTTL`, `rideRescueTTL` | 30 min each | `activation_cache.go:23,25` | Notified set and rescue dedup |
     | `activationConfigTTL` | 5 min | `activation_cache.go:21` | Config cache |
     | `aqAttemptedTTL`, `queueSummaryTTL` | 1 h, 30 min | `data/redis/queue_cache.go:18,20` | Auto-queue markers and summaries |
-    | Queue refresh loop | 3 min | `main.go:589` | Rebuilds queue summaries |
+    | Queue refresh loop | 3 min | `main.go:599` | Rebuilds queue summaries |
     | Auto-queue weights | efficiency 0.5, equity 0.5, rides 0.6, fare 0.4, tie 0.05 | `service/activation/auto_queue.go:14-18` | Ranking |
     | `bufferMinutes` | 2 per ride | `auto_queue.go:19` | Queue minutes per ride |
     | `auto_queue_max_minutes`, `auto_queue_default_minutes` | 120, 60 | `migrations/000184`, `auto_queue.go:335` | Community queue capacity. Users can override |
@@ -150,7 +150,7 @@ For environment variables that override some of these values, see [Environment v
     | `MaxTip` | $100 | `models/tip.go:16`, validated in `service/ride/ride.go:851` | In-app tip ceiling |
     | Tip presets | $2, $5, $10 | `models/tip.go:22` | Returned by tip options. Mobile falls back to the same (`app/(app)/ride-complete/index.tsx:34`) |
     | Tip window | 24 h | `service/ride/driver.go:575` | Capture is deferred after completion |
-    | Tip capture loop | Every 5 min, batch 50 | `main.go:598`, `service/ride/tip_capture.go:13` | Captures when the window expires |
+    | Tip capture loop | Every 5 min, batch 50 | `main.go:608`, `service/ride/tip_capture.go:13` | Captures when the window expires |
     | Stuck tip alert | 1 h past window | `tip_capture.go:32` | Error log |
     | QR tip min, max, preset | $1, $500, $5 | `service/tipping/tipping.go:17-21` | Guest tipping through `pay.yelo.link` |
     | Web tip fallback min, max | 100 or 50 cents, 10000 cents | `src/shared/signup/steps/TipStep.tsx:78-79,194` | Used only when the config omits them |
@@ -205,7 +205,7 @@ For environment variables that override some of these values, see [Environment v
     | Stale orchestration batch | 1000 | `notify/queue/stale.go:15` | |
     | Ride-available and unclaimed cooldown | 900 s per user | `notify/seed/templates.go:221,238,254` | |
     | Signup alert | 90 s delay, 3 attempts, 30 s timeout | `notify/signup_alert.go:25-26` | |
-    | Scheduled notifications loop | 1 min | `main.go:580` | |
+    | Scheduled notifications loop | 1 min | `main.go:590` | |
     | Dashboard notification history | Max 100 | `server/http/dashboard/notifications/handler.go:225,281` | |
   </Accordion>
   <Accordion title="Friend bumps">
@@ -243,9 +243,9 @@ For environment variables that override some of these values, see [Environment v
     | Auth v3 phone attempt | 10 min TTL, 30 s cooldown, 5 sends, 5 verifies | `service/authv3/phone_orchestration.go:72-75` | |
     | Auth v3 phone limits | Send 10/h per phone and 20/h per requester; verify 20/h and 40/h | `phone_orchestration.go:76-79` | |
     | Auth v3 phone code | 5 digits | `service/authv3/phone/code.go:12` | |
-    | OTP fallback | After 60 s, sweep every 15 s, batch 100 | `config.go:178,184`, `phone_fallback.go:50,100` | Off by default |
+    | OTP fallback | After 60 s, sweep every 15 s, batch 100 | `config.go:181,187`, `phone_fallback.go:50,100` | Off by default |
     | Auth v3 lifetimes | Transaction 10 min, provider start 5 min, handoff 2 min, onboarding 15 min, web access 1 h, web session idle 90 days and absolute 365 days | `utilities/config/authv3.go:18-24` | Env-overridable within bounds at `authv3.go:462-468` |
-    | Runtime cleanup | Every 5 min; handoffs kept 24 h, transactions 30 days; batch 500 | `main.go:534`, `runtime_cleanup.go:12,37-39` | |
+    | Runtime cleanup | Every 5 min; handoffs kept 24 h, transactions 30 days; batch 500 | `main.go:544`, `runtime_cleanup.go:12,37-39` | |
     | Serializable retry | 5 attempts, 10 ms × 2^n with jitter | `service/authv3/resolver.go:24-25` | |
     | OIDC JWKS cache | From `Cache-Control`, default 5 min, max 1 h | `service/authv3/providers/oidc.go:20-22` | |
     | Provider HTTP | 10 s, cache 5 min | `providers/types.go:70,72` | |
@@ -290,7 +290,7 @@ For environment variables that override some of these values, see [Environment v
   <Accordion title="API">
     | Name | Value | Where | Effect |
     | --- | --- | --- | --- |
-    | Places bias radius | 10 km (env), max 50 km | `config.go:309`, `data/googleplaces/googleplaces.go:34-35` | |
+    | Places bias radius | 10 km (env), max 50 km | `config.go:315`, `data/googleplaces/googleplaces.go:34-35` | |
     | Place resolve bias | 150 m | `data/googleplaces/poi_details.go:30` | |
     | POI distance limits | 5000 m (authority, details), 250 m (lookup) | `service/mapping/poi_google_authority.go:46`, `data/poilookup/poilookup.go:23` | |
     | Minimum POI evidence | 0.65 | `poi_google_authority.go:25` | |
@@ -308,8 +308,8 @@ For environment variables that override some of these values, see [Environment v
     | Friends layer | Positions 7 days, 500 rows, 100 spots, moves 24 h | `service/maplayer/friends_layer.go:17-23` | |
     | Map layer TTLs | Vehicles 60 s, community 300 s; 20 top locations, 25 events, 2000 routes | `service/maplayer/maplayer.go:20-24` | |
     | Community moves window | 168 h default, 1 to 720 h | `migrations/000276`, `server/http/community/requests/community.go:74` | |
-    | Mobility feeds | Poll every 1 min; backoff 2^n min to 1 h; 10 MiB live, 20 MiB GTFS | `main.go:613`, `service/maplayer/mobility.go:19-23`, `data/mobility/client.go:15-18` | |
-    | Map heat loop | 5 min | `main.go:607` | |
+    | Mobility feeds | Poll every 1 min; backoff 2^n min to 1 h; 10 MiB live, 20 MiB GTFS | `main.go:623`, `service/maplayer/mobility.go:19-23`, `data/mobility/client.go:15-18` | |
+    | Map heat loop | 5 min | `main.go:617` | |
     | `HotIndexWindow` | 6 h | `service/location/location.go:22` | |
   </Accordion>
   <Accordion title="Mobile map and search">
@@ -351,9 +351,9 @@ See [Contact sync](/administration/contact-sync).
 
 | Name | Value | Where | Effect |
 | --- | --- | --- | --- |
-| Operational loop | 30 s | `main.go:560` | Purges offline drivers, cancels unmatched rides, runs activation |
-| Feed refresh loop | 2 min | `main.go:571` | |
-| Vehicle type registry | 5 min | `main.go:411` | |
+| Operational loop | 30 s | `main.go:570` | Purges offline drivers, cancels unmatched rides, runs activation |
+| Feed refresh loop | 2 min | `main.go:581` | |
+| Vehicle type registry | 5 min | `main.go:421` | |
 | Loop task timeout, stale | 2 min, 5 min | `cmd/api/background_cleanup.go:17-18` | |
 | Calendar dispatch | Every 15 s | `queue.go:227-231` | |
 | Calendar sync | Lease 4 min, next sync 270 to 330 s, stale 7 min | `queries/calendar_sync.sql:40,76` | |
@@ -372,16 +372,16 @@ See [Background jobs](/engineering/api/background-jobs).
 | HTTP server | Read 30 s, write 30 s, idle 60 s | `server/http/server.go:82-84` | |
 | Per-IP limiter | 50 rps, burst 100, idle eviction 3 min | `main.go:76-83`, `server/http/middleware.go:137-148` | Flags override. In memory per instance |
 | CORS max age | 3600 s | `middleware.go:121` | |
-| Graceful shutdown | 8 s drain, then OTel 5 s and Sentry 2 s | `main.go:503,158,141` | |
+| Graceful shutdown | 8 s drain, then OTel 5 s and Sentry 2 s | `main.go:513,158,141` | Up to 15 s in the worst case. Cloud Run sends SIGKILL 10 s after SIGTERM, so a slow drain can cut off the OTel and Sentry flushes |
 | DB pools | API 10, River 12, CLI 2; lifetime 1 h, idle 30 min | `data/repository/storage.go:337-349,432-435` | |
 | DB timeouts | Queries 5 s, dial 5 s, ping 30 s, dashboard 15 s | `storage.go:30,402,449`, `data/repository/dashboard.go:1840` | |
-| Pool monitoring | Log 30 s, warn at 80%, leak after 5 min, stats 15 s | `config.go:277,302`, `storage.go:509-510` | |
-| Slow thresholds | Request 150 ms, query 50 ms | `config.go:300-301` | |
+| Pool monitoring | Log 30 s, warn at 80%, leak after 5 min, stats 15 s | `config.go:280,308`, `storage.go:509-510` | |
+| Slow thresholds | Request 150 ms, query 50 ms | `config.go:306-307` | |
 | Redis client | Pool 50, 10 idle, 3 retries; dial 5 s, read and write 3 s; startup 180 s | `data/redis/client.go:36-57,127-133` | |
 | Redis circuit breaker | Trips at 50 or more requests with 80% failures in 120 s; open 60 s; 10 probes | `data/redis/client.go:161-172` | |
 | Default circuit breaker | Trips at 5 consecutive failures; open 60 s; 3 probes | `utilities/circuitbreaker/circuitbreaker.go:22,58-64` | Stripe, Twilio, Photon, Resend, Google, Mapbox |
 | Network retrier | 5 attempts, 200 ms to 10 s | `utilities/retry/retry.go:66-73` | |
-| OTel | Sampling 0.1, batch 5 s or 512 | `config.go:291`, `utilities/otel/otel.go:89,166-167` | |
+| OTel | Sampling 0.1, batch 5 s or 512 | `config.go:297`, `utilities/otel/otel.go:89,166-167` | |
 | Healthcheck | 5 s; 1 GiB free disk, 90% used max | `server/http/healthcheck/healthcheck_handler.go:31-32,54` | |
 | Body limits | Multipart 100 MiB, App Store 64 KiB, vehicle catalog 20 MiB | `utilities/helpers/helpers.go:17` and handlers | |
 | Detached background context | 30 s | `utilities/context/context.go:15` | |
@@ -452,10 +452,9 @@ See [Background jobs](/engineering/api/background-jobs).
     | Name | Value | Where | Effect |
     | --- | --- | --- | --- |
     | Query defaults | `staleTime` 5 min, 1 retry | `src/sites/dashboard/main.tsx:89-90`, `src/shared/bootstrap/renderSite.tsx:19` | |
-    | Presence | 10 s | `src/sites/dashboard/pages/PresencePage.tsx:77-99` | |
     | Rides tab | 10 s with active rides, else 60 s; page 50 | `src/sites/dashboard/components/RidesTab.tsx:359,445` | |
-    | Driver ops | 20 s | `src/hooks/useDriverOps.ts:4` | |
-    | Supply and demand | 15 s and 60 s | `src/hooks/useSupplyDemand.ts:208,219` | |
+    | Driver ops | 20 s | `src/hooks/useDriverOps.ts:4` | Only the unrouted `DriverOpsPage` polls. `SilentCancelRide` imports only `driverOpsKeys` for cache invalidation |
+    | Live operations | 10 s, stale 10 s, one retry | `src/hooks/useLive.ts:31` | |
     | Contact sync, marketing segments | 15 s | `src/sites/dashboard/pages/ContactSyncPage.tsx:111`, `components/MarketingSegments.tsx:155` | |
     | Fleet calendar | 15 s | `src/components/FleetCalendar.tsx:75` | |
     | Notification logs | 30 s, page 25 | `src/components/notifications/NotificationLogsTable.tsx:60,112` | |
@@ -487,8 +486,8 @@ See [Background jobs](/engineering/api/background-jobs).
 
 | Name | Value | Where | Effect |
 | --- | --- | --- | --- |
-| `E2E_FIXTURE_TTL` | 30 min, must be above 0 and at most 24 h | `config.go:383,494` | |
-| Control API key | At least 32 bytes | `config.go:486` | |
+| `E2E_FIXTURE_TTL` | 30 min, must be above 0 and at most 24 h | `config.go:389,500` | |
+| Control API key | At least 32 bytes | `config.go:492` | |
 | Auth rate multiplier | ×100 | `service/authv3_composition.go:24` | |
 | Expired run sweep | 100 | `server/http/e2econtrol/routes.go:147` | |
 | Smoke test | 18 attempts, 6 deep, 5 s delay, 5 s connect, 10 s request | `yelo-api` `scripts/release/smoke-candidate.sh:16-20` | Release candidate checks |

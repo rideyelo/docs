@@ -1,0 +1,246 @@
+---
+title: "API changelog"
+description: "Merged yelo-api pull requests since August 25, 2026, grouped by week, with migrations, breaking changes, and configuration called out."
+---
+
+This page tracks merged pull requests in `rideyelo/yelo-api`, newest week first. Weeks start on Monday and use the merge date in UTC.
+
+Markers on each line:
+
+- **Migration**: adds files under `migrations/`. The release pipeline applies them before the new revision takes traffic. See [Deployment](/engineering/deployment).
+- **Breaking**: changes an HTTP contract, an authorization rule, or a behavior that a client or operator has to adapt to.
+- **Config**: needs an environment variable, secret, trigger setting, or dashboard setting outside the code. See [Environment variables](/reference/environment-variables).
+
+Dependency bumps, CI changes, and E2E tooling are summarized in one line per week.
+
+<Update label="Week of September 21, 2026" description="Live market operations API, silent ride cancellation, fleet membership editing and archive guards, canonical top locations, and coordinate-only stops">
+  **Dashboard**
+
+  - **Breaking.** Market operations moved from `/dashboard/supply-demand/*` to `/dashboard/live/*`. The routes add scoped ride analytics, prior-period comparisons, timing ranges, cancellation flows, cached competitor quotes, effective operating hours, and recent driver locations. **Config:** competitor quotes need `POSTHOG_PERSONAL_API_KEY` and `POSTHOG_PROJECT_ID`. `POSTHOG_QUERY_HOST` defaults to `https://us.posthog.com`. The optional `DASHBOARD_PREVIEW=true` needs `ENVIRONMENT=dev`. [#277](https://github.com/rideyelo/yelo-api/pull/277). See [Live operations](/dashboard/live).
+  - Admins can silently cancel a free, accepted ride (`driver_en_route`, `driver_waiting`, or `in_progress`). The cancellation skips notifications and payments and is guarded by the ride's lifecycle revision. New endpoints: `GET /dashboard/rides/{id}/silent-cancellation` and `POST /dashboard/rides/{id}/silent-cancel`. [#278](https://github.com/rideyelo/yelo-api/pull/278). See [Admin silent cancellation](/concepts/cancellations#admin-silent-cancellation).
+  - Uncomplete metrics, totals, and ride lists only count confirmed rides that never matched, and exclude superseded searches. Pre-match cancellations split into `match_timeout`, `rider_cancel`, `driver_cancel`, and `unknown_cancel`. **Breaking** for consumers with fixed category mappings. [#254](https://github.com/rideyelo/yelo-api/pull/254). See [Ride metrics](/dashboard/ride-metrics).
+  - Community and fleet KPIs add `confirmed_requests`. `completion_rate` is now completed confirmed rides divided by confirmed requests. [#255](https://github.com/rideyelo/yelo-api/pull/255). See [Ride metrics](/dashboard/ride-metrics).
+  - Derived fleet tags require an activated driver application, and the activation check is scoped to the target user. **Migration** `000343` and `000344` replace `dashboard_user_tags`, with no table changes or backfill. [#261](https://github.com/rideyelo/yelo-api/pull/261), [#263](https://github.com/rideyelo/yelo-api/pull/263). See [User directory](/dashboard/user-directory).
+  - Log triage fixes. Idle drivers show up in driver options again, after only busy drivers had been offered. Fleet Stripe status no longer returns 500 for accounts that haven't finished onboarding. Stripe accounts rejected outright count as `invalid` and are rechecked weekly. `num_seats` is validated against the vehicle type's `min_seats`. **Breaking:** dashboard role and scope denials in handlers return 403 instead of 401, and lead messages add a required `phone_invalid` field. [#266](https://github.com/rideyelo/yelo-api/pull/266). See [Direct requests](/engineering/matching/direct-requests) and [Vehicle types and catalog](/engineering/domains/vehicle-types-and-catalog).
+
+  **Fleets**
+
+  - Admins can read and edit a driver's fleet memberships and active fleet with `GET` and `PUT /dashboard/users/detail/{id}/fleets`. Edits are rejected during rides, take idle drivers offline, and update payout routing and shared vehicle selection in one transaction. Archiving a fleet is refused until its drivers, payouts, rides, sessions, primary communities, vehicles, and QR links are cleared. **Migration** `000346` adds archive reference-guard triggers. **Breaking:** legacy email enrollment is admin-only, and automatic enrollment only uses the default community's primary fleet. **Config:** that fleet must be active core Yelo with `owner_operator` payouts and `has_custom_payouts = false`. [#273](https://github.com/rideyelo/yelo-api/pull/273). See [Fleet Stripe accounts and lifecycle](/engineering/fleets/stripe-and-lifecycle) and [Active fleet, membership, and payout routing](/engineering/fleets/membership-and-payout-routing).
+
+  **Rides and matching**
+
+  - Immediate (T0) ride notifications no longer check seats. The check compared against `num_riders`, which is null until the trip is rated, so it matched no drivers. [#275](https://github.com/rideyelo/yelo-api/pull/275). See [Notification fan-out](/engineering/matching/notification-fan-out).
+  - The `verified_student` badge now follows the fleet's `is_student_only` setting instead of the fleet name `Yelo`. [#276](https://github.com/rideyelo/yelo-api/pull/276). See [Rider option ordering and badges](/engineering/fleets/isolation#rider-option-ordering-and-badges).
+  - Ride options carry at most one badge, picked in the order `verified_student`, `fleet`, `cheapest`, `fastest`. The community's primary fleet no longer gets a `fleet` badge. [#280](https://github.com/rideyelo/yelo-api/pull/280). See [Rider option ordering and badges](/engineering/fleets/isolation#rider-option-ordering-and-badges).
+  - Missing or "Current location" stop addresses are resolved before any ride, location, or payment write. Stops are compared by coordinates, and transient geocoding failures are retried once. **Config:** needs Mapbox permanent-geocoding access. [#267](https://github.com/rideyelo/yelo-api/pull/267). See [Search, geocoding, and places](/engineering/location/search-and-places#reverse-geocoding).
+  - Coordinate stops are accepted even when address lookup fails. Stops without an address skip address caches, search tracking, and address-targeted discounts. **Migration** `000347` restores the `Locations_address_key` unique constraint on fresh databases and is a no-op in production. [#274](https://github.com/rideyelo/yelo-api/pull/274). See [Search, geocoding, and places](/engineering/location/search-and-places#reverse-geocoding).
+  - Idle drivers' auto-assignments start right away, and stranded queued rides are recovered by existing maintenance. Assignment is recorded before promotion. [#264](https://github.com/rideyelo/yelo-api/pull/264). See [Queue promotion and recovery](/engineering/matching/queue-promotion).
+  - `ride_auto_queued` events record candidate count, deadhead minutes, final score, queue load, and confirm-to-assignment time again. [#268](https://github.com/rideyelo/yelo-api/pull/268). See [Auto-queue scoring](/engineering/matching/auto-queue-scoring).
+
+  **Places**
+
+  - Community top locations point to canonical Yelo place profiles, with per-community visibility and an opt-in 24-hour River refresh. **Migration** `000345` adds place profiles, community slots, and settings. It backfills existing entries as manual and unverified, and hides every community's list by default. **Breaking:** dashboard create and update take place references instead of venue snapshots. [#265](https://github.com/rideyelo/yelo-api/pull/265). See [Community top locations](/guides/community-top-locations).
+
+  **Platform**
+
+  - `/metrics` and `/debug/pprof` are only mounted when `METRICS_AUTH_TOKEN` is set. `PPROF_ENABLED` now defaults to `false`. **Config:** production reads the token from the `yelo-api-metrics-auth-token` secret. Local `.env` files need `METRICS_AUTH_TOKEN` for the local Prometheus stack. [#279](https://github.com/rideyelo/yelo-api/pull/279). See [Observability](/engineering/observability).
+  - Dependencies: maps, Twilio, gRPC, and OpenTelemetry modules. [#262](https://github.com/rideyelo/yelo-api/pull/262)
+</Update>
+
+<Update label="Week of September 14, 2026" description="Ride state snapshots, fleet calendars, shared fleet vehicles, contact sync, place identity, dashboard authorization scopes, and whole-dollar fares">
+  **Rides and matching**
+
+  - Ride state is protected by authoritative snapshots, monotonic revisions, assignment generations, and transactional lifecycle fences. **Migration** `000336` to `000342` add revision counters, operation journal and cancellation-quote tables, E2E fixture constraints, and backfill `payment_consent_at` from `confirm_time`. **Config:** set `RIDE_STATE_SNAPSHOT_ENABLED=true` only after every writer runs the revision-aware binary. New clients negotiate `X-Ride-State-Protocol: 1`. **Breaking:** the minimum app version is 5.7.3, and older apps get HTTP 426. [#253](https://github.com/rideyelo/yelo-api/pull/253). See [Concurrency and races](/engineering/matching/concurrency).
+  - Non-Yelo fleets get T0 alerts whether or not they're the community's primary fleet. [#237](https://github.com/rideyelo/yelo-api/pull/237). See [Notification fan-out](/engineering/matching/notification-fan-out).
+  - "Current location" pickup labels are replaced with the pickup address before the ride is stored. [#243](https://github.com/rideyelo/yelo-api/pull/243). See [Search, geocoding, and places](/engineering/location/search-and-places).
+
+  **Fleets and vehicles**
+
+  - Fleets can own shared vehicles with per-vehicle approval, a default selection, and inherited application approval. Drivers can share a vehicle at the same time. **Migration** `000333` adds fleet ownership and selection triggers. `000334` seeds the Tallahassee Breeze cart. `000335` creates the mobile artwork catalog. **Breaking** deploy order: drain driver traffic during the cutover, because the old API can't read ownerless vehicles. [#242](https://github.com/rideyelo/yelo-api/pull/242). See [Fleet vehicles and vehicle resolution](/engineering/fleets/vehicles) and [Fleet vehicles](/dashboard/fleet-vehicles).
+  - Vehicle catalog republication reuses byte-identical artwork instead of returning 502. [#248](https://github.com/rideyelo/yelo-api/pull/248). See [Vehicle types and catalog](/engineering/domains/vehicle-types-and-catalog).
+  - Owner-operator fleets can create and redeem invitations without fleet Stripe onboarding. [#251](https://github.com/rideyelo/yelo-api/pull/251). See [Fleet joins and invitation links](/engineering/fleets/joins-and-invitations).
+  - Fleet calendars are imported from Google Calendar every five minutes, and community timezones are derived from bounds. **Migration** `000314` to `000318` retire waitlisting, add timezone history, backfill fleet service communities, and add calendar credentials, bindings, and snapshots. **Breaking:** bounds updates require `expected_geography_revision`, and retired capacity fields return validation errors. **Config:** calendar OAuth credentials, URLs, owner email, and token encryption keys go on the `yelo-api-release-manual` trigger. [#197](https://github.com/rideyelo/yelo-api/pull/197). See [Fleet service communities and operating calendars](/engineering/fleets/service-communities-and-calendars).
+  - Admins can rename calendar zone prefixes. Zone geometry and descriptions are returned for the dashboard calendar. **Migration** `000319`. [#220](https://github.com/rideyelo/yelo-api/pull/220). See [Fleet operating hours](/admin/operating-hours).
+  - Admins can correct fleet calendar IDs. Community and rider hours come from the primary fleet calendar. User and lead fleet tags are derived from active membership. **Migration** `000320` and `000321`. [#224](https://github.com/rideyelo/yelo-api/pull/224). See [Fleet operating hours](/admin/operating-hours).
+
+  **Dashboard**
+
+  - Dashboard roles and assignments are enforced for interns and fleet managers, including on global endpoints. **Breaking:** missing or malformed Clerk assignments are denied. [#228](https://github.com/rideyelo/yelo-api/pull/228). See [Dashboard roles and access](/administration/dashboard-roles).
+  - Ride maps with optional route geometry, ride ID search, typo-tolerant user search, and tag filters. **Breaking:** the retired dashboard GTM endpoints are removed. [#213](https://github.com/rideyelo/yelo-api/pull/213). See [User directory](/dashboard/user-directory).
+  - Admins can manually activate approved driver leads. [#221](https://github.com/rideyelo/yelo-api/pull/221). See [Driver leads pipeline](/dashboard/driver-leads).
+  - App version telemetry returns every version and filters by report age (`app_version_months`). [#226](https://github.com/rideyelo/yelo-api/pull/226). See [Telemetry](/dashboard/telemetry).
+
+  **Pricing**
+
+  - Pricing configs can add jitter, round up to whole dollars, or leave fares unadjusted. Admins manage global jitter settings. **Migration** `000324` and `000325`. [#232](https://github.com/rideyelo/yelo-api/pull/232). See [Global jitter settings](/dashboard/ride-pricing#global-jitter-settings).
+
+  **Contact sync**
+
+  - Contact profiles sync to Resend and Quo through a shared engine with change-driven jobs and periodic reconciliation. **Migration** `000322` and `000323`. **Config:** a dedicated contacts secret, Resend enablement, account alias, and 200 ms Quo pacing on the release trigger. [#227](https://github.com/rideyelo/yelo-api/pull/227). See [Contact sync](/administration/contact-sync).
+  - `GET /dashboard/contact-sync` reports sync progress. Resend reads no longer send a request body. [#229](https://github.com/rideyelo/yelo-api/pull/229)
+  - Resend contact throughput rises to 5 requests per second under a shared 8 per second budget. **Config:** `RESEND_REQUEST_INTERVAL=125ms` and `RESEND_CONTACT_REQUEST_INTERVAL=200ms` on the release trigger. [#230](https://github.com/rideyelo/yelo-api/pull/230). See [Contact sync internals](/engineering/domains/contact-sync).
+  - Admins can build marketing segments from typed filters, reconciled through River. **Migration** `000332` adds segment tables, activity triggers, and a contact refresh backfill. [#239](https://github.com/rideyelo/yelo-api/pull/239). See [Contact sync](/administration/contact-sync).
+  - Reliability: Quo binding imports are batched ([#231](https://github.com/rideyelo/yelo-api/pull/231)), control jobs are coalesced ([#233](https://github.com/rideyelo/yelo-api/pull/233)), and the signup subscription choice survives rejected creates ([#234](https://github.com/rideyelo/yelo-api/pull/234)).
+
+  **Places**
+
+  - Stored places get an application-owned identity across locations, likes, recents, venues, bumps, and ride stops. **Migration** `000326` to `000328` add the place catalog, provider aliases, and a resumable River backfill. [#238](https://github.com/rideyelo/yelo-api/pull/238). See [Search, geocoding, and places](/engineering/location/search-and-places).
+  - **Migration** `000331` skips oversized provider aliases so the identity backfill can finish. [#241](https://github.com/rideyelo/yelo-api/pull/241)
+  - POI enrichment fixes for YELO-1279: bounded name extensions ([#244](https://github.com/rideyelo/yelo-api/pull/244)), abbreviated street names and `yelo_place_id` on recents sync ([#246](https://github.com/rideyelo/yelo-api/pull/246)), no 15-minute repair cooldown and Google profiles preferred ([#247](https://github.com/rideyelo/yelo-api/pull/247)), local label variants and paginated text search ([#249](https://github.com/rideyelo/yelo-api/pull/249)), ranking by distance and name evidence ([#250](https://github.com/rideyelo/yelo-api/pull/250)), and street-address recovery queries ([#252](https://github.com/rideyelo/yelo-api/pull/252)). **Config:** #252 needs Geocoding API access on the Google Maps key. See [Search, geocoding, and places](/engineering/location/search-and-places).
+
+  **Notifications**
+
+  - Signup Slack alerts are sent once, 90 seconds after signup, with fewer fields. [#222](https://github.com/rideyelo/yelo-api/pull/222). See [Slack alerts](/engineering/notifications/slack-alerts).
+  - Template saves reject malformed placeholders and unsupported settings. Dispatch lists show sender names. **Breaking** for saves that used to be accepted. [#223](https://github.com/rideyelo/yelo-api/pull/223). See [Templates and rendering](/engineering/notifications/templates-and-rendering).
+  - Dashboard (Clerk) actors are stored separately from app users on schedules, dispatches, and template edits. **Migration** `000329` and `000330`. [#240](https://github.com/rideyelo/yelo-api/pull/240). See [Operator broadcasts and scheduling](/engineering/notifications/broadcasts-and-scheduling).
+
+  **Accounts and communities**
+
+  - The reserved Yelo community is excluded from automatic assignment, and ordinary accounts in it are repaired on their next community resolution. [#212](https://github.com/rideyelo/yelo-api/pull/212), [#214](https://github.com/rideyelo/yelo-api/pull/214). See [Community assignment by location](/engineering/location/community-assignment).
+  - Test accounts (`is_test`) keep their community during Auth v3 geo resolution. [#235](https://github.com/rideyelo/yelo-api/pull/235)
+  - Hosted Auth v3 redirects keep the app channel and transaction ID. [#236](https://github.com/rideyelo/yelo-api/pull/236). See [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions).
+  - School verification keeps an authenticated session instead of replacing it with a presignup token. [#245](https://github.com/rideyelo/yelo-api/pull/245). See [School verification](/engineering/identity/school-verification).
+
+  **Platform**
+
+  - Dependencies: pgx, oauth2, uuid, and Redis test modules. [#225](https://github.com/rideyelo/yelo-api/pull/225)
+</Update>
+
+<Update label="Week of September 7, 2026" description="Durable ride messaging, driver leads CRM, school catalog imports, recent locations sync, and founding-driver T0 alerts">
+  **Messaging**
+
+  - Ride messaging gets inbox batches, forward deltas, paginated history, monotonic read state, and idempotent sends. **Migration** `000300` adds message ordinals, read state, and counters, and backfills existing messages. [#170](https://github.com/rideyelo/yelo-api/pull/170). See [Ride messaging](/engineering/domains/ride-messaging).
+
+  **Rides and matching**
+
+  - Founding-tagged drivers get immediate T0 notifications, and non-primary fleet T0 recipients get the same eligibility checks. [#188](https://github.com/rideyelo/yelo-api/pull/188). See [Notification fan-out](/engineering/matching/notification-fan-out).
+  - Each fleet or vehicle option is a selectable parent with auto-queue drivers as children. Pickup estimates include active and queued rides. **Migration** `000311` adds `display_name` and `image_asset` to pricing records. [#194](https://github.com/rideyelo/yelo-api/pull/194). See [Pricing configuration and admin](/engineering/domains/pricing-configuration).
+  - Direct driver offers are back, with a 30-second expiry and fallback matching. [#196](https://github.com/rideyelo/yelo-api/pull/196). See [Direct requests](/engineering/matching/direct-requests).
+
+  **Accounts and schools**
+
+  - Student verification grants student status and home community without moving the user's current community. School OAuth no longer overwrites `user.email`. Adds a dry-run-first annual school importer. **Migration** `000301` to `000303`. [#172](https://github.com/rideyelo/yelo-api/pull/172). See [Schools and communities](/administration/schools-and-communities).
+  - School imports use an explicit `Schools.is_synthetic` flag and stricter identity checks. **Migration** `000307`. [#175](https://github.com/rideyelo/yelo-api/pull/175), [#183](https://github.com/rideyelo/yelo-api/pull/183). See [Community and school administration](/engineering/domains/communities-and-schools-admin).
+  - Auth v3 signup contention and lost responses are recovered with `/authv3/transaction/resume`. **Migration** `000308` adds durable Quo sync requests. [#184](https://github.com/rideyelo/yelo-api/pull/184). See [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions).
+  - Users more than 20 miles outside their community move to the default community. If no default exists, they stay where they are. [#185](https://github.com/rideyelo/yelo-api/pull/185), [#190](https://github.com/rideyelo/yelo-api/pull/190). See [Community assignment by location](/engineering/location/community-assignment).
+  - Web Auth v3 returns `/auth/v3` as the entry instead of the callback. **Config:** `https://signup.yelo.link/auth/v3` was added to the web redirect allowlist. [#198](https://github.com/rideyelo/yelo-api/pull/198)
+  - Twilio Verify client-side rejections log at warn instead of error. [#192](https://github.com/rideyelo/yelo-api/pull/192)
+
+  **Dashboard and integrations**
+
+  - Driver leads CRM with phone-keyed leads, deterministic stages, notes, and deduplicated batch imports. **Migration** `000306`. [#174](https://github.com/rideyelo/yelo-api/pull/174). See [Driver leads pipeline](/dashboard/driver-leads).
+  - Quo requests are paced globally, and Stripe account reconciliation runs as per-account River jobs. `+1555` test numbers skip SMS. **Migration** `000304` and `000305`. [#173](https://github.com/rideyelo/yelo-api/pull/173). See [Connect accounts and onboarding](/engineering/payments/connect-accounts).
+  - Dashboard Quo reads use a second key behind a shared gate. **Config:** `QUO_DASHBOARD_API_KEY`, with optional `QUO_DASHBOARD_REQUEST_INTERVAL_MS` (default 200). [#199](https://github.com/rideyelo/yelo-api/pull/199). See [Driver leads internals](/engineering/domains/driver-leads).
+  - Contact sync rejects incomplete snapshots, and user detail shows matching diagnostics. **Migration** `000312` and `000313`. [#195](https://github.com/rideyelo/yelo-api/pull/195). See [User social graph and saved places](/engineering/domains/user-social-graph).
+  - Dashboard POIs are filtered before pagination, and silent cache-invalidation pushes follow POI, like, friendship, privacy, and deletion changes. [#186](https://github.com/rideyelo/yelo-api/pull/186). See [Map layer payloads, access, and map change pushes](/engineering/domains/map-layers-and-map-changes).
+  - Google Play release changes post to Slack. **Migration** `000310`. [#191](https://github.com/rideyelo/yelo-api/pull/191). See [App stores, telemetry, and system endpoints](/engineering/domains/app-stores-and-telemetry).
+
+  **Places and notifications**
+
+  - Recent locations sync per user, capped at 50. **Migration** `000309`. [#187](https://github.com/rideyelo/yelo-api/pull/187). See [Search, geocoding, and places](/engineering/location/search-and-places#recents-and-likes).
+  - `GET /notification/bump/preview` renders the bump SMS without sending it. [#176](https://github.com/rideyelo/yelo-api/pull/176). See [SMS, iMessage, and friend bumps](/engineering/notifications/sms-and-friend-bumps).
+
+  **Platform**
+
+  - CI moved Go jobs back to x64 ([#171](https://github.com/rideyelo/yelo-api/pull/171)) and retired legacy tooling, including the old deploy, redeem-bucket, and repair targets ([#200](https://github.com/rideyelo/yelo-api/pull/200)). The E2E deploy gets a Mapbox key ([#193](https://github.com/rideyelo/yelo-api/pull/193)). The recents handoff doc was removed ([#189](https://github.com/rideyelo/yelo-api/pull/189)). Dependencies: [#179](https://github.com/rideyelo/yelo-api/pull/179), [#182](https://github.com/rideyelo/yelo-api/pull/182), [#211](https://github.com/rideyelo/yelo-api/pull/211).
+</Update>
+
+<Update label="Week of August 31, 2026" description="sqlc migration, fleet driver invitations, silent data pushes, isolated E2E environment, and latency work">
+  **Fleets**
+
+  - Fleets get rotatable driver invitation links with public preview and authenticated redemption. Fleet membership, active fleet, community, and payout ownership update together. **Migration** `000299`. [#163](https://github.com/rideyelo/yelo-api/pull/163). See [Fleet driver invitations](/fleets/driver-invitations).
+  - Breeze and other non-primary fleet drivers get notified immediately at T0. [#168](https://github.com/rideyelo/yelo-api/pull/168). See [Notification fan-out](/engineering/matching/notification-fan-out).
+
+  **Rides and matching**
+
+  - A confirmed ride is no longer superseded by a delayed duplicate create. Drivers who come online get pending rides. [#139](https://github.com/rideyelo/yelo-api/pull/139). See [Ride board](/engineering/matching/ride-board).
+  - Driver declines are idempotent and hidden from that driver's board. **Migration** `000285` enforces one decline reason per ride and driver. [#150](https://github.com/rideyelo/yelo-api/pull/150). See [Ride board](/engineering/matching/ride-board).
+  - Auto-queue defaults to off. **Migration** `000282` resets existing rows. [#129](https://github.com/rideyelo/yelo-api/pull/129). See [Matching and auto-queue](/concepts/matching-and-auto-queue).
+  - Messages return 403 for non-participants and are stored before notifying. [#125](https://github.com/rideyelo/yelo-api/pull/125). See [Ride messaging](/engineering/domains/ride-messaging).
+  - Fewer Mapbox and Google calls through shared route caches, and queue summaries rebuild on drift. [#149](https://github.com/rideyelo/yelo-api/pull/149). See [Routing, distance, and ETA providers](/engineering/location/routing-and-distance).
+
+  **Notifications**
+
+  - Push tokens live only on `Users.push_notification_token`, and deliveries are recorded in the ride timeline. **Migration** `000286` backfills tokens from `DeviceTelemetry`. [#151](https://github.com/rideyelo/yelo-api/pull/151). See [Push send pipeline](/engineering/notifications/send-pipeline).
+  - Silent data pushes for cache invalidation, including a `ride_status_changed` template. **Migration** `000293` and `000294`. **Config:** `AUTH_V3_APPLE_NATIVE_CLIENT_ID` for the new `POST /authv3/providers/apple/native`. [#154](https://github.com/rideyelo/yelo-api/pull/154). See [Mobile push handling](/engineering/notifications/mobile-push-handling).
+  - SMS variants can omit the title ([#123](https://github.com/rideyelo/yelo-api/pull/123)), and admins not linked to a Yelo user can edit templates ([#126](https://github.com/rideyelo/yelo-api/pull/126)). See [Templates and rendering](/engineering/notifications/templates-and-rendering).
+
+  **Accounts**
+
+  - Auth v3 lists connected login identities, and school email OTP verification is persisted. [#131](https://github.com/rideyelo/yelo-api/pull/131)
+  - Deleted accounts get a machine-readable `AccountDeletedError`, and their sessions are revoked. [#134](https://github.com/rideyelo/yelo-api/pull/134). See [Account deletion and retention](/engineering/identity/account-deletion).
+  - Adding school proof no longer replaces an authenticated user's email or links Google as a login. [#141](https://github.com/rideyelo/yelo-api/pull/141). See [School verification](/engineering/identity/school-verification).
+  - Auth v3 authorize accepts an optional `attempt_id`, and `authv3.step` telemetry gains more dimensions. **Migration** `000284`. [#148](https://github.com/rideyelo/yelo-api/pull/148)
+  - **Breaking.** The minimum app version rose to 5.7.1. Update responses include the link in both the nested and legacy fields. [#164](https://github.com/rideyelo/yelo-api/pull/164). See [Mobile releases](/engineering/mobile/releases).
+
+  **Dashboard and analytics**
+
+  - Global user filters, admin-only community archive, and nightly top public locations. **Migration** `000281`. [#128](https://github.com/rideyelo/yelo-api/pull/128). See [Communities](/dashboard/communities).
+  - Signup acquisition uses Auth v3 touches, onboarding surveys, and referrals. [#136](https://github.com/rideyelo/yelo-api/pull/136). See [Global KPIs](/dashboard/overview).
+  - Mobility feeds track errors and back off when they fail. **Migration** `000283`. [#135](https://github.com/rideyelo/yelo-api/pull/135). See [Map layers and mobility feeds](/engineering/location/map-layers-and-mobility).
+  - Historical ride routes for pricing maps, over 7 to 60 days. **Migration** `000297` and `000298`. [#162](https://github.com/rideyelo/yelo-api/pull/162). See [Ride pricing](/dashboard/ride-pricing).
+  - Clearing a zone description with `null` now saves. [#169](https://github.com/rideyelo/yelo-api/pull/169)
+
+  **Places**
+
+  - Uncategorized POI imports resolve their category by name search, and the category backfill covers public and liked rows. [#130](https://github.com/rideyelo/yelo-api/pull/130), [#132](https://github.com/rideyelo/yelo-api/pull/132). See [Search, geocoding, and places](/engineering/location/search-and-places).
+
+  **Performance and reliability**
+
+  - Lower latency for user status polling ([#137](https://github.com/rideyelo/yelo-api/pull/137)) and Auth v2 status and community reads ([#138](https://github.com/rideyelo/yelo-api/pull/138)). See [User profile, status, and account lifecycle](/engineering/domains/user-profile-and-status).
+  - Drive history reads Stripe fees from the database, and Quo sync moves to a transactional outbox with River jobs. **Migration** `000287` to `000292`. [#153](https://github.com/rideyelo/yelo-api/pull/153). See [Integrations](/engineering/api/integrations).
+  - `ListCommunities` runs as one aggregate pass. [#167](https://github.com/rideyelo/yelo-api/pull/167)
+  - PostHog business events were being dropped without a `DistinctId`. They now send, and Auth v3 funnel events carry `transaction_id`. [#121](https://github.com/rideyelo/yelo-api/pull/121), [#122](https://github.com/rideyelo/yelo-api/pull/122). See [Analytics events](/reference/analytics-events).
+  - Expected 4xx responses log at warn, and Quo retries honor `Retry-After`. [#133](https://github.com/rideyelo/yelo-api/pull/133)
+
+  **Data layer**
+
+  - Every repository statement now goes through sqlc, and integration tests run in production pgx mode. [#124](https://github.com/rideyelo/yelo-api/pull/124), [#127](https://github.com/rideyelo/yelo-api/pull/127), [#140](https://github.com/rideyelo/yelo-api/pull/140), [#158](https://github.com/rideyelo/yelo-api/pull/158), [#159](https://github.com/rideyelo/yelo-api/pull/159). See [Data layer](/engineering/api/data-layer).
+
+  **Platform**
+
+  - Isolated E2E environment that follows production. **Migration** `000295` and `000296` add run and paired-actor tables. **Config:** set `E2E_RELEASE_ENABLED=true` to turn on convergence. [#155](https://github.com/rideyelo/yelo-api/pull/155), [#156](https://github.com/rideyelo/yelo-api/pull/156), [#157](https://github.com/rideyelo/yelo-api/pull/157), [#160](https://github.com/rideyelo/yelo-api/pull/160), [#161](https://github.com/rideyelo/yelo-api/pull/161), [#165](https://github.com/rideyelo/yelo-api/pull/165). See [E2E environment reset](/runbooks/e2e-environment-reset).
+  - CI runner changes ([#166](https://github.com/rideyelo/yelo-api/pull/166)) and dependencies ([#147](https://github.com/rideyelo/yelo-api/pull/147)).
+</Update>
+
+<Update label="Week of August 24, 2026" description="Automated releases and migrations, map layers, friend bumps, Resend and StudID verification, and Auth v3 web sessions">
+  **Releases and infrastructure**
+
+  - Production releases run through GitHub Actions and Cloud Build. Migrations run as a Cloud Run job before a 0% candidate is smoke-tested and promoted. Releases are serialized. **Config:** `API_RELEASE_ENABLED` gated the cutover, and the native push trigger was disabled for #120. [#71](https://github.com/rideyelo/yelo-api/pull/71), [#72](https://github.com/rideyelo/yelo-api/pull/72), [#73](https://github.com/rideyelo/yelo-api/pull/73), [#75](https://github.com/rideyelo/yelo-api/pull/75), [#78](https://github.com/rideyelo/yelo-api/pull/78), [#86](https://github.com/rideyelo/yelo-api/pull/86), [#120](https://github.com/rideyelo/yelo-api/pull/120). See [Deployment](/engineering/deployment).
+  - **Migration** `000267` was checked in to match production ([#74](https://github.com/rideyelo/yelo-api/pull/74)). `000271` replaced a failed B-tree index on `Locations.mapbox_id` with a hash index ([#93](https://github.com/rideyelo/yelo-api/pull/93)). See [Failed migration](/runbooks/failed-migration).
+  - Database connections are sized to the production budget, and every connection sets `application_name`. [#77](https://github.com/rideyelo/yelo-api/pull/77), [#87](https://github.com/rideyelo/yelo-api/pull/87). See [Data layer](/engineering/api/data-layer).
+  - Production pins `AUTH_V3_CORS_ALLOW_CREDENTIALS=false` ([#76](https://github.com/rideyelo/yelo-api/pull/76)). Disk health is capacity-aware ([#79](https://github.com/rideyelo/yelo-api/pull/79)). The Redis startup budget is 180 seconds for Direct VPC cold starts ([#116](https://github.com/rideyelo/yelo-api/pull/116)).
+
+  **Accounts**
+
+  - Auth v3 OTP delivery tracking with a Twilio Verify status webhook and fallback resend. **Migration** `000266`. [#70](https://github.com/rideyelo/yelo-api/pull/70). See [Phone OTP and abuse controls](/engineering/identity/phone-otp-and-rate-limits).
+  - Auth v3 funnel metrics and `transaction_id` from authorize ([#81](https://github.com/rideyelo/yelo-api/pull/81)). Web-native signup sessions with one-hour access tokens, rotating refresh sessions, and guest Stripe tip checkout ([#82](https://github.com/rideyelo/yelo-api/pull/82)). Abandoned attempts can restart ([#84](https://github.com/rideyelo/yelo-api/pull/84)). Web callers keep their origin, and tip links point to JoinYelo ([#85](https://github.com/rideyelo/yelo-api/pull/85)). See [Tokens, sessions, and keys](/engineering/identity/tokens-and-sessions).
+  - Transactional email moves from SendGrid to Resend, and StudID verification is added. **Migration** `000280` backfills Google education proofs. [#119](https://github.com/rideyelo/yelo-api/pull/119) fixed the backfill after it failed in production. **Config:** `GOOGLE_ALLOWED_AUDIENCES` and the StudID settings, with `AUTH_V3_STUDID_ENABLED=false` until smoke checks pass. [#115](https://github.com/rideyelo/yelo-api/pull/115). See [School verification](/engineering/identity/school-verification).
+  - Community assignment reconciliation is hardened for native coordinates, manual switches, and ride creation. [#117](https://github.com/rideyelo/yelo-api/pull/117). See [Community assignment by location](/engineering/location/community-assignment).
+
+  **Map and social**
+
+  - Privacy-aware map layers (community, friends, vehicles, heatmap, and mobility), destination bumps, and rider location-sharing controls. **Migration** `000272` to `000276`. [#100](https://github.com/rideyelo/yelo-api/pull/100). See [Map layers and mobility feeds](/engineering/location/map-layers-and-mobility).
+  - Static GTFS feeds, Mobility Database suggestions, and dashboard map previews. **Migration** `000277`. [#104](https://github.com/rideyelo/yelo-api/pull/104). See [Community map](/dashboard/community-map).
+  - The heatmap refreshes at startup and every five minutes, uses 60 days of locations, and uses 50 m cells. **Migration** `000278`. [#105](https://github.com/rideyelo/yelo-api/pull/105), [#107](https://github.com/rideyelo/yelo-api/pull/107)
+  - Live vehicle presence is stored and shown end to end. [#109](https://github.com/rideyelo/yelo-api/pull/109). See [Heartbeat and presence](/engineering/location/heartbeat-and-presence).
+  - Liked-location categories resolve on read. **Migration** `000270`. [#90](https://github.com/rideyelo/yelo-api/pull/90)
+
+  **Notifications**
+
+  - Server-driven friend bumps over push and SMS with `POST /notification/bump`. **Migration** `000268` and `000269` add SMS delivery state and `Users.sms_opted_out_at`. **Config:** point the Twilio inbound webhook at `POST /twilio-webhook`, and set `TWILIO_AUTH_TOKEN`. [#83](https://github.com/rideyelo/yelo-api/pull/83). See [SMS, iMessage, and friend bumps](/engineering/notifications/sms-and-friend-bumps).
+  - Bumps go by SMS first with push as a fallback, and public bump intent appears in the Moves feed ([#101](https://github.com/rideyelo/yelo-api/pull/101)). Bump SMS copy comes from the editable `friend_bump_sms` template ([#103](https://github.com/rideyelo/yelo-api/pull/103)). A Photon iMessage sender is available but off unless `PHOTON_PROJECT_ID` and `PHOTON_PROJECT_SECRET` are set ([#118](https://github.com/rideyelo/yelo-api/pull/118)).
+  - The River push pipeline is restored, stale time-sensitive jobs are canceled, and missing templates block startup. [#88](https://github.com/rideyelo/yelo-api/pull/88), [#92](https://github.com/rideyelo/yelo-api/pull/92), [#94](https://github.com/rideyelo/yelo-api/pull/94). See [Push send pipeline](/engineering/notifications/send-pipeline).
+  - Signup Slack notifications are restored for every auth path. [#91](https://github.com/rideyelo/yelo-api/pull/91). See [Slack alerts](/engineering/notifications/slack-alerts).
+
+  **Dashboard**
+
+  - Experimental flags on users and communities, with active experiments in user detail. **Migration** `000265`. [#67](https://github.com/rideyelo/yelo-api/pull/67), [#68](https://github.com/rideyelo/yelo-api/pull/68)
+  - Admins can move a user to the Yelo community ([#102](https://github.com/rideyelo/yelo-api/pull/102)) and toggle test status, which also controls free test pricing. **Migration** `000279` backfills test users ([#114](https://github.com/rideyelo/yelo-api/pull/114)). See [User directory](/dashboard/user-directory).
+  - Funnel metrics exclude incomplete and test accounts. [#89](https://github.com/rideyelo/yelo-api/pull/89). See [Dashboard analytics internals](/engineering/domains/dashboard-analytics).
+  - Ride history tolerates a null `complete_time`. [#113](https://github.com/rideyelo/yelo-api/pull/113)
+
+  **Platform**
+
+  - Consumer OpenAPI contract reconciliation ([#69](https://github.com/rideyelo/yelo-api/pull/69)), migration code owners ([#80](https://github.com/rideyelo/yelo-api/pull/80)), frontend release sync ([#110](https://github.com/rideyelo/yelo-api/pull/110), [#111](https://github.com/rideyelo/yelo-api/pull/111), [#112](https://github.com/rideyelo/yelo-api/pull/112)), CI caching ([#108](https://github.com/rideyelo/yelo-api/pull/108)), and dependencies ([#95](https://github.com/rideyelo/yelo-api/pull/95) to [#99](https://github.com/rideyelo/yelo-api/pull/99), [#106](https://github.com/rideyelo/yelo-api/pull/106)).
+</Update>

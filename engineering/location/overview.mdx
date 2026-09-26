@@ -62,7 +62,7 @@ flowchart LR
 | Is this driver online for matching? | `Users.is_online_driver` | Until 30 minutes without a status ping |
 | Which community is this user in? | `Users.community_id`, echoed in the JWT | JWT lags until reissued |
 | Which zone is this point in? | `"Zones".geometry`, resolved in Go | Read per pricing call, quotes cached 5 minutes |
-| Which places are top locations? | `CommunityTopLocations` joined to `PlaceProfiles` | Refreshed at most every 24 hours |
+| Which places are top locations? | `CommunityTopLocations` joined to `PlaceProfiles` | Manual by default. Automatic refresh is opt-in per community, then at most every 24 hours |
 
 ## Threshold reference
 
@@ -124,7 +124,7 @@ flowchart LR
 | Session suggestions | 10 minutes | `sessionSuggestTTL` |
 | Place details and retrieve cache | 7 days | `placeDetailsCacheTTL` |
 | POI match | Score ≥ 0.65, ≤ 5 km | `minimumPOIEvidence` |
-| Top-location refresh | Every 24 hours, 40 candidates, 8 seconds each | `toplocations.go` |
+| Top-location refresh | Every 24 hours when `automatic` is on, 40 candidates, 8 seconds each | `toplocations.go` |
 
 ### Map layers
 
@@ -142,7 +142,7 @@ flowchart LR
 
 | Area | API | Mobile | Dashboard |
 | --- | --- | --- | --- |
-| Presence | `internal/service/heartbeat`, `internal/data/redis/presence_cache.go` | `providers/HeartbeatProvider.tsx` | `src/sites/dashboard/pages/PresencePage.tsx` |
+| Presence | `internal/service/heartbeat`, `internal/data/redis/presence_cache.go` | `providers/HeartbeatProvider.tsx` | `src/sites/dashboard/pages/LivePage.tsx` |
 | Location upload | `internal/service/user/user.go`, `internal/server/http/user` | `providers/LocationProvider.tsx`, `tasks/DriverLocationTask.ts` | None |
 | Communities | `internal/service/authv3/active_community.go`, `queries/community.sql` | `lib/map/communityResolution.ts` | `src/components/CommunityBoundingBoxPicker.tsx` |
 | Zones | `internal/models/zone.go`, `internal/utilities/pricing/zoned.go` | `lib/map/zones.ts` | `src/components/communitymap/useZonesLayer.ts` |

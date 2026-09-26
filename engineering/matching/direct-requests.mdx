@@ -63,7 +63,7 @@ flowchart TD
 | 3 | `no_active_session` | `GetDriverSession` fails or returns nothing |
 | 4 | `session_changed` | Session fleet differs from the confirmed price's fleet, or session vehicle differs from the presence vehicle |
 | 5 | `vehicle_changed` | `driverOptionProfiles` has no profile, or its fleet or vehicle type differs from the confirmed price |
-| 6 | `eta_unavailable` | The rough ETA filter dropped the driver |
+| 6 | `eta_unavailable` | The rough ETA filter dropped the driver, or the active-ride or queue-summary lookup failed |
 | 7 | `eta_too_long` | Accurate ETA is 60 minutes or more |
 
 Two more reasons come from later steps: `board_unavailable` and `notification_failed`.
@@ -72,7 +72,7 @@ Two more reasons come from later steps: `board_unavailable` and `notification_fa
 
 `directDriverETAUnavailableReason` reuses the driver-options helpers in `driver_options.go`:
 
-1. `enrichWithQueueSummaries` loads the cached queue summary. If the driver has an active ride, it counts that ride and adds its remaining time, rounded up to whole minutes. The origin becomes the active ride's dropoff when the queue is empty.
+1. `enrichWithQueueSummaries` checks for an active ride and loads the cached queue summary. A `NotFound` from `GetDriverActiveRideInfo` means the driver is idle and they stay a candidate. Any other lookup error drops them. If the driver has an active ride, it counts that ride and adds its remaining time, rounded up to whole minutes. The origin becomes the active ride's dropoff when the queue is empty.
 2. `roughSortAndFilter` computes `roughMinutes = totalMinutes + haversineKm / 0.5`, which assumes 30 km/h. Drivers at 60 rough minutes or more are dropped, which returns `eta_unavailable`.
 3. `applyAccurateETAs` calls Mapbox. `etaSeconds = totalMinutes * 60 + duration`. On a Mapbox error or invalid result, it falls back to `roughMinutes * 60`.
 4. `etaSeconds >= 3600` returns `eta_too_long`.

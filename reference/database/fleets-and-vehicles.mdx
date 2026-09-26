@@ -75,7 +75,7 @@ erDiagram
 | `stripe_status` | `text` | no | `'not_required'` | Fleet Stripe onboarding state. `complete` is required for payout readiness. |
 | `stripe_onboarding_url` | `text` | yes | | Stripe onboarding link. |
 | `is_active` | `boolean` | no | `true` | Inactive fleets are hidden from pricing, joins, and vehicle availability. |
-| `deleted_at` | `timestamptz` | yes | | Soft delete. Partial index on rows where it is null. |
+| `deleted_at` | `timestamptz` | yes | | Archive time. Set by **Archive fleet**. Partial index on rows where it is null. See [Fleet archival](#fleet-archival). |
 | `created_at`, `updated_at` | `timestamptz` | no | `now()` | Timestamps. |
 | `requires_confirmation_code` | `boolean` | no | `true` | When `false`, `generateConfirmCodeForFleet` in `internal/service/ride/rider.go` skips the pickup PIN. |
 | `is_student_only` | `boolean` | no | `false` | Hides the fleet's ride options from riders without a student account (`filterRideTypesForRider`). |
@@ -90,6 +90,34 @@ erDiagram
 
 Dashboard fleet invites are Clerk invitations with fleet assignments in metadata (`internal/service/dashboard/dashboard.go`). No invite table exists in Postgres.
 
+### Fleet archival
+
+`DELETE /dashboard/communities/{id}/fleets/{fleet_id}` archives a fleet through `DeleteFleet` in `internal/data/repository/dashboard.go`. It locks the fleet, then runs `GetFleetArchiveBlockers` (`queries/fleet_archive.sql`). Archival is refused while any of these exist:
+
+- An active `"FleetDrivers"` row for the fleet.
+- A `"DriverApplications".payout_fleet_id` pointing at it.
+- An open `"DriverSessions"` row (`end_time IS NULL`).
+- A `"Rides"` row for the fleet outside `complete`, `pending_rider_rating`, and `no_drivers_available`.
+- A `"Communities".primary_fleet_id` pointing at it.
+- A fleet vehicle that is unarchived or selected as some user's `vehicle_id`.
+- An active `"QrPaymentConfigs"` row.
+
+When nothing blocks, one transaction runs `DeactivateDashboardFleet` (`is_active = false`, `deleted_at = now()`, `driver_join_code = NULL`), `RetireArchivedFleetServices` (`updated_by = 'fleet_archive'`), `EndArchivedFleetPricing`, and `DisableArchivedFleetWhitelist`. The row, historical rides, and `stripe_merchant_id` are kept. There is no unarchive path.
+
+**Archive guard triggers.** Migration `000346_fleet_archive_reference_guards` adds `guard_unarchived_fleet_reference()`. It takes `FOR SHARE` on the referenced fleet row, which conflicts with archival's `UPDATE`, and raises `Fleet is archived or missing` (SQLSTATE `23514`) when the fleet has `deleted_at` set or doesn't exist. It checks on insert, when the fleet column changes, and for `"FleetDrivers"` and `"QrPaymentConfigs"` whenever the row is active. For `"QrPaymentConfigs"` it also checks when `stripe_payment_link_id` changes. Historical rows stay editable while their fleet reference doesn't change.
+
+| Trigger | Table | Fires before |
+| --- | --- | --- |
+| `guard_fleet_membership_archive` | `"FleetDrivers"` | Insert, or update of `fleet_id` or `is_active` |
+| `guard_fleet_ride_archive` | `"Rides"` | Insert, or update of `fleet_id` |
+| `guard_fleet_primary_archive` | `"Communities"` | Insert, or update of `primary_fleet_id` |
+| `guard_fleet_vehicle_archive` | `"FleetVehicles"` | Insert, or update of `fleet_id` |
+| `guard_fleet_payout_archive` | `"DriverApplications"` | Insert, or update of `payout_fleet_id` |
+| `guard_fleet_qr_archive` | `"QrPaymentConfigs"` | Insert, or update of `fleet_id`, `is_active`, or `stripe_payment_link_id` |
+| `guard_fleet_session_archive` | `"DriverSessions"` | Insert, or update of `fleet_id` |
+
+The migration adds no columns and backfills nothing. Its down migration drops the triggers and the function.
+
 ## Fleet drivers
 
 `"FleetDrivers"` records fleet membership.
@@ -102,12 +130,14 @@ Dashboard fleet invites are Clerk invitations with fleet assignments in metadata
 
 - Primary key `(fleet_id, driver_id)`. Unique partial index `fleet_drivers_one_active_per_driver` on `driver_id` where `is_active`, so a driver has at most one active fleet.
 - `SetDriverActiveFleet` flips every membership in one statement. `UpsertDriverFleetMembership` inserts or reactivates. `DeactivateOtherDriverFleets` clears the others.
+- The admin membership editor (`GET` and `PUT /dashboard/users/detail/{id}/fleets`, `internal/data/repository/driver_fleet_memberships.go`) reads `ListDriverFleetMemberships`, which includes archived fleets as `is_archived`. A confirmed edit locks the user, compares the expected memberships and active fleet, then locks the fleets in order. It adds rows with `AddInactiveDriverFleetMembership`, deletes explicit removals with `RemoveDriverFleetMemberships`, and clears a fleet vehicle the driver can no longer use (`ClearRevokedDriverFleetVehicle`). A driver with an active ride blocks the whole edit.
+- Inactive memberships in archived fleets remain and can be removed, but the archive guard rejects reactivating them.
 - Trigger `fleet_driver_default_vehicle` runs `select_fleet_default_vehicle()` after insert or update of `is_active`. When a membership becomes active, it sets `"Users".vehicle_id` to the fleet's default approved, unarchived vehicle. If the fleet has none and the user's current vehicle is fleet inventory, it clears `vehicle_id`.
-- Assignment on driver onboarding (`reconcileFleetAssignmentForUser` in `internal/service/driver/driver.go`): keep an existing fleet, then use the whitelist entry for the user's email, then the community's `primary_fleet_id`.
+- Assignment on going online (`reconcileFleetAssignmentForUser` in `internal/service/driver/driver.go`): keep the active fleet, else activate the first existing membership, else call `AddDriverToDefaultFleet` with the `primary_fleet_id` of the default community (`GetDefaultCommunity`: `is_default`, not test, not archived). That insert only happens when the driver still has no membership under the driver lock, and the fleet must be ready and `owner_operator`. The email whitelist and a market community's `primary_fleet_id` aren't used.
 
 ## Fleet driver whitelist
 
-`"FleetDriverWhitelist"` pre-assigns a driver to a fleet and community by email before they sign up.
+`"FleetDriverWhitelist"` maps an email to a fleet and community. Automatic fleet assignment no longer reads it, so an entry doesn't create a membership.
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
@@ -121,7 +151,8 @@ Dashboard fleet invites are Clerk invitations with fleet assignments in metadata
 
 - Indexes on `community_id`, `email` (redundant with the unique constraint), and `(fleet_id, is_active)` where active.
 - `UpsertFleetDriverWhitelist` moves an existing email to the new fleet and reactivates it.
-- Read by `internal/service/driver/driver.go` for fleet assignment and by `GetWhitelistSchoolMatch` (`queries/education_commerce.sql`) to place a whitelisted user in the right community.
+- Read only by `GetWhitelistSchoolMatch` (`queries/education_commerce.sql`, called from `internal/data/repository/schools.go`) to place a whitelisted user in the right community.
+- `DisableArchivedFleetWhitelist` sets `is_active = false` on a fleet's entries when the fleet is archived.
 
 ## Fleet community services
 
@@ -191,7 +222,7 @@ Used by dashboard pricing lists in `queries/community.sql`, `ListActiveFleetComm
 | `driver_id` | `uuid` | yes | | Owner of a personal vehicle. Null for fleet inventory since migration `000333_fleet_owned_vehicles`. No foreign key. |
 | `color`, `make`, `model`, `license_plate` | `varchar(255)` | no | | Vehicle details. |
 | `year` | `integer` | no | | Model year. |
-| `num_seats` | `integer` | no | `4` | Seats. Dispatch requires `num_seats >= num_riders`. |
+| `num_seats` | `integer` | no | `4` | Seats. Must be at least the vehicle type's `min_seats`. Dispatch doesn't compare it to `Rides.num_riders`, which is only set after the trip. |
 | `license_plate_state` | `text` | no | `''` | Plate state. |
 | `application_status` | `text` | no | `'not_applied'` | Review state: `not_applied`, `pending`, `complete`, `failed`, or `restricted` (`models.ApplicationStatus`). Only `complete` vehicles can go online. |
 | `application_submission_time` | `timestamptz` | yes | | Submission time. |

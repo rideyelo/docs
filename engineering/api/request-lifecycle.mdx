@@ -43,21 +43,21 @@ sequenceDiagram
 
 `enableCORS` runs before routing so it can answer preflight requests.
 
-- In `dev`, CORS is disabled and any `Origin` is echoed back.
+- In `dev`, CORS is disabled and any `Origin` is echoed back. `ENVIRONMENT` defaults to `dev`, so a deployment that omits it reflects every origin.
 - Elsewhere, only origins in `CORS_TRUSTED_ORIGINS` (or the built-in default list) receive `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials: true`.
 - `/authv3` paths use a separate exact allowlist, `AUTH_V3_CORS_ORIGINS`, and never inherit the legacy trusted origins. Auth v3 preflights also allow the `X-API-Version` header and expose `Retry-After` and `X-Request-ID`.
 - Preflight responses allow `OPTIONS, GET, POST, PUT, PATCH, DELETE` and cache for 3600 seconds.
 
 ### Global middleware
 
-The router registers these in order, so they wrap every Fuego route:
+The router registers these in order. Fuego applies them to each route when it's registered on its `http.ServeMux`, so they wrap every Fuego route but don't run for requests that match no route:
 
 | Order | Middleware | What it does |
 | --- | --- | --- |
 | 1 | `middleware.Recoverer` (Chi) | Recovers panics and returns 500 |
 | 2 | `sentryhttp` | Only when Sentry is initialized; re-panics after capture |
 | 3 | `contextSetRequestInfo` | Generates a UUID request ID, stores method, path, `Origin`, and the start time in context |
-| 4 | `otelInstrumentation` | Creates the span (named `METHOD /route/pattern`), records request and response size, inflight gauge, slow requests, and error counters |
+| 4 | `otelInstrumentation` | Wraps the request in an `otelhttp` span, records request and response size, inflight gauge, slow requests, and error counters. Span names and the `http.route` label use the raw path, because Fuego routes on `http.ServeMux` and the middleware looks for a Chi route pattern. See [Metrics](/reference/metrics#spans) |
 | 5 | `contextSetLogger` | Attaches a zerolog logger with trace correlation fields to the context |
 | 6 | `rateLimit` | Per-IP token bucket (see [Rate limiting](#rate-limiting)) |
 
@@ -80,7 +80,7 @@ After the global chain, Fuego groups add their own middleware. The group decides
 | `/dashboard` | `getClerkAuthMiddleware` + `getDashboardScopeMiddleware` | Clerk session JWT |
 | `/internal` | `getInternalKeyMiddleware` | `X-Internal-Key` header |
 | `/internal/e2e` | `getE2EKeyMiddleware` | `X-E2e-Key` header, only when `E2E_ENABLED=true` |
-| `/metrics`, `/debug/pprof/` | `metricsAuthMiddleware` | Bearer `METRICS_AUTH_TOKEN` when set |
+| `/metrics`, `/debug/pprof/` | `metricsAuthMiddleware` | Bearer `METRICS_AUTH_TOKEN`. Not mounted when the token is empty |
 | Webhooks | None at the group level | Each handler verifies a signature |
 
 Some ride routes use `getOptionalAuthMiddleware`: a valid token attaches the user, but a missing or invalid token never returns 401. Details of every credential are in [Authentication](/engineering/api/authentication).
@@ -220,6 +220,7 @@ When you add a new error type, add it to this switch and to the circuit breaker'
 - Defaults: 50 requests per second with a burst of 100, set by the `--limiter-rps`, `--limiter-burst`, and `--limiter-enabled` flags.
 - A janitor goroutine runs every minute, evicts IPs not seen for 3 minutes, and reports `rate.limiter.active_clients`. It stops when `Server.Shutdown` closes the `done` channel.
 - Rejections return 429 with a `null` body and increment the rate-limit rejection metric.
+- The key is spoofable. `GetRealIP` (`internal/utilities/network/ip.go`) trusts a client-supplied `X-Real-IP` header first, then the leftmost `X-Forwarded-For` entry, and only falls back to `RemoteAddr` when both are absent. A client that rotates these headers gets a fresh bucket per value.
 
 Because the bucket is per instance, the effective limit scales with the number of Cloud Run instances. Auth v3 adds a separate durable limiter backed by Postgres for OTP and sign-in dimensions. See [Authentication](/engineering/api/authentication#auth-v3).
 
@@ -249,8 +250,8 @@ These handlers bypass Fuego and mount on the underlying mux:
 
 | Path | Purpose |
 | --- | --- |
-| `/metrics` | Prometheus scrape endpoint |
-| `/debug/pprof/` | pprof, when `PPROF_ENABLED` is true |
+| `/metrics` | Prometheus scrape endpoint, only when `METRICS_AUTH_TOKEN` is set (`mountObservability`) |
+| `/debug/pprof/` | pprof, only when `METRICS_AUTH_TOKEN` is set and `PPROF_ENABLED` is true (default `false`) |
 | `/riverui/` and `POST /riverui/session` | Embedded River UI for admins |
 | `/authv3`, `/authv3/` | Return `AuthV3UnavailableError` (503) when Auth v3 is disabled |
 | `/swagger/...` | Fuego's OpenAPI JSON and UI |

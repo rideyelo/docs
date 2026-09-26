@@ -26,30 +26,32 @@ One endpoint that every page uses is **not** a dashboard route. `useCommunityGet
 
 ## Shell queries on every page
 
-These run regardless of route, from `DashboardLayout`, `Topbar`, and `Sidebar`.
+These run regardless of route, from `DashboardLayout`, `Topbar`, `Sidebar`, and `SidebarCommunityScope`.
 
 | Component | Call | Endpoint | Refresh | Notes |
 | --- | --- | --- | --- | --- |
-| `components/Topbar.tsx` | `useCommunityGetAllCommunities` | `GET /community/` | Default (5 min stale) | Feeds `CommunityDropdown` and `GlobalSearch`. |
+| `components/Topbar.tsx`, `components/SidebarCommunityScope.tsx` | `useCommunityGetAllCommunities` | `GET /community/` | Default (5 min stale) | One shared query. Feeds `GlobalSearch` in the top bar and `CommunityDropdown` in the sidebar. |
+| `components/SidebarCommunityScope.tsx` | `useCommunityGetCommunityFleets` | `GET /dashboard/{id}/fleets` | 60 s stale, fleet managers only | Labels the fleet manager's current fleet. |
 | `components/Sidebar.tsx` | `useDriversGetGlobalPendingDrivers` | `GET /dashboard/drivers/global/pending` | `staleTime` 5 min, `gcTime` 15 min, admin only | Handler `community/global_drivers_handler.go:46` rejects non-admins. |
 | `sites/dashboard/search/GlobalSearch.tsx` | `useDashboardGetAllFleets` | `GET /dashboard/fleets` | Only while the palette is open, admin only, 5 min stale | Warms the cache so fleets become search results. |
 | `GlobalSearch.tsx` | `dashboardGetUsersGlobal` (`useQuery`) | `GET /dashboard/users?search=&limit=15` | 300 ms debounce, 30 s stale, admin only, query length 1–256 | Live user results. |
 | `components/GlobalLoadingBar.tsx` | `useIsFetching()` | — | — | Shows while any query is in flight, including background polls. |
 
-## Overview and KPI
+## Home and KPI
+
+`/` renders `RootRoute`, which redirects `admin` to `/live`, `intern` to `/community`, and `fleet` to `/fleets`. It issues no queries.
 
 | Route · component | Hook | Endpoint | API handler → service | Refresh |
 | --- | --- | --- | --- | --- |
-| `/` · `OverviewPage` | `useCommunityGetMarketKPIs(id, { range })` | `GET /dashboard/{id}/kpis` | `community_handler.go:161` → `DashboardService.GetMarketKPIs` | Default; refetches when `range` changes |
 | `/kpi` · `OrgKpiCards`, `KpiCharts` | `useDashboardGetGlobalKPIs` | `GET /dashboard/kpi/global` | `dashboard/kpi/handlers.go:44` → `KpiService.GetGlobalKPIs` | Default. Both components share one query key, so one request. |
 | `/kpi` · `AcquisitionBreakdown` | `useDashboardGetAcquisitionBreakdown` | `GET /dashboard/kpi/acquisition` | `kpi/handlers.go:59` → `KpiService.GetAcquisitionBreakdown` | Default |
 | `/kpi` · `NextActionQueue` | `useDriverLeads` | `GET /dashboard/leads/drivers` | `dashboard/leads/handler.go:118` → `ListDriverLeads` | **30 s poll**, refetch on focus, `retry: false` |
 
-`GetMarketKPIs` runs four queries: `GetDashboardMarketMetrics` and `CountDashboardSearches` for the current window and again for the previous window (`service/dashboard/dashboard.go:108`). `calculateTimeRanges` only knows `last_7_days`, `last_14_days`, and `last_30_days`; anything else silently becomes seven days. All KPI handlers call `requireAdmin` (`kpi/handlers.go:28`).
+All KPI handlers call `requireAdmin` (`kpi/handlers.go:28`). `GetMarketKPIs`, used by `/rides`, `/community`, and `/fleets`, runs four queries: `GetDashboardMarketMetrics` and `CountDashboardSearches` for the current window and again for the previous window (`service/dashboard/dashboard.go`). `calculateTimeRanges` handles `last_24_hours`, `last_7_days`, `last_14_days`, `last_30_days`, and `all_time`; anything else becomes seven days, but `GetKPIsRequest.Validate` rejects other values with `400` first.
 
 ## Drivers (`/drivers`)
 
-`LeadsPage` renders one of two trees. Fleet managers get only an embedded `DriversPage`. Everyone else gets `DriverPipelinePage` with `?tab=` values `pipeline` (default), `priority`, `payouts`, `disqualified`, and `drivers`. A `?userId=` parameter forces the `drivers` tab. `?lead=` or `?user=` opens the lead detail.
+`LeadsPage` renders one of two trees. For admins, `DriversPage` reads the market from `?community=` before falling back to the remembered community. Fleet managers get only an embedded `DriversPage`. Everyone else gets `DriverPipelinePage` with `?tab=` values `pipeline` (default), `priority`, `payouts`, `disqualified`, and `drivers`. A `?userId=` parameter forces the `drivers` tab. `?lead=` or `?user=` opens the lead detail.
 
 | Component | Hook | Endpoint | Refresh and gate |
 | --- | --- | --- | --- |
@@ -76,30 +78,43 @@ These run regardless of route, from `DashboardLayout`, `Topbar`, and `Sidebar`.
 | Trips · `RidesTab` | `useRidesList` (`hooks/useRides.ts`) | `GET /dashboard/rides` with `community_id` or `all=true`, `status`, `search`, `fleet_id`, `limit`, `offset`, `sort`, `order`, `include_routes` | **10 s while `has_active`, else 60 s** | Scope allows `GET /dashboard/rides` for all roles. Handler forces fleet managers to their assigned fleets and ignores `all` for non-admins. |
 | Trips · fleet filter | `useCommunityGetCommunityFleets` | `GET /dashboard/{id}/fleets` | Default | Disabled for fleet managers |
 | Trips · zone overlay | `useZonesList` | `GET /dashboard/communities/{id}/zones` | Default | Admin only in UI |
-| Trips · `RideDetailSheet` | `useRideEvents`, `useRideRoute` | `GET /dashboard/rides/{id}/events`, `/route` | Default | Admin-only in UI and in `rides_handler.go:129,166` |
+| Trips · `RideDetailSheet` | `useRideEvents`, `useRideRoute` | `GET /dashboard/rides/{id}/events`, `/route` | Default | Admin-only in UI and in `rides_handler.go` |
+| Trips · `SilentCancelRide` (inside `RideEventsTimeline`) | `dashboardGetSilentCancellation`, `dashboardSilentCancelRide` | `GET /dashboard/rides/{id}/silent-cancellation`, `POST /dashboard/rides/{id}/silent-cancel` | Eligibility `staleTime: 0`, no retry. Success invalidates `ride-events`, rides, `live`, and driver ops keys. | Admin-only in UI, handler, and service |
 | KPIs · `RidesKpisTab` | `useCommunityGetMarketKPIs`, `useCommunityGetCancellationKPIs`, `useCommunityGetUncompleteKPIs` | `GET /dashboard/{id}/kpis`, `/dashboard/community/{id}/cancellations/kpis`, `.../uncompletes/kpis` | Default | Intern scope allows `cancellations` and `uncompletes` GETs for their own community |
-| Issues | `useCommunityGetCancellationBreakdowns`, `useCommunityGetUncompleteBreakdowns`, `useIssueRows` | `.../cancellations`, `.../cancellations/breakdowns`, `.../uncompletes`, `.../uncompletes/breakdowns` | Rows: 30 s stale | Same |
+| Issues | `useCommunityGetCancellationBreakdowns`, `useCommunityGetUncompleteBreakdowns`, `useIssueRows` | `.../cancellations`, `.../cancellations/breakdowns`, `.../uncompletes`, `.../uncompletes/breakdowns` with `range` from `?range=` | Rows: 30 s stale | Same |
 | Searches · `SearchesPage` | `useCommunityGetSearchInsights`, `useCommunityGetSearchMapData` | `GET /dashboard/{id}/search-insights`, `/search-map-data` | Default | Intern read allowlist |
 | Searches · `TopLocationsManager` | `useCommunityGetTopLocations`, `...Settings`, plus create, update, delete, seed, resolve | `/dashboard/{id}/top-locations/*` | Polls every **2 s for up to 180 s** after a refresh request, until `refreshed_at` advances | Intern scope allows all `top-locations` methods |
 
-On `/rides`, admins choose scope with `?community=` and `?scope=community|global`. `useActivityCommunity` returns no community for the global scope, so the KPIs, Issues, and Searches tabs show `ActivityMarketPrompt` instead of silently using the top-bar community.
+On `/rides`, admins choose scope with `?community=` and `?scope=community|global`. `useActivityCommunity` returns no community for the global scope, so the KPIs, Issues, and Searches tabs show `ActivityMarketPrompt` instead of silently using the sidebar community.
 
-`include_routes=true` (admins) adds each ride's stored route, capped at 256 coordinates per row, and clamps `limit` to 200 (`rides_handler.go:100`). In all cases, `DashboardService.GetDashboardRides` (`internal/service/dashboard/rides.go`) replaces a `limit` below 1 or above 1000 with 50.
+`include_routes=true` (admins) adds each ride's stored route, capped at 256 coordinates per row, and clamps `limit` to 200 (`rides_handler.go`). In all cases, `DashboardService.GetDashboardRides` (`internal/service/dashboard/rides.go`) replaces a `limit` below 1 or above 1000 with 50.
 
-## Supply and demand (`/supply-demand`)
+## Live (`/live`)
 
-Tabs are local state (`defaultValue="overview"`), not URL-synced. The legacy `/presence` and `/driver-ops` redirects land on **Overview**.
+For the API side of this page, see [Live operations internals](/engineering/domains/live-operations).
 
-| Tab · component | Hook (`hooks/useSupplyDemand.ts` unless noted) | Endpoint | Refresh |
+`LivePage` has no tabs. The selected market is the shared `CommunityContext` selection, and `period` and the rides filter are local state, so neither is in the URL. `/presence` and `/driver-ops` redirect here. `/supply-demand` has no route and renders the **Coming Soon** fallback.
+
+Queries use `useLiveData` (`components/live/useLiveData.ts`) or `hooks/useLive.ts`. `staleTime` equals the poll interval, `gcTime` is 5 minutes, and `retry` is 1.
+
+| Section · component | Hook | Endpoint | Refresh |
 | --- | --- | --- | --- |
-| Overview · `KPISummaryBar` | `useSupplyDemandKPIs` | `GET /dashboard/supply-demand/kpis` | 60 s |
-| Overview · `MarketList` | `useSupplyDemandMarkets` | `GET /dashboard/supply-demand/markets` | 15 s |
-| Overview · `DriverTable`, `RidesTable` | `useSupplyDemandDrivers`, `useSupplyDemandRides` | `.../markets/{id}/drivers`, `.../markets/{id}/rides?older=` | 15–20 s, staggered per community by a hash of its ID |
-| Overview · actions | `useSetSurge`, notify, ping driver, ping rider | `POST .../markets/{id}/surge`, `.../notify`, `.../drivers/{id}/ping`, `.../riders/{id}/ping` | Surge invalidates all supply-demand keys |
-| Presence · `PresencePanel` | `dashboardGetPresenceSummary`, `...Users`, `...Map` | `GET /dashboard/presence/summary`, `/users`, `/map` | 10 s each |
-| Driver Ops · `DriverOpsPage` | `useDriverOps` (`hooks/useDriverOps.ts`) | `GET /dashboard/driver-ops` | 20 s, refetch on focus |
+| Market cards | `useCommunityGetAllCommunities` | `GET /community/` | 60 s, filtered to `is_active` and not `rides_disabled` |
+| Market cards | `useLiveMarkets` | `GET /dashboard/live/markets` | 10 s |
+| Performance cards, **Service quality**, `RideFunnel` | `useLiveData('analytics')` | `GET /dashboard/live/analytics?community_id=&period=` | 60 s |
+| `LiveMap` markers | `useLiveData('map')` | `GET /dashboard/presence/map?community_id=` | 10 s |
+| `LiveMap` markers, **Drivers** table | `useLiveDrivers` | `GET /dashboard/live/markets/{id}/drivers` | 10 s |
+| `LiveMap` routes, **Live / active** rides | `useLiveData('rides')` | `GET /dashboard/rides?status=live&include_routes=true&limit=200` | 10 s |
+| 24-hour ride views | `useLiveData('recent-rides')` | `GET /dashboard/rides?status=<filter>&recent_only=true&limit=50&offset=` | 30 s, only when the filter isn't live |
+| Last-known users and rider fallback | `useUserCoords` | `GET /dashboard/communities/{id}/locations/user-coords` | 10 s, only while **Last known users** is on, a presence marker lacks coordinates, or a live ride exists |
+| `LiveMap` zones | `useZonesList` | `GET /dashboard/communities/{id}/zones` | Default |
+| `LivePricing` configs | `usePricingGetOverview` | `GET /dashboard/pricing/overview` | 60 s |
+| `LivePricing` quotes | `useLiveData('competitor-prices')` | `GET /dashboard/live/competitor-prices?community_id=&period=` | 5 min |
+| `SurgeSlider` | `useSetSurge` | `POST /dashboard/live/markets/{id}/surge` | Invalidates every `['live']` key |
 
-Presence reads Redis only (`service/dashboard/presence.go`, `PresenceCache` and `ActivationCache`). Ping endpoints and driver ops call `requireAdmin` in their handlers.
+Hovering a market card prefetches its presence map and analytics. `LiveMap`, `LiveTables`, `RideFunnel`, and `LivePricing` are lazy chunks. The drivers table and map apply the same 10 km bounding-box buffer that the API uses for `drivers_online` (`liveMarkers.ts` `isNearMarket`).
+
+`NotifyMarketDialog` and `PingDialog` live in `components/live/` but only the unrouted `DriverOpsPage` imports `NotifyMarketDialog`, and nothing imports `PingDialog`. `/dashboard/live/notify`, `/ping`, `/kpis`, `/markets/{id}/rides`, `/surge-history`, `/dashboard/driver-ops`, and `/dashboard/presence/summary` and `/users` have no caller from a routed page.
 
 ## Map (`/map`)
 
@@ -160,15 +175,13 @@ Tabs are local state: `overview`, `payments`, `hours`. The active fleet resolves
 | Interval | Query | Where |
 | --- | --- | --- |
 | 2 s (bounded to 180 s) | Top locations + settings | `components/search/TopLocationsManager.tsx:39` |
-| 10 s | Presence summary, users, map | `sites/dashboard/components/PresencePanel.tsx:78` |
+| 10 s | Live markets, drivers, presence map, live rides, user coordinates | `hooks/useLive.ts`, `pages/LivePage.tsx` |
 | 10 s / 60 s | Rides list, depending on `has_active` | `sites/dashboard/components/RidesTab.tsx:445` |
-| 15 s | Market summaries | `hooks/useSupplyDemand.ts:219` |
-| 15–20 s | Market drivers and rides (staggered) | `hooks/useSupplyDemand.ts:17` |
 | 15 s | Fleet calendar, contact sync, marketing segments | `FleetCalendar.tsx:75`, `ContactSyncPage.tsx:111`, `MarketingSegments.tsx:155` |
-| 20 s | Driver ops snapshot | `hooks/useDriverOps.ts:4` |
-| 30 s | Driver leads, notification logs | `hooks/useDriverLeads.ts:27`, `NotificationLogsTable.tsx:112` |
+| 30 s | Driver leads, notification logs, **Live** 24-hour ride views | `hooks/useDriverLeads.ts:27`, `NotificationLogsTable.tsx:112`, `pages/LivePage.tsx` |
 | 45 s | River UI cookie | `pages/JobsPage.tsx:47` |
-| 60 s | Supply-demand KPIs, mobility layer, feed content layer | `useSupplyDemand.ts:208`, `CommunityMapPage.tsx:267`, `FeedPreview.tsx:230` |
+| 60 s | Live analytics, community catalog, pricing overview on **Live**, mobility layer, feed content layer | `pages/LivePage.tsx`, `components/live/LivePricing.tsx`, `CommunityMapPage.tsx:267`, `FeedPreview.tsx:230` |
+| 5 min | Competitor quotes on **Live** | `components/live/LivePricing.tsx` |
 
 TanStack Query's `refetchIntervalInBackground` defaults to `false`, so every poll above pauses in a hidden tab even where the option is omitted.
 
@@ -181,8 +194,9 @@ TanStack Query's `refetchIntervalInBackground` defaults to `false`, so every pol
 | `GET /dashboard/rides` | `ListDashboardRides` and `CountDashboardRides` each join riders, drivers, fleets, and communities, `ILIKE` on concatenated names, and sort with a large `CASE` expression. With `all=true` there is no community predicate. | `analytics.sql:851`, `:935`; `data/repository/dashboard_rides.go:12` |
 | `GET /dashboard/telemetry/summary` | Eleven sequential scans of `DeviceTelemetry` joined to `Users` (one per dimension) sharing a 15 s timeout instead of the default 5 s. | `data/repository/dashboard.go:1839` |
 | `GET /dashboard/{id}/search-insights` | Four aggregations plus a per-user name lookup for up to 100 recent searches, memoized per request. | `service/dashboard/dashboard.go:716`, `:811` |
-| `GET /dashboard/supply-demand/markets` | One `Community.GetByID` per market to compute `MarketStatus`, polled every 15 s by every open tab. | `service/dashboard/supply_demand.go:93` |
-| `GET /dashboard/presence/summary` | Two Redis calls per community on every 10 s poll. | `service/dashboard/presence.go:145` |
+| `GET /dashboard/live/markets` | One `Community.GetByID` per active, ride-enabled market (six at a time), then one Redis presence-hash read per online driver for the 10 km check. Polled every 10 s by every open **Live** tab, for every market. | `service/dashboard/supply_demand.go` `GetMarketSummaries`, `populateLivePresence` |
+| `GET /dashboard/live/analytics` | Two `GetLiveRideCohorts` group-bys and two `GetSupplyDemandKPIs` statements per call. `all` scans every ride in the market since 2020. | `service/dashboard/live.go`, `queries/supply_demand.sql` |
+| `GET /dashboard/communities/{id}/locations/user-coords` | Up to 5000 rows, polled every 10 s on **Live** while any ride is live. | `queries/places.sql` |
 
 Most repository methods wrap their context in `WithPostgresTimeout`, a 5-second deadline (`data/repository/storage.go:30`).
 
@@ -205,8 +219,9 @@ Most repository methods wrap their context in `WithPostgresTimeout`, a 5-second 
 
 - **Role changes lag.** The API reads role and assignments from Clerk session token claims, not from the Clerk API. After someone edits a user on `/access`, that user keeps their old scope until Clerk refreshes their token, even though `DashboardSession` remounts on the new `publicMetadata`.
 - **`401` means "outside the allowlist", not "signed out".** `dashboardScopeAllows` answers `401` for interns and fleet managers who hit a route not on their list. Check `dashboard_scope.go` before debugging Clerk.
-- **Rides always poll fast.** `HasActiveDashboardRides` treats any ride that is not `complete` and not canceled as active, with no time bound (`analytics.sql:954`). Stale `no_drivers_available` or `pending_rider_rating` rows keep `has_active` true, which keeps the Trips tab on the 10-second interval.
+- **Rides always poll fast.** `HasActiveDashboardRides` treats any ride that is not `complete` and not canceled as active, with no time bound (`analytics.sql:954`). Stale `no_drivers_available` or `pending_rider_rating` rows keep `has_active` true, which keeps the Trips tab on the 10-second interval. Every **Live** ride poll also pays for this `EXISTS` scan.
 - **Feed ad cards cannot load.** `FeedPreview` calls `GET /ad/{id}`, which sits in the app-JWT group (`router.go:186`). The dashboard's Clerk token fails there, so ad cards fall back to the "Ad" placeholder. `GET /ride/{id}` works because its optional-auth middleware ignores tokens it cannot parse.
-- **Tabs are not all URL-backed.** `/rides`, `/drivers`, `/manage`, `/communities`, and `/notifications` persist their tab in the query string. `/supply-demand`, `/fleets`, `/events`, and `/access` do not, so deep links always open their first tab.
+- **Tabs are not all URL-backed.** `/rides`, `/drivers`, `/manage`, `/communities`, and `/notifications` persist their tab in the query string. `/fleets`, `/events`, and `/access` do not, so deep links always open their first tab. **Live** keeps its period and rides filter in local state.
+- **`/supply-demand` bookmarks break.** `/presence` and `/driver-ops` redirect to `/live`, but `/supply-demand` falls through to **Coming Soon**.
 - **Invalid `community_id` on telemetry means global.** The handler ignores an unparseable ID and returns org-wide numbers instead of an error.
-- **Community list includes test communities.** `GET /community/` is unfiltered, so the top-bar dropdown and `CommunityFilterDropdown` show test markets to admins. `CommunityFilterDropdown` also does not filter by role.
+- **Community list includes test communities.** `GET /community/` is unfiltered, so the sidebar dropdown, **Live** market cards, and `CommunityFilterDropdown` show active test markets to admins. **Live** analytics exclude test communities, so a test market card shows live rides but zero performance numbers. `CommunityFilterDropdown` also does not filter by role.

@@ -53,11 +53,11 @@ Its search box filters only string fields of the rows already loaded, and sortin
 
 | Component or hook | File | Use it for |
 | --- | --- | --- |
-| `CommunityDropdown` | `src/components/CommunityDropdown.tsx` | Picking one community from a list you pass in. Props: `communities`, `value`, `onChange(id, community)`, `isLoading`, `disabled`, `variant`, `placeholder`. The top bar uses it with the role-filtered list. |
-| `CommunityFilterDropdown` + `useGlobalCommunityFilter` | `src/components/CommunityFilterDropdown.tsx`, `src/hooks/useGlobalCommunityFilter.ts` | Pages that default to **All Communities**. The hook returns `communityId`, `setCommunityId`, `communityParam` (`undefined` for all), and `isAll`. Used by `TelemetryPage` and `PresencePanel`. |
+| `CommunityDropdown` | `src/components/CommunityDropdown.tsx` | Picking one community from a list you pass in. Props: `communities`, `value`, `onChange(id, community)`, `isLoading`, `disabled`, `variant`, `placeholder`. `SidebarCommunityScope` uses it with the role-filtered list. |
+| `CommunityFilterDropdown` + `useGlobalCommunityFilter` | `src/components/CommunityFilterDropdown.tsx`, `src/hooks/useGlobalCommunityFilter.ts` | Pages that default to **All Communities**. The hook returns `communityId`, `setCommunityId`, `communityParam` (`undefined` for all), and `isAll`. Used by `TelemetryPage`. |
 | `useActivityCommunity` | `src/hooks/useActivityCommunity.ts` | Community analytics inside `/rides`. Returns `needsCommunity` when an admin is on the global scope so the page can render `ActivityMarketPrompt` instead of guessing. |
 | `FleetDropdown` | `src/components/FleetDropdown.tsx` | Picking a fleet within a community. Pair it with `rememberFleetId` from `useCommunity()` so the choice survives navigation. |
-| `TimeRangeSelector` | `src/components/TimeRangeSelector.tsx` | `last_7_days`, `last_14_days`, `last_30_days`. These are the only values the KPI services understand. |
+| `TimeRangeSelector` | `src/components/TimeRangeSelector.tsx` | `last_24_hours`, `last_7_days`, `last_14_days`, `last_30_days`, `all_time`. These are the only `range` values `GetKPIsRequest.Validate` accepts. Every selector lists all five. |
 | `TagCombobox`, `NotificationFilterSelect` | `src/components/users/`, `src/components/notifications/` | Searchable multi-option pickers built on `cmdk` |
 
 ### URL-backed state
@@ -68,8 +68,9 @@ Prefer query parameters for anything a teammate might link to. Existing conventi
 | --- | --- | --- |
 | `tab` | `/rides`, `/drivers`, `/manage`, `/communities` | Active tab |
 | `notification_tab` | `/notifications` | Active tab |
-| `community`, `scope` | `/rides`, `/pricing`, `/communities` | Admin market scope, or the community to open |
+| `community`, `scope` | `/rides`, `/pricing`, `/communities`, `/drivers` | Admin market scope, or the community to open |
 | `status`, `fleet`, `older`, `ride_id` | `/rides` | Trips filters and the open ride sheet |
+| `range` | `/rides` | Issues tab time range. **Live** links set it. |
 | `user` | `/users` | Open user sheet |
 | `lead`, `user`, `userId` | `/drivers` | Open lead, or jump to the drivers tab |
 | `fleet` | `/manage` | Open fleet (also `/manage/:fleetId`) |
@@ -90,7 +91,7 @@ Detail and edit surfaces use the shadcn `Sheet` from the right. The recurring sh
 | Read-mostly detail | `UserDetailSheet`, `RideDetailSheet`, `FleetDetailSheet`, `NotificationDetailSheet`, `DriverApplicationReviewSheet`, access detail sheets |
 | Forms with `react-hook-form` + `zod` | `PricingConfigSheet`, `SendNotificationSheet`, `MarketingSegments` |
 | Forms with local state | `FleetFormSheet`, `SchoolFormSheet`, `EventFormSheet`, `SpotFormSheet`, `LocationFormSheet`, `VehicleTypeFormSheet`, `InviteUserSheet` |
-| Confirmations (`AlertDialog`) | `CommunityDeleteDialog`, `CancelNotificationDialog`, `NotifyMarketDialog`, `PingDialog`, and inline confirms in `ManageFleetsPage`, `FleetDriverJoinLinkCard`, `SurgeSlider`, `UserDetailSheet` |
+| Confirmations (`AlertDialog`) | `CommunityDeleteDialog`, `CancelNotificationDialog`, `SilentCancelRide`, `UserFleetMemberships`, and inline confirms in `ManageFleetsPage`, `FleetDriverJoinLinkCard`, `SurgeSlider`, `UserDetailSheet`. `NotifyMarketDialog` and `PingDialog` in `components/live/` have no routed caller. |
 
 `UserDetailSheet` is a role wrapper: it renders nothing unless `useRole().isAdmin`, then mounts `AdminUserDetailSheet`. Follow that pattern when a sheet's endpoints are admin-only, so interns never fire requests that the API rejects.
 
@@ -101,14 +102,15 @@ All maps use `mapbox-gl` with `VITE_MAPBOX_API_KEY`. Each map module sets `mapbo
 | Component | Used by | Style | Notes |
 | --- | --- | --- | --- |
 | `useMapboxMap` + layer hooks (`src/components/communitymap/`) | `CommunityMapPage` | Follows theme (`light-v11` / `dark-v11` via `mapboxStyleForTheme`) | One long-lived map. Community changes call `fitBounds`; theme changes call `setStyle`, which drops `styleReady` so layer hooks re-add their sources. |
-| `RidesExplorerMap` | `RidesTab` | Follows theme | Trips map with stored routes |
-| `CommunityMap` | `OverviewPage`, `SchoolMappingPreviewPanel` | Follows theme | Bounding box and school pins |
+| `LiveMap` + `useDriverPhotoMarkers` (`src/components/live/`) | `LivePage` | Follows theme (`useMapboxMap`) | GeoJSON people and route layers updated in place, driver photo DOM markers, zones through `useZonesLayer`, and `MapLayerPanel` toggles |
+| `RidesExplorerMap` | `RidesTab` | Follows theme | Trips map with stored routes; layer toggles in `MapLayerPanel` |
+| `CommunityMap` | `SchoolMappingPreviewPanel` (and the unrouted `OverviewPage`) | Follows theme | Bounding box and school pins |
 | `CommunityManagementMap` | `CommunitiesPage`, `PricingPage` | Follows theme | Service-area overview |
 | `CommunityBoundingBoxPicker` | `CommunityEditor` | Follows theme | Draws the community bounding box; helpers in `communityBoundingBox.ts` |
-| `ZoneEditor` | `PricingZoneMap`, retired `ZonesPage` | `light-v11` only | `@mapbox/mapbox-gl-draw` polygon and trash controls |
-| `PresenceMap` | `PresencePanel` | `light-v11` only | Live user markers |
-| `SearchHeatmap` | `SearchesPage` | `light-v11` only | Search density |
-| `RideRouteMapPanel` → `RouteZonesMap` | `RideDetailSheet` | — | One ride's route over zones |
+| `ZoneEditor` | `PricingZoneMap`, retired `ZonesPage` | Follows theme | `@mapbox/mapbox-gl-draw` polygon and trash controls |
+| `SearchHeatmap` | `SearchesPage` | Follows theme | Search density |
+| `CalendarZoneMap` | `FleetCalendar` | Follows theme (`useMapboxMap`) | Calendar zones |
+| `RideRouteMapPanel` → `RouteZonesMap` | `RideDetailSheet` | Follows theme (`useMapboxMap`) | One ride's route over zones |
 
 ### Writing a layer hook
 
@@ -156,7 +158,8 @@ The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
 | `GlobalLoadingBar` | `src/components/GlobalLoadingBar.tsx` | Visible whenever `useIsFetching()` is non-zero |
 | `CachedAvatar` | `src/components/CachedAvatar.tsx`, `src/utils/avatarCache.ts` | Loads when visible, resizes to 80 px at 0.78 quality, stores in Cache Storage `yelo-avatars-v2` for 30 days, at most six concurrent fetches. Pass `cacheNamespace` when IDs from different entity types could collide. |
 | `getApiErrorMessage` | `src/lib/api-error.ts` | First non-empty `detail`, `message`, or `title`, including a nested `error` object |
-| `formatElapsed`, `formatDuration`, `formatCents` | `src/lib/elapsed.ts` | Count-up timers between polls, durations, and USD from cents |
+| `formatElapsed`, `formatDuration`, `formatCents` | `src/lib/elapsed.ts` | Count-up timers, durations, and USD from cents. Only the unrouted `DriverOpsPage` imports it. |
+| `rideFormatting`, `RideStatusBadge` | `src/components/rides/` | Shared TTM, TTP, TTD, wait, time, distance, and status rendering for `RidesTab` and **Live** |
 | `getTagColor` | `src/lib/tag-colors.ts` | Fixed colors for known user tags, hashed hue otherwise |
 | `cn` | `src/lib/utils.ts` | `clsx` + `tailwind-merge` |
 
@@ -182,13 +185,13 @@ The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
 | `kpi/` | Global KPI cards, charts, acquisition breakdown | `/kpi` |
 | `leads/` | Import dialog, next-action queue and rules | `/drivers`, `/kpi` |
 | `locations/` | Location form and table | `/map` |
-| `map/` | Ride route panel and route-over-zones map | Ride sheet |
+| `live/` | Live map, tables, pricing, ride journey, operating hours, surge slider, and the unused notify and ping dialogs | `/live`, `/pricing` (surge) |
+| `map/` | Ride route panel, route-over-zones map, `MapLayerPanel` | Ride sheet, `/live`, `/rides` |
 | `notifications/` | Templates, analytics, logs, scheduled, send, cancel | `/notifications` |
 | `qr-payments/` | Config cards, create and pricing modals, payments table | `/fleets` Payments tab |
-| `rides/` | Ride detail sheet | `/rides` |
+| `rides/` | Ride detail sheet, silent cancellation, status badge, formatting helpers | `/rides`, `/live`, `/pricing` |
 | `search/` | Search heatmap, top locations manager | `/rides` Searches tab |
 | `spot/` | Spot card, form, history | `/events` |
-| `supply-demand/` | Market list, sections, driver and ride tables, surge, notify, ping | `/supply-demand` |
 | `users/` | User sheet, profile editor, tags, Quo messages, contact matching | `/users`, `/rides`, `/drivers` |
 | `zones/` | Zone edit dialog, zone pricing editor | `/map`, `/pricing` |
 
@@ -207,10 +210,9 @@ The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
 
 ## Gotchas and edge cases
 
-- **Three maps ignore dark mode.** `ZoneEditor`, `PresenceMap`, and `SearchHeatmap` hardcode `light-v11` while the rest follow `ThemeProvider`.
-- **`CommunityFilterDropdown` lists every community.** It calls the public `GET /community/` and does not filter by role or hide test communities. It is safe today only because its pages are admin-only.
+- **`CommunityFilterDropdown` lists every community.** It calls the public `GET /community/` and does not filter by role or hide test communities. It is safe today only because `TelemetryPage` is admin-only.
 - **`getApiErrorMessage` prefers developer text.** API envelopes carry `message`, `title`, and user-facing `body`. The helper returns `message` first and never reads `body`, so toasts can show technical wording. `TipStep` and `EduClaimStep` read `body` directly.
-- **Changing `/manage` tabs drops other parameters.** `ManageFleetsPage` calls `setParams({ tab })`, which clears `fleet` and anything else in the query string.
-- **Duplicate presence UIs.** `pages/PresencePage.tsx` (retired route) and `components/PresencePanel.tsx` (live tab) duplicate the same three 10-second queries. Change the panel; the page is dead code.
+- **The `/manage` tab setter replaces the query string.** The list view's tabs call `setParams({ tab })`. That list only renders when no fleet is open, so no `fleet` parameter is lost today, but any parameter you add to the list view will be.
+- **Dead page modules linger.** `OverviewPage` and `DriverOpsPage` have no route. `OverviewPage` is still in `routeImporters` under `/`, so it's still bundled as a chunk and indexed for global search. `DriverOpsPage` is only type-checked.
 - **Search indexing depends on static copy.** Headings built from variables or placed inside tabs, sheets, or dialogs are not indexed. See [Add a dashboard page](/engineering/web/adding-a-dashboard-page).
 - **`RecentViews` resets on reload.** It is component state only.

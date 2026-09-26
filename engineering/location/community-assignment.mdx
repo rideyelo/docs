@@ -163,10 +163,10 @@ School mapping never moves users. A user's `school_id` and `community_id` are in
     `GetCommunityByCoordinates` orders only by area. Two identical boxes can resolve either way between calls. School mapping breaks ties by ID.
   </Accordion>
   <Accordion title="Multiple default communities">
-    `GetDefaultCommunity` has no `ORDER BY`. If more than one non-test community has `is_default`, the fallback is whichever row Postgres returns first. `MoveSchoolToDefaultCommunity` has the same issue.
+    `GetDefaultCommunity` has no `ORDER BY`, and no unique index limits `is_default` to one row. If more than one non-test community has `is_default`, the fallback is whichever row Postgres returns first. `MoveSchoolToDefaultCommunity` and the fallback branch of `FindCommunityArchiveReplacement` have the same issue.
   </Accordion>
   <Accordion title="Archived current community with no local match">
-    `communityAtLocation` calls `GetSearchBounds` for the user's current community, and that query filters out archived rows. A user still assigned to an archived community, standing outside every eligible box, gets a server error from resolve instead of a move to the default.
+    `communityAtLocation` calls `GetSearchBounds` for the user's current community, and that query filters out archived rows. A user still assigned to an archived community, standing outside every eligible box, gets a server error from resolve instead of a move to the default. Archiving through the dashboard can't cause this: `ArchiveCommunity` in `internal/data/repository/community.go` moves every user, home community, and school to a replacement community in the same transaction. Only an `archived_at` set directly in the database leaves users behind.
   </Accordion>
   <Accordion title="The exit buffer ignores other nearby communities">
     Only containment picks a new community. A user 15 miles outside community A and 2 miles outside community B stays in A. At 21 miles from A, they go to the default, not to B.

@@ -19,7 +19,7 @@ Paths below drop route groups the way URLs do, except where the group matters fo
 | `(auth-v3)/_layout.tsx` | `Stack` | Each screen bounces to the entry when the Auth v3 transaction is missing. |
 | `(app)/_layout.tsx` | `Stack` with explicit options per child | Signs out once if `profile_initialized` is false. Reconciles a stale JWT community with `PUT /user/community`. Mounts `useRideLifecycleNavigation`. Pushes `post-signup/14-student` once per pending World Cup claim. Warms Stripe, reports app version (`PUT /user/app-version`) and telemetry. Shows "Connection issues — retrying..." on non-401 profile errors. `gestureEnabled: false` on `index`, `post-signup`, `verify`, `(tabs)`, `drive`, `ride`, `ride-matching`, `ride-complete`, `driver-signup`, `profile`, `link`. |
 | `(tabs)/_layout.tsx` | `Stack` (not tabs) with `map` and `profile` | `profile` presents from the bottom. |
-| `(tabs)/map/_layout.tsx` | `MapFeedProvider`, `MapFocusProvider`, `MapBoundingBoxLabelProvider`, `MapTopBarProvider`, `MarkerProximityProvider`, `MapCameraFrameProvider`, `CenteredPoiProvider`, `MapTutorialProvider`, `MapSearchProvider`, the map, and a `GlassBottomSheet` hosting a nested `Stack` | `LocationGate` unless the route is `request`. Community change closes search, the friends hub, and POI, event, or vehicle routes. |
+| `(tabs)/map/_layout.tsx` | `MapFeedProvider`, `MapFocusProvider`, `MapBoundingBoxLabelProvider`, `MapTopBarProvider`, `MarkerProximityProvider`, `MapCameraFrameProvider`, `CenteredPoiProvider`, `MapTutorialProvider`, `MapSearchProvider`, the map, and a `GlassBottomSheet` hosting a nested `Stack` | `LocationGate` unless the route is `request`. Community change closes search, the friends hub, and POI, event, or vehicle routes. See [Map tab internals](/engineering/mobile/map-tab-internals). |
 | `ride/_layout.tsx` | `FeatureErrorBoundary feature="ride"`, `RideProvider`, `MessagingProvider`, a map, a `GlassBottomSheet`, `RiderChatSheet` | All children `gestureEnabled: false`. |
 | `ride-matching/_layout.tsx` | `RideMatchingProvider` | `index` redirects to `1-waiting`. |
 | `ride-complete/_layout.tsx` | `Stack` | none |
@@ -146,8 +146,8 @@ All routes in this group render inside the map sheet.
 
 ## Gotchas and edge cases
 
-- **The drive guard is a substring check.** `StatusGuard` tests `pathname.includes('/drive')`, which also matches `/driver-earnings`, `/driver-signup`, and `/driver-marketing`.
-- **The World Cup prompt can interrupt a ride.** `(app)/_layout.tsx:72` skips only `/tip/` paths before pushing `post-signup/14-student`.
+- **The drive guard is a substring check.** `StatusGuard` tests `pathname.includes('/drive')`, which also matches `/driver-earnings`, `/driver-signup`, and `/driver-marketing`. Online drivers reach earnings and payouts from the hub only because of this.
+- **The World Cup prompt ignores ride state.** `(app)/_layout.tsx:71` skips only `/tip/` paths before pushing `post-signup/14-student`. During an assigned or matching ride, `useRideLifecycleNavigation` replaces it with the ride screen right away. For a driving user, `StatusGuard` replaces it with `/drive`. The prompt flashes and is marked as shown, so it doesn't return until the next launch. On the request sheet (`requested`), nothing bounces it.
 - **`ride/*` legacy routes are reachable by URL.** `com.rideyelo://ride/pickup` still opens the old pickup screen because `+native-intent` passes unknown paths through.
 - **The Stripe return URL points nowhere.** `lib/payments/paymentSheetConfig.ts:80` returns to `ride/2-select-ride`, which has no route file.
 - **The approval push targets a missing route.** The API's `driver_application_approved` push deep-links to `/driver-signup/1-application-status`. See [Driver onboarding](/concepts/driver-onboarding#admin-review).

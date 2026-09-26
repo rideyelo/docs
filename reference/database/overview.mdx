@@ -78,7 +78,7 @@ There's no single soft-delete pattern:
 | Table | Mechanism | Meaning |
 | --- | --- | --- |
 | `Users` | `is_deleted`, `deleted_at` | Personal fields scrubbed, row kept. See [Users](/reference/database/users-and-identity#soft-delete). |
-| `Fleets` | `deleted_at` | Deleted fleets also get `is_active = false`. Queries filter `deleted_at IS NULL`. |
+| `Fleets` | `deleted_at` | Archived fleets also get `is_active = false`. Queries filter `deleted_at IS NULL`. Triggers reject new references to an archived fleet. See [Fleet archival](/reference/database/fleets-and-vehicles#fleet-archival). |
 | `Communities` | `archived_at` | Archived communities. |
 | `Vehicles` | `archived_at` | Archived vehicles. |
 | `FleetCommunityServices` | `retired_at` | Retired fleet service in a community. |
@@ -96,11 +96,11 @@ Money types vary by era: `real` dollars on `Rides`, `numeric(10,2)` dollars for 
 
 ### Triggers and database functions
 
-59 triggers do real work in the database. The main families are:
+66 triggers do real work in the database. The main families are:
 
 - **Outbox triggers** that queue sync work: `enqueue_contact_sync`, `enqueue_contact_activity`, `enqueue_quo_user_sync`, and `enqueue_community_cache_invalidation`.
 - **Place resolution**: `attach_yelo_place` on `Rides`, `Bumps`, and location tables assigns `PlaceIdentities`.
-- **Integrity guards** that raise errors: `guard_fleet_vehicle_session`, `protect_ride_operation_identity`, `protect_ride_cancellation_quote`, and the calendar guards.
+- **Integrity guards** that raise errors: `guard_fleet_vehicle_session`, `protect_ride_operation_identity`, `protect_ride_cancellation_quote`, the calendar guards, and the seven fleet archive guards that call `guard_unarchived_fleet_reference`.
 - **Counters**: `assign_ride_message_index` and `remove_ride_message_counts`.
 - **Legacy compatibility**: `retire_user_waitlisting` and `sync_legacy_telemetry_push_token`.
 
@@ -112,10 +112,11 @@ Row level security is enabled on 17 tables, including `Users`, `Rides`, `Communi
 
 ### Migrations
 
-- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 345 versions, each with both files.
+- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 347 versions, each with both files.
 - `000001_init_db` is a `pg_dump` of the original Supabase schema, including Supabase extensions. Integration tests and the sqlc schema generator rewrite the Supabase-only statements.
 - `000242_river_v1` through `000248_river_v7` vendor River's own migrations.
 - Some migrations change data as well as schema, for example `000254_normalize_user_shape`, which backfilled missing `DriverApplications` rows.
+- `000347_restore_location_address_constraint` adds `"Locations_address_key"` only when it's missing, because production already had it from outside the migration history. It fails on duplicate addresses. See [Locations](/reference/database/markets-locations-and-places).
 - Migrations `000082` and `000083` repeat the same rename on `Rides`. The release script and test tooling work around it. See [Platform and admin](/reference/database/platform-and-admin).
 - Applied migrations are immutable. See [Data layer](/engineering/api/data-layer#migrations) for the workflow and checks.
 
@@ -155,7 +156,7 @@ Every table and view in the `public` schema, grouped by reference page, plus gol
 | --- | --- |
 | `Rides` | One row per ride request through completion or cancellation. |
 | `RideEvents` | Best-effort timeline of ride events. |
-| `RideOperations` | Idempotent journal of money-affecting ride commands (not yet wired). |
+| `RideOperations` | Idempotent journal of money-affecting ride commands (no production writer yet). |
 | `RideOperationSteps` | Provider calls inside a ride operation. |
 | `RideCancellationQuotes` | Immutable short-lived cancellation fee quotes. |
 | `RideMessages` | Rider and driver chat messages. |
@@ -247,7 +248,7 @@ Every table and view in the `public` schema, grouped by reference page, plus gol
 | `Fleets` | Fleets with payout model and Stripe account. |
 | `FleetDrivers` | Driver membership in fleets. |
 | `FleetVehicles` | Vehicles assigned to fleets. |
-| `FleetDriverWhitelist` | Emails pre-approved to join a fleet. |
+| `FleetDriverWhitelist` | Emails mapped to a fleet and community. No longer grants membership. |
 | `FleetCommunityServices` | Which fleets serve which communities. |
 | `FleetCommunityServiceHistory` | Audit history of fleet community services. |
 | `ActiveFleetCommunityServices` | View of enabled services for active, non-deleted fleets in active, unarchived communities. |

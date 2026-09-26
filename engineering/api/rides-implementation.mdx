@@ -54,16 +54,15 @@ flowchart LR
   Q -->|promotion| D
   D -->|at-pickup| E[driver_waiting]
   E -->|pickup + confirm code| F[in_progress]
-  F -->|complete, tips enabled| G[pending_rider_rating]
-  F -->|complete, no tips| H[complete]
-  G -->|rate or tip window expiry| H
+  F -->|complete| G[pending_rider_rating]
+  G -->|rider rates, or tip window expiry| H[complete]
 ```
 
 Key implementation points:
 
 - **Confirm** (`ConfirmRide`) validates the payment method, picks the effective price and fleet, generates a four-digit confirm code when the fleet sets `RequiresConfirmationCode`, then either adds the ride to the board and notifies drivers (`addToRideBoardAndNotify`) or offers it to one driver (`directAssignDriver`). Riders with an `@rideyelo.com` email always get confirm code `1234` so Maestro E2E flows can finish the handshake.
 - **Accept** (`AcceptRide`) loads the driver's session and fleet, calculates the pickup route, creates or reuses the Stripe payment intent when the price is above zero, calls `Ride.Accept`, refreshes the driver's queue summary, removes the ride from the board, and notifies the rider.
-- **Complete** (`Complete`) selects the Stripe merchant (fleet or driver). With tips enabled and a nonzero price, it sets `pending_rider_rating` and a 24-hour `tip_window_expires_at` and defers capture. Otherwise it captures immediately.
+- **Complete** (`Complete`) selects the Stripe merchant (fleet or driver) and always moves the ride to `pending_rider_rating`. With tips enabled and a nonzero price, it sets a 24-hour `tip_window_expires_at` and defers capture. Otherwise it captures the fare immediately, and the ride stays in `pending_rider_rating` until the rider rates it.
 - **Direct requests** give the chosen driver a 30-second response window. `ActivationService.resumeExpiredDirectRide` returns the ride to normal matching after the window.
 
 ## Ride board
@@ -88,7 +87,7 @@ type RideBoardProvider interface {
     | `ride:details` | Hash | Ride ID to serialized `BoardRide` |
     | `rides:refresh:<community_id>` | String, 10-second TTL | Unix timestamp of the last change |
 
-    `AddRide` writes all three in one `TxPipeline`. Every method falls back to the in-memory board when Redis is disabled or a command fails.
+    `AddRide` writes all three in one `TxPipeline` and falls back to the in-memory board if it fails. `RemoveRide` falls back only when the `SREM` fails. Nothing reads the set or the refresh key; they only feed `GET /ride/board/{id}` through `ride:details`. Drivers read the board from Postgres. See [Ride board](/engineering/matching/ride-board).
   </Tab>
   <Tab title="In-memory">
     `RideBoard` keeps per-community maps guarded by a `sync.RWMutex` and loads a community lazily from `Ride.GetAvailableRides`. `NewRedisBacked` returns it directly when Redis is disabled.
@@ -175,7 +174,7 @@ Ride events are an audit trail, not a source of truth. Do not read them to make 
     `GetUnmatchedRidesForActivation` returns confirmed rides without a driver. Expired direct requests are resumed first.
   </Step>
   <Step title="Notify drivers by tier">
-    For each ride, the service loads the community's activation config (cached 5 minutes), picks the tier for the elapsed time since confirm, and notifies drivers from the warm pool (recently seen driver locations in the Redis activation cache) and then from inactive drivers. Notified drivers are tracked in Redis so a driver is not notified twice.
+    For each ride, the service loads the community's activation config (cached 5 minutes), picks the lowest due tier that hasn't fired yet, and notifies offline drivers near the pickup. The warm-pool pass reads a Redis sorted set that nothing writes, so candidates come from `ListNearbyInactiveDrivers`. Notified drivers are tracked in Redis so earlier tiers don't repeat them, and a per-driver cooldown blocks re-paging across rides. See [Activation tiers](/engineering/matching/activation-tiers).
   </Step>
   <Step title="Check rescue">
     `checkRescue` sends a rescue alert when a ride has waited past the configured threshold.
@@ -192,9 +191,9 @@ Ride events are an audit trail, not a source of truth. Do not read them to make 
 - `timeToStart` = queued minutes + deadhead minutes + 2 minutes per queued ride.
 - `queueLoad` = 0.6 × queued ride count + 0.4 × queued fare.
 
-Both are min-max normalized. The final score is 0.5 × efficiency + 0.5 × equity, and the lowest score wins. Scores within 0.05 of each other tie-break on the smaller queue. When there are no eligible candidates, no winner, or the winner has no active session, the ride is flagged `auto_queue_attempted` in Redis for 1 hour so the pass skips it. When there are no candidates at all, the fleet is also notified about the missed ride.
+Both are min-max normalized. The final score is 0.5 × efficiency + 0.5 × equity, and the lowest score wins. Scores within 0.05 of each other tie-break on the smaller queue. When the eligibility query returns nobody, or filtering and Mapbox leave no scored candidate, the ride is flagged in Redis (`ride:aq_attempted:{rideId}`) for 1 hour so the pass skips it. When there are no candidates at all, the fleet is also notified about the missed ride. Read errors, a missing session, and a lost assignment race don't set the flag, so the ride is retried on the next tick.
 
-The winner is assigned through the callback that `NewService` passes to the activation service, which calls `RideService.AutoAssignRide`. That method runs `Ride.AutoQueueAssign` (status `queued`), records `ride_auto_queued`, refreshes the queue summary, and calls `RecoverIdleQueue`. If the driver has no active ride, the queue head is promoted to `driver_en_route` through `prepareAndPromoteQueuedRide`, which authorizes payment and recalculates the pickup route before `PromoteQueuedRide`.
+The winner is assigned through the callback that `NewService` passes to the activation service, which calls `RideService.AutoAssignRide` with the scoring decision. That method runs `Ride.AutoQueueAssign` (status `queued`), records `ride_auto_queued` with the candidate count, deadhead, score, and queue load, refreshes the queue summary, and calls `RecoverIdleQueue`. If the driver has no active ride, the queue head is promoted to `driver_en_route` through `prepareAndPromoteQueuedRide`, which authorizes payment and recalculates the pickup route before `PromoteQueuedRide`.
 
 ### Queue recovery
 

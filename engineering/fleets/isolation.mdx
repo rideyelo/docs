@@ -36,7 +36,7 @@ If both sets are empty, `GetAvailableRideTypes` in `repository/ride_matching.go`
 
 `sortVehicleOptionsLiveFirst` stable-sorts options: live options first, then the community's primary fleet first within each tier. Driver-specific options (direct booking) are then re-sorted among themselves by ETA while fleet rows keep their positions.
 
-`assignFleetBadges` gives options whose `FleetName == "Yelo"` the verified-student badge and every other option the fleet badge. Each option keeps at most two badges, ranked verified-student, fleet, cheapest, fastest.
+`assignVehicleOptionV2Badges` adds `cheapest` and `fastest` when there are at least two options, then calls `assignFleetBadges`. That gives options from `is_student_only` fleets the `verified_student` badge. Other options get the `fleet` badge, except options from the community's primary fleet, which get no fleet badge. Fleet-wide options carry `IsStudentOnly` from the ride type (`NewVehicleOptionsV2`), and direct driver options carry it from `buildFleetMetaMap`. It's an internal field (`json:"-"`), so riders only see the resulting badge. Each option keeps one badge (`maxBadgesPerOption = 1`), chosen by `badgePriority`: `verified_student`, then `fleet`, then `cheapest`, then `fastest`. A partner-fleet option therefore shows its fleet name instead of **cheapest** or **fastest**.
 
 ### Direct driver options
 
@@ -91,7 +91,7 @@ On accept, `AssignAcceptedRideToDriver` overwrites `Rides.fleet_id` with the ses
 - The driver lives in the ride's community and has an active membership in the ride's fleet.
 - For the fleet named `Yelo`, the driver has a founding-driver tag (`Founding Driver`, `founding driver`, or `founding`).
 - If online, the driver's session fleet is the ride's fleet. The vehicle checked is the session vehicle when online and `Users.vehicle_id` when offline.
-- The vehicle matches the ride's vehicle type, is approved, has enough seats, isn't owned by another fleet, and is available to the driver for this fleet.
+- The vehicle matches the ride's vehicle type, is approved, isn't owned by another fleet, and is available to the driver for this fleet. There is no seat check, because `Rides.num_riders` is only written after the trip.
 - The driver passes the same payout predicate used for going online.
 - The driver's unfinished ride count is below `max_queue_length`.
 
@@ -101,7 +101,7 @@ On accept, `AssignAcceptedRideToDriver` overwrites `Rides.fleet_id` with the ses
 
 ## Student-only fleets
 
-`is_student_only` is enforced on the rider side only. `filterRideTypesForRider` removes the fleet from ride types for non-student riders, and `determineFallbackRidePrice` applies the same filter before choosing a fallback fleet. Nothing on the driver side reads it.
+`is_student_only` is enforced on the rider side only. `filterRideTypesForRider` removes the fleet from ride types for non-student riders, `determineFallbackRidePrice` applies the same filter before choosing a fallback fleet, and `assignFleetBadges` uses it for the verified-student badge. Nothing on the driver side reads it.
 
 ## Fleet-scoped views and counts
 
@@ -129,8 +129,8 @@ On accept, `AssignAcceptedRideToDriver` overwrites `Rides.fleet_id` with the ses
 - **Offline unqueue drops the fleet.** `UnqueueDriverRides` sets `fleet_id = NULL` when a queued driver goes offline past the grace period. The ride returns to `confirmed` without a fleet: it disappears from every fleet's board, skips T0, and can be auto-queued, activated, or accepted by any fleet's driver. `RequeueRideAfterDriverCancel` keeps `fleet_id`, so the two requeue paths disagree.
 - **Price fallback crosses fleets.** If the requested fleet has no price for the vehicle type at confirm (for example, the row ended between options and confirm), the rider is booked at another fleet's price, and the ride gets that fleet.
 - **The student filter doesn't cover the last fallback.** `selectFleetIdForVehicleType` returns `primaryFleetId` when no filtered ride type matches, even if the primary fleet is student-only.
-- **Service coverage doesn't gate riders.** `ListAvailableRideTypes` and `ListActiveRidePriceParameters` don't join `ActiveFleetCommunityServices` and don't check whether the fleet is active or deleted. Retiring a service keeps its prices open (by design, to preserve them), and deleting a fleet doesn't end them. A featured price row or a live session for such a fleet can still produce a rider option. See [Service communities](/engineering/fleets/service-communities-and-calendars#what-service-coverage-does-and-doesnt-control).
+- **Service coverage doesn't gate riders.** `ListAvailableRideTypes` and `ListActiveRidePriceParameters` don't join `ActiveFleetCommunityServices` and don't check whether the fleet is active. Retiring a service keeps its prices open (by design, to preserve them), and an inactive fleet (Stripe pending or unlinked) keeps its prices open too. A featured price row for such a fleet still produces a rider option. Archiving a fleet ends its prices and requires no open sessions, so archived fleets drop out. See [Service communities](/engineering/fleets/service-communities-and-calendars#what-service-coverage-does-and-doesnt-control).
 - **Live ride types follow the driver's community, not the fleet's.** A driver in community B who is online under a fleet homed in A contributes a live `(fleet, type)` pair to B.
-- **Fleet identity is by name in two places.** Badges and T0 compare `Fleets.name` to `'Yelo'`.
+- **Fleet identity is by name in T0.** `ListRideT0NotificationTargets` compares `Fleets.name` to `'Yelo'` for the founding-driver filter.
 - **KPIs ignore the community selector.** The fleet page picks a community, but `GET /dashboard/fleet/{fleet_id}/kpis` takes no community and aggregates every community.
 - **The directory includes former active members.** `ListDashboardFleetDrivers` doesn't filter `fd.is_active`, so a driver who switched to another fleet still appears if they live in the same community.

@@ -50,8 +50,10 @@ A **Fleet Merchant** fleet needs **Custom Payouts** on to be payout-ready. An **
   </Step>
   <Step title="Bring in drivers">
     - **Invitation link.** On **Invite drivers**, create the fleet's reusable link and share it. It's only available when the fleet can accept joins. See [Fleet driver invitations](/fleets/driver-invitations).
-    - **Existing driver.** On the driver's user detail sheet, use **Assign active payout fleet**. It only lists payout-ready fleets.
-    - **Community default.** Set the fleet as the community's **Primary Fleet** so new drivers without a fleet join it.
+    - **Existing driver.** On the driver's user detail sheet, add the fleet in **Fleet membership** and set it active, or use **Assign active payout fleet**, which only lists payout-ready fleets. Both are admin-only.
+    - **Community default.** A community's **Primary Fleet** no longer enrolls drivers. Only the default community's primary fleet receives drivers who have no fleet, and it must be an active **Owner Operator** fleet without custom payouts.
+
+    Fleet managers can't enroll drivers directly. `POST /dashboard/fleet/{fleet_id}/drivers` returns 403 for them, so they share the join link.
 
     Drivers still need an activated application. See [Driver can't go online](/runbooks/driver-cannot-go-online).
   </Step>
@@ -85,7 +87,7 @@ FROM "FleetDrivers" fd WHERE fd.fleet_id = '<fleet-id>';
 ROLLBACK;
 ```
 
-- The fleet is active and not deleted. For **Fleet Merchant**, `has_custom_payouts` is true and `stripe_status` is `complete`.
+- The fleet is active and not archived (`deleted_at` is null). For **Fleet Merchant**, `has_custom_payouts` is true and `stripe_status` is `complete`.
 - Each service community has `enabled = true`.
 - Each service community has open price rows for the fleet's vehicle types.
 - The fleet appears under **Select a payout-ready fleet** on a user detail sheet (**Fleet Merchant** only).
@@ -101,3 +103,19 @@ ROLLBACK;
 | **Custom Payouts** on for **Owner Operator** | Joins are refused. |
 | No **Always shown** pricing | The fleet's option only appears while one of its drivers is online with auto-queue on. |
 | Service community retired | The fleet's prices disappear in that community. |
+
+## Archive a fleet
+
+**Archive fleet** on the fleet's page under **Fleets** (Configuration) calls `DELETE /dashboard/communities/{id}/fleets/{fleet_id}`. It sets `is_active = false` and `deleted_at`, clears `driver_join_code`, and keeps the fleet row, its rides and payments, and its Stripe account reference. It refuses with "Cannot archive fleet: …" until all of these are resolved:
+
+| Blocker | Resolve with |
+| --- | --- |
+| Drivers who have this fleet active | Switch them in **Fleet membership** |
+| `DriverApplications.payout_fleet_id` pointing at the fleet | Move the driver's payout fleet |
+| Open `DriverSessions` | The driver goes offline |
+| Rides not in `complete`, `pending_rider_rating`, or `no_drivers_available` | Let them finish, or see [Stuck or ghost ride](/runbooks/stuck-ride) |
+| A community with this fleet as **Primary Fleet** | Pick another **Primary Fleet** |
+| Unarchived fleet vehicles, or fleet vehicles a user has selected | Archive or reassign the vehicles |
+| Active QR payment links | Deactivate them. A Stripe failure blocks deactivation |
+
+Archiving also deactivates whitelist entries, retires the fleet's service communities, and ends current and future pricing. Inactive memberships stay visible as **Archived** and can be removed. Database triggers from migration `000346` reject new memberships, rides, sessions, vehicles, payout assignments, QR links, and **Primary Fleet** references to an archived fleet.

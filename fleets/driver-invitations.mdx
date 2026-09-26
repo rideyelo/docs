@@ -25,9 +25,9 @@ What a driver must complete after joining depends on your fleet's payment model.
 
 When a driver joins your fleet, Yelo:
 
-- Makes your fleet the driver's active fleet and removes the driver from any previous fleet.
+- Makes your fleet the driver's active fleet. The driver's other fleet memberships become inactive but aren't removed.
 - Switches the driver to your fleet's community.
-- Clears any previous fleet-managed payout association.
+- Routes the driver's payouts through your fleet's Stripe account for fleet-managed payouts, or through the driver's own account for owner-operator fleets.
 - Activates the driver automatically once all remaining application steps are complete.
 
 ## Manage your invitation link
@@ -80,6 +80,10 @@ The current link stops accepting drivers immediately. Share the new link with dr
 
 Drivers who already joined stay in your fleet. The link no longer accepts new drivers. To invite drivers again, click **Create driver join link** to generate a new link.
 
+<Note>
+  Disabling a link, or archiving the fleet, doesn't remove the `yelo.link` short link. Old links still open the invitation page, which reports that the link isn't available.
+</Note>
+
 ## Join a fleet as a driver
 
 ### Prerequisites
@@ -123,7 +127,7 @@ If you're already a member of the fleet, the app skips the invitation and return
 
 <AccordionGroup>
   <Accordion title="This fleet link isn't available">
-    The link was rotated, disabled, or is invalid. Ask the fleet manager for their current driver invitation link.
+    The link was rotated or disabled, the fleet was archived, or the link is invalid. Ask the fleet manager for their current driver invitation link.
   </Accordion>
   <Accordion title="The fleet can't accept drivers right now">
     The fleet is inactive or doesn't meet the requirements for its payment model. For fleet-managed payouts, the fleet's Stripe payout setup must be complete. For owner-operator fleets, custom payouts must be disabled. Contact the fleet manager and try again later.
@@ -159,3 +163,7 @@ The join response lists outstanding application steps in `remaining_steps`. Poss
 ```
 
 `result` is `joined` for a new member or `already_joined` if the driver was already in the fleet. If the fleet can't accept drivers, the API returns an error with the message "This fleet cannot accept drivers right now."
+
+The join commits before Yelo tries to activate the driver. If activation fails for a reason other than a missing phone number, the API returns that error even though the driver has joined. Retrying returns `already_joined`.
+
+Fleet managers can't add drivers directly. `POST /dashboard/fleet/{fleet_id}/drivers` is admin only and returns "Only admins can enroll drivers directly. Share the fleet join link instead." to other roles.

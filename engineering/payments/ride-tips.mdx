@@ -143,7 +143,7 @@ A failed ride is retried on the next tick. After an hour past its window, each f
 | --- | --- |
 | Sweeper and in-buffer rating hit Stripe together | Whichever captures first wins. The loser gets `charge_already_captured`, treated as success. `CompleteRideTip`'s status guard picks one DB winner. If the sweeper won, the rating falls back to a dedicated tip charge |
 | Two instances sweep the same ride | Same as above. Both captures are fare-only, so the amounts agree |
-| Rider taps rate twice with the same tip over the buffer | Second call cancels the first tip intent, then reuses the idempotency key. Stripe replays the first response, so the rider gets the canceled intent back |
+| Rider rates twice with the same over-buffer tip after a `requires_action` result | Second call cancels the first tip intent, then reuses the idempotency key. Stripe replays the first response, so the caller gets `requires_action` and a client secret for an intent that's now canceled. The tip can't be completed without changing the amount |
 | In-buffer capture succeeds, `CompleteRideTip` fails with a server error | The rider paid fare plus tip. The sweeper later captures fare-only, gets `charge_already_captured`, and records `tip_amount = 0` |
 | Fare capture, then tip charge, then the fare's `payment_intent.succeeded` webhook | The webhook sets `driver_payout = amount_received`, which is the fare. That overwrites the fare plus tip written by `RecordTip`. See [Stripe webhooks](/engineering/payments/webhooks) |
 

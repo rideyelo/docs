@@ -294,7 +294,8 @@ Command defaults (`cmd/sync-school-catalog/main.go`): `--dry-run=true`, `--min-c
 
 ## Gotchas and edge cases
 
-- **`primary_fleet_id` can't be cleared.** `CommunityUpdate` documents "null to clear", but `UpdateCommunityFields` uses `COALESCE`, and a JSON `null` decodes to a nil pointer. Neither path clears the column.
+- **`primary_fleet_id` can't be cleared.** `CommunityUpdate` documents "null to clear", but `UpdateCommunityFields` uses `COALESCE`, and a JSON `null` decodes to a nil pointer. Neither path clears the column. The dashboard's **None** option sends no value, so it doesn't clear it either.
+- **`primary_fleet_id` must point at a live fleet.** Trigger `guard_fleet_primary_archive` (migration `000346`) rejects setting it to an archived fleet with SQLSTATE `23514`, which fails the save. A fleet can't be archived while any community references it. See [Archive](/engineering/fleets/stripe-and-lifecycle#archive).
 - **Auto-queue limits have no writer.** `CommunityUpdate` and the SQL support `auto_queue_max_minutes` and `auto_queue_default_minutes`, but `AdminUpdateCommunityRequest` has no such fields. No API route sets them.
 - **Deactivating skips the timezone gate.** `validateCommunityGeographyUpdate` only runs when the box changes, `is_active` becomes true, or `rides_disabled` becomes false. You can hide or disable an unresolved community freely.
 - **Activation doesn't need a revision.** Only `bounding_box` requires `expected_geography_revision`. Two admins can toggle flags concurrently with last write wins.

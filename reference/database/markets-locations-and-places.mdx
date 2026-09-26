@@ -170,7 +170,7 @@ The `placeIdentityBackfillWorker` River worker in `internal/notify/queue/queue.g
 | `is_public` | `boolean` | no | `false` | Public venue flag from reverse geocoding. Only public locations qualify as automatic top-location candidates. |
 | `yelo_place_id` | `uuid` | yes | | FK to `"PlaceIdentities"`. Set by the trigger. |
 
-**Indexes.** Unique `idx_locations_community_address` on `(community_id, address)`. Indexes on `community_id`, on `community_id` where `show_on_map`, hash on `mapbox_id` where non-empty, and on `yelo_place_id` where not null.
+**Indexes.** Unique constraint `Locations_address_key` on `address`, restored by migration `000347_restore_location_address_constraint`. Unique `idx_locations_community_address` on `(community_id, address)`, which the global constraint already implies. Indexes on `community_id`, on `community_id` where `show_on_map`, hash on `mapbox_id` where non-empty, and on `yelo_place_id` where not null.
 
 **Written by / read by**
 
@@ -180,7 +180,9 @@ The `placeIdentityBackfillWorker` River worker in `internal/notify/queue/queue.g
 - `ListLocationsByAddresses` joins active `"Discounts"` and events within 24 hours to decorate search results.
 
 <Warning>
-`UpsertCachedLocation` in `queries/places.sql` uses `ON CONFLICT (address)`, but no migration creates a unique constraint on `address` alone. The integration test harness (`internal/utilities/testutils/db.go`) adds `"Locations_address_key" UNIQUE (address)` after running migrations. Production must carry that constraint out of band, or the cache write fails.
+`UpsertCachedLocation` in `queries/places.sql` uses `ON CONFLICT (address)`, which needs `"Locations_address_key" UNIQUE (address)`. Production had that constraint from the original schema without a migration. Migration `000347` adds it when it's missing and skips when a valid, non-deferrable unique constraint on `address` already exists. If duplicate addresses exist, the migration raises `cannot restore Locations_address_key: duplicate addresses require operator review` and the release stops. Its down migration keeps the constraint.
+
+Because `address` is unique across the whole table, the same address can't be stored for two communities, even as curated POIs.
 </Warning>
 
 ## Top locations

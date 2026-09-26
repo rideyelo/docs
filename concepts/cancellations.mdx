@@ -3,12 +3,13 @@ title: "Cancellations"
 description: "Who can cancel a ride, which cancellations requeue instead of ending the ride, how fees are calculated by status and actor, and how they're charged"
 ---
 
-A ride can end early in four ways:
+A ride can end early in five ways:
 
 - The rider cancels.
 - The assigned driver cancels.
 - The system expires an unmatched request.
 - A payment step fails.
+- An admin silently cancels a free, accepted ride from the dashboard.
 
 Driver cancellations before pickup don't end the ride at all. They put it back on the board.
 
@@ -105,6 +106,33 @@ The ride is removed from the board. If the canceled ride belonged to a driver wi
 | Payment method clone or PaymentIntent creation fails | The service calls `Cancel` with reason `Payment Failed` as the requesting user. See the note below. |
 | Driver offline more than 5 minutes with queued rides | Not a cancellation. Queued rides return to `confirmed` and go back on the board. |
 
+## Admin silent cancellation
+
+Admins can end a stuck ride from **Ride Details** in the dashboard without notifying anyone. The control sits under **Admin cancellation**, below the ride timeline. For the operator steps, see [Stuck or ghost ride](/runbooks/stuck-ride#fix).
+
+A ride is eligible only when all of these hold:
+
+- Its status is `driver_en_route`, `driver_waiting`, or `in_progress`.
+- Its effective fare is 0, and `payment_intent_id` and `tip_payment_intent_id` are null.
+- It has no `RideOperations` row in `pending` or `quarantined`.
+- Its driver has no other ride in `queued`.
+- No notification for the ride has a delivery in `queued` or `sending`.
+
+`GET /dashboard/rides/{id}/silent-cancellation` returns the eligibility preview, the blocking reason, and the ride's `lifecycle_revision`. `POST /dashboard/rides/{id}/silent-cancel` takes that revision and a `reason` of 1 to 500 characters. The API repeats every check under the ride command locks and rejects the request if the revision changed. Both endpoints are admin-only.
+
+A silent cancellation skips payment handling, queue promotion, and every notification, including ride-state pushes. It writes:
+
+| Column or event | Value |
+| --- | --- |
+| `status` | `complete` |
+| `cancel_phase` | The status the ride was in |
+| `cancel_user` | Null |
+| `cancel_reason` | `admin_silent_cancellation` |
+| `cancel_comment` | The admin's reason |
+| `ride_canceled` event | Actor `system`, with `admin_id`, `reason`, `notifications_suppressed: true`, and `cancellation_fee: 0` in its metadata |
+
+Participants' apps pick up the change on their next refresh. The dashboard can't undo it.
+
 <Note>
 The `Payment Failed` cancel runs through the same authorization check as a user cancel. During a manual accept, the caller is a driver who isn't assigned to the ride yet, so `Cancel` rejects the call and only logs it. The accept returns the payment error, and the ride stays `confirmed` on the board. When payment fails while promoting a queued ride and the request context carries that ride's driver, as in `RecoverIdleQueue`, the cancel counts as a driver cancel and takes the requeue path.
 </Note>
@@ -124,3 +152,4 @@ The dashboard's cancellation and uncompleted-ride views read `cancel_phase`, `ca
 | Who may cancel from which status | `yelo-api/internal/data/repository/ride_command.go` (`validateRideCancellation`) |
 | Stripe capture and cancel | `yelo-api/internal/data/stripe/intent.go` |
 | Rider cancel button | `yelo-frontend/components/rider-flow/RiderCancelButton.tsx` |
+| Admin silent cancellation | `yelo-api/internal/service/dashboard/ride_admin_cancel.go`, `internal/data/repository/ride_admin_cancel.go`, `queries/ride_admin_cancel.sql`; `yelo-web/src/components/rides/SilentCancelRide.tsx` |

@@ -66,7 +66,7 @@ Promoting a queued ride changes another rider's ride. The revision finalizer als
 | `persistPaymentIntent` | `ride.LifecycleRevision` from the service's `GetByID` | Stripe clone and intent creation | `AddPaymentIntent` rejects a mismatch with a conflict and cancels the new intent |
 | `prepareRidePickup` | Same | Mapbox route, Stripe authorization | `PromoteQueuedRide` rejects a mismatch with a conflict |
 
-`AddPaymentIntent` doesn't increment the revision itself. Two writers that read the same revision can both pass.
+`AddPaymentIntent` doesn't increment the revision itself, and doesn't run the revision finalizer. That's what lets `prepareRidePickup` persist its authorization and still pass the revision check in `PromoteQueuedRide`. The cost is that two writers that read the same revision can both pass.
 
 ## The revision finalizer
 

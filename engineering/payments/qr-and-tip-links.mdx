@@ -130,14 +130,20 @@ The dashboard's **QR Payment History** and the **QR Payments** KPI read `QrPayme
 
 ## QR config Stripe objects
 
-`QrPaymentService.CreateConfig` creates these on the fleet's connected account:
+`QrPaymentService.CreateConfig` rejects a fleet that's archived, inactive, or has no `stripe_merchant_id`. It then creates these on the fleet's connected account:
 
 1. `Products.New` with the product name.
 2. `Prices.New`: `unit_amount` for fixed, or `custom_unit_amount` with `minimum`, `maximum`, `preset` for custom.
 3. `PaymentLinks.New` with that price, quantity 1, and phone number collection enabled.
 4. A Dub link on `pay.yelo.link/{slug}` pointing to `https://joinyelo.com/pay/tip/{slug}`. A Dub failure is logged and the config is saved without a short link.
 
-`UpdatePricing` creates a new price and payment link, updates the Dub destination (a Dub failure aborts the update), deactivates the old payment link (failure only logged), then saves. `DeactivateConfig` deactivates the payment link and sets `is_active = false`.
+If the config row isn't saved, a deferred `cleanupPaymentLink` deactivates the new payment link so it can't take money.
+
+`UpdatePricing` rejects an inactive config and an archived or inactive fleet. It creates a new price and payment link, updates the Dub destination (a Dub failure aborts the update), and deactivates the old payment link. A failed deactivation aborts the update. The save is conditional on the stored `stripe_payment_link_id` still being the old one, so a concurrent edit fails with "QR payment config changed or is inactive; reload and retry". On any abort, the new payment link is deactivated.
+
+`DeactivateConfig` deactivates the payment link on the fleet's current account, then sets `is_active = false` with the same conditional check. A Stripe failure aborts the deactivation. A config with a payment link on a fleet with no `stripe_merchant_id` is rejected with "restore the fleet Stripe account reference before deactivating its payment link".
+
+Migration `000346_fleet_archive_reference_guards` adds a trigger that rejects inserting a config, activating it, or changing its payment link while its fleet is archived.
 
 <Note>
 The tip page never uses the stored Stripe price or payment link. Checkout Sessions use inline `price_data`, and amounts are validated against the config row. The Stripe Payment Link still works if someone has its `buy.stripe.com` URL. Its sessions arrive without Yelo metadata and are attributed by connected account only.
@@ -163,6 +169,6 @@ The tip page never uses the stored Stripe price or payment link. Checkout Sessio
 - **Slug reuse.** `QrPaymentConfigs.slug` is unique across active and inactive configs, so a deactivated slug can't be recreated.
 - **Case sensitivity.** Config slugs are lowercased before lookup. Referral codes are matched exactly as typed.
 - **Success page trusts the URL.** Anyone can load `?status=success` and see "tip sent."
-- **Deleted accounts.** If a fleet's account is replaced with **Unlink**, configs keep their old Stripe product and payment link IDs. New checkouts use the new account, but `UpdatePricing` tries to reuse the old product ID on the new account and fails.
+- **Deleted accounts.** If a fleet's account is replaced with **Unlink**, configs keep their old Stripe product and payment link IDs. New checkouts use the new account, but `UpdatePricing` tries to reuse the old product ID on the new account and fails. `DeactivateConfig` calls Stripe on the new account with the old payment link ID. Because a Stripe failure aborts it, such a config likely can't be deactivated from the dashboard.
 - **Webhook failures.** A `QrPayments` insert failure returns 500 and Stripe retries. If the fleet lookup for attribution fails, the row is still inserted without `fleet_id`.
 - **Phone numbers.** Checkout Sessions don't collect phones, so `customer_phone` is only present for signed-in payers, from metadata.

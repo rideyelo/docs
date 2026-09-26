@@ -30,11 +30,12 @@ The query doesn't check whether the fleet is deleted or inactive. `GetUserDriver
 | --- | --- | --- | --- | --- | --- | --- |
 | Invitation redeem | `sqlFleetJoinRepository.EnrollDriver` | Yes, separate statement | Yes | Yes | Yes | Yes, under row lock |
 | Admin assign | `EnrollDriver` via `fleetjoin.Service.Assign` | Yes | Yes | Yes | Yes | Yes |
-| Driver switch | `sqlUserRepository.SetDriverActiveFleet` | Yes, same statement | Yes | Yes | Yes | Payout-ready for fleet-merchant only |
-| Automatic assignment | `AddDriverToFleet` from `reconcileFleetAssignmentForUser` | Yes | No | No | No | No |
-| Legacy add by email | `AddDriverToFleet` from `DashboardService.AddDriverToFleet` | Yes | No | No | No | No |
+| Admin transfer, legacy add by email | `TransferDriver` via `DashboardService.TransferUserFleet` | Yes | Yes | No | Takes the driver offline; an unfinished ride blocks | Yes, under row lock |
+| Admin membership edit | `UpdateDriverMemberships` | Yes, when the active fleet changes | Yes, or clears it for an empty set | No | Takes the driver offline; an unfinished ride blocks | New and selected fleets, under row lock |
+| Driver switch | `sqlUserRepository.SetDriverActiveFleet` | Yes, same statement | Yes | Yes | Yes | Target must be active and not archived; payout-ready for fleet-merchant |
+| Automatic enrollment | `AddDriverToDefaultFleet` from `reconcileFleetAssignmentForUser` | Not applicable (no memberships) | No | No | No | Default fleet must be joinable and owner-operator |
 
-The first three paths keep all three facts aligned. The last two only touch `FleetDrivers`, which leaves `payout_fleet_id` and `Users.community_id` unchanged.
+Every path except automatic enrollment keeps the active fleet and payout fleet aligned. Only redeem, admin assign, and the driver switch move `Users.community_id`. Automatic enrollment only writes `FleetDrivers`, and only for a driver with no non-archived memberships.
 
 ## Switching the active fleet
 
@@ -42,10 +43,10 @@ The first three paths keep all three facts aligned. The last two only touch `Fle
 
 <Steps>
   <Step title="Lock the driver">
-    `LockDriverForFleetSwitch` selects the user `FOR UPDATE` and computes `has_ride` (any ride not in `complete` or `pending_rider_rating`) and `has_session` (an open `DriverSessions` row). If the driver is online or either flag is set, the switch fails with `ErrorTypeFleetJoinBusy` (HTTP 409, **Finish Driving First**).
+    `lockRideParticipants` takes the shared assignment lock. `LockDriverForFleetSwitch` then selects the user `FOR UPDATE` and computes `has_ride` (any ride not in `complete` or `pending_rider_rating`) and `has_session` (an open `DriverSessions` row). If the driver is online or either flag is set, the switch fails with `ErrorTypeFleetJoinBusy` (HTTP 409, **Finish Driving First**).
   </Step>
   <Step title="Load the target">
-    `GetFleetSwitchTarget` joins `Fleets` to `FleetDrivers`, so a missing membership returns **driver is not a member of this fleet** (404). The query computes `payout_ready`.
+    `GetFleetSwitchTarget` joins `Fleets` to `FleetDrivers` and requires the fleet to be active and not archived, locking the fleet row `FOR UPDATE`. A missing membership or an unavailable fleet returns **driver is not a member of this fleet** (404). The query computes `payout_ready`.
   </Step>
   <Step title="Gate fleet-merchant targets">
     If the target uses `fleet_merchant` and isn't payout-ready, the switch fails with `ErrorTypeFleetPayoutUnavailable` (409, **Fleet Payouts Unavailable**). Owner-operator targets have no readiness gate.
@@ -69,18 +70,19 @@ flowchart TD
   A["ActiveFleetId set?"] -->|Yes| Z["Return, no change"]
   A -->|No| B["ListDriverFleets non-empty?"]
   B -->|Yes| C["SetDriverActiveFleet(fleets[0])"]
-  B -->|No| D["Active whitelist entry for email?"]
-  D -->|Yes| E["AddDriverToFleet(whitelist.fleet_id)"]
-  D -->|No| F["Community has primary_fleet_id?"]
-  F -->|Yes| G["AddDriverToFleet(primary_fleet_id)"]
+  B -->|No| F["Default community has primary_fleet_id?"]
+  F -->|Yes| G["AddDriverToDefaultFleet(primary_fleet_id)"]
   F -->|No| H["Stay without a fleet"]
 ```
 
+Only the default community (`Communities.is_default`, via `Community.GetDefault`) supplies automatic enrollment. The driver's own community primary fleet and the email whitelist are never used.
+
+`AddDriverToDefaultFleet` runs in one transaction. It re-reads `ListDriverFleets` and does nothing if the driver gained a membership concurrently. It then locks the fleet with `LockFleetForJoin` and fails with **default driver fleet must be an active personal-payout fleet** unless the fleet is joinable and uses `owner_operator`. It doesn't set `payout_fleet_id` or move the driver's community.
+
 Tie-breaks and failure modes:
 
-- `ListDriverFleets` has no `ORDER BY`, so "first fleet" is whatever order PostgreSQL returns. It excludes deleted fleets but not inactive ones.
-- If `fleets[0]` is a fleet-merchant fleet that isn't payout-ready, `SetDriverActiveFleet` returns an error and the function doesn't try the next membership.
-- The whitelist and primary-fleet branches use `AddDriverToFleet`, which doesn't check joinability, set `payout_fleet_id`, or move the driver's community. The whitelist row's own `community_id` is ignored.
+- `ListDriverFleets` has no `ORDER BY`, so "first fleet" is whatever order PostgreSQL returns. It excludes archived fleets but not inactive ones.
+- If `fleets[0]` is inactive, or a fleet-merchant fleet that isn't payout-ready, `SetDriverActiveFleet` returns an error and the function doesn't try the next membership.
 - `ensureFleetAssignmentForUser` logs failures and swallows them. `RefreshOnlineStatus` then reloads the user and fails with **Fleet Not Found** if `ActiveFleetId` is still nil.
 
 ## Online eligibility
@@ -101,7 +103,7 @@ Tie-breaks and failure modes:
 `EffectivePayoutStatus` returns the personal `stripe_status` when `payout_fleet_id` is nil. Otherwise it returns `payout_fleet_status` from `GetDriverApplicationState`, which is `complete` only if the payout fleet is payout-ready and the driver's membership in it is active. It returns `restricted` if the fleet's Stripe status is `restricted`, and `pending` in all other cases.
 
 <Note>
-  Because only one membership can be active, a fleet-managed driver's payout fleet is effectively required to be their active fleet. A driver whose payout fleet was switched away from (through `AddDriverToFleet`, for example) reads as `pending` until they switch back or join again.
+  Because only one membership can be active, a fleet-managed driver's payout fleet is effectively required to be their active fleet. Every current writer that changes the active fleet also rewrites the payout fleet, so the two only diverge for rows written before these paths existed.
 </Note>
 
 ## Every path that picks a Stripe account
@@ -142,6 +144,7 @@ The `fleet` argument is loaded by `getDriverSessionAndFleet`, which reads the op
 | Switch and join SQL | `LockDriverForFleetSwitch`, `GetFleetSwitchTarget`, `SetDriverApplicationPayoutFleet`, `ClearDriverApplicationPayoutFleet` in `yelo-api/internal/data/repository/queries/fleet_join.sql` |
 | Driver endpoints | `GET /driver/fleet`, `POST /driver/active-fleet` in `yelo-api/internal/server/http/driver/driver_routes.go` |
 | Automatic assignment, activation, go online | `yelo-api/internal/service/driver/driver.go` |
+| Default enrollment transaction | `addDriverToFleet`, `defaultFleetAssignmentNeeded` in `yelo-api/internal/data/repository/user_fleet.go` |
 | Session commit | `RefreshDriverSession` in `yelo-api/internal/data/repository/driver_availability.go` |
 | Online and activation SQL | `SetEligibleDriverOnline`, `ActivateEligibleDriver`, `GetDriverOnlineSelection`, `GetDriverApplicationState` in `yelo-api/internal/data/repository/queries/user_driver.sql` |
 | Payout status model | `DriverApplication.EffectivePayoutStatus` in `yelo-api/internal/models/driver.go` |
@@ -151,10 +154,10 @@ The `fleet` argument is loaded by `getDriverSessionAndFleet`, which reads the op
 ## Gotchas and edge cases
 
 - **Routing ignores readiness.** A fleet with `has_custom_payouts = TRUE` and any non-nil `stripe_merchant_id` receives fares, even if it is an owner-operator fleet, inactive, restricted, or has an empty-string account ID. Online eligibility checks readiness, and routing doesn't.
-- **Payout fleet and routing fleet can differ.** A driver with `payout_fleet_id = NULL` (added through `AddDriverToFleet` or the primary-fleet fallback) goes online on personal Stripe readiness. If their session fleet has custom payouts, fares still go to the fleet's account.
-- **Capture recomputes the account.** `Complete` calls `selectStripeMerchantID` again instead of reusing `Rides.stripe_merchant_id`. If an admin unlinks Stripe or toggles `has_custom_payouts` while a ride is in progress, the capture targets a different connected account than the one that holds the authorization. Deleting the fleet sets `stripe_merchant_id` to `NULL`, which makes capture fall back to the driver's account.
+- **Payout fleet and routing fleet can differ.** A driver with `payout_fleet_id = NULL` goes online on personal Stripe readiness. If their session fleet has custom payouts, fares still go to the fleet's account.
+- **Capture recomputes the account.** `Complete` calls `selectStripeMerchantID` again instead of reusing `Rides.stripe_merchant_id`. If an admin unlinks Stripe or toggles `has_custom_payouts` while a ride is in progress, the capture targets a different connected account than the one that holds the authorization. Archive can't cause this, because open rides and sessions block it.
 - **Rematch across an account change fails.** `reuseRideAuthorization` treats "same driver, different account" as **ride authorization belongs to an unknown assignment**.
 - **Switch timestamps stick.** `SetDriverApplicationPayoutFleet` uses `COALESCE(payout_fleet_joined_at, NOW())`, so a switch from fleet A to fleet B keeps A's join time. The join path uses `SetDriverApplicationPayoutFleetOnJoin`, which resets it.
-- **Deleted owner-operator fleets can still be selected.** `GetFleetSwitchTarget` only checks membership, and readiness only for fleet-merchant fleets. A driver can switch to a deleted owner-operator fleet through the API, then fail to go online because `fleet_matches` requires an active, non-deleted fleet. `GET /driver/fleet` hides deleted fleets, so the app won't offer this.
-- **Busy means any unfinished ride.** `has_ride` counts every ride not in `complete` or `pending_rider_rating`, including `queued` rides, so a driver with a queued ride can't switch fleets.
-- **Legacy adds skip cache invalidation.** `AddDriverToFleet` doesn't invalidate the auth or profile caches, unlike the join and switch paths.
+- **Busy means any unfinished ride.** `has_ride` counts every ride not in `complete` or `pending_rider_rating`, including `queued` rides, so a driver with a queued ride can't switch fleets, and an admin can't transfer or edit their memberships.
+- **Admin edits skip the auth cache.** `clearFleetEditPresence` invalidates the profile cache and presence, but not the auth cache, unlike the join and switch paths.
+- **Default enrollment skips caches.** `AddDriverToDefaultFleet` invalidates nothing. `RefreshOnlineStatus` reloads the user from the database right after, so going online sees the new fleet.

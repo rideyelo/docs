@@ -1,0 +1,159 @@
+---
+title: "Dev runtime and simulator pool"
+description: "How make dev allocates per-worktree Metro and API ports, runs them in tmux behind Portless names, leases simulators from a shared pool, and how purge and the asset generators work."
+---
+
+Several `yelo-frontend` worktrees can run at once on one Mac. Each gets its own Metro port, API port, tmux session, and simulator leases, so they never collide. This page explains the scripts behind `make dev`, `make sims`, and `make asims`.
+
+For first-time setup and the basic commands, see [Local development](/engineering/local-development). For release builds, see [Releases](/engineering/mobile/releases).
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `make dev` | Allocate this worktree's runtime, start Metro and a local API in tmux, and wait for both |
+| `make dev-attach` | Attach to this worktree's tmux session |
+| `make dev-status` | Show ports, Portless routes, service health, tmux session, and leased devices |
+| `make dev-stop` | Kill the tmux session, remove Portless aliases and `adb reverse` rules, delete the generated env file, and release ports and devices |
+| `make dev-reset` | Stop, reallocate ports, and start again |
+| `make sims` / `make sims-local` | Start services, lease iOS simulators, install the dev client if needed, and open it. `sims` points at the production API, `sims-local` at the local API |
+| `make sims-rebuild` | Same as `sims`, but force a native rebuild (`SIM_FORCE_REBUILD=1`) |
+| `make asims` / `make asims-local` | Start services, lease or claim an Android AVD, forward ports, and open the dev client |
+| `make asims-rebuild AVD=<name>` | Rebuild and install the Android app on the AVD |
+| `make asims-list`, `make asims-stop AVD=<name>` | List installed AVDs with their state, or stop one |
+| `make pool-status` | Every pool device and the worktree that holds it, or `free` |
+| `make pool-create [N=10] [DEVICE="iPhone 17"]` | Create `yelo-pool-<n>` iOS simulators and register them |
+| `make pool-add KIND=android ID=<avd>` | Register an existing device. For iOS, pass `ID=<udid> NAME=<name>` |
+| `make pool-clean` | Drop leases and port claims whose worktree directory no longer exists |
+| `make pool-reset` | Shut down every pool device, drop every device lease, then run `pool-clean` |
+| `make purge [DRY=1]`, `make purge-native [DRY=1]` | Delete build output and dependencies. See [Purge](#purge) |
+
+## Runtime allocation
+
+`scripts/dev-runtime.sh` owns shared state. It lives in the Git common directory, so every worktree of the repository sees the same state:
+
+```text
+<git-common-dir>/yelo-dev/
+  .lock            mkdir-based lock, waits up to 10 s
+  ports/<port>     first line = owning worktree path
+  devices/<key>    owner path, kind, device ID
+  pool.conf        one line per device: "<kind> <id> <name>"
+```
+
+The first command in a worktree writes `.expo/dev-runtime.env`:
+
+| Variable | Value |
+| --- | --- |
+| `DEV_WORKSPACE` | Branch name, or the directory name, slugified to 48 characters. Override with `DEV_WORKSPACE` |
+| `DEV_METRO_PORT` | A free port in 41000–41999 |
+| `DEV_API_PORT` | A free port in 42000–42999 |
+| `DEV_METRO_URL`, `DEV_API_URL` | `http://127.0.0.1:<port>` |
+| `DEV_METRO_NAME`, `DEV_API_NAME` | `metro.<workspace>.yelo`, `api.<workspace>.yelo` |
+| `DEV_TMUX_SESSION` | `yelo-<workspace>` |
+| `DEV_API_DIR` | `YELO_API_DIR`, or `yelo-api` next to the main checkout |
+
+Ports are picked by hashing the worktree path into the range, then probing upward. A port is skipped when another worktree's claim file owns it or when something is already listening on it (`lsof`). The same worktree gets the same ports on the next run until `make dev-stop` or `make dev-reset` releases them.
+
+## Starting services
+
+`scripts/dev.sh start` does this, in order:
+
+1. Load the runtime. If `YELO_API_DIR` is set and differs from the cached `DEV_API_DIR`, stop and ask for `make dev-reset`.
+2. Symlink `.env` and `.env.local` from the main checkout when this is a linked worktree that lacks them.
+3. Require `tmux`, the Portless binary in `node_modules`, and (for a local API) the API checkout.
+4. Start the Portless proxy in the foreground, so first-run certificate prompts are visible.
+5. Write `.env.development.local` with `EXPO_PUBLIC_API_URL` set to the local API URL, or `https://api.rideyelo.com` when `SIM_API_ENV=prod`. Expo gives this file precedence over `.env.local`.
+6. Create the tmux session (socket and session both named `DEV_TMUX_SESSION`) with a `services` window. Pane 0 registers the Metro Portless alias and runs `expo start --port <DEV_METRO_PORT> --clear`.
+7. For a local API, split a pane in the API checkout that registers its alias and runs `go run ./cmd/api --port <DEV_API_PORT>`. It's skipped when `/healthcheck` already answers. With the production API, any local API pane for this checkout is killed.
+8. Poll Metro `/status` and API `/healthcheck` once per second, up to 90 attempts each, then print the status.
+
+`SIM_API_ENV` defaults to `dev` for `make dev` and to `prod` for `make sims` and `make asims`. The `-local` targets set it to `dev`.
+
+## Simulator pool
+
+With no pinned devices, iOS and Android devices come from `pool.conf`.
+
+`checkout-device <kind> <count>` hands out devices in two passes: first devices this worktree already holds, then free ones. A lease whose owner directory no longer exists counts as free and is deleted. If not enough devices are free, the command fails and suggests `make pool-status`, `make dev-stop` in a finished worktree, or `make pool-clean`.
+
+`claim-device` leases a specific device instead. It fails when another live worktree holds it.
+
+### iOS
+
+`dev.sh ios` either checks out `SIM_COUNT` pool devices (default 1) or, when `.simulators.mk` defines `SIM_1_UDID`, claims the pinned devices listed there. It then runs `scripts/ios-sims.sh` with Metro on `127.0.0.1` at the worktree's port.
+
+`ios-sims.sh`:
+
+- Boots each simulator that isn't booted and waits for `bootstatus`, with up to 3 retries.
+- Installs the dev client with `expo run:ios --device <udid> --no-bundler` when bundle `io.flutterflow.ridedesi.desirider` isn't installed, or on every device when `SIM_FORCE_REBUILD=1`. It waits up to 900 seconds (`SIM_INSTALL_WAIT_SECONDS`) and treats a changed app container as success, because Expo can hang at its post-install "Connecting" step.
+- Opens `exp+yelo://expo-development-client/?url=<metro>` on each device. One Metro serves every device in a worktree.
+
+Run the script through `make sims`. Called directly with arguments, it exits with an error.
+
+### Android
+
+`dev.sh android` claims `AVD` when set, else checks out the first free Android pool device. `scripts/android-sim.sh` then:
+
+- Boots the AVD if needed and waits for `sys.boot_completed`.
+- Runs `adb reverse` for the Metro and API ports, so the emulator reaches them on `127.0.0.1`. Never hardcode `10.0.2.2`.
+- In `start` mode, fails with a hint to run `make asims-rebuild` when the app isn't installed. Otherwise it waits up to 60 seconds for Metro and opens the dev client URL.
+- In `rebuild` mode, runs `expo run:android --device <avd>` with `JAVA_HOME` defaulting to Homebrew OpenJDK 17.
+
+## Purge
+
+`scripts/purge.sh` deletes local build state for this worktree only. It refuses to run when the workspace path is empty, `/`, or `$HOME`, and refuses any path outside the workspace.
+
+| Mode | Removes |
+| --- | --- |
+| `project` (`make purge`) | `.expo`, `node_modules`, `dist`, `web-build`, `ios/build`, `ios/DerivedData`, `android/.gradle`, `android/build`, `android/app/build` |
+| `native` (`make purge-native`) | Everything above, plus `ios/Pods` and every Xcode DerivedData folder whose `info.plist` records a workspace or project path inside this worktree |
+
+`DRY=1` prints what would be removed. Reinstall dependencies afterward.
+
+## Asset generators
+
+`scripts/asset-gen/` holds one-shot image tools for map icons. They aren't part of any build.
+
+| Script | Output |
+| --- | --- |
+| `generate-outlined-emoji.ts` | Category emoji with a white outline that follows the shape, at 256 × 256, plus saved variants at 320 × 320 |
+| `generate-saved-emoji.ts` | Saved variants: the heart badge composited onto each emoji, so icon and heart hide together on collision |
+| `generate-outlined-vehicles.ts` | Outlined vehicle icons for the map only. Card icons are untouched |
+| `optimize-emoji.js` | 8-bit palette re-encodes into `*-optimized/` sibling folders. Never overwrites sources |
+
+The TypeScript generators run with `npx --yes -p tsx -p sharp tsx <script>`. Their header comments still show the old path `scripts/<name>.ts`, so use `scripts/asset-gen/<name>.ts`.
+
+For the color tools (`make color-inventory`, `make color-codemod`), see [UI system](/engineering/mobile/ui-system).
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Make targets | `yelo-frontend/Makefile` |
+| Runtime state, ports, pool | `yelo-frontend/scripts/dev-runtime.sh` |
+| Service orchestration | `yelo-frontend/scripts/dev.sh`, `scripts/dev.test.mjs` |
+| Simulators | `yelo-frontend/scripts/ios-sims.sh`, `scripts/android-sim.sh`, `.simulators.mk` (git-ignored) |
+| Purge | `yelo-frontend/scripts/purge.sh` |
+| Asset tools | `yelo-frontend/scripts/asset-gen/` |
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="A stale .env.development.local overrides everything">
+    `dev.sh` writes `.env.development.local` and `make dev-stop` deletes it only when it still carries the `Generated by scripts/dev.sh` marker. If a run is killed, the file stays and keeps pointing the app at the old API URL. Run `make dev-stop` or `make dev-reset`.
+  </Accordion>
+  <Accordion title="Changing YELO_API_DIR needs a reset">
+    The API path is cached in `.expo/dev-runtime.env` on first use. Setting a different `YELO_API_DIR` later makes `make dev` exit rather than silently start the cached checkout. Run `make dev-reset` with the new value.
+  </Accordion>
+  <Accordion title="Deleted worktrees keep their leases until checked">
+    Leases for a deleted worktree are only reclaimed lazily, when another checkout touches that device, or by `make pool-clean`. Port claims are reclaimed only by `pool-clean`.
+  </Accordion>
+  <Accordion title="First launch on a new simulator needs a tap">
+    iOS shows a one-time prompt before a URL can open the dev client. If the app doesn't appear, `ios-sims.sh` asks you to tap **Open** on that prompt and rerun `make sims`. Approval persists per device.
+  </Accordion>
+  <Accordion title="pool-reset affects every worktree">
+    `make pool-reset` shuts down every simulator in the pool and drops all device leases, including those held by other running worktrees.
+  </Accordion>
+  <Accordion title="The lock is a directory">
+    The runtime lock is `yelo-dev/.lock`, removed on exit. If a process is killed with `SIGKILL`, the directory stays and every later command times out after 10 seconds with **Timed out waiting for the dev runtime lock.** Remove the directory by hand.
+  </Accordion>
+</AccordionGroup>

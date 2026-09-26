@@ -61,12 +61,13 @@ This is a second, permanent dedupe on top of the event key. The promotion and au
 
 ### T0 fleet targets
 
-`ListRideT0NotificationTargets` (`internal/data/repository/queries/community.sql`) returns drivers who:
+`ListRideT0NotificationTargets` (`internal/data/repository/queries/community.sql`) only returns targets while the ride is `confirmed` with no driver, and its community is not archived. It returns drivers who:
 
-- Belong to the ride's active fleet and community, with an active `FleetDrivers` row and an active driver application.
-- Drive a vehicle of the ride's `vehicle_type` with enough seats and `application_status = complete`. Online drivers use their session vehicle, offline drivers their default vehicle.
+- Belong to the ride's active fleet and community, with an active `FleetDrivers` row and an active driver application. The community's primary fleet does not matter.
+- Drive a vehicle of the ride's `vehicle_type` with `application_status = complete`. Online drivers use their session vehicle, offline drivers their default vehicle. Seat count is not checked.
+- Use a vehicle that no other fleet's inventory (`FleetVehicles`) claims, and that `AvailableDriverVehicles` lists for this driver under the ride's fleet, or with no fleet when the fleet has no inventory.
 - Are online under the same fleet, or offline.
-- Have a token, allow notifications, are not deleted, banned, or locked, and have not declined the ride.
+- Are not the rider, have a token, allow notifications, are not deleted, banned, or locked, and have not declined the ride.
 - Have payout readiness: `stripe_status = complete`, or a complete fleet merchant with custom payouts.
 - Have fewer than `matching.MaxQueueLength` open rides.
 - For the fleet named `Yelo`, carry a `Founding Driver`, `founding driver`, or `founding` tag.

@@ -3,7 +3,11 @@ title: "Operator broadcasts and scheduling"
 description: "How dashboard broadcasts, scheduled sends, market notifications, and driver and rider pings flow through the API, the SQL behind each recipient group, and the edge cases in the scheduling loop."
 ---
 
-Admins reach users in four ways: the **Send Notification** sheet, scheduled sends from the same sheet, **Notify market** on Supply & Demand, and single-user pings. All four become push notifications through the standard pipeline. None of them send SMS.
+The API offers four ways to reach users: the **Send Notification** sheet, scheduled sends from the same sheet, market notifications, and single-user pings. All four become push notifications through the standard pipeline. None of them send SMS.
+
+<Note>
+Only the **Send Notification** sheet is reachable in the dashboard today. The **Supply & Demand** page was replaced by **Live**, which has no notify or ping controls. `NotifyMarketDialog`, `PingDialog`, and `DriverOpsPage` still exist in `yelo-web`, but no route renders them. The market notify and ping routes below are API-only.
+</Note>
 
 For the admin workflow, see [Send notifications](/dashboard/notifications). For the pipeline, see [Push send pipeline](/engineering/notifications/send-pipeline).
 
@@ -13,9 +17,9 @@ For the admin workflow, see [Send notifications](/dashboard/notifications). For 
 | --- | --- | --- | --- | --- |
 | Send now | `POST /dashboard/notifications/send` | Handler requires Clerk role `admin` | `community_broadcast` | Community scope |
 | Schedule | Same route with `schedule_send_timestamp` | Same | Stored, later `community_broadcast` | Community scope |
-| Notify market | `POST /dashboard/supply-demand/markets/{id}/notify` | Community resolved from path (admin) or claims (others). **No role check.** | `community_broadcast` | Community scope |
-| Ping driver | `POST /dashboard/supply-demand/drivers/{id}/ping` | `requireAdmin` | `dashboard_ping_driver` | One user |
-| Ping rider | `POST /dashboard/supply-demand/riders/{id}/ping` | `requireAdmin` | `dashboard_ping_rider` | One user |
+| Notify market | `POST /dashboard/live/markets/{id}/notify` | Admin only: `dashboardScopeAllows` rejects interns and fleet managers on `/dashboard/live`. Community resolved from the path | `community_broadcast` | Community scope |
+| Ping driver | `POST /dashboard/live/drivers/{id}/ping` | Admin scope plus `requireAdmin` | `dashboard_ping_driver` | One user |
+| Ping rider | `POST /dashboard/live/riders/{id}/ping` | Admin scope plus `requireAdmin` | `dashboard_ping_rider` | One user |
 
 The send and schedule route is registered by `registerNotificationRoutes` in `internal/server/http/community/community_router.go`. Its handler is `CommunityHandler.SendNotification`.
 
@@ -155,11 +159,11 @@ Timing:
 | Broadcast and schedule logic | `yelo-api/internal/service/dashboard/notification.go` |
 | Scope mapping | `yelo-api/internal/service/notifications/notification.go` (`SendNotificationToCommunity`) |
 | Scope SQL | `yelo-api/internal/notify/repository/recipients.go` (`ListBroadcastTokens`) |
-| Scheduled rows SQL | `yelo-api/internal/data/repository/notification.go`, `queries/notification.sql` |
+| Scheduled rows SQL | `yelo-api/internal/data/repository/notification.go`, `queries/notification_log.sql` |
 | Validation | `yelo-api/internal/models/notification_validation.go` |
 | Market notify and pings | `yelo-api/internal/server/http/dashboard/supply_demand/handlers.go`, `internal/service/dashboard/supply_demand.go` |
 | Ticker | `yelo-api/cmd/api/main.go` (`startBackgroundTasks`), `cmd/api/background_cleanup.go` |
-| Dashboard UI | `yelo-web/src/sites/dashboard/pages/NotificationsPage.tsx`, `src/components/notifications/SendNotificationSheet.tsx` |
+| Dashboard UI | `yelo-web/src/sites/dashboard/pages/NotificationsPage.tsx`, `src/components/notifications/SendNotificationSheet.tsx`. Unrouted market and ping dialogs: `src/components/live/NotifyMarketDialog.tsx`, `PingDialog.tsx` |
 
 ## Gotchas and edge cases
 

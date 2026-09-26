@@ -26,7 +26,7 @@ Drivers read it with `GET /ride/v2/board`, served by `RideService.GetEnrichedRid
 
 Results are ordered by `confirm_time`, oldest first. When the driver has a location, Mapbox adds pickup distance and duration to each row.
 
-The `RideBoardProvider` (`ride_board_redis.go`, with an in-memory fallback in `ride_board_memory.go`) mirrors board membership in Redis. It stores ride IDs in `rides:community:{communityId}`, ride details in the `ride:details` hash, and a 10-second `rides:refresh:{communityId}` key that signals clients to refresh. `GET /ride/board/{id}` reads details from it and falls back to Postgres for `confirmed` rides.
+The `RideBoardProvider` (`ride_board_redis.go`, with an in-memory fallback in `ride_board_memory.go`) mirrors board membership in Redis. It stores ride IDs in `rides:community:{communityId}`, ride details in the `ride:details` hash, and a 10-second `rides:refresh:{communityId}` timestamp that nothing reads. `GET /ride/board/{id}` reads details from it and falls back to Postgres for `confirmed` rides. The driver app relies on its 10-second poll and on `ride_available` pushes to refresh the board.
 
 ### Manual accept
 
@@ -46,7 +46,7 @@ Declining (`POST /ride/i/{id}/decline`) appends the driver to `declined_drivers`
 When a ride is confirmed or requeued, `notifyDriversAboutNewRide` pushes it to eligible members of the ride's fleet right away. The target query (`ListRideT0NotificationTargets`) requires that each driver:
 
 - Is an active member of the fleet with an active driver application.
-- Has a completed vehicle of the right type and seat count.
+- Has a completed vehicle of the right type. Seat count isn't checked, because a ride's `num_riders` isn't known until the driver rates the rider.
 - Is either offline, or online under this fleet.
 - Is payout-ready: either their own Stripe status is complete, or they're paid through a fleet with completed custom payouts.
 - Allows notifications and isn't banned, locked, or deleted.
@@ -57,7 +57,7 @@ For the fleet named `Yelo`, only drivers tagged `Founding Driver` (or `founding 
 
 A rider can confirm with a `driver_id` to request a specific driver. `directAssignDriver` checks that the driver is online in the community, still in the same fleet and vehicle type, and less than an hour away. If any check fails, it falls back to normal matching and records a `direct_assign_fallback` event.
 
-On success, the ride is reserved with `potential_driver` and `offer_time`. Only that driver can accept for 30 seconds. If they decline, or the window lapses, the activation loop releases the reservation, sends T0 notifications to the rest of the fleet, and tells the rider their request fell back.
+On success, the ride is reserved with `potential_driver` and `offer_time`. Only that driver can accept for 30 seconds. If they decline, the decline clears the reservation right away, sends T0 notifications to the rest of the fleet, and tells the rider their request fell back. If the window lapses, the next activation loop tick does the same.
 
 ## Activation tiers
 
@@ -106,7 +106,7 @@ The driver's effective capacity is their personal `auto_queue_max_minutes`, or t
 
 ### Assignment
 
-After tier activation, the same loop runs an auto-queue pass over rides that have been unmatched for at least 2 minutes (`autoQueueMinAge`), oldest first. Each ride gets one attempt. A Redis `auto_queue_attempted` flag prevents retries.
+After tier activation, the same loop runs an auto-queue pass over rides that have been unmatched for at least 2 minutes (`autoQueueMinAge`), oldest first. When a pass finds no eligible driver or no scorable candidate, it sets the Redis flag `ride:aq_attempted:{rideId}` for 1 hour and the ride isn't tried again. A pass that fails on a read error or loses the assignment race doesn't set the flag, so it retries on the next tick.
 
 <Steps>
   <Step title="Find eligible drivers">
@@ -123,11 +123,11 @@ After tier activation, the same loop runs an auto-queue pass over rides that hav
     The final score is 0.5 × time + 0.5 × load. Lowest wins. Scores within 0.05 of each other count as a tie, and the driver with fewer queued rides wins the tie.
   </Step>
   <Step title="Assign">
-    `RideService.AutoAssignRide` assigns the ride as `queued` with `auto_queued = true`, removes it from the board, and notifies both the driver and the rider. If the driver has no active ride, `RecoverIdleQueue` promotes it immediately.
+    `RideService.AutoAssignRide` assigns the ride as `queued` with `auto_queued = true` and records a `ride_auto_queued` event with the dispatch decision (candidate count, deadhead, score, and queue load). If the driver has no active ride, `RecoverIdleQueue` then calculates the pickup route, authorizes payment, and promotes it to `driver_en_route` before anyone is notified. If that preparation fails but the ride is still assigned, it stays `queued` for the 3-minute recovery loop. Finally the ride is removed from the board and both the driver and the rider are notified.
   </Step>
 </Steps>
 
-If no driver is eligible, `notifyFleetOfMissedRide` pushes an "unclaimed ride" alert to every driver in the ride's fleet.
+If the eligibility query returns no drivers, `notifyFleetOfMissedRide` pushes an "unclaimed ride" alert to up to 50 active members of the ride's fleet in the community, online or not.
 
 ## Queue promotion and recovery
 

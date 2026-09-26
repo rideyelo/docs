@@ -1,9 +1,9 @@
 ---
 title: "Fleets"
-description: "Track fleet performance on the Fleet page, and create, configure, and remove fleets from Fleet Management in the Yelo dashboard."
+description: "Track fleet performance on the Fleet page, create, configure, and archive fleets from Fleet Management, and edit a driver's fleet memberships in the Yelo dashboard."
 ---
 
-The dashboard has two fleet pages. The **Fleet** page shows how one fleet is performing, and fleet managers use it every day. The **Fleets** page, titled **Fleet Management**, is where admins create fleets, connect Stripe, choose service communities, and remove fleets.
+The dashboard has two fleet pages. The **Fleet** page shows how one fleet is performing, and fleet managers use it every day. The **Fleets** page, titled **Fleet Management**, is where admins create fleets, connect Stripe, choose service communities, and archive fleets.
 
 For background on how fleets, operators, and payouts fit together, see [Fleets](/concepts/fleets).
 
@@ -14,7 +14,7 @@ For background on how fleets, operators, and payouts fit together, see [Fleets](
 
 ## Monitor a fleet
 
-Open **Fleet** in the **Community** group of the sidebar. The page shows the fleet for the community selected in the top bar.
+Open **Fleet** in the **Community** group of the sidebar. The page shows the fleet for the community selected in the sidebar community selector.
 
 - Use the fleet dropdown to switch fleets. It's disabled when only one fleet is available.
 - Use the time range menu to pick **Last 7 Days**, **Last 14 Days**, or **Last 30 Days**.
@@ -39,7 +39,7 @@ Below the KPIs you'll find:
 
 - **Ride Requests Over Time**: an hourly chart in the community's timezone.
 - Driver metrics: **Total Drivers**, **Approved Drivers**, **Avg. Rating**, and **Total Drives**.
-- **Fleet Driver Directory**: the fleet's drivers, sorted by **Total Earnings (GMV)**. Other columns are **Name**, **Drives**, **Cancels (Driver+Rider)**, **Rating**, **Last Active**, and **Status**. Admins can select a row to review the driver's application. See [Review a driver application](/dashboard/drivers#review-a-driver-application).
+- **Fleet Driver Directory**: the fleet's activated drivers who live in the selected community, sorted by **Total Earnings (GMV)**. It includes members who have since switched to another active fleet. Other columns are **Name**, **Drives**, **Cancels (Driver+Rider)**, **Rating**, **Last Active**, and **Status**. Admins can select a row to review the driver's application. See [Review a driver application](/dashboard/drivers#review-a-driver-application).
 - **Invite drivers**: opens the fleet's driver invitation link. See [Fleet driver invitations](/fleets/driver-invitations).
 - **Fleet Pricing Management**: the fleet's active pricing configs in this community. See [Ride pricing](/dashboard/ride-pricing).
 
@@ -63,7 +63,7 @@ Open **Fleets** in the **Configuration** group of the sidebar. The **Fleets** ta
 | **Service communities** | The first active service community, with a **+N more** tooltip for the rest. **Home** shows the fleet's home community. |
 | **Payment Model** | **Owner Operator** or **Fleet Merchant**. |
 | **Vehicle Types** | The supported vehicle types. The primary type is marked **(primary)**. |
-| **Status** | **Deleted**, **Restricted**, **Pending Stripe**, **Active**, or **Inactive**. |
+| **Status** | **Restricted**, **Pending Stripe**, **Active**, or **Inactive**. Archived fleets aren't listed. |
 | **Drivers** | The number of active drivers. |
 | **Created** | The date the fleet was created. |
 
@@ -172,9 +172,47 @@ Each service community shows its timezone and one of these statuses:
 
 Select **Retire** to stop serving a community, or **Restore** to bring it back with its previous configuration. Select **Stored pricing** to view the pricing history kept for that community.
 
-## Delete a fleet
+## Edit a driver's fleet memberships
 
-1. Select the delete icon on the fleet's row, or **Delete fleet** in the fleet editor.
-2. Confirm with **Delete Fleet**.
+Admins manage which fleets a driver belongs to from the **Fleet membership** section of the user detail sheet. See [User directory](/dashboard/user-directory).
 
-Yelo soft-deletes the fleet and deactivates it. Rides already in progress complete normally. Deleted fleets show a **Deleted** status in the fleet list.
+<Steps>
+  <Step title="Open the section">
+    Open the driver's detail sheet and expand **Fleet membership**. **Enrolled fleets** lists every membership, including archived fleets, with **Active** and **Archived** badges.
+  </Step>
+  <Step title="Add or remove fleets">
+    Search **Find a fleet to add…** and select a fleet to add it. Select the remove icon to mark a membership for removal, or **Undo removal** to keep it. Only fleets that can accept drivers can be added.
+  </Step>
+  <Step title="Choose the active fleet">
+    Select the radio button next to the fleet the driver should drive under. If you remove the active fleet, pick another remaining fleet, or remove every membership.
+  </Step>
+  <Step title="Review and confirm">
+    Select **Review membership changes**. The dialog lists additions, revocations, and the active fleet change. Select **Confirm changes**.
+  </Step>
+</Steps>
+
+When you save:
+
+- The driver is taken offline. The save is refused while the driver has an unfinished ride.
+- The driver's community doesn't change.
+- Adding a fleet doesn't change the active fleet or the selected vehicle.
+- Changing the active fleet changes where future payouts go and selects that fleet's approved default vehicle.
+- Removing a fleet revokes access to its shared vehicles.
+- Removing every membership clears fleet-managed payouts. Yelo may enroll the driver in the default fleet again when they next try to drive.
+
+If someone else changed the driver's memberships after you opened the sheet, saving fails. Select **Reload latest memberships** and review your changes again.
+
+## Archive a fleet
+
+1. Select the archive icon on the fleet's row, or **Archive fleet** in the fleet editor.
+2. Read the prerequisites and confirm with **Archive Fleet**.
+
+Yelo refuses to archive a fleet until you resolve every blocker. The error lists each one:
+
+- Drivers who still have the fleet active, or whose payouts go through it. Move them to another fleet with [Fleet membership](#edit-a-drivers-fleet-memberships).
+- Outstanding rides and open driver sessions.
+- Communities that use the fleet as **Primary Fleet**. Change it on the [Communities](/dashboard/communities#ride-configuration) page.
+- Fleet vehicles that aren't archived. See [Fleet vehicles](/dashboard/fleet-vehicles#remove-a-vehicle).
+- Active QR payment links. See [QR payments](/dashboard/qr-payments).
+
+Archiving keeps ride history and the Stripe account reference. It disables the fleet's join link, retires its service communities, and ends its pricing. Archived fleets leave the fleet list, and you can't restore them from the dashboard.

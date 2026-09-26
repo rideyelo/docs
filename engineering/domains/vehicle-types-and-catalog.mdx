@@ -276,9 +276,9 @@ stateDiagram-v2
 
 ## Gotchas and edge cases
 
-- **`PATCH /dashboard/vehicle-types/{id}` is a full replace.** `UpdateVehicleType` writes every listed column from the body. An omitted `min_seats` becomes 0, which disables the seat floor. An omitted `image_asset` clears the artwork. `Update` also skips `validateConfig`, so it can blank `display_name` and `icon_name`.
-- **Some fields can't be changed after creation.** `slug`, `is_active`, and `metadata` aren't in the update SQL. No endpoint reactivates a deactivated type. You need a manual database change.
-- **New types are inactive unless you say otherwise.** `Create` inserts `is_active` from the body, and Go's zero value is `false`. A type created without `"is_active": true` never enters the registry.
+- **`PATCH /dashboard/vehicle-types/{id}` is a full replace.** `UpdateVehicleType` writes every listed column from the body. An omitted `min_seats` becomes 0, which disables the seat floor. An omitted `image_asset` clears the artwork. `Update` also skips `validateConfig`, so it can blank `display_name` and `icon_name`. The dashboard form (`VehicleTypeFormSheet.tsx`) sends every field, so this mainly affects direct API callers.
+- **Some fields can't be changed after creation.** `slug`, `is_active`, and `metadata` aren't in the update SQL. No endpoint reactivates a deactivated type. The dashboard form sends `is_active` on edit, and the API ignores it. You need a manual database change.
+- **New types are inactive unless you say otherwise.** `Create` inserts `is_active` from the body, and Go's zero value is `false`. A type created without `"is_active": true` never enters the registry. The dashboard form defaults **Active** to on.
 - **Some failures surface as 500.** A duplicate slug fails the unique constraint in `CreateVehicleType`. A missing ID in `UpdateVehicleType` returns `pgx.ErrNoRows`. `sqlVehicleTypeRepository` wraps both with `NewServerErrorFromError`, so the caller gets a server error.
 - **The registry is eventually consistent across instances.** Only the instance that served a write refreshes immediately. Other instances pick it up within 5 minutes. During that window, one instance can accept a vehicle type that another rejects.
 - **Deactivation strands existing rows.** A deactivated slug fails `IsValid`, so drivers can't edit vehicles of that type without changing type, riders can't confirm rides with it, and `VehicleTypeSeats` falls back to 4.

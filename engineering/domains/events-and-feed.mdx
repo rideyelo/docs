@@ -203,6 +203,8 @@ The read path in Redis mode:
 3. `HGET` the page. A missing field returns an empty page, not an error.
 4. Deserialize. A decode error falls back to memory.
 
+In Redis mode, `NewRedisFeedCache` warms every community's key in the background at startup. With `DASHBOARD_PREVIEW=true`, a dev-only mode that also skips background tasks, it skips that warming.
+
 `CommunityService.RefreshFeed` walks every community from `GetAllLight`. In Redis mode, an instance that loses the lock skips that community and leaves its own memory copy untouched. The winner writes Redis and its memory copy.
 
 Nothing invalidates the feed on write. A new ride, bump, or ad shows up on the next refresh tick or after the key expires. The Spot is the exception, because `GetFeed` reads it live on every page-0 request.
@@ -285,7 +287,7 @@ Changes reach the rider map on the next `Mobility` tick, about one minute later.
 ## Gotchas and edge cases
 
 <Warning>
-  With Redis disabled, `NewRedisFeedCache` stores `redisClient: nil`, but `GetFeed` and `RefreshFeed` still call `rfc.redisClient.IsEnabled()` first (`feed_cache_redis.go:53`, `:124`). `IsEnabled` reads `c.enabled` on a nil pointer. Every feed request panics into a 500 through `Recoverer`. The `Refresh` tick runs in a goroutine from `executeBackgroundTask` with no `recover`, so the first tick, two minutes after boot, crashes the API process unless `BACKGROUND_TASKS_ENABLED=false`. The in-memory mode is unreachable.
+  With Redis disabled, `NewRedisFeedCache` stores `redisClient: nil`, but `GetFeed` and `RefreshFeed` still call `rfc.redisClient.IsEnabled()` first (`feed_cache_redis.go:55`, `:126`). `IsEnabled` reads `c.enabled` on a nil pointer. Every feed request panics into a 500 through `Recoverer`. The `Refresh` tick runs in a goroutine from `executeBackgroundTask` with no `recover`, so the first tick, two minutes after boot, crashes the API process unless `BACKGROUND_TASKS_ENABLED=false` or `DASHBOARD_PREVIEW=true` keeps the loops from starting. The in-memory mode is unreachable.
 </Warning>
 
 - **Creating an event with no times panics.** The dashboard form sends `null` for empty times. `buildNewEvent` then leaves `Timetable` nil, and `eventCreateParams` dereferences `event.Timetable.ReleaseTime` (`repository/event.go:599`). `Recoverer` turns this into a 500, although the UI marks only **Name** as required.
@@ -300,6 +302,6 @@ Changes reach the rider map on the next `Mobility` tick, about one minute later.
 - **The page count is unbounded.** Up to 60 moves and one ad per group can produce more than 3 pages. Docs that say "up to 3 pages" describe the query limit, not the output.
 - **The memory fallback starts empty in Redis mode.** Startup warming writes only Redis. Until the first refresh tick, two minutes after boot, any Redis read error falls back to an empty map and returns 400 **Invalid Community ID**. The app does not retry 400s.
 - **Cold reads can return an empty feed.** The key's 2-minute TTL equals the refresh interval, so it can expire just before a tick. A reader that loses the `SETNX` race sleeps 100 ms and then reads a missing hash, getting an empty page. A community with zero items never gets a key, so every read regenerates it.
-- **Deactivating on create is unconditional.** Saving an inactive draft Spot turns off the live one (`spot.go:63`). Deactivate and insert aren't in one transaction, so two concurrent creates can hit the unique index and return 500.
+- **Deactivating on create is unconditional.** Saving an inactive draft Spot turns off the live one (`spot.go:62`). Deactivate and insert aren't in one transaction, so two concurrent creates can hit the unique index and return 500.
 - **Spot and event edits lag on the map.** Nothing invalidates the 300-second community layer after an event or Spot write, so the app can show the old Spot or event list for up to 5 minutes. Top-location writes do invalidate it.
 - **The feed page parameter isn't validated on the dashboard.** `dashboard/feed.GetFeed` passes any integer through. A negative page returns an empty list, while the app route rejects it with 400.
