@@ -1,0 +1,124 @@
+---
+title: "Rider can't request"
+description: "Diagnose riders who see no Yelo ride options, a COMING or OFF-PEAK chip, or an error at request or confirm"
+---
+
+A ride request has two calls. `POST /ride/v2/` (or the older `POST /ride/`) creates a `requested` ride and returns vehicle options, a SetupIntent, and prices. `POST /ride/i/{id}/confirm` saves the rider's choice and payment method and puts the ride on the board. Problems show up as missing options at the first call, or as an error at either one.
+
+## Symptoms
+
+- The **Where to?** bar shows **COMING**, and searching offers no Yelo options, only third-party ones.
+- The bar shows **OFF-PEAK** or a next window such as **THU | 9PM**.
+- Fewer ride types than expected, or a type the community shouldn't offer.
+- An error popup at request or confirm.
+
+## Diagnose
+
+<Steps>
+  <Step title="Identify the rider's community">
+    Open the user detail sheet. **Profile** shows **Community** and **Home Community**. `GET /internal/context/user?user_id=<user-id>` returns the community's `is_active`, `is_hidden`, `rides_disabled`, `market_status`, and `is_waitlisted` in one read.
+  </Step>
+  <Step title="Match the symptom">
+    | What the rider sees | Cause in code | Go to |
+    | --- | --- | --- |
+    | **COMING**, no Yelo options | `Communities.rides_disabled` is true. Create-ride returns success with no vehicle options on purpose, so the app falls back to third-party states | [Option 1](#fix) |
+    | **OFF-PEAK** or a next window | `market_status` is `OFF_PEAK`: no driver online, outside operating windows, and more than an hour since the last driver went offline. The chip is informational. The API still accepts requests | [Option 3](#fix) |
+    | Missing or unexpected ride types | Ride types come from open driver sessions and from **Always shown** pricing configs | [Option 2](#fix) |
+    | **Pickup Outside Service Area** or **Destination Outside Service Area** | A stop is outside the community bounding box | [Option 4](#fix) |
+    | **Payment Required** at confirm | The fare is above $0 and no payment method was sent | The rider adds or selects a card in the payment sheet. |
+    | **Existing ride in progress** | Another ride is in a live status | [Stuck or ghost ride](/runbooks/stuck-ride) |
+    | **Invalid Ride** at confirm | The ride isn't in `requested` anymore, usually because a newer request superseded it | The rider requests again. |
+    | **Invalid Vehicle Size** | The selected vehicle type has no price | [Option 2](#fix) |
+    | **Invalid Email** ("rideyelo admin cannot book rides") | The account email starts with `rideyelo` and ends with `edu` | Expected. Use a normal account. |
+    | **Invalid Location** ("No suggestions found") | The place lookup returned nothing | The rider picks another pickup or dropoff. |
+    | Update prompt at confirm | `GET /update-required` returned 426 | The rider updates the app. |
+  </Step>
+  <Step title="Check the community's ride configuration">
+    **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT id, name, is_active, is_hidden, rides_disabled, is_default, archived_at,
+           primary_fleet_id, primary_vehicle_type, limited_hours_enabled, is_asleep
+    FROM "Communities" WHERE id = '<community-id>';
+
+    -- Pricing rows that can surface a ride type even with no driver online
+    SELECT id, fleet_id, vehicle_type, pricing_type, is_featured, display_name, start_time
+    FROM "RidePriceParameters"
+    WHERE community_id = '<community-id>' AND end_time IS NULL
+    ORDER BY start_time DESC;
+
+    -- Fleets that currently serve the community
+    SELECT fleet_id, community_name FROM "ActiveFleetCommunityServices"
+    WHERE community_id = '<community-id>';
+
+    -- Live ride types: open sessions of auto-queue drivers in the community
+    SELECT DISTINCT ds.fleet_id, v.vehicle_type
+    FROM "DriverSessions" ds
+    JOIN "Users" u ON u.id = ds.driver_id
+    JOIN "Vehicles" v ON v.id = ds.vehicle_id
+    WHERE u.community_id = '<community-id>' AND ds.end_time IS NULL AND u.auto_queue = TRUE;
+
+    ROLLBACK;
+    ```
+  </Step>
+  <Step title="Check the quote in the ride timeline">
+    Every quote records a `price_calculated` event. Its `metadata` holds `used_default_pricing`, `surge_multiplier`, and `vehicle_prices`. **Read-only:**
+
+    ```sql
+    SELECT created_at, metadata->'used_default_pricing' AS used_default_pricing,
+           metadata->'surge_multiplier' AS surge
+    FROM "RideEvents"
+    WHERE ride_id = '<ride-id>' AND event_type = 'price_calculated';
+    ```
+
+    Logs also warn with `Using default prices (no params configured)` or `Configured prices don't match any available ride types - falling back to default pricing`.
+  </Step>
+</Steps>
+
+### How ride types are chosen
+
+`ListAvailableRideTypes` builds the rider's options from two sources:
+
+1. **Live.** The fleet and vehicle type of every open `DriverSessions` row for auto-queue drivers in the community.
+2. **Always shown.** Every open `RidePriceParameters` row with `is_featured = true`. The dashboard calls this switch **Always shown**: "Show this ride option even when no matching driver is online."
+
+If both are empty, the rider gets one option: the community **Primary Fleet**'s primary vehicle type. Riders without a verified student account don't see student-only fleets. See [Pricing](/concepts/pricing) for how each option is priced.
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Turn rides on for the community">
+    In **Communities**, open the community's workspace. Under **Controls**, turn off **Rides Disabled** and make sure **Active** is on. Select **Save Changes**. See [Controls](/dashboard/communities#controls).
+
+    Community caches hold entries for up to 60 seconds, so allow a minute before the rider retries.
+  </Accordion>
+  <Accordion title="Option 2: Make ride types available">
+    - On **Pricing Management**, open the fleet's pricing config for the community and turn on **Always shown** and **Enabled**. See [Ride pricing](/dashboard/ride-pricing).
+    - Make sure the fleet serves the community. In the fleet editor, open **Service communities** and **Restore** the community if it's **Retired**. See [Manage service communities](/dashboard/fleets#manage-service-communities).
+    - Set the community's **Primary Fleet** so the fallback option exists.
+  </Accordion>
+  <Accordion title="Option 3: OFF-PEAK is expected">
+    OFF-PEAK doesn't block requests. It clears when a driver comes online or the market enters an operating window. To change the windows, edit **Operating Hours** on the **Community** page. See [Operating hours](/dashboard/communities#operating-hours). To bring drivers online, use **Notify Drivers** on **Supply & Demand**.
+  </Accordion>
+  <Accordion title="Option 4: The rider is in the wrong community">
+    Create-ride already repairs the rider's community automatically when it's the default community, has rides disabled, or doesn't contain the pickup. It moves the rider to the smallest active, non-test community containing the pickup.
+
+    If the rider still lands in the wrong community, select **Edit profile** on the user detail sheet and change **Active community**. If the stop is genuinely outside every service area, expand the community's bounding box under **Geography**. That also reassigns schools, so check the preview first.
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- The rider requests again and sees the expected options.
+- **Rides** → **Trips** shows the new ride. Its timeline has `ride_requested` and `price_calculated`, and `ride_confirmed` after confirm.
+- `used_default_pricing` is `false` when the community has pricing configured.
+
+## Root causes seen in code
+
+- **Rides disabled is a silent state.** `errRidesDisabled` is converted to a success response with no vehicle options, so riders don't see an error.
+- **No pricing configs means default fares.** With no open `RidePriceParameters`, or none matching an available ride type, the API prices with platform defaults.
+- **No live drivers and nothing "Always shown."** The rider sees only the primary fleet fallback.
+- **Bounding box, not zones.** Service-area checks use the community bounding box. Zones only affect pricing.
+- **Stale community assignment** after travel or an admin move. Create-ride reads the community from the database, not the token, so admin changes apply on the next request.

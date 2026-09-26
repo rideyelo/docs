@@ -1,0 +1,105 @@
+---
+title: "Push notifications not delivered"
+description: "Trace a missing push through the notification pipeline: suppression, missing or dead tokens, stuck deliveries, expired jobs, and Expo failures"
+---
+
+Every templated push goes `notify.Emit` → `notify_orchestrate` → `notify_send` → Expo → `notify_receipt_check`. Each step leaves rows you can inspect. Read [Notifications](/concepts/notifications) for the pipeline.
+
+## Symptoms
+
+- One user says they never get pushes, or stopped getting them.
+- A driver didn't hear about a ride, or a rider wasn't told the driver arrived.
+- A dashboard broadcast reached fewer people than expected.
+- Many users stopped getting pushes at once.
+
+## Diagnose
+
+<Steps>
+  <Step title="Look up the user's recent deliveries">
+    Open the user detail sheet and expand **Recent Notifications**. For more detail, open **Notifications** → **History**, filter by **Recipient**, and click a dispatch to see its recipients, delivery receipts, and taps. See [Dispatch history](/dashboard/notification-templates#dispatch-history).
+  </Step>
+  <Step title="Test delivery to the user">
+    On **Notifications** → **Templates**, pick a template, render a preview, enter the user's phone number under **Admin test send**, and select **Send test**. The test fails with "user has no current opted-in push token" when the user has notifications turned off or has no token. It fails with "multiple current users share this phone number" when the phone matches more than one account. You can also send **Ping** from **Driver Ops**, or **Ping driver** and **Ping rider** from **Supply & Demand**.
+  </Step>
+  <Step title="Read the user's token and deliveries">
+    **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT id, allow_notifications,
+           push_notification_token IS NOT NULL AND push_notification_token <> '' AS has_token,
+           app_version
+    FROM "Users" WHERE id = '<user-id>';
+
+    SELECT notifications_enabled, platform, app_version
+    FROM "DeviceTelemetry" WHERE user_id = '<user-id>';
+
+    SELECT d.created_at, n.template_code, d.status, d.suppression_reason,
+           d.error_code, d.error_message, d.expo_receipt_status,
+           d.sent_at, d.delivered_at, d.failed_at, d.scheduled_for
+    FROM "NotificationDeliveries" d
+    JOIN "Notifications" n ON n.id = d.notification_id
+    WHERE d.user_id = '<user-id>'
+    ORDER BY d.created_at DESC
+    LIMIT 50;
+
+    ROLLBACK;
+    ```
+
+    `DeviceTelemetry.notifications_enabled` is the OS permission the app last reported. `Users.allow_notifications` is the in-app setting.
+  </Step>
+  <Step title="Read the result">
+    | What you see | Meaning |
+    | --- | --- |
+    | No delivery row at all | The notification wasn't emitted for this user, the orchestrate job hasn't run, or the event was deduplicated by `event_key`. Check the **Jobs** page for `notify_orchestrate`. |
+    | `suppressed`, `notifications_disabled` | `Users.allow_notifications` is false. |
+    | `suppressed`, `missing_push_token` | The user has no token. |
+    | `suppressed`, `user_cooldown` or `community_cooldown` | A template cooldown dropped it. See [Limits, cooldowns, and quiet hours](/concepts/notifications#limits-cooldowns-and-quiet-hours). |
+    | `suppressed`, `quiet_hours_expired` | Deferred for quiet hours past `max_defer_seconds`. |
+    | `deferred` | Waiting for quiet hours to end. `scheduled_for` shows when. |
+    | `queued` or `sending` for a long time | The send job is retrying or stuck. `notify_recovery` requeues rows in `sending` for more than 10 minutes. |
+    | `sent`, no receipt | Expo accepted it. `notify_receipt_check` reads receipts for deliveries 15 minutes to 24 hours old. |
+    | `failed` with `DeviceNotRegistered` | The device token is dead. Yelo clears it from the user. |
+    | `delivered` | Expo delivered it to Apple or Google. Anything after that is on the device. |
+  </Step>
+  <Step title="For a platform-wide drop">
+    On the **Jobs** page, check `notify_orchestrate`, `notify_send`, `notify_receipt_check`, and `notify_recovery` for retrying or discarded jobs. Check the `notifications.sent`, `notifications.receipt.status`, and `notifications.queue.dropped` metrics. Then see [River job failures](/runbooks/river-jobs).
+  </Step>
+</Steps>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Re-register the user's token">
+    The app only sends a token to the API when it differs from the token it stored locally. If the API cleared the token, because Expo reported `DeviceNotRegistered` or another account registered the same device token, the app won't re-send it on its own.
+
+    Ask the user to sign out and sign back in. Sign-out deletes the stored token, so the next sign-in sends it again with `POST /notification/set-token`. Also confirm that notifications are allowed for Yelo in the phone's settings and in the app.
+  </Accordion>
+  <Accordion title="Option 2: Suppressed by settings or limits">
+    - **`notifications_disabled`**: the user turns notifications back on in the app, which calls `PUT /user/allow-notifications`.
+    - **Cooldowns**: working as designed. Template limits are edited under **Template settings**. See [Notification templates](/dashboard/notification-templates#template-settings).
+    - **Quiet hours**: they come from `NotificationPolicies`, which no dashboard page edits.
+  </Accordion>
+  <Accordion title="Option 3: Stuck or failing jobs">
+    Retry a discarded `notify_send` job from River UI once the cause is fixed. Delivery rows are unique per notification and user, so a retry doesn't create duplicate rows.
+
+    <Warning>
+    Time-sensitive codes, such as `ride_confirmed`, `driver_arrived`, `ride_available`, and `dashboard_ping_*`, expire 15 minutes after they're created. A late retry is rejected, and API startup cancels stale ones (`CancelStaleOrchestrationJobs`). Don't try to resend old ride alerts.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- **Send test** succeeds, and the delivery row reaches `sent`, then `delivered`.
+- The user's next real notification shows `delivered` in **History**.
+
+## Root causes seen in code
+
+- **Tokens are unique per device.** Registering a token clears it from every other user (`ClearCanonicalPushTokenOtherOwners`). Switching accounts on one phone silently moves pushes to the newest account.
+- **Dead tokens are cleared, not retried.** A `DeviceNotRegistered` ticket or receipt clears the user's token. The app won't re-send an unchanged token until the user signs in again.
+- **The in-app switch overrides everything.** `allow_notifications = false` suppresses all push, including ride alerts.
+- **Freshness drops late ride alerts** after outages by design.
+- **Deduplication by `event_key`.** A second emit with the same key in the same 5-minute bucket is dropped.
+- **Broadcast recipients need a token.** Community broadcasts only resolve users with a non-empty token and `allow_notifications = true`, so the recipient count is lower than the community size.

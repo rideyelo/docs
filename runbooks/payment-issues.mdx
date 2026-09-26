@@ -1,0 +1,117 @@
+---
+title: "Payment failures and holds"
+description: "Diagnose failed ride authorizations, holds that weren't released, captures that didn't happen, and cancellation fee disputes"
+---
+
+Yelo authorizes a ride when a driver accepts it, and captures later with an explicit amount. Every PaymentIntent lives on the driver's or fleet's Stripe connected account, saved as `Rides.stripe_merchant_id`. Read [Payments and payouts](/concepts/payments-and-payouts) and [Cancellations](/concepts/cancellations#how-fees-are-charged) first.
+
+## Symptoms
+
+- A driver's accept fails with a payment error, and the ride stays on the board.
+- A rider reports a pending charge for a ride that expired or was canceled with no fee.
+- A driver reports a completed ride with no payout, or a tip that never arrived.
+- A rider disputes a cancellation fee.
+- Logs contain `needs manual review` or `manual reconciliation required`.
+
+## Diagnose
+
+<Steps>
+  <Step title="Read the ride's payment fields">
+    **Read-only.** Never select `PaymentIntents.client_secret` or `ephemeral_key`.
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT id, status, price, tips_enabled, tip_amount, driver_payout,
+           payment_intent_id, pre_auth_amount, stripe_merchant_id,
+           cancel_phase, cancel_user, cancel_reason, complete_time, tip_window_expires_at
+    FROM "Rides" WHERE id = '<ride-id>';
+
+    SELECT pi.status, pi.created_at
+    FROM "PaymentIntents" pi
+    JOIN "Rides" r ON r.payment_intent_id = pi.payment_intent_id
+    WHERE r.id = '<ride-id>';
+
+    SELECT created_at, event_type, actor_type, metadata
+    FROM "RideEvents"
+    WHERE ride_id = '<ride-id>'
+      AND event_type IN ('merchant_selected', 'payment_intent_created', 'payment_confirmed',
+                         'payment_canceled', 'payment_processing_failed',
+                         'tip_captured', 'tip_window_expired', 'ride_canceled')
+    ORDER BY created_at;
+
+    ROLLBACK;
+    ```
+
+    `driver_payout` is set from the `payment_intent.succeeded` webhook. If it's still null after a capture, the webhook hasn't arrived or didn't match.
+  </Step>
+  <Step title="Search the logs">
+    Search Cloud Logging for the ride ID and these messages:
+
+    | Message | Meaning |
+    | --- | --- |
+    | `DB complete failed for tips_enabled ride, PI still authorized, needs manual review` | `Complete` failed to save a tip-enabled ride. The hold is still open. |
+    | `Failed to cancel payment intent after DB complete failure, manual reconciliation required` | `Complete` captured, the save failed, and the cleanup cancel also failed. |
+    | `ride stuck past tip window for >1 hour, needs manual review` | The tip-window sweeper keeps failing on this ride. |
+    | `failed to auto-capture expired tip window, will retry next run` | One sweeper attempt failed. It retries every 5 minutes. |
+    | `Failed to release obsolete ride authorization` | A rematch couldn't cancel the previous driver's hold. |
+
+    An open `stripe` circuit breaker posts to Slack and makes every Stripe call fail fast. See [Integrations](/engineering/api/integrations#resilience).
+  </Step>
+  <Step title="Find expired rides that kept a hold">
+    The expiry sweep never calls Stripe, so a requeued ride that later expired can still hold an authorization. **Read-only:**
+
+    ```sql
+    SELECT id, stripe_merchant_id, payment_intent_id, pre_auth_amount, complete_time
+    FROM "Rides"
+    WHERE status = 'complete' AND cancel_reason = 'automatic'
+      AND payment_intent_id IS NOT NULL
+      AND complete_time > now() - interval '7 days'
+    ORDER BY complete_time DESC;
+    ```
+  </Step>
+</Steps>
+
+### Cases and what the code does
+
+| Case | What happens in code | Operator action |
+| --- | --- | --- |
+| Accept fails with a payment error | `processRidePayment` failed to clone the card or create the PaymentIntent. `payment_processing_failed` is recorded, the accept returns the error, and the ride stays `confirmed` | None required. The ride expires after 10 minutes or another driver accepts. The rider may need a different card on their next request. |
+| Canceled with no fee | The PaymentIntent is canceled, releasing the full hold | Confirm `payment_canceled` in the timeline with `cancellation_fee` of 0. |
+| Canceled with a fee | The fee is captured with `amount_to_capture`, and Stripe releases the rest | Check `cancellation_fee` on the `payment_canceled` and `ride_canceled` events against [Fee rules](/concepts/cancellations#fee-rules). |
+| Expired after a requeue | Status `complete`, `cancel_reason = 'automatic'`, hold still open | No Yelo tool releases it. See the warning below. |
+| Tip window never closed | `TipCapture` captures the fare after `tip_window_expires_at`, retrying every 5 minutes | Wait. Escalate if the "stuck past tip window" log appears. |
+| `Complete` save failed on a tip-enabled ride | The hold stays authorized | No Yelo tool captures or releases it. See the warning below. |
+
+<Warning>
+Yelo has no endpoint, dashboard control, or script that refunds, captures, or cancels a PaymentIntent, and the API never creates refunds. `scripts/create_payment_link` only creates a payment link on one hard-coded account. Any refund or manual release happens outside Yelo tooling, on the connected account in `Rides.stripe_merchant_id`. Record the ride ID and PaymentIntent ID in the ticket.
+</Warning>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Let the automatic paths finish">
+    - **Tip-enabled ride waiting on the rider.** The rider rates, which captures fare plus tip. Otherwise `TipCapture` captures the fare after 24 hours.
+    - **Accept failure.** Nothing to repair. The ride keeps waiting for another driver.
+    - **Missing `driver_payout`.** Check the `payment_intent.succeeded` delivery for that PaymentIntent. The webhook handler updates every ride with that `payment_intent_id`.
+  </Accordion>
+  <Accordion title="Option 2: Fee dispute">
+    Compare `cancel_phase`, `cancel_user`, and the ride timestamps with [Fee rules](/concepts/cancellations#fee-rules). The `payment_canceled` event records `cancellation_fee`, `cancel_phase`, and `original_amount`. The `ride_canceled` event records `cancellation_fee`, `cancel_phase`, `canceled_by`, `had_driver`, and the time since confirm. If the fee was charged by the rules and still needs reversing, that's a refund outside Yelo. See the warning above.
+  </Accordion>
+  <Accordion title="Option 3: Stripe outage">
+    When the `stripe` breaker is open, accepts, captures, and cancels fail fast for 60 seconds at a time. Captures that fail on the tip-window path retry every 5 minutes. After the breaker closes and Slack posts the recovery, re-run the diagnostics for rides completed during the outage.
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- The timeline shows `payment_canceled` for a cancellation, or `payment_confirmed`, `tip_captured`, or `tip_window_expired` for a capture.
+- `Rides.driver_payout` is set for completed paid rides.
+- The `PaymentIntents` row status matches what you expect after the webhook.
+
+## Root causes seen in code
+
+- **Expiry doesn't release holds.** `CancelUnmatchedRides` only updates the ride row. A requeued ride keeps the previous authorization until a new driver accepts or it expires.
+- **Post-capture save failures.** `Complete` captures before writing. If the write fails, it cancels the PaymentIntent for rides without tips, but only logs for tip-enabled rides.
+- **Webhook dependency.** `driver_payout` and the `PaymentIntents` status row only change through webhooks.
+- **Concurrent capture paths.** Rating and the tip sweeper can race. `PartiallyConfirm` treats `charge_already_captured` as success, and `CompleteTip failed after capture - ride may have been rated concurrently` is expected noise.

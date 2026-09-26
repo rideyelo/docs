@@ -1,0 +1,305 @@
+---
+title: "Events, The Spot, and the community feed"
+description: "Internals of community events, the featured Spot, feed generation and its Redis cache, top-location and mobility-feed dashboard APIs, and the category resolver, with exact queries, limits, TTLs, and known defects."
+---
+
+This page covers the community content layer in `yelo-api`: events and their review workflow, **The Spot** (one featured event or place per community), the pre-built community feed, and the dashboard APIs for top locations and mobility feeds. For the product view, see [Events and the community feed](/concepts/events-and-feed) and [Events and The Spot](/dashboard/feed-and-events).
+
+Two neighbors own the deeper internals of shared pieces:
+
+- Top-location ranking, refresh, and the canonical place catalog: [Search and places](/engineering/location/search-and-places).
+- The community map layer, its 300-second cache, and the mobility poller: [Map layers and mobility feeds](/engineering/location/map-layers-and-mobility).
+
+## Data touched
+
+| Store | Object | Written by | Read by |
+| --- | --- | --- | --- |
+| Postgres | `"Events"` | Dashboard event CRUD, `ArchivePastEvents` | App, public event site, community layer, Spot hydration |
+| Postgres | `"EventAttendees"` | `POST` and `DELETE /event/{id}/attend` | Event detail, attendee list, dashboard counts |
+| Postgres | `"EventStoryViews"` | `POST /event/{id}/view` (upsert) | `viewed` flag on app event reads |
+| Postgres | `"EventShares"`, `"TicketPurchases"` | Not written by this domain | `metrics.shares`, `metrics.tickets_sold` |
+| Postgres | `"Venues"`, `"EnterpriseAccounts"`, `"Discounts"` | Joined only | Venue block, account block, `is_discounted` |
+| Postgres | `"CommunitySpots"` | Dashboard Spot CRUD | Feed page 0, community map layer |
+| Postgres | `"Ads"`, `"Bumps"`, `"Rides"` | Other domains | Feed generation |
+| Postgres | `"CommunityTopLocations"`, `"CommunityTopLocationSettings"`, `"PlaceProfiles"` | Top-location service | Search context, community layer |
+| Postgres | `"MobilityFeeds"` | Dashboard mobility CRUD, poller health columns | Mobility poller |
+| Redis | `feed:community:{communityID}` (hash, field per page) | `refreshFeedInRedis` | `RedisFeedCache.GetFeed` |
+| Redis | `feed:refresh:lock:{communityID}` | `SetNX` in `initCommunityFeed` and `RefreshFeed` | Same |
+| Process memory | `FeedCache.communityFeedPages` | `FeedCache.RefreshFeed` | Fallback when Redis fails |
+| Supabase Storage | `event_photos/{eventID}/{uuid}{ext}`, `spot_photos/{spotID}/{uuid}{ext}` (public bucket) | Photo upload endpoints | `photo_url`, `image_url` |
+
+Table definitions live in the [database reference](/reference/database/overview). `"MobilityFeeds"` is in [Markets, communities, and zones](/reference/database/markets-communities-and-zones), and the top-location tables are in [Locations and places](/reference/database/markets-locations-and-places).
+
+## Endpoints
+
+### App and public
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/event/upcoming?limit=` | JWT, role `user` | `GetUpcoming`. Published events in the caller's community where `release_time` is before now and `close_time` is after now, ordered by `start_time`. `limit` defaults to 20, max 100. |
+| `GET` | `/event/{id}` | JWT, role `user` | `GetEventByID`. Published event plus metrics, attendee count, a 5-person preview, and `is_attending`. |
+| `POST` | `/event/{id}/view` | JWT, role `user` | `ViewEvent`. Upserts `"EventStoryViews"` with `viewed_at = now`. |
+| `POST` | `/event/{id}/attend` | JWT, role `user` | `Attend`. Inserts status `going`, `ON CONFLICT DO NOTHING`. |
+| `DELETE` | `/event/{id}/attend` | JWT, role `user` | `Leave`. Deletes the attendee row. |
+| `GET` | `/event/{id}/attendees` | JWT, role `user` | `GetAttendees`. Every attendee, oldest first, plus a count. |
+| `GET` | `/public/events/slug/{slug}` | Public | `GetPublicEventBySlug`. Case-insensitive slug match on published events, trimmed to `PublicEvent`. |
+| `GET` | `/community/feed?page=` | JWT, role `user` | `CommunityHandler.GetFeed`. Cached feed page for the caller's community. `page` must be 0 or more. |
+
+### Dashboard
+
+Every route below sits under `/dashboard`, behind `getClerkAuthMiddleware` and `getDashboardScopeMiddleware`. The "Scope" column is what `dashboard_scope.go` lets through for non-admins. Admins pass everything. Fleet managers get none of these routes.
+
+| Method | Path | Scope for interns | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/communities/{id}/events?status=&search=&limit=&offset=` | Own community, any method | `ListEvents`. Comma-separated statuses, name `ILIKE`, newest first. `limit` defaults to 50 with no maximum. |
+| `GET` | `/communities/{id}/events/check-slug?slug=` | Own community | `CheckSlug`. Global, case-insensitive. |
+| `GET` | `/communities/{id}/events/{event_id}` | Own community | `GetEvent` |
+| `POST` | `/communities/{id}/events` | Own community | `CreateEvent`. Always starts as `draft`. |
+| `PUT` | `/communities/{id}/events/{event_id}` | Own community | `UpdateEvent`. Full replace, except `photo_url`. |
+| `PUT` | `/communities/{id}/events/{event_id}/status` | Own community | `UpdateEventStatus` |
+| `POST` | `/communities/{id}/events/{event_id}/photo` | Own community | `UploadEventPhoto`. Multipart field `photo`. |
+| `GET` | `/communities/{id}/spot` | Denied | `GetActiveSpot`. 404 `no active spot` when none is live. |
+| `GET` | `/communities/{id}/spot/history` | Denied | `GetSpotHistory`. Every Spot, newest `updated_at` first. |
+| `POST` | `/communities/{id}/spot` | Denied | `CreateSpot` |
+| `PUT` | `/communities/{id}/spot/{spot_id}` | Denied | `UpdateSpot`. Partial update. |
+| `POST` | `/communities/{id}/spot/{spot_id}/photo` | Denied | `UploadSpotPhoto` |
+| `DELETE` | `/communities/{id}/spot/{spot_id}` | Denied | `DeleteSpot`. Hard delete. |
+| `GET` | `/communities/{id}/feed?page=` | Own community, `GET` only | `dashboard/feed.GetFeed`. Same `CommunityService.GetFeed` as the app. |
+| `GET`, `POST`, `PATCH`, `DELETE` | `/communities/{id}/mobility-feeds[/{feed_id}]` | Denied | Mobility feed CRUD |
+| `GET` | `/{id}/top-locations`, `/{id}/top-locations/settings` | Own community, any method | List slots and settings |
+| `PUT` | `/{id}/top-locations/settings` | Same | `SetTopLocationSettings`. Bumps `revision`. |
+| `POST` | `/{id}/top-locations/resolve` | Same | `ResolveTopLocation`. Provider lookup into `"PlaceProfiles"`, 8-second timeout. |
+| `POST` | `/{id}/top-locations` | Same | `CreateTopLocation`. Body is only `yelo_place_id` and `priority` 0 to 3. |
+| `PATCH`, `DELETE` | `/{id}/top-locations/{location_id}` | Same | Update pins the slot (`manual = true`). Delete clears it. |
+| `POST` | `/{id}/top-locations/seed` | Same | `SeedTopLocations`. Enqueues a manual River refresh. 400 when the feature is disabled. |
+
+For non-admins, each handler's `resolveCommunityID` ignores the `{id}` path parameter and uses the community in the Clerk claims. Admins must pass `{id}`. The top-location handlers use `ResolveDashboardCommunity` instead.
+
+## Events
+
+### Status workflow
+
+`models.ValidEventStatusTransitions` is the only gate. `EventService.UpdateEventStatus` loads the event, checks the transition, then runs `SetEventStatus` scoped by `id` and `community_id`.
+
+| From | Allowed targets |
+| --- | --- |
+| `draft` | `pending_review` |
+| `pending_review` | `published`, `draft` |
+| `published` | `archived` |
+| `archived` | `draft` |
+
+Any other pair returns 400 `cannot transition from 'X' to 'Y'`.
+
+### Auto-archiving on read
+
+`ArchivePastEvents` runs before `GetUpcoming` and `GetEventsByStatus`, so reads write. It archives published events in the community where `COALESCE(close_time, end_time)` is before now. A failure is logged and the read continues.
+
+### Create and update
+
+`buildNewEvent` in `dashboard/event/event_handler.go` maps `CreateEventRequest` to `models.NewEvent`:
+
+- Times must be RFC 3339. A bad value returns 400 naming the field, such as `release_time must be a valid RFC3339 timestamp`.
+- `Timetable` is only set when at least one of the four times is present. Missing times inside a set timetable become Go's zero time, which is stored as `0001-01-01`.
+- The community always comes from the caller, never the body.
+- `slug` must match `^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?$` (1 to 64 characters). Uniqueness is the partial index `idx_events_slug_unique` on `LOWER(slug)`. A violation returns `ErrorTypeDuplicate` **Duplicate Slug**.
+- `UpdateEvent` keeps the stored `photo_url` when the body omits it. Every other field is overwritten, including nullable ones.
+
+`requireEventInCommunity` runs before every by-ID dashboard read or write, including the photo upload, so a foreign event returns 404 before any storage write.
+
+### Reads and metrics
+
+| Read | Query | Notes |
+| --- | --- | --- |
+| App detail | `GetPublishedEventByID` | Published only. `is_discounted` is true when a `"Discounts"` row targets the venue address and spans `start_time`. |
+| App upcoming | `ListUpcomingEvents` | `slug` is cleared in the response. |
+| Public slug | `GetPublishedEventBySlug` | Response drops attendees, metrics, status, creator, and community. Location falls back from venue to the event's own `location_*` fields and is omitted when all four are empty. |
+| Dashboard list | `ListEventsByStatus` + `CountEventsByStatus` | Attendee count per row, empty preview array. |
+| Community layer | `GetUpcoming(uuid.Nil, community, 25)` | Cached for 300 seconds per community. |
+
+`getEventMetrics` issues two `COUNT` queries per event (`"TicketPurchases"` and `"EventShares"`). `GetUpcoming` calls it once per returned event, so 20 events cost 40 extra queries.
+
+## The Spot
+
+A Spot row references exactly one event or one location. The table enforces this with a `CHECK` constraint. `idx_community_spots_active` is a unique partial index, so each community can have at most one `is_active = true` row.
+
+### Rules
+
+- `validateSpotTypeRef` requires `spot_type` of `event` with only `event_id`, or `location` with only `location_id`. Anything else returns 400.
+- `CreateSpot` runs `DeactivateSpotsByCommunity` and then inserts. This happens even when the new Spot has `is_active: false`.
+- `UpdateSpot` deactivates the community's Spots only when the body sets `is_active: true`. `UpdateSpotFields` uses `COALESCE` for every column, so an update can't clear a field back to null.
+- `spot_type`, `event_id`, and `location_id` are accepted on update only so the strict decoder doesn't reject them. They are ignored.
+- `requireSpotInCommunity` guards update, photo, and delete. A foreign Spot returns 404.
+
+### Liveness
+
+`GetActiveSpotByCommunity` returns the Spot when all of these hold:
+
+```sql
+s.is_active = TRUE
+AND (s.starts_at IS NULL OR s.starts_at <= NOW())
+AND (s.ends_at IS NULL OR s.ends_at > NOW())
+```
+
+The server ignores `display_start_time` and `display_end_time`. The app filters with `useSpotDisplayWindow` in `yelo-frontend`, and the dashboard preview filters in `FeedPreview.tsx`. Hydration joins the event and venue, or the location, with no status check. A Spot pointing at an archived event still shows.
+
+## Community feed
+
+### Generation
+
+`generateCommunityFeed` in `feed_logic.go` builds a whole community feed at once. It uses `FeedPageSize = 10` and `MaxFeedPages = 3` from `community.go`, so each source is asked for 30 rows.
+
+| Source | Query | Filter and order |
+| --- | --- | --- |
+| Events | Commented out | `events` is always an empty slice. `ListFeedEventIDs` exists but is unused. |
+| Ads | `GetCommunityAds` | Every ad whose `community_ids` contains the community, ordered by `tier DESC, RANDOM()`. The 30-row limit is ignored. |
+| Rides | `ListPublicFeedRideIDs` | Status `complete`, `confirmed`, or `pending_rider_rating`, with `confirm_time` set and a public pickup or destination. Newest `confirm_time` first, 30 rows. |
+| Bumps | `GetFeedBumps` | Unexpired bumps with coordinates, excluding bumps already fulfilled by a matching public ride. Newest first, 30 rows. |
+
+For the ad model itself, see [Coupons, ads, and promo bars](/engineering/domains/coupons-ads-and-promo-bars).
+
+`buildMoveFeedItems` concatenates all bumps first, then all rides. The loop then repeats until moves run out:
+
+<Steps>
+  <Step title="Take a group of moves">
+    Append `rand.Intn(3)+1` moves, so 1 to 3, capped by what is left.
+  </Step>
+  <Step title="Add one ad">
+    Append the next ad if any remain.
+  </Step>
+</Steps>
+
+The flat list is then cut into pages of 10. There is no cap at 3 pages.
+
+**Worked example.** A community has 3 bumps, 12 rides, 4 ads, and a live Spot. Suppose the random group sizes are 2, 3, 1, 2, and so on:
+
+| Position | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Page 0 | bump | bump | ad | bump | ride | ride | ad | ride | ad | ride |
+
+After four groups, the ads run out, and the last 7 rides follow with no ads. That makes 15 moves plus 4 ads, or 19 items: page 0 has 10 and page 1 has 9. `CommunityService.GetFeed` prepends the Spot on page 0 only, so page 0 returns 11 items.
+
+### Cache and invalidation
+
+`NewRedisFeedCache` picks a mode at startup:
+
+| Mode | When | Read path | Write path |
+| --- | --- | --- | --- |
+| Redis | `RedisClient` exists and is enabled | `HGET feed:community:{id} {page}` | Regenerate, `DEL`, `HSET` each page, `EXPIRE` 2 minutes |
+| Memory | Redis missing or disabled | Map lookup | `FeedCache.RefreshFeed` replaces the community's pages |
+
+Timings and keys:
+
+| Constant | Value | File |
+| --- | --- | --- |
+| `feedTTL` | 2 minutes | `feed_cache_redis.go` |
+| `feedLockTTL` | 30 seconds | Same |
+| Contended cold read wait | 100 ms, then read whatever exists | `initCommunityFeed` |
+| `Refresh` loop | Every 2 minutes, first tick after 2 minutes | `cmd/api/main.go` |
+
+The read path in Redis mode:
+
+1. `EXISTS feed:community:{id}`. On a Redis error, fall back to memory.
+2. If the key is missing, take `feed:refresh:lock:{id}` with `SETNX` and regenerate. If another caller holds the lock, sleep 100 ms and continue.
+3. `HGET` the page. A missing field returns an empty page, not an error.
+4. Deserialize. A decode error falls back to memory.
+
+`CommunityService.RefreshFeed` walks every community from `GetAllLight`. In Redis mode, an instance that loses the lock skips that community and leaves its own memory copy untouched. The winner writes Redis and its memory copy.
+
+Nothing invalidates the feed on write. A new ride, bump, or ad shows up on the next refresh tick or after the key expires. The Spot is the exception, because `GetFeed` reads it live on every page-0 request.
+
+### Consumers
+
+- **App.** `MapFeedProvider.tsx` requests only page 0 and keeps only `ride` items. It feeds their IDs to `useRideFeedSummaries`. The Spot comes from the community map layer instead.
+- **Dashboard.** `FeedPreview.tsx` takes the Spot and events from the dashboard community layer and only `ride` items from `GET /dashboard/communities/{id}/feed`. Top locations render as **Popular place** cards.
+
+## Top locations
+
+The dashboard stores up to four slots per community (`slot` 0 to 3, unique per community and per place). Place details are server-owned: `CreateTopLocationRequest.Validate` rejects any body carrying `name`, `address`, `mapbox_id`, `categories`, or coordinates.
+
+| Action | Service call | Effect |
+| --- | --- | --- |
+| Pin a place | `Service.Create` | Locks the settings row, checks the place is verified, inserts with `manual = true`, bumps `revision` |
+| Replace or move | `Service.Update` | `UpdateTopLocationFields`, which also sets `manual = true` |
+| Clear | `Service.Delete` | Deletes the row, bumps `revision` |
+| Toggle settings | `Service.SetSettings` | Upserts `enabled` and `automatic`, `revision + 1` |
+| Refresh now | `Service.Seed` | Requires `enabled`, then enqueues `top_locations_refresh` with `Manual: true` |
+
+Every mutation calls the `changed` hook from `service.go`, which runs `mapLayerService.InvalidateCommunity` and `mapChanges.CommunityPOIsChanged`. A duplicate slot or place returns 400 **that slot or place is already assigned in this community** (Postgres code `23505`).
+
+Riders see verified slots through `GET /mapping/search-context` (4 rows) and the community layer (20 rows). For ranking, the refresh algorithm, and River scheduling, see [Top locations internals](/engineering/location/search-and-places#top-locations-internals).
+
+## Mobility feeds
+
+`MobilityFeedService` in `internal/service/mobilityfeed/mobilityfeed.go` owns dashboard CRUD. The poller that reads these rows is documented in [Map layers and mobility feeds](/engineering/location/map-layers-and-mobility#mobility-feeds).
+
+| Rule | Value |
+| --- | --- |
+| `source` | `gbfs`, `gtfs`, or `gtfs_rt` |
+| `name` | Required, non-empty |
+| Default `vehicle_type` | `bike` when empty, except for `gtfs` |
+| GTFS page rewrite | `mobilitydatabase.org/feeds/gtfs/{id}` becomes `https://files.mobilitydatabase.org/{id}/latest.zip` |
+| `gtfs_rt` guard | Rejects `files.mobilitydatabase.org` hosts and `.zip` paths |
+| URL guard | `http` or `https` with a host, not a blocked hostname, and every resolved IP public |
+| Update | Re-normalizes and re-validates when `source` or `feed_url` changes |
+| Delete | Hard delete after `requireFeedInCommunity` |
+
+Changes reach the rider map on the next `Mobility` tick, about one minute later.
+
+## Place categories
+
+`models.Category` is the canonical POI vocabulary: 24 named values plus `misc`. `AllCategories` doubles as the precedence list, from `cocktail_bar` (most specific) to `misc`. Each value must have a matching sprite in `yelo-frontend`.
+
+`category.Resolve` in `internal/data/category/category.go` maps raw provider types:
+
+1. Tokenize each raw type: lowercase, fold accents, and split on non-alphanumerics.
+2. An exact override phrase in `tables.go` wins for that raw type. The longest phrase wins, then alphabetical order. Examples: `sports bar` → `bar`, `parking lot` → `misc`, `nightlife` → `bar`.
+3. Otherwise, the most specific keyword match wins. Matching is on word boundaries, so `parking` never matches `park`.
+4. Otherwise, try closed-compound suffixes such as `skatepark`.
+5. Across all raw types, the result with the best precedence wins. No match gives `misc`.
+
+`FromMapbox` and `FromGoogle` both call `Resolve`. `PreferSnapshot` keeps a stored category list unless it resolves to `misc` and the candidate doesn't.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Event model and transitions | `internal/models/event.go` | `Event`, `NewEvent`, `ValidEventStatusTransitions` |
+| Event service | `internal/service/event/event.go` | `EventService`, `UpdateEventStatus`, `requireEventInCommunity` |
+| Event queries | `internal/data/repository/queries/engagement.sql`, `repository/event.go`, `event_attendee.go` | `ArchivePastEvents`, `ListUpcomingEvents`, `eventCreateParams` |
+| App and public handlers | `internal/server/http/event/` | `EventHandler`, `toPublicEvent`, `RegisterPublicRoutes` |
+| Dashboard event handlers | `internal/server/http/dashboard/event/` | `buildNewEvent`, `validateSlug`, `CheckSlug` |
+| Spot | `internal/service/spot/spot.go`, `internal/models/spot.go`, `repository/spot.go`, `queries/places.sql` | `validateSpotTypeRef`, `spotFromSQLC` |
+| Dashboard Spot handlers | `internal/server/http/dashboard/spot/` | `SpotHandler`, `CreateSpotRequest` |
+| Feed generation | `internal/service/community/feed_logic.go` | `generateCommunityFeed`, `buildMoveFeedItems` |
+| Feed caches | `internal/service/community/feed_cache_redis.go`, `feed_cache_memory.go` | `RedisFeedCache`, `FeedCache` |
+| Feed service and loop | `internal/service/community/community.go`, `cmd/api/main.go` | `GetFeed`, `RefreshFeed`, `Refresh` loop |
+| Dashboard feed | `internal/server/http/dashboard/feed/` | `FeedHandler.GetFeed` |
+| Dashboard scope | `internal/server/http/dashboard_scope.go` | `internCommunityResourceScopeAllows`, `internCommunityOperationAllows` |
+| Top locations | `internal/service/toplocations/toplocations.go`, `internal/server/http/community/top_location_settings.go`, `community_handler.go` | `Service`, `assertTopLocationInCommunity` |
+| Mobility CRUD | `internal/service/mobilityfeed/`, `internal/server/http/dashboard/mobilityfeed/`, `internal/models/mobility_feed.go` | `MobilityFeedService`, `validateFeedURL` |
+| Categories | `internal/models/category.go`, `internal/data/category/` | `Resolve`, `overrides`, `keywords` |
+| Photo storage | `internal/data/supabasestorage/storage.go` | `UploadEventPhoto`, `UploadSpotPhoto` |
+| Dashboard UI | `yelo-web/src/sites/dashboard/pages/feed/`, `src/components/events/`, `src/components/spot/`, `src/components/feed/FeedPreview.tsx` | `EventFormSheet`, `SpotFormSheet` |
+| App | `yelo-frontend/providers/MapFeedProvider.tsx`, `components/map/feed/useFeaturedSpot.ts`, `components/feed/` | `useSpotDisplayWindow` |
+
+## Gotchas and edge cases
+
+<Warning>
+  With Redis disabled, `NewRedisFeedCache` stores `redisClient: nil`, but `GetFeed` and `RefreshFeed` still call `rfc.redisClient.IsEnabled()` first (`feed_cache_redis.go:53`, `:124`). `IsEnabled` reads `c.enabled` on a nil pointer. Every feed request panics into a 500 through `Recoverer`. The `Refresh` tick runs in a goroutine from `executeBackgroundTask` with no `recover`, so the first tick, two minutes after boot, crashes the API process unless `BACKGROUND_TASKS_ENABLED=false`. The in-memory mode is unreachable.
+</Warning>
+
+- **Creating an event with no times panics.** The dashboard form sends `null` for empty times. `buildNewEvent` then leaves `Timetable` nil, and `eventCreateParams` dereferences `event.Timetable.ReleaseTime` (`repository/event.go:599`). `Recoverer` turns this into a 500, although the UI marks only **Name** as required.
+- **Partial times archive or hide events.** A missing `close_time` inside a set timetable is stored as year 1. `ArchivePastEvents` archives the event on the next list, because `COALESCE(close_time, end_time)` isn't null and is in the past. `ListUpcomingEvents` never returns it either.
+- **Unknown IDs return 500, not 404.** `GetByID` and `GetDashboardEvent` wrap `pgx.ErrNoRows` as a server error (`repository/event.go:37`, `:470`). The nil check in `requireEventInCommunity` is unreachable. A foreign event returns 404, but a nonexistent one returns 500.
+- **Interns can publish.** `UpdateEventStatus` has no role check, and the scope middleware allows every method on `/communities/{own}/events`. Only the UI limits interns to **Submit for Review**.
+- **Updates wipe hidden fields.** `CreateEventRequest` has no `posh_event_id` or `has_dynamic_pricing`, and `UpdateEvent` writes every column. Any dashboard save sets both to null or false.
+- **Attendance has no gates.** `Attend`, `Leave`, and `GetAttendees` don't check status or community. Any signed-in user can list names and photos for any event ID.
+- **Uploaded photos get a malformed content type.** The handler keeps the dot in the extension, and storage builds `"image/" + photo.Extension`, which gives `image/.png` (`storage.go:180`, `:206`). There is no file-type check, and the size limit is `MaxMultipartFormSize`, 100 MiB.
+- **Expired ads stay in the feed.** `GetCommunityAds` doesn't filter on `start_time` or `end_time`, and the repository ignores its `limit`.
+- **Bumps crowd out rides.** Moves are all bumps, then all rides. With 10 or more live bumps, page 0 holds no rides. With ads interleaved, as few as 7 bumps can fill it (groups of 3, 3, and 1 plus 3 ads). The app then shows no ride activity, because it reads only page 0.
+- **The page count is unbounded.** Up to 60 moves and one ad per group can produce more than 3 pages. Docs that say "up to 3 pages" describe the query limit, not the output.
+- **The memory fallback starts empty in Redis mode.** Startup warming writes only Redis. Until the first refresh tick, two minutes after boot, any Redis read error falls back to an empty map and returns 400 **Invalid Community ID**. The app does not retry 400s.
+- **Cold reads can return an empty feed.** The key's 2-minute TTL equals the refresh interval, so it can expire just before a tick. A reader that loses the `SETNX` race sleeps 100 ms and then reads a missing hash, getting an empty page. A community with zero items never gets a key, so every read regenerates it.
+- **Deactivating on create is unconditional.** Saving an inactive draft Spot turns off the live one (`spot.go:63`). Deactivate and insert aren't in one transaction, so two concurrent creates can hit the unique index and return 500.
+- **Spot and event edits lag on the map.** Nothing invalidates the 300-second community layer after an event or Spot write, so the app can show the old Spot or event list for up to 5 minutes. Top-location writes do invalidate it.
+- **The feed page parameter isn't validated on the dashboard.** `dashboard/feed.GetFeed` passes any integer through. A negative page returns an empty list, while the app route rejects it with 400.

@@ -1,0 +1,157 @@
+---
+title: "Driver eligibility"
+description: "Every filter each matching path applies to drivers, side by side: community, fleet, online state, vehicle, capacity, notification preferences, declines, cooldowns, and distance, plus how each path orders its candidates."
+---
+
+Each matching path has its own driver query, written at a different time for a different purpose. They don't share a predicate library, so a driver can be eligible for one path and not another. This page lines them up.
+
+For what each path does, see [Matching engine internals](/engineering/matching/overview).
+
+## The paths compared
+
+Legend: **Yes** means the path enforces the filter. **—** means it doesn't check.
+
+| Filter | Board (`GetEligibleEnrichedRideBoard`) | Manual accept (`AcceptRide` + `acceptRide`) | T0 (`ListRideT0NotificationTargets`) | Activation (`ListNearbyInactiveDrivers`) | Auto-queue (`ListAutoQueueEligibleDrivers` + Go) | Auto-queue admission (`acceptRide`, automatic) | Missed-ride alert (`ListFleetDriverIDs`) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Driver's community equals ride's | Yes | — | Yes | Yes | Yes | — | Yes |
+| Fleet | Session fleet equals ride fleet | Session fleet equals ride fleet, rechecked under lock | Active `FleetDrivers` membership, plus session fleet when online | Membership, or unaffiliated when the ride's fleet is the community's primary | Open session in the ride's fleet | Session fleet equals ride fleet, rechecked under lock | Active membership |
+| Online state | Needs an open session | `is_online_driver` | Offline, or online under the ride's fleet | Offline only | `is_online_driver` | `is_online_driver` | — |
+| Exactly one open session matching vehicle and fleet | — | Yes (`GetDriverSessionOwnership`) | — | — | — | Yes | — |
+| Vehicle type | — | — | Yes, session vehicle when online, else `Users.vehicle_id` | Yes, `Users.vehicle_id` | Yes, `Users.vehicle_id` | — | — |
+| Seats at least `num_riders` | — | — | Yes | — | — | — | — |
+| Vehicle application `complete` and available to driver | — | — | Yes (`AvailableDriverVehicles`, `FleetVehicles`) | — | — | — | — |
+| Active `DriverApplications` row | — | — | Yes | Yes | Yes | — | — |
+| Payout ready | — | — | Yes | — | — | — | — |
+| Push token present | — | — | Yes (non-empty) | Yes | Only for the driver push | — | Yes |
+| `allow_notifications` | — | — | Yes | Yes | — | — | Yes |
+| Not banned, deleted, or locked | — | — | Yes | Locked only | — | — | — |
+| Not in `declined_drivers` | Yes | — | Yes | Yes | Yes | — | — |
+| Not the rider | — | — | Yes | — | — | — | — |
+| Queue capacity | — | Under 100 rides | Under 100 rides | — | Cached minutes under effective max | Under 100 rides | — |
+| `auto_queue` on and not paused | — | — | — | — | Yes | Yes (`accepts_auto_queue`) | — |
+| Distance | — | — | — | Tier radius (bounding box, then haversine) | Mapbox result must be valid | — | — |
+| Notified set and cooldown | — | — | — | Yes | — | — | — |
+| Founding tag for fleet `Yelo` | — | — | Yes | — | — | — | — |
+
+<Note>
+Manual accept and auto-queue admission skip `declined_drivers`. A driver who declined a ride can still accept it with a direct `POST /ride/i/{id}/accept`, because the board hides it but the command doesn't reject it.
+</Note>
+
+## Manual accept, step by step
+
+`RideService.AcceptRide` in `internal/service/ride/driver.go` runs these checks in order. The first failure wins.
+
+| Order | Check | Code | Error |
+| --- | --- | --- | --- |
+| 1 | Driver has an open session | `getDriverSessionAndFleet` | 400 "No Active Session" |
+| 2 | `IsOnlineDriver` | `validateDriverAvailability` | 400 "Driver Not Online" |
+| 3 | `QueueLength` below `matching.MaxQueueLength` (100) | `validateDriverAvailability` | 400 "Driver Queue Length Exceeded" |
+| 4 | Ride is `confirmed` | `validateRideRequestAcceptance` | 400 "Ride request no longer valid" |
+| 5 | No live hold for another driver | `validateRideRequestAcceptance` | 400 "Ride is awaiting the selected driver" |
+| 6 | Ride fleet is null or equals session fleet | `validateRideFleet` | 400 "This ride is for a different fleet" |
+| 7 | Pickup route | `getPickupRoute` | Mapbox error |
+| 8 | Payment authorization, when the effective price is above 0 | `processRidePayment` | Stripe error |
+| 9 | Transaction checks (below) | `Ride.Accept` | See below |
+
+Inside `acceptRide` in `internal/data/repository/ride_lifecycle.go`, under participant and ride row locks:
+
+1. `state.Status` must be `confirmed`.
+2. `validateRideAssignmentDriver` rereads `is_online_driver` and requires exactly one open `DriverSessions` row whose vehicle and fleet match the IDs read in step 1.
+3. `CanAcceptDirectRide` rechecks the 30-second hold.
+4. `validateRideAssignmentAdmission` rechecks the ride's fleet and the 100-ride cap.
+
+Steps 1 to 3 return a 400 conflict. Step 4 failures are wrapped with `NewServerErrorFromError`, so a fleet mismatch or a full queue detected under lock surfaces as a 500 "Something Went Wrong".
+
+## T0 targets in detail
+
+`ListRideT0NotificationTargets` in `queries/community.sql` is the strictest query. It starts from the ride and joins outward, so it also requires:
+
+- The ride is still `confirmed` with no driver.
+- The community isn't archived, and the fleet is active and not deleted.
+- The vehicle it checks is the session's vehicle when the driver is online, otherwise `Users.vehicle_id`.
+- The vehicle isn't owned by a different fleet (`FleetVehicles`) and is available to the driver for this fleet (`AvailableDriverVehicles`). A vehicle with no fleet qualifies only when the ride's fleet owns no vehicles at all.
+- Payout readiness matches the go-online check. Either `payout_fleet_id` is null and the driver's `stripe_status` is `complete`, or the driver is paid through this fleet and the fleet is a `fleet_merchant` with custom payouts, a merchant ID, and `stripe_status = 'complete'`.
+- For the fleet named exactly `Yelo`, the driver's `tags` overlap `Founding Driver`, `founding driver`, or `founding`.
+
+Results are `DISTINCT` and ordered by `u.id`. There's no limit.
+
+## Activation candidates in detail
+
+`ActivationService.getCandidatesFromInactive` computes a bounding box first:
+
+```go
+latDelta := radiusKm / kmPerDegree // kmPerDegree = 111.0
+lngDelta := radiusKm / (kmPerDegree * math.Cos(ride.PickupLatitude*math.Pi/180))
+```
+
+`ListNearbyInactiveDrivers` returns up to 50 rows inside the box. Go then drops drivers in the exclude set, drops drivers outside the true haversine radius, and tries to take each remaining driver's cooldown with `SETNX`. It stops once it has the tier's `TargetDrivers`.
+
+Fleet filtering uses membership, because offline drivers have no session:
+
+```sql
+AND (sqlc.narg(fleet_id)::uuid IS NULL
+  OR EXISTS (SELECT 1 FROM "FleetDrivers" fd WHERE fd.driver_id = u.id
+    AND fd.fleet_id = sqlc.narg(fleet_id)::uuid AND fd.is_active = TRUE)
+  OR (sqlc.arg(include_unaffiliated)::boolean = TRUE
+    AND NOT EXISTS (SELECT 1 FROM "FleetDrivers" fd
+      WHERE fd.driver_id = u.id AND fd.is_active = TRUE)))
+```
+
+`include_unaffiliated` comes from `rideFleetIsCommunityPrimary`, which compares the ride's fleet to `Communities.primary_fleet_id`. Drivers without any fleet default to the primary fleet when they go online, so they're notified for primary-fleet rides.
+
+## Auto-queue candidates in detail
+
+`ListAutoQueueEligibleDrivers` in `queries/user_driver.sql` returns online, opted-in, unpaused drivers with an open session in the ride's fleet. `filterEligibleCandidates` in `auto_queue.go` then reads each driver's cached queue summary and drops:
+
+- Drivers whose cache read errors.
+- Drivers whose cached `TotalMinutes` is at or above their effective max.
+- Drivers with a queue whose cached last dropoff is `(0, 0)`.
+- Drivers with no queue and no `Users.latitude`.
+
+The effective max is `COALESCE(Users.auto_queue_max_minutes, Communities.auto_queue_default_minutes)`, capped at `Communities.auto_queue_max_minutes`. See [Auto-queue scoring](/engineering/matching/auto-queue-scoring) for what happens next.
+
+## Ordering
+
+| Path | Order | Limit |
+| --- | --- | --- |
+| Board | `confirm_time ASC` | None |
+| T0 | `u.id` | None |
+| Activation inactive pool | None in SQL, so Postgres returns rows in any order | 50 per query, then `TargetDrivers` |
+| Activation warm pool | Sorted-set score ascending, which is the oldest ping first | `TargetDrivers` |
+| Auto-queue candidates | None in SQL. The score decides, and the SQL order breaks ties | — |
+| Missed-ride fleet alert | None | 50 |
+| Pending ride for a newly online driver | Board order, so the oldest eligible ride | 1 |
+| Activation rides per tick | `confirm_time ASC` | None |
+
+## Debugging "why didn't this driver get the ride"
+
+Work through the paths in the order a ride reaches them:
+
+1. **Board.** Did the driver have an open `DriverSessions` row in the ride's fleet? Is the ride's `fleet_id` non-null? Is the driver in `declined_drivers`? Was a direct request hold live?
+2. **T0.** Rerun `ListRideT0NotificationTargets` for the ride ID while it's still `confirmed`. The most common misses are payout readiness, `AvailableDriverVehicles`, and the founding-driver tag on the `Yelo` fleet.
+3. **Tiers.** Was the driver offline with a stored location inside the tier radius? Were they in `ride:notified:{rideId}` or cooldown? Were there more than 50 drivers in the bounding box?
+4. **Auto-queue.** Was `auto_queue` on and unpaused? Was their cached `total_minutes` at their effective max? Was `ride:aq_attempted:{rideId}` already set when they came online?
+
+## Where this lives in code
+
+| Path | Service | SQL |
+| --- | --- | --- |
+| Board | `yelo-api/internal/service/ride/driver.go` (`GetEnrichedRideBoard`) | `queries/ride_driver.sql` (`GetEligibleEnrichedRideBoard`) |
+| Manual accept | `driver.go` (`AcceptRide`, `validateDriverAvailability`, `validateRideRequestAcceptance`, `validateRideFleet`) | `queries/ride_lifecycle.sql` (`CanAcceptDirectRide`, `GetRideAcceptingDriver`), `queries/user_driver.sql` (`GetDriverSessionOwnership`) |
+| Admission helpers | `yelo-api/internal/data/repository/ride_command.go` (`validateRideAssignmentDriver`, `validateRideAssignmentAdmission`) | `queries/ride_command.sql` (`GetRideCommandDriverAvailability`) |
+| T0 | `yelo-api/internal/service/ride/rider.go` (`notifyDriversAboutNewRide`) | `queries/community.sql` (`ListRideT0NotificationTargets`) |
+| Activation | `yelo-api/internal/service/activation/activation.go` (`fillDriverQuota`, `getCandidatesFromInactive`, `getCandidatesFromWarmPool`) | `queries/user_driver.sql` (`ListNearbyInactiveDrivers`, `ListActiveSessionFleetIDs`) |
+| Auto-queue | `yelo-api/internal/service/activation/auto_queue.go` (`filterEligibleCandidates`) | `queries/user_driver.sql` (`ListAutoQueueEligibleDrivers`), `queries/community.sql` (`GetCommunityAutoQueueSettings`) |
+| Missed-ride alert | `auto_queue.go` (`notifyFleetOfMissedRide`) | `queries/driver_fleet_primitives.sql` (`ListFleetDriverIDs`) |
+
+## Gotchas and edge cases
+
+- **Vehicle type comes from `Users.vehicle_id` in two paths.** Activation and auto-queue join the driver's profile vehicle, not the session vehicle. A driver whose session is on a different vehicle can be auto-queued for a type they aren't driving. Admission rechecks session ownership but not vehicle type.
+- **No path checks seats except T0.** Auto-queue and manual accept can assign a four-rider request to a smaller vehicle.
+- **Activation's 50-row cap is taken before exclusions.** When more than 50 drivers are inside the box, Postgres picks an arbitrary 50. If those are all already notified or in cooldown, the tier notifies nobody even though other eligible drivers exist.
+- **Auto-queue doesn't check freshness.** `is_online_driver` stays true for up to 30 minutes without a ping (`DriverExpiryInterval`). A driver who closed the app 20 minutes ago can win auto-queue. Promotion later requires a ping in the last 5 minutes, so the ride sits `queued` until [offline unqueue](/engineering/matching/queue-promotion#offline-unqueue) returns it.
+- **Auto-queue doesn't check payout readiness, bans, or locks.** Going online enforces payout readiness. A driver banned while online stays eligible until their session ends.
+- **An empty cache looks like an empty queue.** `GetQueueSummary` returns zeros when the key is missing or expired (30-minute TTL). A driver with queued rides whose summary lapsed is scored as idle and routed from their current position.
+- **Busy drivers look idle to auto-queue.** The queue summary excludes the active ride. A driver mid-trip with nothing queued gets `timeToStart` equal to deadhead from their current GPS. The rider-facing driver options code (`enrichWithQueueSummaries`) does account for the active ride, so the two can disagree about the same driver.
+- **The `Yelo` fleet rule is a name match.** Renaming the fleet removes the founding-driver restriction from T0.
+- **Declined drivers can still accept.** The board and every notification path exclude them, but the accept command doesn't.

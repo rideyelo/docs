@@ -1,0 +1,212 @@
+---
+title: "Dashboard data map"
+description: "Every dashboard route and tab traced from React hook to API endpoint, handler, service, and SQL, with polling intervals, caching, role enforcement, and the expensive queries behind each page"
+---
+
+Use this page to answer "what does this screen actually call, how often, and who is allowed to?" Each section follows one route from [Dashboard architecture](/engineering/web/dashboard-architecture): the component that issues the request, the generated operation, the `yelo-api` registration, the service method, and the refresh behavior.
+
+Paths are relative to the repo root: `yelo-web/src/...` for the frontend and `yelo-api/internal/...` for the API. Generated hooks live in `src/generated/dashboard/endpoints/<tag>/<tag>.ts`. The hook name is the operation ID with the tag prefix camel-cased, so `useCommunityGetMarketKPIs` is operation `community.GetMarketKPIs`.
+
+## How a dashboard request is authorized
+
+Every `/dashboard/*` request passes four layers. A request can fail at any of them, and they return different status codes.
+
+| Layer | Where | Behavior |
+| --- | --- | --- |
+| Clerk session | `server/http/clerk_middleware.go` (`clerkAuthMiddleware`) | Verifies the bearer token and reads `metadata.role`, `community_id`, and `fleet_assignments` from the **session token claims**. Missing claims → `401` with an empty envelope. |
+| Scope allowlist | `server/http/dashboard_scope.go` (`dashboardScopeAllows`) | Path-based allowlist for `intern` and `fleet`. Anything not listed → `401`, even if the handler would allow it. Admins pass everything. |
+| Group role gate | `server/http/router.go` `registerDashboardRoutes` | `getRequireClerkRoleMiddleware` on `/dashboard/users/*` (admin), `/dashboard/notifications/*` (admin), `/dashboard/leads/drivers/*` (admin, intern), `/dashboard/education-claims/*` (admin). Wrong role → `403`. |
+| Handler check | Individual handlers | `Role != roleAdmin` checks or `ResolveDashboardCommunity` / `HasFleetAccess`. Usually returns a `403` error envelope. |
+
+The full allowlist is documented in [API authentication](/engineering/api/authentication). The UI never relies on status codes for gating; it hides controls with `useRole()`, so a mismatch shows up as an inline error or an empty table.
+
+<Note>
+One endpoint that every page uses is **not** a dashboard route. `useCommunityGetAllCommunities` calls `GET /community/`, registered by `community.RegisterUnauthenticatedRoutes` (`server/http/community/community_router.go:52`). It is public, served from the Redis `communities:all` cache with a 60-second TTL (`data/redis/community_cache.go`), and returns every community including test communities. Role filtering happens in the browser.
+</Note>
+
+## Shell queries on every page
+
+These run regardless of route, from `DashboardLayout`, `Topbar`, and `Sidebar`.
+
+| Component | Call | Endpoint | Refresh | Notes |
+| --- | --- | --- | --- | --- |
+| `components/Topbar.tsx` | `useCommunityGetAllCommunities` | `GET /community/` | Default (5 min stale) | Feeds `CommunityDropdown` and `GlobalSearch`. |
+| `components/Sidebar.tsx` | `useDriversGetGlobalPendingDrivers` | `GET /dashboard/drivers/global/pending` | `staleTime` 5 min, `gcTime` 15 min, admin only | Handler `community/global_drivers_handler.go:46` rejects non-admins. |
+| `sites/dashboard/search/GlobalSearch.tsx` | `useDashboardGetAllFleets` | `GET /dashboard/fleets` | Only while the palette is open, admin only, 5 min stale | Warms the cache so fleets become search results. |
+| `GlobalSearch.tsx` | `dashboardGetUsersGlobal` (`useQuery`) | `GET /dashboard/users?search=&limit=15` | 300 ms debounce, 30 s stale, admin only, query length 1–256 | Live user results. |
+| `components/GlobalLoadingBar.tsx` | `useIsFetching()` | — | — | Shows while any query is in flight, including background polls. |
+
+## Overview and KPI
+
+| Route · component | Hook | Endpoint | API handler → service | Refresh |
+| --- | --- | --- | --- | --- |
+| `/` · `OverviewPage` | `useCommunityGetMarketKPIs(id, { range })` | `GET /dashboard/{id}/kpis` | `community_handler.go:161` → `DashboardService.GetMarketKPIs` | Default; refetches when `range` changes |
+| `/kpi` · `OrgKpiCards`, `KpiCharts` | `useDashboardGetGlobalKPIs` | `GET /dashboard/kpi/global` | `dashboard/kpi/handlers.go:44` → `KpiService.GetGlobalKPIs` | Default. Both components share one query key, so one request. |
+| `/kpi` · `AcquisitionBreakdown` | `useDashboardGetAcquisitionBreakdown` | `GET /dashboard/kpi/acquisition` | `kpi/handlers.go:59` → `KpiService.GetAcquisitionBreakdown` | Default |
+| `/kpi` · `NextActionQueue` | `useDriverLeads` | `GET /dashboard/leads/drivers` | `dashboard/leads/handler.go:118` → `ListDriverLeads` | **30 s poll**, refetch on focus, `retry: false` |
+
+`GetMarketKPIs` runs four queries: `GetDashboardMarketMetrics` and `CountDashboardSearches` for the current window and again for the previous window (`service/dashboard/dashboard.go:108`). `calculateTimeRanges` only knows `last_7_days`, `last_14_days`, and `last_30_days`; anything else silently becomes seven days. All KPI handlers call `requireAdmin` (`kpi/handlers.go:28`).
+
+## Drivers (`/drivers`)
+
+`LeadsPage` renders one of two trees. Fleet managers get only an embedded `DriversPage`. Everyone else gets `DriverPipelinePage` with `?tab=` values `pipeline` (default), `priority`, `payouts`, `disqualified`, and `drivers`. A `?userId=` parameter forces the `drivers` tab. `?lead=` or `?user=` opens the lead detail.
+
+| Component | Hook | Endpoint | Refresh and gate |
+| --- | --- | --- | --- |
+| Pipeline, priority, payouts, disqualified | `useDriverLeads` (`hooks/useDriverLeads.ts`) | `GET /dashboard/leads/drivers` (admins omit `community_id`) | 30 s poll. Group gate admin+intern; handler scopes interns to their community. |
+| Lead detail | `useDriverLeadDetail`, `useDriverLeadMessages` | `GET /dashboard/leads/drivers/{id}`, `.../messages` | Messages: 30 s stale, 25 s axios timeout, no retry |
+| Lead actions | `dashboardImportDriverLeads`, `AddDriverLeadNote`, `UpdateDriverLeadReferrer`, `UpdateDriverLeadTags`, `DisqualifyDriverLead`, `ActivateDriverLead` | `POST/PUT/PATCH /dashboard/leads/drivers/...` | All except notes call `requireAdmin` (`leads/handler.go:49`) |
+| `DriversPage` (community) | `useCommunityGetCommunityDrivers` | `GET /dashboard/{id}/drivers` | 10 min stale, 30 min gc |
+| `DriversPage` (fleet manager) | `useFleetGetFleetDrivers(fleetId, { community_id })` | `GET /dashboard/fleet/{fleetId}/drivers` | 10 min stale. Scope: `fleetDirectScopeAllows` checks fleet+community. |
+| `DriversPage` (admin, all communities) | `useDriversGetGlobalActiveDrivers`, `...PendingDrivers`, `...InProcessDrivers` | `GET /dashboard/drivers/global/*` | Admin-only handler checks |
+| `DriverApplicationReviewSheet` | `useDriversGetDriverApplicationDetails`, `useDriversReviewDriverApplication` | `GET /dashboard/drivers/{userId}/application`, `POST /dashboard/drivers/review` | Invalidates pending and in-process keys |
+
+## Users (`/users`)
+
+`UsersPage` uses a `useInfiniteQuery` keyed `['users-directory', scope, community, search, type, tag, sorting]` with 100-row pages, 60 s stale, and 10 min gc. Admins call `dashboardGetUsersGlobal` (`GET /dashboard/users`, handler `dashboard/users/handler.go:130`); interns call `usersGetUsers` (`GET /dashboard/{id}/users`, `community_handler.go:769`). The search input is debounced 300 ms.
+
+`UserDetailSheet` returns `null` for non-admins, so interns can browse the table but cannot open a user. For admins it loads `GET /dashboard/users/detail/{id}`, `GET /dashboard/fleets`, `GET /dashboard/users/detail/{id}/notifications?limit=20`, and, in `UserQuo`, `GET /dashboard/users/detail/{id}/messages` (30 s stale, no focus refetch). Mutations: tags, test status, profile, fleet assignment, and move to Yelo, all under the admin-gated `/dashboard/users` group.
+
+## Rides (`/rides`)
+
+`RidesShellPage` reads `?tab=`: `kpis`, `trips` (default), `issues`, `searches`. Fleet managers are forced to `trips`.
+
+| Tab · component | Hook | Endpoint | Refresh | API gate |
+| --- | --- | --- | --- | --- |
+| Trips · `RidesTab` | `useRidesList` (`hooks/useRides.ts`) | `GET /dashboard/rides` with `community_id` or `all=true`, `status`, `search`, `fleet_id`, `limit`, `offset`, `sort`, `order`, `include_routes` | **10 s while `has_active`, else 60 s** | Scope allows `GET /dashboard/rides` for all roles. Handler forces fleet managers to their assigned fleets and ignores `all` for non-admins. |
+| Trips · fleet filter | `useCommunityGetCommunityFleets` | `GET /dashboard/{id}/fleets` | Default | Disabled for fleet managers |
+| Trips · zone overlay | `useZonesList` | `GET /dashboard/communities/{id}/zones` | Default | Admin only in UI |
+| Trips · `RideDetailSheet` | `useRideEvents`, `useRideRoute` | `GET /dashboard/rides/{id}/events`, `/route` | Default | Admin-only in UI and in `rides_handler.go:129,166` |
+| KPIs · `RidesKpisTab` | `useCommunityGetMarketKPIs`, `useCommunityGetCancellationKPIs`, `useCommunityGetUncompleteKPIs` | `GET /dashboard/{id}/kpis`, `/dashboard/community/{id}/cancellations/kpis`, `.../uncompletes/kpis` | Default | Intern scope allows `cancellations` and `uncompletes` GETs for their own community |
+| Issues | `useCommunityGetCancellationBreakdowns`, `useCommunityGetUncompleteBreakdowns`, `useIssueRows` | `.../cancellations`, `.../cancellations/breakdowns`, `.../uncompletes`, `.../uncompletes/breakdowns` | Rows: 30 s stale | Same |
+| Searches · `SearchesPage` | `useCommunityGetSearchInsights`, `useCommunityGetSearchMapData` | `GET /dashboard/{id}/search-insights`, `/search-map-data` | Default | Intern read allowlist |
+| Searches · `TopLocationsManager` | `useCommunityGetTopLocations`, `...Settings`, plus create, update, delete, seed, resolve | `/dashboard/{id}/top-locations/*` | Polls every **2 s for up to 180 s** after a refresh request, until `refreshed_at` advances | Intern scope allows all `top-locations` methods |
+
+On `/rides`, admins choose scope with `?community=` and `?scope=community|global`. `useActivityCommunity` returns no community for the global scope, so the KPIs, Issues, and Searches tabs show `ActivityMarketPrompt` instead of silently using the top-bar community.
+
+`include_routes=true` (admins) adds each ride's stored route, capped at 256 coordinates per row, and clamps `limit` to 200 (`rides_handler.go:100`). In all cases, `DashboardService.GetDashboardRides` (`internal/service/dashboard/rides.go`) replaces a `limit` below 1 or above 1000 with 50.
+
+## Supply and demand (`/supply-demand`)
+
+Tabs are local state (`defaultValue="overview"`), not URL-synced. The legacy `/presence` and `/driver-ops` redirects land on **Overview**.
+
+| Tab · component | Hook (`hooks/useSupplyDemand.ts` unless noted) | Endpoint | Refresh |
+| --- | --- | --- | --- |
+| Overview · `KPISummaryBar` | `useSupplyDemandKPIs` | `GET /dashboard/supply-demand/kpis` | 60 s |
+| Overview · `MarketList` | `useSupplyDemandMarkets` | `GET /dashboard/supply-demand/markets` | 15 s |
+| Overview · `DriverTable`, `RidesTable` | `useSupplyDemandDrivers`, `useSupplyDemandRides` | `.../markets/{id}/drivers`, `.../markets/{id}/rides?older=` | 15–20 s, staggered per community by a hash of its ID |
+| Overview · actions | `useSetSurge`, notify, ping driver, ping rider | `POST .../markets/{id}/surge`, `.../notify`, `.../drivers/{id}/ping`, `.../riders/{id}/ping` | Surge invalidates all supply-demand keys |
+| Presence · `PresencePanel` | `dashboardGetPresenceSummary`, `...Users`, `...Map` | `GET /dashboard/presence/summary`, `/users`, `/map` | 10 s each |
+| Driver Ops · `DriverOpsPage` | `useDriverOps` (`hooks/useDriverOps.ts`) | `GET /dashboard/driver-ops` | 20 s, refetch on focus |
+
+Presence reads Redis only (`service/dashboard/presence.go`, `PresenceCache` and `ActivationCache`). Ping endpoints and driver ops call `requireAdmin` in their handlers.
+
+## Map (`/map`)
+
+`CommunityMapPage` keeps one long-lived Mapbox map and toggles layers from `DEFAULT_LAYER_VISIBILITY` in `components/communitymap/types.ts`. Layers that are off do not fetch.
+
+| Layer | Default | Hook | Endpoint | Refresh |
+| --- | --- | --- | --- | --- |
+| Zones | On | `useZonesList` | `GET /dashboard/communities/{id}/zones` | Default |
+| Ride routes | On | `useHistoricalRideRoutes(id, days)` | `GET /dashboard/communities/{id}/map/ride-routes?days=` (7, 14, 30, 60) | 60 s stale |
+| Locations | On | `useLocationsList` | `GET /dashboard/communities/{id}/locations` | Default |
+| Users | Off | `useUserCoords` (admin) | `.../locations/user-coords` | 60 s stale; admin-only handler |
+| Ride destinations | Off | `useRideDestinations` (admin) | `.../locations/ride-destinations` | 5 min stale; admin-only handler |
+| Community content | Off | `useDashboardGetCommunityContentMapLayer` | `.../map/community` | 120 s stale |
+| Mobility | Off | `useDashboardGetCommunityMobilityLayer` | `.../map/mobility` | 30 s stale, **60 s poll while visible** |
+
+Zone writes go to `POST/PATCH/DELETE /dashboard/zones`, which the intern scope denies. `MobilityFeedsPanel` manages `/dashboard/communities/{id}/mobility-feeds` and suggestions. Admins also see this map embedded at the bottom of `/fleets`.
+
+## Events (`/events`) and Community (`/community`)
+
+| Route · component | Hook | Endpoint | Refresh |
+| --- | --- | --- | --- |
+| `/events` · `EventsTab` | `useEventsList`, `useEventDetail`, create, update, status, photo (`hooks/useEvents.ts`) | `/dashboard/communities/{id}/events/*`, `.../events/check-slug` | Default |
+| `/events` · `SpotTab` (admin) | `useActiveSpot`, `useSpotHistory`, spot mutations (`hooks/useSpot.ts`) | `/dashboard/communities/{id}/spot/*` | Default. The intern scope denies `spot`. |
+| `/community` · `CommunityPage` | `useCommunityGetMarketKPIs`, `useCommunityGetCommunityDemographics`, `useSchoolGetAll` | `/dashboard/{id}/kpis`, `/dashboard/{id}/demographics`, public `GET /school/` | Default |
+| `/community` · `FeedPreview` | `useCommunityFeed`, `useDashboardGetCommunityContentMapLayer` | `.../feed`, `.../map/community` | Layer polls 60 s |
+| `/community` · feed cards | `rideGetRide`, `dashboardGetEvent`, `adGetAdById` | `GET /ride/{id}`, `.../events/{eventId}`, `GET /ad/{id}` | 5 min stale |
+| `/community` · `OperatingHoursCard` (admin) | `useCommunityGetOperatingWindows`, upsert | `/dashboard/manage/{id}/operating-windows` | Default; admin-only handler |
+
+## Fleet (`/fleets`)
+
+Tabs are local state: `overview`, `payments`, `hours`. The active fleet resolves from the remembered fleet, then the first assignment in the selected community.
+
+| Component | Hook | Endpoint | Refresh and gate |
+| --- | --- | --- | --- |
+| Fleet list | `useCommunityGetCommunityFleets` | `GET /dashboard/{id}/fleets` | Fleet scope allows `GET /dashboard/{community}/fleets` if the community resolves |
+| Overview metrics | `useFleetGetFleetKPIs`, `useFleetGetFleetRideHistogram` | `GET /dashboard/fleet/{fleetId}/kpis`, `/histogram` | Handler checks `HasFleetAccess` |
+| Drivers table | `useFleetGetFleetDrivers` | `GET /dashboard/fleet/{fleetId}/drivers?community_id=` | 10 min stale |
+| Pricing table | `usePriceParametersGetPriceParameters` | `GET /dashboard/communities/{id}/price-parameters` | Fleet scope allows `price-parameters` for resolvable communities |
+| Join link | `FleetDriverJoinLinkCard` | `/dashboard/fleets/driver-join-link/{fleetId}` (+ `/rotate`) | Scope checks `HasFleetAccess` |
+| Payments | `QRConfigCards`, `QRPaymentsTable` | `/dashboard/qr/qr-configs`, `/dashboard/qr/qr-payments` | Handlers scope non-admins to assigned fleets |
+| Operating hours | `FleetCalendar` | `/dashboard/fleets/{f}/communities/{c}/calendar` | **15 s poll**, not in background |
+
+## Configuration pages
+
+| Route · tab | Components | Endpoints | Notes |
+| --- | --- | --- | --- |
+| `/pricing` | `PricingPage`, `CommunityPricingCard`, `PricingConfigSheet`, `LivePreviewPanel`, `GlobalJitterSettings`, `PricingZoneMap`, `ZonePricingEditor`, `ZonePricingBacktest` | `GET /dashboard/pricing/overview`, `POST /dashboard/pricing/preview`, `GET/PUT /dashboard/pricing/jitter`, `/dashboard/communities/{id}/price-parameters[/history]`, `/dashboard/zone-pricing`, `.../zone-pricing/backtest` | Mutations invalidate `getPricingGetOverviewQueryKey` and the per-community parameter keys. `RecentPricingActivity` reads ride events with 60 s stale. Zone pricing writes clear the community's quote cache asynchronously (`service/dashboard/zone_pricing.go:140`). |
+| `/manage` `?tab=fleets\|vehicles` | `ManageFleetsPage`, `FleetFormSheet`, `FleetDetailSheet`, `FleetServiceCommunities`, `VehicleInventory`, `VehiclesPage` | `GET /dashboard/fleets`, `/dashboard/communities/{id}/fleets/*` (CRUD, Stripe status, refresh link, unlink), `/dashboard/fleets/services/{fleetId}`, `/dashboard/vehicles`, `/dashboard/vehicle-types[/all]`, `/dashboard/vehicle-artwork` | `/manage/{fleetId}` has its own `settings`, `operations`, `vehicles` tabs. Vehicle type writes are admin-only in `vehicle_type_handler.go:50`. |
+| `/notifications` `?notification_tab=` | `NotificationTemplatesPanel`, `NotificationAnalyticsPanel`, `NotificationLogsTable`, `ScheduledNotificationsTable`, `SendNotificationSheet`, `ActivationPage` | `/dashboard/notifications/*`, `/dashboard/{id}/notifications/history\|scheduled`, `POST /dashboard/notifications/send`, `/dashboard/manage/{id}/activation-config` | Logs table polls **30 s**. The whole `/dashboard/notifications` group is admin-gated because history and detail are cross-community. |
+| `/communities` `?tab=communities\|schools` | `CommunitiesPage`, `CommunityEditor`, `CommunityManagementMap`, `CommunityDeleteDialog`, `SchoolsPage`, `SchoolFormSheet`, `SchoolMappingPreviewPanel` | `/dashboard/manage[/{id}]`, `POST /dashboard/manage/timezone-preview`, `/dashboard/schools`, `POST /dashboard/schools/mapping-preview` | Previews use `staleTime: 0`. `?community=` opens the editor. |
+| `/access` | `AccessPage`, `InviteUserSheet`, detail sheets, `CalendarOwnerConnection` | `GET /dashboard/access/users?role=`, `PATCH /dashboard/access/users/{clerkUserId}`, `POST /dashboard/access/invite`, `/dashboard/calendar-owner/*` | Tabs: `interns`, `fleet`, `admins`, `account`, `calendar`. Handlers check admin. Changes reach the target user only after their Clerk session token refreshes. |
+| `/telemetry` | `TelemetryPage`, `CommunityFilterDropdown` | `GET /dashboard/telemetry/summary?community_id=&app_version_months=` | `app_version_months` must be 0, 1, or 3 or the API returns `400`. No handler role check; the scope middleware keeps it admin-only. |
+| `/jobs` | `JobsPage` | `POST /riverui/session`, iframe `/riverui` | Raw `fetch` re-mints the cookie every 45 s. |
+| `/contact-sync` | `ContactSyncPage`, `MarketingSegments` | `GET /dashboard/contact-sync`, `/dashboard/contact-sync/segments[/preview]` | Both poll **15 s**, 5 s stale, not in background. Handlers check admin. |
+
+## Polling summary
+
+| Interval | Query | Where |
+| --- | --- | --- |
+| 2 s (bounded to 180 s) | Top locations + settings | `components/search/TopLocationsManager.tsx:39` |
+| 10 s | Presence summary, users, map | `sites/dashboard/components/PresencePanel.tsx:78` |
+| 10 s / 60 s | Rides list, depending on `has_active` | `sites/dashboard/components/RidesTab.tsx:445` |
+| 15 s | Market summaries | `hooks/useSupplyDemand.ts:219` |
+| 15–20 s | Market drivers and rides (staggered) | `hooks/useSupplyDemand.ts:17` |
+| 15 s | Fleet calendar, contact sync, marketing segments | `FleetCalendar.tsx:75`, `ContactSyncPage.tsx:111`, `MarketingSegments.tsx:155` |
+| 20 s | Driver ops snapshot | `hooks/useDriverOps.ts:4` |
+| 30 s | Driver leads, notification logs | `hooks/useDriverLeads.ts:27`, `NotificationLogsTable.tsx:112` |
+| 45 s | River UI cookie | `pages/JobsPage.tsx:47` |
+| 60 s | Supply-demand KPIs, mobility layer, feed content layer | `useSupplyDemand.ts:208`, `CommunityMapPage.tsx:267`, `FeedPreview.tsx:230` |
+
+TanStack Query's `refetchIntervalInBackground` defaults to `false`, so every poll above pauses in a hidden tab even where the option is omitted.
+
+## Expensive queries
+
+| Endpoint | Why it is heavy | Code |
+| --- | --- | --- |
+| `GET /dashboard/kpi/global` | Four statements: `GetGlobalKPITotals` three times (all-time, this week, last week) and `ListWeeklyKPISeries`. The series aggregates the full `Users`, `DriverApplications`, `EventAttendees`, and `Rides` history by week, then keeps 12 weeks. | `data/repository/queries/analytics.sql:98`, `:173`; `service/dashboard/kpi.go:31` |
+| `GET /dashboard/{id}/kpis` | Two passes of `GetDashboardMarketMetrics` (a `COUNT FILTER` scan of the community's rides plus two user subqueries) and an hourly histogram joined on `date_trunc('hour', request_time)`. | `analytics.sql:345`, `:465` |
+| `GET /dashboard/rides` | `ListDashboardRides` and `CountDashboardRides` each join riders, drivers, fleets, and communities, `ILIKE` on concatenated names, and sort with a large `CASE` expression. With `all=true` there is no community predicate. | `analytics.sql:851`, `:935`; `data/repository/dashboard_rides.go:12` |
+| `GET /dashboard/telemetry/summary` | Eleven sequential scans of `DeviceTelemetry` joined to `Users` (one per dimension) sharing a 15 s timeout instead of the default 5 s. | `data/repository/dashboard.go:1839` |
+| `GET /dashboard/{id}/search-insights` | Four aggregations plus a per-user name lookup for up to 100 recent searches, memoized per request. | `service/dashboard/dashboard.go:716`, `:811` |
+| `GET /dashboard/supply-demand/markets` | One `Community.GetByID` per market to compute `MarketStatus`, polled every 15 s by every open tab. | `service/dashboard/supply_demand.go:93` |
+| `GET /dashboard/presence/summary` | Two Redis calls per community on every 10 s poll. | `service/dashboard/presence.go:145` |
+
+Most repository methods wrap their context in `WithPostgresTimeout`, a 5-second deadline (`data/repository/storage.go:30`).
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Route table and roles | `yelo-web/src/sites/dashboard/App.tsx` |
+| Generated operations | `yelo-web/src/generated/dashboard/endpoints/*` |
+| Wrapper hooks with key factories | `yelo-web/src/hooks/*.ts` |
+| Query defaults | `yelo-web/src/sites/dashboard/main.tsx:89` |
+| Dashboard route mounting | `yelo-api/internal/server/http/router.go` `registerDashboardRoutes` |
+| Scope allowlist | `yelo-api/internal/server/http/dashboard_scope.go` |
+| Community, driver, fleet, pricing, zone routes | `yelo-api/internal/server/http/community/community_router.go` |
+| Per-feature dashboard routes | `yelo-api/internal/server/http/dashboard/<feature>/` |
+| Services | `yelo-api/internal/service/dashboard/`, `service/<feature>/` |
+| SQL | `yelo-api/internal/data/repository/queries/*.sql` (sqlc), generated into `internal/data/sqlc` |
+
+## Gotchas and edge cases
+
+- **Role changes lag.** The API reads role and assignments from Clerk session token claims, not from the Clerk API. After someone edits a user on `/access`, that user keeps their old scope until Clerk refreshes their token, even though `DashboardSession` remounts on the new `publicMetadata`.
+- **`401` means "outside the allowlist", not "signed out".** `dashboardScopeAllows` answers `401` for interns and fleet managers who hit a route not on their list. Check `dashboard_scope.go` before debugging Clerk.
+- **Rides always poll fast.** `HasActiveDashboardRides` treats any ride that is not `complete` and not canceled as active, with no time bound (`analytics.sql:954`). Stale `no_drivers_available` or `pending_rider_rating` rows keep `has_active` true, which keeps the Trips tab on the 10-second interval.
+- **Feed ad cards cannot load.** `FeedPreview` calls `GET /ad/{id}`, which sits in the app-JWT group (`router.go:186`). The dashboard's Clerk token fails there, so ad cards fall back to the "Ad" placeholder. `GET /ride/{id}` works because its optional-auth middleware ignores tokens it cannot parse.
+- **Tabs are not all URL-backed.** `/rides`, `/drivers`, `/manage`, `/communities`, and `/notifications` persist their tab in the query string. `/supply-demand`, `/fleets`, `/events`, and `/access` do not, so deep links always open their first tab.
+- **Invalid `community_id` on telemetry means global.** The handler ignores an unparseable ID and returns org-wide numbers instead of an error.
+- **Community list includes test communities.** `GET /community/` is unfiltered, so the top-bar dropdown and `CommunityFilterDropdown` show test markets to admins. `CommunityFilterDropdown` also does not filter by role.

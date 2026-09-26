@@ -1,0 +1,256 @@
+---
+title: "Map layer payloads, access, and map change pushes"
+description: "Field-level contracts for every map layer payload, the rider and dashboard access rules, the historical ride-routes overlay, the privacy controls on each layer, and every code path that sends a map_content_changed invalidation."
+---
+
+This page fills the gaps left by [Map layers and mobility feeds](/engineering/location/map-layers-and-mobility), which already explains how each layer is built, the heatmap and moves floors, the Redis layer caches, and the GBFS and GTFS pipeline. Read that page first. This page covers what it doesn't:
+
+- The exact payload shapes in `internal/models/maplayer.go`.
+- Who can call each route, including the dashboard scope rules.
+- The dashboard historical ride-routes overlay.
+- A single matrix of the privacy controls applied to each layer.
+- Every caller of `internal/service/mapchanges` and what each push invalidates.
+
+For how the app handles the push, see [Mobile push handling](/engineering/notifications/mobile-push-handling). For the dashboard map UI, see [Dashboard data map](/engineering/web/dashboard-data-map) and [Community map](/dashboard/community-map).
+
+## Data touched
+
+| Store | Key or table | Written by | Read by |
+| --- | --- | --- | --- |
+| Redis | `maplayer:vehicles:{community}` (60 s) | `MapLayerCache.Get` miss | `GET /map/vehicles`, `GET /map/mobility` |
+| Redis | `maplayer:community:canonical-places:{community}` (300 s) | `MapLayerCache.Get` miss | `GET /map/community`, dashboard community preview |
+| Redis | `maplayer:heat:{community}` (15 min) | `RefreshHeatmaps` | `buildCommunityLayer` via `readHeatmap` |
+| Redis | `presence:{user}` | Heartbeat pipeline | Friends layer `GetPresenceBatch` |
+| Postgres | `Friendships`, `Users` | Social and profile flows | `ListFriendsForMap` |
+| Postgres | `Bumps` | Friend bumps (`notifications/bump.go`) | Friend moves, community moves, `DeleteExpiredBumps` |
+| Postgres | `Rides` (`route`, `is_public_destination`, `is_public_pickup`) | Ride flow | Ride-routes overlay, moves |
+| Postgres | `RideDeclineReasons` | Driver declines | `pricing_declined` flag |
+| Postgres | `LikedLocations`, `RecentLocations`, `Locations`, `CommunityTopLocations` | Likes, search, dashboard | `GetPlaceAffectedUsers`, `GetPlaceCommunities` |
+| Notify queue | Template `map_content_changed` | `mapchanges.Service.emit` | Mobile app |
+
+Column definitions live in [Locations and places](/reference/database/markets-locations-and-places) and [Rides](/reference/database/rides).
+
+## Endpoints
+
+All rider routes are mounted in `internal/server/http/router.go` on `authenticatedGroup` with prefix `/map`. That group runs `getValidateJWTMiddleware` and `getRequireRoleMiddleware([]string{"user"})`. Dashboard routes are mounted by `maplayerhttp.RegisterDashboardRoutes` on the `/dashboard` group, which runs Clerk auth and then `getDashboardScopeMiddleware`.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/map/vehicles` | User JWT, role `user` | `GetVehiclesLayer`. Community from the JWT. |
+| `GET` | `/map/mobility` | User JWT, role `user` | `GetMobilityLayer`. Vehicles plus GTFS stops and shapes. |
+| `GET` | `/map/community` | User JWT, role `user` | `GetCommunityLayer`. Curated content, heatmap, moves. |
+| `GET` | `/map/friends` | User JWT, role `user` | `GetFriendsLayer`. Per caller, `Cache-Control: no-store`. |
+| `GET` | `/dashboard/communities/{id}/map/mobility` | Clerk, admin or intern for own community | `GetDashboardMobilityLayer` |
+| `GET` | `/dashboard/communities/{id}/map/community` | Clerk, admin or intern for own community | `GetDashboardCommunityLayer` |
+| `GET` | `/dashboard/communities/{id}/map/ride-routes?days=` | Clerk, admin or intern for own community | `GetDashboardHistoricalRideRoutes` |
+| `GET` | `/dashboard/communities/{id}/mobility-feed-suggestions` | Clerk, admin only in practice | `DiscoverDashboardMobilityFeeds` |
+
+User-side routes that trigger map change pushes:
+
+| Method | Path | Auth | Push |
+| --- | --- | --- | --- |
+| `PUT` | `/user/location-sharing` | User JWT | `SocialChanged` (scope `friends`) |
+| `POST` | `/user/likes` | User JWT | `SocialChanged`, only when a new like row is created |
+| `DELETE` | `/user/likes/{id}` | User JWT | `SocialChanged` |
+| `DELETE` | `/user/i/{id}` | User JWT | `SocialChanged` for the caller, see gotchas |
+
+### Dashboard access rules
+
+Scope is decided in two places:
+
+1. `dashboardScopeAllows` in `internal/server/http/dashboard_scope.go` runs first. Admins pass everything. Interns pass only through `internCommunityResourceScopeAllows`, which requires the path's community to equal the Clerk `CommunityID` and allows `GET` for path segment `map`. Fleet managers go through `fleetCommunityResourceScopeAllows`, which only allows `fleets` and `price-parameters`, so every map route returns 401 for them.
+2. `resolveDashboardCommunityID` in `internal/server/http/maplayer/handler.go` then picks the community. Admins get the path `{id}`. Everyone else gets their Clerk `CommunityID`, and the path is ignored.
+
+`mobility-feed-suggestions` is not in the intern allow list, so interns get 401 there.
+
+## Payload contracts
+
+The handlers replace every `nil` slice with an empty slice before responding, so clients never see `null` arrays. All payloads are wrapped in `json.StandardResponse`.
+
+### `VehiclesLayer`
+
+`{ vehicles: MapVehicle[] }`
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | string | Vehicle UUID for Yelo vehicles. `{feed name}:{vehicle id}` for feeds. Never a user ID. |
+| `source` | string | `yelo`, `gbfs`, or `gtfs` (`MapVehicleSource*`) |
+| `vehicle_type` | string | Vehicle type slug. Defaults to `x` when the ID doesn't parse or has no type (`resolveVehicleType`). |
+| `status` | string, omitted when empty | `online`, `online_auto_queue`, `in_ride`. Yelo only. |
+| `latitude`, `longitude` | number | Presence or last cached driver location |
+| `heading` | number, optional | From presence `orient`. Lapsed in-ride vehicles have none. |
+| `fleet_id`, `fleet_name`, `fleet_logo_url` | optional | Yelo only. Filled by `enrichVehicles` from `GetFleetsByIDs`. |
+| `updated_at_ms` | integer | Presence `ts × 1000`, or now when `ts` is 0 (`presenceUpdatedAtMs`) |
+
+In-ride detection uses `ListActiveRideDrivers`: rides in the community with a driver and status `driver_en_route`, `driver_waiting`, or `in_progress`.
+
+### `MobilityLayer`
+
+`{ vehicles, stops, shapes }`. `vehicles` is the same list as `VehiclesLayer`. `stops` are `MapTransitStop` (`id`, `name`, `latitude`, `longitude`). `shapes` are `MapTransitShape` (`id`, `route_id`, `short_name`, `long_name`, `vehicle_type`, `color`, `text_color`, `coordinates[]`).
+
+### `CommunityLayer`
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| `spot` | `Spot.GetActiveByCommunity` | `null` when none |
+| `top_locations` | `Location.GetTopLocations`, limit 20 | `[]TopLocation` |
+| `events` | `Event.GetUpcoming(uuid.Nil, …, 25)` | No per-user viewed flag |
+| `moves` | `collectCommunityMoves` | `MapDestinationCount`: place IDs, `name`, `address`, `categories`, coordinates, `count`. No user identity. |
+| `heatmap` | `maplayer:heat:{c}` | `HeatCell`: cell center `latitude`, `longitude`, `weight` |
+| `heatmap_max_weight` | `maxHeatWeight` | Largest cell weight, 0 when empty. Lets the client normalize Mapbox `heatmap-weight`. |
+
+### `FriendsLayer`
+
+| Field | Element | Key fields |
+| --- | --- | --- |
+| `friends` | `MapFriend` | `id`, `first_name`, `last_name`, `photo_url` (thumbnail), `latitude`, `longitude`, `last_seen_ms`, `is_online`, `active_vehicle_id` |
+| `moves` | `MapMove` | `kind` (`bump` or `ride`), `user_id`, destination name, address, coordinates, `categories`, optional `from_latitude` and `from_longitude`, `created_at_ms` |
+| `liked_spots` | `MapLikedSpot` | `id` (grouping key), `name`, `address`, `categories`, coordinates, `liked_by[]` |
+
+`active_vehicle_id` is set only when the friend's `Users.is_online_driver` is true. It is `Users.vehicle_id` (`GetFriendsForMap` in `internal/data/repository/friendship.go`). The app can use it to match a friend to a vehicles-layer marker.
+
+## Historical ride-routes overlay
+
+`GetHistoricalRideRoutes` in `internal/service/maplayer/maplayer.go` builds an uncached demand overlay for the dashboard.
+
+<Steps>
+  <Step title="Validate the window">
+    The handler accepts `days` of 7, 14, 30, or 60. A missing or zero value becomes 7. Any other value returns 400 **days must be one of 7, 14, 30, or 60**. The service repeats the check and falls back to 7.
+  </Step>
+  <Step title="Query one extra row">
+    `GetCommunityRideRoutesSince` (`queries/ride_history.sql`) reads rides in the community with `request_time` at or after now minus `days`, a non-empty `route`, ordered newest first, limited to 2,001 (`historicalRideRoutesLimit + 1`).
+  </Step>
+  <Step title="Flag pricing declines">
+    `pricing_declined` is true when any `RideDeclineReasons.reason` for the ride matches the case-insensitive regex `(price|pricing|fare|pay|payout|too\s+(low|high)|not\s+enough|expensive|cheap)`.
+  </Step>
+  <Step title="Decode and truncate">
+    The repository decodes `route` with `models.ParseRoute` and drops rows that fail or have fewer than 2 points. The service sets `truncated` when more than 2,000 routes remain, then cuts to 2,000.
+  </Step>
+</Steps>
+
+The response is `{ routes, days, total, truncated }`, where `total` is the number of routes returned, not the number that exist. Every ride status is included, so canceled and unmatched requests appear alongside completed rides. `Cache-Control` is `private, max-age=60, stale-while-revalidate=300`.
+
+## Privacy controls by layer
+
+| Layer | Control | Where |
+| --- | --- | --- |
+| Vehicles | Marker IDs are vehicle IDs, never driver IDs | `buildOnlineVehicles`, `buildLapsedInRideVehicles` |
+| Friends | Only friends with `share_location_with_friends = true` and `is_deleted != true` | `ListFriendsForMap` (`queries/account_utilities.sql`) |
+| Friends | Offline positions older than 7 days are omitted | `friendPositionMaxAge` |
+| Friends, moves | Bumps from senders no longer in the ghost-filtered friend set are dropped | `collectFriendMoves` |
+| Friends, moves | Ride pickup coordinates are returned only when `is_public_pickup` | `GetRecentPublicDestinations` (`internal/data/repository/ride_matching.go`) |
+| Friends, moves | Ride moves need `is_public_destination`, status `confirmed`, `complete`, or `pending_rider_rating`, and `confirm_time` within 24 hours. Limit 200 rows. | `queries/ride_history.sql` |
+| Friends, moves | A bump is hidden once the sender has a matching public ride (same trimmed name, or within 0.0015 degrees on both axes, confirmed from 3 hours before the bump until it expires). Limit 100 rows. | `GetActiveBumpsForRecipient` (`queries/engagement.sql`) |
+| Friends, liked spots | Only likes from ghost-filtered friends. At most 500 rows read and 100 places returned. | `collectLikedSpots` |
+| Community, heatmap | Postgres positions only, opted-in users only, 60-day freshness, cells of fewer than 3 users dropped | `heatmap.go` |
+| Community, moves | Distinct movers of at least 2 per source, applied in SQL. No user IDs. | `communityMovesMinCount`, `ListPublicDestinationCounts`, `GetCommunityBumpDestinationCounts` |
+| Community, events | Built with `uuid.Nil` so one user's viewed state never enters the shared cache | `buildCommunityLayer` |
+
+Liked spots group by `yelo_place_id`. Legacy likes without one group by `pin|{lat:.6f}|{lng:.6f}|{name}`, so a reused provider ID alone never merges two neighboring businesses.
+
+## Map change pushes
+
+`internal/service/mapchanges` sends a silent push with template code `map_content_changed` after a committed mutation. The app then invalidates its React Query caches. The service is built once in `internal/service/service.go`: `mapchanges.New(repository.Friendship, notify.NewPoolEmitter(...), l, repository.PlaceCatalog)`.
+
+### Emit rules
+
+- `emit` adds `scope` to the push data and sets event key `map_content_changed:{random UUID v4}`. Every mutation gets its own key, so the default five-minute dedupe never drops it.
+- `bypassesCooldowns` in `internal/notify/queue/orchestrate.go` returns true for this code, so template cooldowns never suppress it.
+- The seeded template (`internal/notify/seed/templates.go`) is `Silent: true`, priority `high`, category `transactional`, with an empty title and body.
+- Each emit runs on `context.WithoutCancel` with a 5-second timeout. Failures log `map.change.enqueue_failed` and are never returned to the caller.
+
+### Scopes and callers
+
+| Scope | Method | Recipients | Extra data |
+| --- | --- | --- | --- |
+| `community_pois` | `CommunityPOIsChanged(communityID)` | `WithCommunityBroadcast(community, BroadcastAll)` | `community_id` |
+| `place_metadata` | `PlaceMetadataChanged(placeID)` | `PlaceCatalog.AffectedUsers(placeID)` | None |
+| `friends` | `SocialChanged(userID)` or friendship wrapper | The user plus current friends, sorted and de-duplicated | None |
+
+| Trigger | Code path | Call |
+| --- | --- | --- |
+| Location created with `show_on_map` and a community | `LocationService.CreateLocation` | `CommunityPOIsChanged` |
+| Location updated | `LocationService.UpdateLocation` | `CommunityPOIsChanged` for the owning community, and again for the new community if reassigned |
+| Location deleted | `LocationService.DeleteLocation` | `CommunityPOIsChanged` |
+| File import with at least one location added | `LocationService.ImportFile` | `CommunityPOIsChanged` |
+| Top locations edited | `toplocations.New` callback in `service.go` | `InvalidateCommunity` then `CommunityPOIsChanged` |
+| Google details stored with changed metadata | `rememberCatalogPlace` (`mapping/poi_details.go`), selection in `mapping/mapping.go` for provider `google` | `PlaceMetadataChanged` |
+| Location sharing toggled | `UserService.SetLocationSharing` | `SocialChanged` |
+| Like created or deleted | `UserService.CreateLike`, `DeleteLike` (`service/user/likes.go`) | `SocialChanged` |
+| Account deleted | `UserService.Delete` | `SocialChanged` |
+| New friendship from invites, referral signup, or contact sync | `friendships.AddMutualBatch` wrapper | `friendsChanged` |
+
+### Place metadata fan-out
+
+`PlaceMetadataChanged` first calls the invalidator set by `mapChanges.SetPlaceInvalidator(mapLayerService.InvalidatePlace)`. `InvalidatePlace` deletes the community layer cache for every community returned by `GetPlaceCommunities`:
+
+- Communities with a `Locations` row for the place.
+- Communities with a `CommunityTopLocations` row for the place.
+- Communities with a public-destination ride to the place confirmed in the last day.
+
+It then pushes to `GetPlaceAffectedUsers`, the union of:
+
+- Users who liked the place.
+- Users with the place in `RecentLocations`.
+- Friends of anyone who liked it.
+- Every non-deleted user in a community that has a `show_on_map` location for the place.
+
+### Friendship wrapper
+
+`WrapFriendships` replaces `repository.Friendship` at startup, so every `AddMutual` and `AddMutualBatch` call goes through it. The wrapper:
+
+1. Reads `FriendsAmong` before the write to learn which pairs already exist.
+2. Runs the real `AddMutualBatch`. A write error returns immediately with no push.
+3. Pushes `friends` to the user and every other ID that wasn't already a friend. If the pre-read failed, every ID counts as new.
+
+The `FriendshipRepository` interface has no remove method, so no unfriend push path exists.
+
+## Cache invalidation matrix
+
+| Event | Server cache dropped | Client push |
+| --- | --- | --- |
+| Heatmap refresh (every 5 minutes) | Community layer, per active non-hidden community | None |
+| Mobility feed refresh with vehicles | Vehicles layer | None |
+| Top locations edit | Community layer | `community_pois` |
+| Location CRUD or import | None | `community_pois` |
+| Google place metadata change | Community layer for linked communities | `place_metadata` |
+| Likes, location sharing, friendships, account deletion | None, the friends layer is never cached | `friends` |
+| Event, spot, or `map_moves_window_hours` edits | None | None |
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Payload types | `internal/models/maplayer.go` | `VehiclesLayer`, `MobilityLayer`, `CommunityLayer`, `FriendsLayer`, `HistoricalRideRoutesLayer` |
+| Rider routes | `internal/server/http/maplayer/routes.go` | `RegisterRoutes` |
+| Dashboard routes | `internal/server/http/maplayer/routes.go` | `RegisterDashboardRoutes` |
+| Community resolution | `internal/server/http/maplayer/handler.go` | `resolveDashboardCommunityID` |
+| Dashboard scope | `internal/server/http/dashboard_scope.go` | `internCommunityResourceScopeAllows`, `fleetCommunityResourceScopeAllows` |
+| Ride-routes overlay | `internal/service/maplayer/maplayer.go` | `GetHistoricalRideRoutes` |
+| Ride-routes query | `internal/data/repository/ride_history.go`, `queries/ride_history.sql` | `GetCommunityRideRoutesSince` |
+| Friends layer | `internal/service/maplayer/friends_layer.go` | `GetFriendsLayer`, `collectFriendMoves`, `collectLikedSpots` |
+| Friend rows | `internal/data/repository/friendship.go` | `GetFriendsForMap` |
+| Place invalidation | `internal/service/maplayer/maplayer.go` | `InvalidatePlace`, `InvalidateCommunity` |
+| Change pushes | `internal/service/mapchanges/mapchanges.go` | `CommunityPOIsChanged`, `PlaceMetadataChanged`, `SocialChanged`, `emit` |
+| Friendship wrapper | `internal/service/mapchanges/friendships.go` | `WrapFriendships`, `AddMutualBatch` |
+| User triggers | `internal/service/user/user.go`, `likes.go` | `SetLocationSharing`, `Delete`, `CreateLike`, `DeleteLike` |
+| Place fan-out SQL | `internal/data/repository/queries/place_catalog.sql` | `GetPlaceAffectedUsers`, `GetPlaceCommunities` |
+| Wiring | `internal/service/service.go` | `mapchanges.New`, `SetPlaceInvalidator`, `toplocations.New` |
+
+## Gotchas and edge cases
+
+<Warning>
+`truncated` on the ride-routes overlay can be false when more than 2,000 routes exist. The repository drops unparseable routes before the service counts them. If any of the 2,001 fetched rows fails to parse, only 2,000 remain and the service reports no truncation.
+</Warning>
+
+- **Friends are not community-scoped.** `ListFriendsForMap` has no community filter, so a friend in another community appears on your map at their real position.
+- **`is_online` means a presence hash exists.** It doesn't check whether the friend is driving. `active_vehicle_id` comes from `Users.is_online_driver`, a separate Postgres flag, so the two can disagree.
+- **Ghosting stops future reads, not past pushes.** `SocialChanged` notifies all friends from `GetFriends`, which ignores `share_location_with_friends`. That is deliberate: friends must refetch to remove content they could already see.
+- **Account deletion ignores the path ID.** `DELETE /user/i/{id}` calls `GetRequestUserID` and deletes the caller. With an identity lifecycle, the `SocialChanged` push is deferred so friends refresh even if the later scrub fails.
+- **`CreateLike` is idempotent without a push.** When the place is already liked, it returns the existing row and sends nothing.
+- **Location edits push without clearing a server cache.** `community_pois` makes clients refetch `/map/community`, but location CRUD never drops that Redis key. The community layer doesn't embed `Locations`, so the refetch returns the same body. The fresh data comes from `/location/pois`.
+- **Events and spots lag by up to 5 minutes.** Nothing invalidates the community layer on event or spot writes. The heatmap loop drops it every 5 minutes for active, non-hidden communities. Otherwise the 300-second TTL applies.
+- **Place invalidation misses older moves.** `GetPlaceCommunities` only includes public rides from the last day and ignores bumps. Community moves use a window of up to 720 hours (default 168). A renamed place can keep its old name in moves until the community cache expires.
+- **`place_metadata` can reach a whole community.** Any community with a `show_on_map` location for the place receives the push for every non-deleted member.
+- **Duplicate counting across sources.** Community moves add bump counts and ride counts after SQL thresholds. One person who bumps and then rides to the same place can count twice if the ride doesn't match the bump's suppression rule.
+- **Dashboard path IDs are ignored for non-admins.** An intern whose path doesn't match their community is rejected by the scope middleware. The handler then uses the Clerk community regardless of the path.

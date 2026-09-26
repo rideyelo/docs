@@ -1,0 +1,214 @@
+---
+title: "Notification catalog"
+description: "Every push notification code Yelo defines: what triggers it, who receives it, seeded copy and variables, deep link, data payload, limits, freshness, and how the mobile app handles it."
+---
+
+This is the reference for every `TemplateCode` in `yelo-api/internal/notify/codes.go`. Copy and settings below are the **seed values** in `internal/notify/seed/templates.go`. The seeder never overwrites an existing row, so production copy may differ if an admin edited it. Check the dashboard (**Notifications** > **Templates**) for live copy.
+
+For how a code moves from emit to device, see [Push send pipeline](/engineering/notifications/send-pipeline). For how the app reacts, see [Mobile push handling](/engineering/notifications/mobile-push-handling).
+
+## How to read this page
+
+- **Trigger** is the function that calls `notify.Emit`, directly or through `NotificationService` in `internal/service/notifications/notification.go`.
+- **Deep link** is the template's `deeplink`, rendered with the variables and sent as `data.url`.
+- **`data.type`** is the template's `client_data_type` if set, otherwise the code. Caller `WithData` keys override it.
+- **Fresh** means the orchestrate job is canceled after 15 minutes. See [Freshness](/engineering/notifications/send-pipeline#freshness).
+- **App** summarizes `invalidateForPush` in `yelo-frontend/lib/notifications/pushInvalidation.ts`. "Ride refresh" means the ride-status invalidation group. "None" means the push only shows a banner and navigates on tap.
+
+Every push also carries `notification_id`, `notification_delivery_id`, `cohort_id`, and `variant_id`, added by the send worker. Ride-bound pushes carry `ride_id`.
+
+## Ride lifecycle (rider)
+
+| Code | Trigger | Seeded title / body | Deep link | Extra data |
+| --- | --- | --- | --- | --- |
+| `ride_confirmed` | `RideService.AcceptRide` (driver accepts), `notifyQueuePromotion` (queued ride promoted to active), `ActivationService.sendAutoQueueNotifications` (auto-queue assigns) | `Woohoo! {{driver_first_name}} is on the way.` / `Get ready — your driver is coming.` | `ride/4-ride` | `status`: `queued` or `driver_en_route` on accept (from `acceptedRideStatus`), `driver_en_route` on promotion, the ride's current status on auto-queue |
+| `driver_arrived` | `RideService.AtPickup` | `Let's ride 🤙` / `{{driver_first_name}} is here in a {{vehicle_color}} {{vehicle_make}} {{vehicle_model}} - {{license_plate}}.` | `ride/4-ride` | `status: driver_waiting` |
+| `ride_completed` | `RideService.Complete` | `Thx!` / `See you soon. - Love, Yelo` | `ride?rate={{ride_id}}` | `status: pending_rider_rating` |
+| `ride_canceled_by_driver` | `RideService.Cancel`, via `notifyRiderOfDriverCancellation`, when the driver cancels outside `queued`, `driver_en_route`, or `driver_waiting` | `Ride canceled 😔` / `Shoot, your driver has canceled. Try again!` | `ride` | `status: complete` |
+| `ride_requeued` | `RideService.requeueAfterDriverCancel` (driver cancels while `queued`, `driver_en_route`, or `driver_waiting`) | `Finding a new driver` / `Your driver canceled. We're finding you a new driver!` | `ride` | `status: confirmed` |
+| `direct_request_fallback` | `RideService.DeclineRide` (selected driver declines), `ActivationService.finishExpiredDirectRide` (30-second direct offer expires) | `Finding another driver` / `Your selected driver couldn't take this ride. We're looking for another driver.` | `ride` | `type: ride_status_changed`, `status: confirmed` |
+| `ride_request_no_drivers` | `sqlRideRepository.CancelUnmatchedRides`, inside the expiry transaction, after `RideRequestExpiry` (10 minutes) | `Ride Request Canceled` / `No drivers were available this time.` | `ride` | `status: complete` |
+
+### Rider gating
+
+`ride_confirmed` (from `AcceptRide`), `driver_arrived`, `ride_completed`, and `ride_canceled_by_driver` go through `RideService.notifyRiderOfRideUpdate`:
+
+- It skips the emit if the rider has no token or `allow_notifications` is false.
+- It checks the legacy `RideNotifications` table (`IsNotified`) for this ride and type and skips if one exists.
+- It writes the `RideNotifications` row only after the emit succeeds.
+
+This is a second, permanent dedupe on top of the event key. The promotion and auto-queue paths for `ride_confirmed` skip this gate and only check that the rider has a token.
+
+## Ride lifecycle (driver)
+
+| Code | Trigger | Seeded title / body | Deep link | Extra data |
+| --- | --- | --- | --- | --- |
+| `ride_canceled_by_rider` | `RideService.handleRiderCancellation` | `Ride Canceled` / `Your rider has canceled. {{fee_dollars}}` | `ride` | `status: complete` |
+
+`fee_dollars` is not a number. It is a whole sentence built in `NotifyDriverRideCanceledByRider`: `You will receive [$X.XX].` when the cancellation fee is above zero, or an empty string. The brackets are literal.
+
+## Driver dispatch
+
+| Code | Trigger | Audience | Seeded title / body | Deep link | Extra data |
+| --- | --- | --- | --- | --- | --- |
+| `ride_available` | `RideService.directAssignDriver` (rider picks a driver), `RideService.notifyDriversAboutNewRide` (fleet T0 on confirm and on requeue), `ActivationService.resumeExpiredDirectRide` (direct offer expired), `ActivationService.NotifyPendingRideForDriver` (driver comes online) | One driver, or all T0 fleet targets from `ListRideT0NotificationTargets` | `${{price_dollars}} New ride available` / `From {{pickup_name}} to {{destination_name}}` | `drive` | `type: ride_request` |
+| `unclaimed_ride` | `ActivationService.activateForConfigTier` | Tier candidates from the warm pool and inactive drivers | Same as `ride_available` | `drive` | `tier` is a variable, not in data |
+| `unclaimed_ride_fleet` | `ActivationService.notifyFleetOfMissedRide` when auto-queue finds no eligible driver for a fleet ride | Every active member of the fleet in the community (`GetFleetDriverIDs`) | Same as `ride_available` | `drive` | none |
+| `ride_auto_queued` | `ActivationService.sendAutoQueueNotifications` | The winning driver | `${{price_dollars}} ride auto-queued` / `{{pickup_name}} → {{destination_name}}` | `drive` | `vibration: "true"` |
+| `driver_renew_online` | `UserService.PurgeOfflineDrivers` (the `Operational` ticker, every 30 seconds) | Online drivers whose `last_pinged_driver` is 29 minutes 15 seconds to 29 minutes 45 seconds old, with no active ride and no ride completed in the last 30 minutes | `Renew Online Status` / `Click back to keep your status online.` | `drive` | none |
+
+`price_dollars` is formatted with two decimals and no currency symbol (`formatRidePrice`). The `$` in the title is literal template text.
+
+### T0 fleet targets
+
+`ListRideT0NotificationTargets` (`internal/data/repository/queries/community.sql`) returns drivers who:
+
+- Belong to the ride's active fleet and community, with an active `FleetDrivers` row and an active driver application.
+- Drive a vehicle of the ride's `vehicle_type` with enough seats and `application_status = complete`. Online drivers use their session vehicle, offline drivers their default vehicle.
+- Are online under the same fleet, or offline.
+- Have a token, allow notifications, are not deleted, banned, or locked, and have not declined the ride.
+- Have payout readiness: `stripe_status = complete`, or a complete fleet merchant with custom payouts.
+- Have fewer than `matching.MaxQueueLength` open rides.
+- For the fleet named `Yelo`, carry a `Founding Driver`, `founding driver`, or `founding` tag.
+
+## Chat
+
+| Code | Trigger | Seeded title / body | Deep link | Extra data |
+| --- | --- | --- | --- | --- |
+| `message_sent` | `enqueueMessage` callback of `MessageRepository.AppendMessage`, from `RideService.SendMessage`. Emitted inside the message insert transaction. | `Message Received` / `{{message}}` | `ride` | `type: message_received`, `ride_id`, `message_id`, `message_index` |
+
+The template also sets `client_data_type = message_received`, but the caller sets `type` explicitly so the contract survives a database where the seeded row predates the column.
+
+## Silent invalidation
+
+These templates have `silent = true`. The send worker strips title, body, and sound and sets `_contentAvailable`. See [Mobile push handling](/engineering/notifications/mobile-push-handling).
+
+| Code | Trigger | Audience | Data |
+| --- | --- | --- | --- |
+| `ride_status_changed` | `RideService.Pickup` (rider, `in_progress`), `RideService.prepareAndPromoteQueuedRide` (driver, `driver_en_route`) | Named users | `ride_id`, `status` |
+| `ride_state_changed` | `finalizeRideCommand` and `withRideStateDelivery` in `internal/data/repository/ride_revision.go`, only when `RIDE_STATE_SNAPSHOT_ENABLED` is true (default false) | Every participant whose ride-state revision advanced: rider, driver, previous driver, and queued participants | `user_id`, `session_revision` |
+| `map_content_changed` | `mapchanges.Service` from place edits (`PlaceMetadataChanged`), community POI changes (`CommunityPOIsChanged`), likes and friend changes (`SocialChanged`) | Affected users, the whole community (`community_pois`), or the user plus their friends (`friends`) | `scope`, plus `community_id` for `community_pois` |
+
+## Payouts and driver application
+
+| Code | Trigger | Seeded title / body | Deep link | Extra data |
+| --- | --- | --- | --- | --- |
+| `driver_application_approved` | `DashboardService.sendDriverApplicationApprovedNotification` after an admin approves a step | `You're approved!` / `We approved your {{step_label}}!` | `/driver-signup/1-application-status` | none |
+| `payout_paid` | `earnings.Service.HandlePayoutEvent` on Stripe `payout.paid` for a connected account | `Payout deposited` / `{{amount}} just landed in your bank account.` | `yelo://drive/earnings` | `payout_id`, `event_type`, `amount` (cents), `currency`, `arrival` (unix), `deeplink` |
+| `payout_failed` | Same, `payout.failed` | `Payout failed` / `Your {{amount}} payout couldn't be deposited. Check your banking details in the app.` | `yelo://drive/earnings` | Same |
+| `payout_canceled` | Same, `payout.canceled` | `Payout canceled` / `Your {{amount}} payout was canceled.` | `yelo://drive/earnings` | Same |
+
+`step_label` is `photo`, `license`, `vehicle`, or `payout info` (`driverApplicationStepLabel`). Unknown steps and steps without a `review_time` send nothing. Platform-level payout events, and connected accounts that match no driver, are ignored.
+
+## Operator and friends
+
+| Code | Trigger | Seeded title / body | Deep link | Extra data |
+| --- | --- | --- | --- | --- |
+| `community_broadcast` | `DashboardService.SendNotification`, `ProcessScheduledNotifications`, `SupplyDemandService.NotifyMarket` | `{{title}}` / `{{body}}` | `ride` | none |
+| `dashboard_ping_driver` | `SupplyDemandService.PingDriver` | `{{title}}` / `{{body}}` | `drive` | none |
+| `dashboard_ping_rider` | `SupplyDemandService.PingRider` | `{{title}}` / `{{body}}` | `ride` | none |
+| `dashboard_send` | `NotificationService.SendNotification`, `SendNotificationToUsers`. Nothing calls either in production. | `{{title}}` / `{{body}}` | none | Caller data |
+| `friend_bump` | `NotificationService.emitFriendBumpPushFallback` and `bumpSMSWorker.enqueuePushFallback` | `{{sender_first_name}} bumped you 👋` / `Heading to {{destination_name}}{{arrival_phrase}}.` | `/map` | `sender_user_id`, `destination_name`, `destination_poi_id`, `destination_latitude`, `destination_longitude` |
+| `friend_bump_sms` | Never emitted. Read directly by the bump SMS worker. | Same copy, joined into one line | none | n/a |
+
+See [Operator broadcasts](/engineering/notifications/broadcasts-and-scheduling) and [SMS, iMessage, and friend bumps](/engineering/notifications/sms-and-friend-bumps).
+
+## Defined but never emitted
+
+| Code | Seeded title / body | Notes |
+| --- | --- | --- |
+| `waitlist_cleared` | `🟡 Welcome to Yelo!` / `Your wait is over. Start exploring and riding with Yelo today.` | No caller. |
+| `welcome_to_yelo` | `Welcome to Yelo, {{first_name}}!` / `Tap to get started.` | No caller. |
+| `dashboard_send` | Passthrough | Only the unused `SendNotification` and `SendNotificationToUsers` helpers emit it. |
+
+`NotifyRiderRideRequestNoDrivers` and `NotifyNewMessage` in `notification.go` are also unused. The live emits for those codes happen in the repository and messaging layers.
+
+## Template properties
+
+| Code | Priority | Sound | Haptic | Category | Max recipients | User cooldown | Fresh | App |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ride_confirmed` | high | default | success | transactional | 1 | none | yes | Ride refresh |
+| `driver_arrived` | high | default | success | transactional | 1 | none | yes | Ride refresh |
+| `ride_completed` | default | default | default | transactional | 1 | none | no | Ride refresh |
+| `ride_canceled_by_driver` | high | default | warning | transactional | 1 | none | yes | Ride refresh |
+| `ride_canceled_by_rider` | default | default | warning | transactional | 1 | none | yes | Ride refresh |
+| `direct_request_fallback` | high | default | default | transactional | 1 | none | yes | Ride refresh |
+| `ride_requeued` | high | default | default | transactional | 1 | none | yes | Ride refresh |
+| `ride_request_no_drivers` | default | default | warning | transactional | 1 | none | yes | Ride refresh |
+| `message_sent` | default | default | default | transactional | 1 (not enforced) | bypassed | no | Chat refresh |
+| `ride_status_changed` | high | silent | none | transactional | 2 | bypassed | yes | Ride refresh |
+| `ride_state_changed` | high | silent | none | transactional | 1 | bypassed | no | Ride refresh (user-checked) |
+| `map_content_changed` | high | silent | none | transactional | none | bypassed | no | Map refresh by scope |
+| `ride_available` | default | default | default | transactional | none | 900 s, bypassed | yes | Board refresh |
+| `unclaimed_ride` | default | default | default | transactional | none | 900 s | yes | None |
+| `unclaimed_ride_fleet` | default | default | default | transactional | none | 900 s | yes | None |
+| `ride_auto_queued` | default | default | default | transactional | none | none | yes | Ride refresh |
+| `driver_renew_online` | default | default | default | transactional | none | none | yes | None |
+| `community_broadcast` | default | default | default | marketing | none | none | no | None |
+| `friend_bump` | default | default | default | transactional | 10 | 300 s | yes | None |
+| `dashboard_ping_driver` | high | default | default | transactional | 1 | none | yes | None |
+| `dashboard_ping_rider` | high | default | default | transactional | 1 | none | yes | None |
+| `driver_application_approved` | high | default | success | transactional | 1 | none | no | None |
+| `payout_paid` | default | default | success | transactional | 1 | none | no | None |
+| `payout_failed` | high | default | warning | transactional | 1 | none | no | None |
+| `payout_canceled` | default | default | warning | transactional | 1 | none | no | None |
+
+All seeded Android channels are `default`. No seeded template uses `kaching.wav` or `kaching-channel`. The seeder sets `quiet_hours_behavior = defer` only for `community_broadcast` and `bypass` for everything else. Haptic is stored but never sent to Expo.
+
+## Adding a code
+
+<Steps>
+  <Step title="Declare the code and variables">
+    Add a `TemplateCode` constant and a `Vars` struct with `notify:"name[,required]"` tags in `codes.go`, and register it in `Registry`.
+  </Step>
+  <Step title="Seed the template">
+    Add a `TemplateSeed` in `seed/templates.go`. CI checks that every registered code has a seed. The loader runs on every boot and fails the instance if seeding fails, so a new code ships with its row.
+  </Step>
+  <Step title="Classify it">
+    Add the code to `orchestrationFreshnessForCode` and `bypassesCooldowns`. Both switches are exhaustive under lint, so a missing case fails the build.
+  </Step>
+  <Step title="Handle it in the app">
+    If the push should refresh cached data, add its `data.type` to `invalidateForPush`. Otherwise the app only shows it.
+  </Step>
+</Steps>
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Codes and `Vars` structs | `yelo-api/internal/notify/codes.go` |
+| Seed copy and settings | `yelo-api/internal/notify/seed/templates.go` |
+| Service wrappers | `yelo-api/internal/service/notifications/notification.go` |
+| Ride lifecycle triggers | `yelo-api/internal/service/ride/driver.go`, `ride.go`, `rider.go`, `messaging.go` |
+| Expiry and ride-state emits | `yelo-api/internal/data/repository/ride_lifecycle.go`, `ride_revision.go` |
+| Dispatch triggers | `yelo-api/internal/service/activation/activation.go`, `auto_queue.go` |
+| Renew reminder | `yelo-api/internal/service/user/user.go` (`PurgeOfflineDrivers`), `queries/user_driver.sql` |
+| Map invalidation | `yelo-api/internal/service/mapchanges/mapchanges.go` |
+| Payouts | `yelo-api/internal/service/earnings/webhook.go` |
+| Application approval | `yelo-api/internal/service/dashboard/driver_application_notification.go` |
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Renew reminders lose cohorts to the 5-minute bucket">
+    `PurgeOfflineDrivers` runs every 30 seconds and each run targets a different 30-second slice of drivers. The event key is `driver_renew_online:{community}:{unix/300}`, so every run after the first in a 5-minute bucket collides and is dropped as `deduped`. In practice only the first cohort in each 5-minute window gets the reminder.
+  </Accordion>
+  <Accordion title="Fleet T0 is skipped after a requeue">
+    `notifyDriversAboutNewRide` uses `ride_available:{ride}:fleet-t0:{fleet}`. When a driver cancels and the ride is requeued, it is called again with the same key, so the fleet never gets a second T0 alert. `resumeExpiredDirectRide` uses the same key, so a direct offer that already triggered T0 cannot trigger it again either.
+  </Accordion>
+  <Accordion title="Drivers do not see the ride on the board from unclaimed_ride">
+    Activation pushes use `data.type` `unclaimed_ride` and `unclaimed_ride_fleet`, which the app does not map to a board refresh. Only `ride_available` (sent as `ride_request`) refreshes the board. Drivers who tap an activation push land on `/drive` and see the ride on the next 10-second board poll.
+  </Accordion>
+  <Accordion title="Deep links that do not resolve in the app">
+    `driver_application_approved` points at `/driver-signup/1-application-status`, which has no route. The payout codes point at `yelo://drive/earnings`, but earnings lives at `driver-earnings/`. `ride_completed` points at `ride?rate={{ride_id}}`, but `app/(app)/ride/index.tsx` redirects to the map and nothing reads `rate`.
+  </Accordion>
+  <Accordion title="Rider-cancel notification is marked sent even when it fails">
+    `handleRiderCancellation` writes the `RideNotifications` row even when the emit returns an error, unlike `notifyRiderOfRideUpdate`. A transient enqueue failure permanently suppresses `ride_canceled_by_rider` for that ride.
+  </Accordion>
+  <Accordion title="Activation marks drivers as notified even when the push is suppressed">
+    `activateForConfigTier` adds drivers to the Redis notified set once the emit is enqueued. If the orchestrator then suppresses a driver for `user_cooldown` or a missing token, activation still treats them as pinged and excludes them from later tiers that do not re-ping.
+  </Accordion>
+  <Accordion title="Copy edits on the server do not change data.type">
+    Changing `client_data_type` in the dashboard changes what the app sees. Setting `ride_available` to anything other than `ride_request` stops driver boards from refreshing.
+  </Accordion>
+</AccordionGroup>

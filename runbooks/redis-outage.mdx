@@ -1,0 +1,88 @@
+---
+title: "Redis outage"
+description: "What degrades when Redis is down or the Redis circuit breaker opens, what keeps working, and how to confirm recovery"
+---
+
+Redis holds caches and short-lived matching state. Postgres is the source of truth for rides, users, sessions, and jobs. When Redis fails, the API falls back where it can, but several ride features degrade and new instances can fail to start. See [Redis](/engineering/api/data-layer#redis) for the client and breaker settings.
+
+## Symptoms
+
+- Logs show `Redis circuit breaker opened` (`event: CIRCUIT_BREAKER_OPENED`, `component: redis`).
+- **Presence** and the market online-driver counts drop to zero, while drivers are clearly online.
+- Drivers get repeated activation pushes for the same ride.
+- Queued rides stay with a driver who went offline.
+- The mobility vehicles layer and heatmaps stop updating.
+- New API instances or a new revision fail to start.
+
+## Diagnose
+
+<Steps>
+  <Step title="Confirm the breaker state">
+    Check the `circuit.breaker.state` metric for the `redis` breaker: 0 is closed, 1 is half-open, and 2 is open. In Cloud Logging, search for `Redis circuit breaker opened` and `Redis circuit breaker state changed`. The Redis breaker only logs and records metrics. Unlike provider breakers, it doesn't post to Slack.
+  </Step>
+  <Step title="Don't rely on the deep health check">
+    `GET /healthcheck/deep` checks Postgres, disk, and runtime, not Redis. It stays healthy during a Redis outage.
+  </Step>
+  <Step title="Check operation errors">
+    Watch `redis.operation.count`, `redis.operation.duration`, `redis.cache.hit`, and `redis.cache.miss`. A collapse in hits with a rise in errors confirms the outage.
+  </Step>
+  <Step title="Reach Redis directly if needed">
+    `make gcp-tunnel` in `yelo-api` opens an IAP tunnel from `localhost:6379` through `yelo-dev-iap` in `prod-yelo`.
+  </Step>
+</Steps>
+
+## What degrades
+
+The breaker opens when at least 50 requests in a 120-second window fail at 80% or more. It stays open for 60 seconds, then lets 10 probe requests through.
+
+| Area | Behavior while Redis fails |
+| --- | --- |
+| Caches (auth, profiles, communities, prices, routes, places, earnings) | Fall back to Postgres or providers. Expect more load and slower responses. |
+| Ride board writes | Fall back to a per-instance in-memory board. The driver board read (`GET /ride/v2/board`) queries Postgres, so drivers still see confirmed rides. |
+| Activation dedup | "Failed to get notified drivers set, proceeding without dedup." Drivers can get the same ride alert more than once. |
+| Driver presence | The **Presence** page and the **Supply & Demand** driver lists read the presence cache, so they show few or no users. The **AQ** badge on **Driver Ops** also comes from presence. |
+| Offline grace for queued rides | `handleQueuedDriverOfflineGrace` skips drivers whose presence can't be read, so their queued rides aren't returned to the board. |
+| Queue summaries | Omitted from `GET /user/status`. The queue itself is in Postgres. |
+| Mobility feeds and heatmaps | Skipped. The map layers go stale. |
+| Rate limiting | Unaffected. The HTTP limiter is in memory, and Auth v3 limits are in Postgres. |
+| Rides, payments, sessions, River jobs | Unaffected. They use Postgres. |
+| API startup | A new instance pings Redis with backoff for up to `REDIS_STARTUP_TIMEOUT_SECONDS` (180 by default) and **fails to start** if Redis never answers. |
+
+<Warning>
+During a Redis outage, Cloud Run instances that scale up or restart can fail to start, and a release candidate won't pass its smoke test. Avoid deploying until Redis is back. Instances already running keep serving.
+</Warning>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Restore Redis and let the breaker close">
+    Once Redis answers, the breaker goes half-open after 60 seconds, probes with 10 requests, and closes. No restart is needed. Caches refill on demand.
+  </Accordion>
+  <Accordion title="Option 2: Run without Redis">
+    Setting `REDIS_ENABLED=false`, or an empty `REDIS_URL`, starts the API with a disabled client. Every cache falls back, the ride board uses its in-memory version, and mobility refresh is skipped. It's a runtime configuration change on the release trigger (`_RUNTIME_ENV_VARS`), so it takes a new revision.
+
+    <Warning>
+    With Redis disabled, presence, activation dedup, and the queued-ride offline grace stop working, as described in [What degrades](#what-degrades). Treat this as a temporary measure. Set it back once Redis recovers.
+    </Warning>
+  </Accordion>
+  <Accordion title="Option 3: Clean up after recovery">
+    - **Queued rides** of drivers who went offline during the outage get the 5-minute offline grace once presence works again, then return to the board.
+    - **Stale queue summaries** are validated against the committed queue on read. `RefreshQueueSummaries` rewrites them every 3 minutes.
+    - **Activation dedup** entries expire after 30 minutes.
+
+    Then check for stuck rides. See [Stuck or ghost ride](/runbooks/stuck-ride).
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- `circuit.breaker.state` for `redis` is 0, and logs show the breaker changed to closed.
+- **Presence** and **Supply & Demand** show online drivers again.
+- `redis.cache.hit` returns to its usual rate.
+
+## Root causes seen in code
+
+- **Startup requires Redis** unless it's disabled explicitly. Scaling events during an outage can reduce capacity.
+- **Presence lives only in Redis.** The dashboard presence views and queue grace logic have no Postgres fallback.
+- **Dedup lives only in Redis.** Activation proceeds without dedup instead of failing, trading duplicate pushes for coverage.
+- **The deep health check doesn't include Redis**, so releases and monitors that rely on it won't catch an outage.

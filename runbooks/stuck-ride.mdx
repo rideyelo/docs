@@ -1,0 +1,133 @@
+---
+title: "Stuck or ghost ride"
+description: "Diagnose and clear rides stuck in a status, and riders or drivers stuck in riding or driving mode"
+---
+
+A ride is stuck when it stays in a non-terminal status after the trip is over or abandoned. The rider stays in **riding** mode, the driver stays in **driving** mode, or both. The server decides these modes, so the app can't clear them on its own. See [Riding or driving: server-driven status](/concepts/accounts-and-sign-in#riding-or-driving-server-driven-status).
+
+## Symptoms
+
+- The rider app keeps opening the matching, queued, ride, or rating screen for a ride that ended.
+- A rider can't book and sees **Existing ride in progress** ("Cannot create another ride while a ride is in progress").
+- A driver is forced onto the drive screens, or sees "finish the current ride before changing driver session", "go offline before changing vehicles", or **Finish Driving First** when switching fleets.
+- **Rides** → **Trips** → **Active** shows a ride far older than a normal trip.
+
+## Diagnose
+
+<Steps>
+  <Step title="Find the ride">
+    On **Rides**, open **Trips**, click **Active**, and search for the rider, driver, or ride ID. Click **Show N older rides (24hr+)** if the ride is older than a day. Open **Ride Details** and read the **Ride Timeline**: the last event, its **Actor**, and its **Transition**. See [Rides](/dashboard/rides#open-ride-details).
+  </Step>
+  <Step title="Check the people">
+    Open the rider and driver in the user detail sheet. **Driver Info** → **Online** shows `is_online_driver`. **Ride History** and **Drive History** show recent statuses. **Driver Ops** shows the driver's live state and queue. See [Driver Ops](/dashboard/driver-ops#read-a-driver-card).
+  </Step>
+  <Step title="Read the database">
+    **Read-only.** Replace the placeholders:
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    -- Every non-terminal ride where the user is the rider or the driver
+    SELECT id, status, rider_id, driver_id, fleet_id, community_id,
+           request_time, confirm_time, match_time, pickup_time, complete_time,
+           tips_enabled, tip_window_expires_at,
+           payment_intent_id IS NOT NULL AS has_payment_intent
+    FROM "Rides"
+    WHERE (rider_id = '<user-id>' OR driver_id = '<user-id>')
+      AND status NOT IN ('complete', 'no_drivers_available')
+    ORDER BY request_time DESC;
+
+    -- Driver availability and open sessions
+    SELECT id, is_online_driver, last_pinged_driver, vehicle_id
+    FROM "Users" WHERE id = '<user-id>';
+
+    SELECT fleet_id, vehicle_id, start_time
+    FROM "DriverSessions"
+    WHERE driver_id = '<user-id>' AND end_time IS NULL;
+
+    -- Ride timeline
+    SELECT created_at, event_type, actor_type, old_status, new_status
+    FROM "RideEvents" WHERE ride_id = '<ride-id>' ORDER BY created_at;
+
+    ROLLBACK;
+    ```
+
+    A ride in `requested` never blocks a new booking. Any ride in `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress`, or `pending_rider_rating` does.
+  </Step>
+  <Step title="Check for fleet-wide anomalies">
+    If several users report this, run `yelo-api/docs/ride-cardinality-preflight.sql` (read-only). It lists riders with more than one live booking, drivers with more than one active trip, requested drafts next to live bookings, active rides without a driver, and session or vehicle ownership conflicts. It never repairs anything. See `docs/ride-cardinality-preflight.md` for how to read it.
+  </Step>
+  <Step title="Confirm the sweepers are running">
+    Expiry and offline cleanup run in the `Operational` background loop every 30 seconds. Search Cloud Logging for errors that mention `CancelUnmatchedRides` or `PurgeOfflineDrivers`. If an instance has `BACKGROUND_TASKS_ENABLED=false`, nothing expires. See [Background jobs](/engineering/api/background-jobs#in-process-ticker-loops).
+  </Step>
+</Steps>
+
+## What ends each status
+
+Match the ride's status to this table before you act.
+
+| Status | Ends on its own? | Who can end it |
+| --- | --- | --- |
+| `requested` | Replaced with `cancel_reason = 'superseded'` when the rider requests again | Rider |
+| `confirmed`, no driver | Yes. `CancelUnmatchedRides` ends it 10 minutes after `confirm_time` | Rider cancels |
+| `queued` | Only indirectly. If the driver is offline past the 5-minute grace, the ride goes back to `confirmed`, then expires | Rider cancels, or the driver cancels (requeue) |
+| `driver_en_route`, `driver_waiting` | No | Rider cancels (fees may apply), or the driver cancels, which requeues the ride to `confirmed` |
+| `in_progress` | No | Driver completes, or either party cancels |
+| `pending_rider_rating`, tips enabled | Yes. The `TipCapture` loop captures the fare after `tip_window_expires_at` (24 hours) | Rider rates |
+| `pending_rider_rating`, tips disabled | No | Rider rates |
+
+A requeue resets `confirm_time`, so the 10-minute expiry clock restarts. See [Ride lifecycle](/concepts/ride-lifecycle) and [Cancellations](/concepts/cancellations).
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Have a participant finish or cancel in the app (preferred)">
+    Every supported way to end an assigned ride is a participant action. These run through the locked ride command, release or capture payment, update the ride board, notify the other party, and promote the driver's next queued ride.
+
+    | Who | Action in the app | Endpoint |
+    | --- | --- | --- |
+    | Rider | Cancel the ride | `POST /ride/i/{id}/cancel` |
+    | Rider | Rate a finished ride | `POST /ride/i/{id}/rate` |
+    | Driver | Cancel before pickup. The ride requeues to `confirmed` and expires after 10 minutes if nobody accepts it | `POST /ride/i/{id}/cancel` |
+    | Driver | Complete the trip | `POST /ride/i/{id}/complete` |
+    | Driver | Go offline, once no active ride remains | `POST /driver/cancel-online` |
+
+    Rider cancellations can carry a fee, depending on status and timing. Check [Fee rules](/concepts/cancellations#fee-rules) before you advise a rider to cancel.
+
+    When the rider is stuck in `pending_rider_rating` on a ride without tips, opening the app sends them to the rating screen (`/(app)/ride-complete`). Submitting a rating ends the ride and unblocks booking.
+  </Accordion>
+  <Accordion title="Option 2: Let the sweeper finish it">
+    - **Unmatched `confirmed` ride.** Wait until `confirm_time` plus 10 minutes, and up to 30 seconds more for the next sweep.
+    - **Queued ride with an offline driver.** Wait for the 5-minute offline grace. This path reads driver presence from Redis. During a Redis outage it doesn't run. See [Redis outage](/runbooks/redis-outage).
+    - **Tip-enabled ride in `pending_rider_rating`.** Wait for `tip_window_expires_at`. The sweep runs every 5 minutes and handles up to 50 rides per run. A ride stuck more than an hour past its window logs `ride stuck past tip window for >1 hour, needs manual review`. See [Payment failures and holds](/runbooks/payment-issues).
+  </Accordion>
+  <Accordion title="Option 3: Driver stuck online with no ride">
+    Ask the driver to go offline from the drive screen (`POST /driver/cancel-online`). This closes open sessions that have no active ride.
+
+    Otherwise `PurgeOfflineDrivers` sets the driver offline once all of these are true:
+
+    - `last_pinged_driver` is more than 30 minutes old (`DriverExpiryInterval`).
+    - The driver has no ride outside `complete` and `pending_rider_rating`.
+    - The driver completed no ride in the last 30 minutes.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+There is no dashboard control, admin endpoint, or script that cancels, completes, or reassigns a ride for an operator. Don't `UPDATE "Rides"` by hand. Ride commands also advance `Users.ride_state_revision`, remove the ride from the board, release or capture the Stripe hold, send notifications, record `RideEvents`, and promote the driver's queue. A raw update skips all of that. `DELETE /ride/` only works when `ENVIRONMENT=dev`.
+</Warning>
+
+## Verify
+
+- The read-only query returns no non-terminal rides for the user.
+- **Ride Details** shows `ride_canceled`, `auto_requeued`, `ride_completed`, `ride_rated`, or `tip_window_expired` as the last event.
+- The driver's **Online** field reads **No**, or the driver can go online again.
+- The rider can request a new ride.
+
+## Root causes seen in code
+
+- **Drivers with an active ride are forced back online.** Every 30 seconds, `SetInactiveDriversOffline` first runs `RestoreDriversWithActiveRides`, which sets `is_online_driver = TRUE` for any driver with a ride outside `complete` and `pending_rider_rating`. A ghost `driver_en_route` or `in_progress` ride keeps its driver in driving mode indefinitely.
+- **Unrated rides without tips never end.** They stay in `pending_rider_rating` until the rider rates, and that status counts as a live booking.
+- **Expiry only covers unassigned rides.** `CancelUnmatchedRides` ignores `queued` and assigned statuses. It also never calls Stripe, so an expired requeued ride can keep an authorization.
+- **Payment failure at a manual accept.** The `Payment Failed` cancel is rejected because the accepting driver isn't assigned yet. The ride stays `confirmed` on the board until it expires. See [System-initiated endings](/concepts/cancellations#system-initiated-endings).
+- **The offline grace needs Redis.** `handleQueuedDriverOfflineGrace` skips a driver when the presence lookup fails.
+- **Timeline gaps.** `RideEvents` are written asynchronously. An event is dropped when the recorder channel stays full for 100 ms. A missing event doesn't prove a transition didn't happen, so trust `Rides.status`.

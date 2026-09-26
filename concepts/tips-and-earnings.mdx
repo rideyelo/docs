@@ -50,11 +50,11 @@ The rider tips by rating: `POST /ride/i/{id}/rate` with an optional `tip_amount`
     The fare is captured first, which releases the buffer. Then a separate **tip PaymentIntent** is created on the same connected account: automatic capture, off-session, using the rider's cloned payment method. For free rides, the payment method is cloned to the matched driver's or fleet's account at this point.
   </Step>
   <Step title="Authentication required">
-    If the card needs authentication, the rate call returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The app presents the confirmation sheet, then calls `POST /ride/i/{id}/confirm-tip`. The API retrieves the stored tip PaymentIntent from Stripe and records the tip only if the status is `succeeded`.
+    If the card needs authentication, the rate call returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The API exposes `POST /ride/i/{id}/confirm-tip` for a client to call after authenticating the card, but the mobile app currently ignores `requires_action` and never calls it, so the tip is not recorded. When called, the API retrieves the stored tip PaymentIntent from Stripe and records the tip only if the status is `succeeded`.
   </Step>
 </Steps>
 
-The rate response includes `tip_status`: `none`, `captured`, or `requires_action`.
+The rate response includes `tip_status`: `none`, `captured`, or `requires_action`. See [Ride tips](/engineering/payments/ride-tips).
 
 Safeguards:
 

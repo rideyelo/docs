@@ -1,0 +1,301 @@
+---
+title: "Driver earnings and activity"
+description: "How every driver-facing earnings number is computed: the driver_payout lifecycle, the activity feed and its ride enrichment, weekly and rolling windows, pagination, payout pushes, and the other driver endpoints that report stats and auto-queue state."
+---
+
+A driver sees earnings in four places, and each one is computed differently. The earnings hub reads Stripe. The weekly headline, the status poll, and drive history read `Rides.driver_payout` from Postgres. This page explains where each number comes from and why they disagree.
+
+For payout mechanics (instant fee, idempotency key, payout schedule, Stripe fee backfill), see [Payouts and earnings internals](/engineering/payments/payouts-and-earnings). For how tips are charged, see [Ride tip charging](/engineering/payments/ride-tips). For the product summary, see [Tips and earnings](/concepts/tips-and-earnings).
+
+## Data touched
+
+| Store | Keys or columns | Read by | Written by |
+| --- | --- | --- | --- |
+| Postgres `Rides` | `driver_payout`, `tip_amount`, `payment_intent_id`, `complete_time`, `request_time`, `status`, `stripe_fee_cents` | Weekly headline, activity enrichment, status poll, drive history | Ride completion, tip capture, `payment_intent.succeeded` webhook, fee backfill |
+| Postgres `Users` | `stripe_merchant_id`, `auto_queue`, `auto_queue_max_minutes`, `auto_queue_paused_until`, `is_online_driver` | Account resolution, auto-queue settings | Connect onboarding, `/driver/auto-queue*` |
+| Postgres `Communities` | `auto_queue_max_minutes`, `auto_queue_default_minutes` | Auto-queue settings | Dashboard |
+| Postgres `DriverAutoQueueLog` | `driver_id`, `community_id`, `enabled_at`, `disabled_at` | Uptime reporting (no live caller) | `reconcileDriverAutoQueueAccounting` |
+| Postgres `RideDemandCurves`, `DriverSessions` | Demand curve by `day_of_week`, open sessions | Demand dashboard | Demand jobs, going online |
+| Redis | `driver:earnings:all_time:{driverID}`, 60 s TTL | Status poll all-time sum | `DriverEarningsCache.Get` on miss |
+| Stripe | Balance, balance transactions (`expand[]=data.source`), payouts, account | Earnings hub | Payout creation, schedule updates |
+
+Column definitions live in [Rides tables](/reference/database/rides).
+
+## Endpoints
+
+All app routes use the shared `authenticatedGroup` or `userAuthGroup` in `internal/server/http/router.go`. Both run `getValidateJWTMiddleware` and `getRequireRoleMiddleware([]string{"user"})`. There's no driver-only middleware: a rider can call these routes, and the handlers rely on missing data (no `stripe_merchant_id`, no rides) instead.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| GET | `/earnings/balance` | JWT, role `user` | `GetBalance`. Stripe balance buckets |
+| GET | `/earnings/external-account` | JWT, role `user` | `GetExternalAccount`. Default bank or card, 404 when none |
+| GET | `/earnings/payout-schedule` | JWT, role `user` | `GetPayoutSchedule`. Cadence and estimated `next_payout_at` |
+| PUT | `/earnings/payout-schedule` | JWT, role `user` | `UpdatePayoutSchedule`. Writes Stripe account settings |
+| GET | `/earnings/payouts` | JWT, role `user` | `ListPayouts`. `limit`, `cursor` |
+| GET | `/earnings/payouts/instant-quote` | JWT, role `user` | `GetInstantQuote` |
+| POST | `/earnings/payouts/instant` | JWT, role `user` | `CreateInstantPayout` |
+| GET | `/earnings/activity` | JWT, role `user` | `GetActivity`. `from`, `to`, `limit`, `cursor` |
+| GET | `/user/status` | JWT, role `user` | `GetUserStatus`. Includes `driver_earnings` daily, weekly, all-time |
+| GET | `/user/drive-history` | JWT, role `user` | `GetDriveHistory`. Last 200 driven rides with fare, tip, fee |
+| GET | `/driver/demand-dashboard` | JWT, role `user` | `GetDemandDashboard`. Requests in last 20 min, drivers online, demand curve |
+| GET | `/driver/auto-queue` | JWT, role `user` | `GetAutoQueueSettings` |
+| PUT | `/driver/auto-queue` | JWT, role `user` | `SetAutoQueue`. `enabled`, optional `max_minutes` |
+| POST | `/driver/auto-queue/pause` | JWT, role `user` | `PauseAutoQueue`. `duration_minutes` 0 to 60 |
+| POST | `/stripe-webhook` | Stripe signature (`STRIPE_WEBHOOK_SECRET`) | `HandleStripeEvent`. `payout.*` fans out to `earnings.Service.HandlePayoutEvent` |
+
+Other `/driver/*` routes are documented by their owners:
+
+| Routes | Owner page |
+| --- | --- |
+| `/driver/refresh-online`, `/driver/cancel-online` | [Heartbeat and presence](/engineering/location/heartbeat-and-presence) |
+| `/driver/fleet`, `/driver/active-fleet` | [Active fleet and payout routing](/engineering/fleets/membership-and-payout-routing) |
+| `/driver/vehicle` | [Fleet vehicles](/engineering/fleets/vehicles) |
+| `/driver/queue` | [Queue promotion](/engineering/matching/queue-promotion) |
+| `/driver/signup-status`, `/driver/profile-photo`, `/driver/license-photos`, `/driver/profile-photo/thumbnail` | [Driver onboarding](/concepts/driver-onboarding) |
+
+## How `driver_payout` is built
+
+`Rides.driver_payout` is the gross amount (fare plus tip, in dollars, `real`) that every database-backed earnings number sums. It's never net of Stripe fees. Several writers touch it over a ride's life:
+
+| Moment | Writer | Value |
+| --- | --- | --- |
+| Driver completes ride | `CompleteRideForRating` via `RideService.Complete` | `GetEffectivePrice()`: `discounted_price` if set, else `price` |
+| Rider tips within the $5.00 buffer | `CompleteRideTip` via `captureTipWithinBuffer` | `fare + tip`, status `complete` |
+| Rider rates with no tip, or tip window expires | `CompleteRideTip` with tip 0 | `fare`, status `complete` |
+| Tip over the buffer, after the fare settled | `RecordCompletedRideTip` | `COALESCE(driver_payout, 0) + tip`, only when `tip_amount = 0` |
+| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists |
+| Cancellation with a fee | Same webhook | Captured fee amount |
+
+### Worked example
+
+A $12.00 ride with tips enabled:
+
+<Steps>
+  <Step title="Complete">
+    `driver_payout = 12.00`. `tip_window_expires_at` is 24 hours later. Status is `pending_rider_rating`.
+  </Step>
+  <Step title="Rider tips $3.00">
+    $3.00 is within the $5.00 buffer. One capture of 1500 cents runs. `driver_payout = 15.00`, `tip_amount = 3.00`.
+  </Step>
+  <Step title="Webhook">
+    `payment_intent.succeeded` arrives with `amount_received = 1500`. `driver_payout` is written again as `15.00`.
+  </Step>
+</Steps>
+
+With an $8.00 tip instead, the fare is captured alone (1200 cents), then a separate tip PaymentIntent charges 800 cents. `RecordCompletedRideTip` sets `driver_payout = 20.00`. If the fare's `payment_intent.succeeded` lands afterward, it writes `12.00` back. The tip survives in `tip_amount`, but every sum below loses $8.00. [Stripe webhooks](/engineering/payments/webhooks) documents this race.
+
+## Earnings surfaces
+
+| Surface | Source | Window | Time column | Includes fleet-paid rides |
+| --- | --- | --- | --- | --- |
+| Hub balance | Stripe `Balance.Get` on `Users.stripe_merchant_id` | Live | n/a | No |
+| Activity rows | Stripe balance transactions | Caller's `from` and `to` | Stripe `created` | No |
+| Activity `gross` per row | `Rides.driver_payout` | Per ride | n/a | No, only rows on the driver's account |
+| Weekly headline (`week_total`, `ride_count`) | `GetDriverWeekEarnings` | Monday 00:00 UTC to now | `complete_time` | Yes |
+| Status `daily_earnings` | `GetUserDriverStatus` | Rolling 24 hours | `request_time` | Yes |
+| Status `weekly_earnings` | `GetUserDriverStatus` | Rolling 7 days | `request_time` | Yes |
+| Status `all_time_earnings` | `GetDriverAllTimeEarnings`, Redis 60 s | All time | n/a | Yes |
+| Drive history | `GetRideHistoryByDriverID` | Last 200 rides | `request_time` order | Yes |
+
+All database-backed sums filter `status IN ('complete', 'pending_rider_rating')` and `driver_payout IS NOT NULL`. A sum with no rows is returned as `null` (status poll) or `0` (weekly headline).
+
+### Period bucketing and timezones
+
+Every window is UTC or rolling. None uses the community's timezone.
+
+- **Week start.** `startOfWeek` in `mappers.go` computes `offset = (weekday + 6) % 7` and truncates to midnight UTC. Sunday maps to offset 6, so the week starts Monday.
+- **Activity groups.** `buildActivityPage` groups by `time.Unix(created).UTC().Format("2006-01-02")`. The `date_key` is a UTC date.
+- **Status poll.** `request_time > CURRENT_TIMESTAMP - INTERVAL '1 day'` and `'1 week'`. These are rolling and keyed on request time, not completion.
+
+Worked example for a driver in `America/New_York` during EDT (UTC-4):
+
+| Ride | Requested (local) | Completed (local) | Completed (UTC) | Headline week | Activity `date_key` |
+| --- | --- | --- | --- | --- | --- |
+| A | Sun 7:30 pm | Sun 7:50 pm | Sun 23:50 | Previous week | Sunday |
+| B | Sun 8:30 pm | Sun 8:50 pm | Mon 00:50 | Current week | Monday |
+
+On Monday morning, the headline includes ride B but not ride A. The hub labels ride B as Monday, although the driver drove it Sunday night. The status poll's `weekly_earnings` includes both, because it's a rolling 7 days.
+
+The mobile client picks its `from` in UTC too. `useEarningsHubData` sends `from = start of today UTC - 7 days` with `limit = 25`. `useAllActivity` sends `from = Monday 00:00 UTC - 30 days` with `limit = 100`.
+
+## Activity feed
+
+`GET /earnings/activity` runs in this order (`Service.GetActivity`):
+
+<Steps>
+  <Step title="Resolve the account">
+    `getMerchantID` returns the dev override or `Users.stripe_merchant_id`. See [account resolution](/engineering/payments/payouts-and-earnings).
+  </Step>
+  <Step title="List transactions">
+    `ListBalanceTransactions` sends `limit` (`normalizeLimit`: default 25, max 100), `starting_after = cursor`, and `created[gte]` and `created[lte]` from `from` and `to`. A zero or unparsable `from` or `to` is dropped (`parseInt64Query` returns 0, `buildCreatedRange` skips values of 0 or less).
+  </Step>
+  <Step title="Build the page">
+    `buildActivityPage` maps each transaction, classifies its type, appends it to its UTC day group, and adds `net` to that group's `total`. It also sums a page-local week total from rows with `created` on or after the week start and `net` greater than 0. Every `charge` or `payment` row among those counts as a ride.
+  </Step>
+  <Step title="Enrich with rides">
+    `enrichActivityWithRides` reads `source.charge.payment_intent.id` from each transaction and runs one `GetRideEarningsByPaymentIntents` query (`WHERE payment_intent_id = ANY($1)`). Matched rows get `ride_id`, `rider_name`, `tip_amount` (cents, `math.Round(tip * 100)`), and `gross` (cents from `driver_payout`). A query failure logs a warning and returns bare rows.
+  </Step>
+  <Step title="Replace the headline">
+    When `cursor` is empty, `weeklySummary` overwrites `week_total` and `ride_count` with `GetDriverWeekEarnings`. A failure logs a warning and keeps the page-local values.
+  </Step>
+</Steps>
+
+### Row fields
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| `id` | Balance transaction ID | Used as the cursor |
+| `type` | `classifyTransactionType` | `charge`, `payment`, `payout`, `refund`, `adjustment`, `fee`, `other` |
+| `amount`, `net`, `fee` | Stripe, cents | Stripe books the charge at the authorized amount, per the `weeklySummary` comment |
+| `gross` | `Rides.driver_payout` | Omitted when 0 or unmatched. The client shows `gross` when present, else `net` (`mappers.ts`) |
+| `tip_amount` | `Rides.tip_amount` | Cents |
+| `created_at`, `available_on` | Stripe | Unix seconds |
+
+### Headline math
+
+`GetDriverWeekEarnings` sums dollars in Postgres, and the repository converts with `int64(math.Round(total * 100))`.
+
+Example week: rides with `driver_payout` of 12.00, 15.00, and 7.50, plus a canceled ride with a $3.00 fee. The query returns `total_dollars = 37.50` and `ride_count = 4`. The response carries `week_total = 3750` and `ride_count = 4`. The canceled ride counts as a ride because the query doesn't filter `cancel_phase`.
+
+### Pagination
+
+| List | Cursor returned | Page size | `has_more` |
+| --- | --- | --- | --- |
+| Activity | ID of the last raw transaction (`page.Data[len-1]`) | `normalizeLimit` | Stripe's `has_more` for the fetched list |
+| Payouts | ID of the last mapped payout | `normalizeLimit` | Same |
+
+Both Stripe helpers stop iterating once they've collected `Limit` items, so they never auto-page past one request. Pass `next_cursor` back as `cursor` to read older rows. The cursor is only valid with the same `from` and `to`.
+
+<Note>
+The mobile app never sends `cursor`. The hub and the **All activity** screen each read one page, so rows beyond 25 or 100 in the window aren't shown.
+</Note>
+
+## Status poll earnings
+
+`UserRepository.GetStatus` runs `GetUserDriverStatus` on every `GET /user/status` poll. The query's `recent_drives` CTE is bounded to one week of `request_time`, so daily and weekly sums stay cheap.
+
+All-time earnings used to run inside the same query. They're now served by `DriverEarningsCache` (`internal/data/redis/driver_status_cache.go`):
+
+- Key `driver:earnings:all_time:{driverID}`, TTL 60 seconds.
+- The cached value wraps the sum as `{"sum": ...}`, so a driver with no rides (null) is still a cache hit.
+- An undecodable value is deleted and recomputed.
+- With Redis disabled, the loader runs inline on every poll.
+- Nothing calls `Invalidate`. A completed ride can take up to 60 seconds to reach `all_time_earnings`.
+
+## Drive history
+
+`GET /user/drive-history` calls `GetRideHistoryByDriverID`. It returns up to 200 rides with status `complete` or `pending_rider_rating`, newest `request_time` first.
+
+| Field | Value |
+| --- | --- |
+| `price` | `COALESCE(discounted_price, price)`, the fare. Not `driver_payout` |
+| `tip_amount` | `COALESCE(tip_amount, 0)` |
+| `fee_cents` | `Rides.stripe_fee_cents`, null until the fee backfill fills it |
+| `rider_name` | Rider first and last name |
+| `duration` | Seconds from `request_time` to `complete_time` |
+
+The model comment in `internal/models/ride.go` defines driver take-home as `price + tip - fee_cents`. The history query doesn't filter `cancel_phase`, so canceled rides appear with their full quoted fare in `price`.
+
+## Payout pushes
+
+`HandlePayoutEvent` (`internal/service/earnings/webhook.go`) runs for `payout.paid`, `payout.failed`, and `payout.canceled`:
+
+1. A nil payout returns 400.
+2. An empty `event.account` (platform payout) is ignored.
+3. `GetByStripeMerchantId` loads the user that owns the connected account.
+4. `formatUSD` renders the absolute amount, for example `12345` becomes `$123.45`.
+5. `NotifyPayout` emits `payout_paid`, `payout_failed`, or `payout_canceled` with event key `{eventType}:{eventID}` and data `payout_id`, `event_type`, `amount`, `currency`, `arrival`, and `deeplink = yelo://drive/earnings`.
+6. A notification error is logged, and the webhook still returns 200.
+
+Copy comes from the seeded templates in `internal/notify/seed/templates.go`, for example **Payout deposited**: "`amount` just landed in your bank account." See the [notification catalog](/engineering/notifications/catalog). Delivery and retry semantics are on [Stripe webhooks](/engineering/payments/webhooks).
+
+## Demand dashboard
+
+`GET /driver/demand-dashboard` reads the caller's community from the JWT context.
+
+- `demand_day` is an integer from 0 to 6 (Sunday is 0). The OpenAPI option marks it required, but the handler accepts an empty value.
+- With no `demand_day`, the handler uses `time.Now()` in `America/New_York`, minus 6 hours, and takes its weekday. At 2:00 am Saturday Eastern, the default day is still Friday.
+- `ride_requests_last_20_minutes` counts rides in the community with `confirm_time` in the last 20 minutes.
+- `drivers_online` counts open `DriverSessions` whose driver's current `community_id` matches.
+- The curve is the newest `RideDemandCurves` row for the day with `end_time` in the future. None returns empty arrays.
+- `ToResponse` converts each `x` (hours) to a timestamp from midnight Eastern of the shifted "today", regardless of `demand_day`.
+
+## Auto-queue settings and uptime log
+
+The matching side of auto-queue is on [Auto-queue scoring](/engineering/matching/auto-queue-scoring). This section covers the driver's own settings endpoints.
+
+### Settings
+
+`GetAutoQueueSettings` returns:
+
+| Field | Value |
+| --- | --- |
+| `enabled` | `Users.auto_queue` |
+| `max_minutes` | `Users.auto_queue_max_minutes`, null for community default |
+| `effective_max_minutes` | `min(max_minutes or community default, community max)` |
+| `community_max_minutes`, `community_default_minutes` | `Communities` columns |
+| `paused_until` | `Users.auto_queue_paused_until`, or null when it's in the past |
+
+Example: a community with max 60 and default 30. A driver with `max_minutes = null` gets 30. A driver with `max_minutes = 45` gets 45. If the community later drops its max to 40, that driver gets 40 without an error.
+
+`SetAutoQueue` rejects `max_minutes` above the community max ("Your max minutes cannot exceed the community limit of N minutes."). It then calls `UpdateAutoQueueSettings` and sets the Redis presence flag with `SetAutoQueueFlag`. A presence failure is logged, not returned.
+
+`PauseAutoQueue` accepts `duration_minutes` from 0 to 60 (`maxPauseMinutes`). A positive value sets `auto_queue_paused_until = now + duration`. Zero clears it. The response is the refreshed settings.
+
+### Uptime accounting
+
+`reconcileDriverAutoQueueAccounting` (`internal/data/repository/auto_queue_settings.go`) keeps `DriverAutoQueueLog` in step with the server's state. It runs inside `withDriverSessionLock`, in the same transaction as the state change, from four writers:
+
+- `UpdateAutoQueueSettings` (settings command)
+- `SetDriverOnline` with `false` (going offline)
+- `RefreshDriverSession` (going online)
+- `SetInactiveDriversOffline` (stale-driver expiry)
+
+The rule is one line: if `is_online_driver AND auto_queue`, open an interval, otherwise close it. `OpenDriverAutoQueueInterval` inserts only when no open row exists, so repeated commands don't split intervals. `CloseDriverAutoQueueInterval` sets `disabled_at` on every open row.
+
+Pausing doesn't touch the log. A driver paused for 30 minutes keeps accruing uptime.
+
+`SumUptimeDuringOperatingHours` reads the log for reporting:
+
+- Each interval ends at the earliest of `disabled_at` (or now), `enabled_at + 12h` (`AutoQueueMaxSessionCap`), and the window end.
+- Overlap with operating hours is counted minute by minute in the community's timezone (`operatingOverlapSeconds`). Without configured windows, the default is 19:00 to 03:00 every day.
+- Timezone changes split the interval, so a correction doesn't reinterpret past uptime.
+- Intervals whose community was deleted (`community_id` null) are excluded and logged.
+
+Example: a driver enables auto-queue at 18:30 local and goes offline at 20:15, with the default window. Only 19:00 to 20:15 counts: 75 minutes, or 4500 seconds.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Earnings service | `internal/service/earnings/earnings.go` | `GetActivity`, `enrichActivityWithRides`, `weeklySummary`, `getMerchantID`, `normalizeLimit` |
+| Activity mapping and week start | `internal/service/earnings/mappers.go` | `buildActivityPage`, `classifyTransactionType`, `paymentIntentIDForTxn`, `startOfWeek` |
+| Payout pushes | `internal/service/earnings/webhook.go` | `HandlePayoutEvent`, `formatUSD` |
+| Routes | `internal/server/http/earnings/earnings_routes.go` | `RegisterRoutes` |
+| Query parsing | `internal/server/http/earnings/earnings_handler.go` | `parseInt64Query`, `GetActivity` |
+| Response models | `internal/models/earnings.go` | `EarningsActivityPage`, `ActivityItem`, `RideEarningEnrichment` |
+| Stripe list calls | `internal/data/stripe/payout.go` | `ListBalanceTransactions`, `ListPayouts`, `buildCreatedRange` |
+| Week headline and enrichment SQL | `internal/data/repository/queries/ride_history.sql` | `GetDriverWeekEarnings`, `GetRideEarningsByPaymentIntents`, `GetRideHistoryByDriverID` |
+| Status poll earnings | `internal/data/repository/queries/user_driver.sql` | `GetUserDriverStatus`, `GetDriverAllTimeEarnings` |
+| All-time cache | `internal/data/redis/driver_status_cache.go` | `DriverEarningsCache` |
+| `driver_payout` writers | `internal/data/repository/queries/ride_lifecycle.sql` | `CompleteRideForRating`, `CompleteRideTip`, `RecordCompletedRideTip`, `MarkRidePaymentSucceeded` |
+| Webhook dispatch | `internal/server/http/payment/payment_handler.go` | `HandleStripeEvent`, `handlePayoutEvent` |
+| Demand dashboard | `internal/server/http/driver/driver_handler.go`, `internal/models/driver.go` | `GetDemandDashboard`, `ToResponse` |
+| Auto-queue settings | `internal/service/driver/driver.go` | `GetAutoQueueSettings`, `SetAutoQueue`, `PauseAutoQueue` |
+| Uptime accounting | `internal/data/repository/auto_queue_settings.go`, `driver_auto_queue_log.go`, `driver_auto_queue_log_overlap.go` | `reconcileDriverAutoQueueAccounting`, `SumUptimeDuringOperatingHours`, `operatingOverlapSeconds` |
+| Mobile hub | `yelo-frontend/hooks/driver-earnings/` | `useEarningsHubData`, `useAllActivity`, `mappers.ts` |
+
+## Gotchas and edge cases
+
+- **`tip_count` is always 0.** `buildActivityPage` declares `tipCount` and never increments it. The response field exists, but carries no data.
+- **Page-local totals on later pages.** Only the first page (empty `cursor`) gets the database headline. A request with a cursor returns `week_total` and `ride_count` computed from that page's rows alone.
+- **Headline counts canceled rides.** `GetDriverWeekEarnings` and the status poll don't filter `cancel_phase`, so a cancellation fee counts as a ride. `drive_count` on the user profile does filter it.
+- **Over-buffer tips can show twice.** Enrichment matches only `Rides.payment_intent_id`. The fare row gets `gross = fare + tip`, and the dedicated tip PaymentIntent's row stays unenriched with its own `net`. The client shows both.
+- **Headline versus status weekly.** The headline is a calendar week from Monday 00:00 UTC on `complete_time`. `weekly_earnings` is a rolling 7 days on `request_time`. They rarely match.
+- **Fleet-paid rides.** Database sums include rides charged on a fleet account. Stripe-backed balance, activity, and payouts don't. See [payout routing](/engineering/fleets/membership-and-payout-routing).
+- **Dev override.** Outside `dev`, `development`, `local`, and `test`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` is ignored. Inside them, every user's Stripe calls hit that account, but the weekly headline still reads the caller's own rides.
+- **Unknown connected accounts fail the webhook.** `GetUserProfileByStripeMerchantID` is a `:one` query, so no match returns an error, not nil. The `user == nil` branch in `HandlePayoutEvent` never runs, and payouts on fleet accounts return 500.
+- **Negative `max_minutes`.** `SetAutoQueue` only checks the upper bound. A negative or zero value is stored and becomes `effective_max_minutes`.
+- **Pause and uptime.** Pausing leaves the uptime interval open, so paused time counts as auto-queue uptime.
+- **Demand curve anchor.** The curve's timestamps always use the shifted "today" in Eastern time, even when `demand_day` asks for another day.
+- **Monthly schedule estimate.** `nextMonthlyAnchor` uses `time.Date`, which normalizes overflow. An anchor of 31 in April estimates May 1.

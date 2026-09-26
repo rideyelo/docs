@@ -1,0 +1,148 @@
+---
+title: "Payment failure modes and invariants"
+description: "What breaks in Yelo's money paths, what each party sees when it does, the log lines that flag it, and the data invariants that should hold between Rides and Stripe, including where the code can violate them."
+---
+
+This page collects every known failure path across ride payments, tips, payouts, QR payments, and Connect accounts. Use it when a rider disputes a charge, a driver reports missing money, or an alert fires. The mechanics behind each row are on the linked pages.
+
+## Failure matrix
+
+### Ride authorization and capture
+
+| Failure | Detection | Rider sees | Driver sees | Money state |
+| --- | --- | --- | --- | --- |
+| Card declined at accept | `payment_processing_failed` ride event with `operation: create_payment_intent` | Nothing. Ride stays searching | Accept fails, "Something Went Wrong" | No hold |
+| Clone fails at accept | Same event, `operation: clone_payment_method` | Nothing | Same | No hold |
+| Card needs 3DS at accept | Same, Stripe code `authentication_required` | Nothing | Same | No hold |
+| Stripe timeout after creating the hold | Same, with a network error | Nothing | Same | Hold on the connected account that Yelo doesn't reference |
+| Lifecycle conflict on persist | `operation: persist_payment_intent`, `Failed to release obsolete ride authorization` if cleanup fails | Nothing | Accept fails | Hold canceled, unless cleanup failed |
+| Queued ride authorization fails at promotion | `Failed to advance queued ride` | Nothing, or a requeue push | Next ride doesn't start | No hold |
+| Capture fails at `Complete` | Error on `RideService.Complete` | Nothing | Can't complete the trip | Hold intact |
+| DB write fails after capture at `Complete` | `Failed to cancel payment intent after DB complete failure, manual reconciliation required` | Charged | Ride looks in progress | Captured, ride not complete |
+| DB write fails at `Complete`, tips on | `DB complete failed for tips_enabled ride, PI still authorized, needs manual review` | Nothing | Ride looks in progress | Hold intact |
+| Sweeper can't capture | `ride stuck past tip window for >1 hour, needs manual review`, every 5 minutes | Hold stays | Payout missing | Hold until Stripe expires it |
+
+See [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
+
+### Cancellation
+
+| Failure | Detection | Result |
+| --- | --- | --- |
+| Fee capture fails | Error on `Cancel` | Cancel rejected, ride continues |
+| $0 cancel voids the hold, then `Ride.Cancel` loses a state race | Error on `Cancel` after Stripe success | Ride continues with a canceled hold. `Complete` later fails to capture |
+| Requeued ride expires unmatched | None | Previous driver's hold stays on the rider's card until it expires |
+
+### Tips
+
+| Failure | Detection | Result |
+| --- | --- | --- |
+| Tip needs authentication | Rate returns `tip_status: requires_action` | Mobile ignores it. Tip not collected. `tip_payment_intent_id` points at an incomplete intent |
+| Driver has no connected account | "This driver can't accept tips right now." | Rating fails. The mobile screen shows "Could not confirm your review" |
+| Rider has no saved method (free ride) | "Add a payment method to leave a tip." | Same |
+| Tip under $0.50 as a dedicated charge | Stripe `amount_too_small` | Same |
+| In-buffer capture above the hold | Stripe rejects `amount_to_capture` | Rating fails. See [Amount math](/engineering/payments/ride-payment-intents#amount-math) |
+
+See [Ride tip charging](/engineering/payments/ride-tips).
+
+### Webhooks
+
+| Failure | Detection | Result |
+| --- | --- | --- |
+| Signature, timestamp, or API version mismatch | `[stripe-webhook] signature verification failed` | 500. Nothing applied. Stripe retries |
+| Secret missing | `[stripe-webhook] STRIPE_WEBHOOK_SECRET is empty` | Same |
+| Payout or account event for a fleet or unknown account | `failed to handle payout event`, `failed to handle account updated` | 500 on every retry |
+
+See [Stripe webhooks](/engineering/payments/webhooks).
+
+### Connect and payouts
+
+| Failure | Detection | Result |
+| --- | --- | --- |
+| Missed `account.updated` | Reconciliation `overdue` count | Status corrected on the next daily reconcile |
+| Stripe 429, 401, or 403 during reconcile | `Stripe reconciliation integration deferred` | Global cooldown. All reconcile jobs snooze |
+| Account deleted in Stripe | Reconcile category `stripe_account_invalid` | Rechecked weekly. Any rides still pointing at it can't settle |
+| Instant payout ineligible | Stripe error on `POST /earnings/payouts/instant` | Driver sees Stripe's error body |
+| Breaker open | `CIRCUIT_BREAKER_TRIPPING` with component `stripe`, Slack alert | 60 seconds of failures for every wrapped call. See [Stripe object map](/engineering/payments/stripe-object-map#resilience-per-call) |
+
+See [Connect accounts and onboarding](/engineering/payments/connect-accounts) and [Payouts and earnings internals](/engineering/payments/payouts-and-earnings).
+
+## Data invariants
+
+These should hold. Each lists what enforces it and how the code can break it.
+
+### Holds and rides
+
+1. **A paid ride that reached `driver_en_route` has a `payment_intent_id` and `stripe_merchant_id`.** Enforced by `processRidePayment` running before `Ride.Accept`. Broken for queue promotions, where `PromoteNextQueuedRide` moves the ride to `driver_en_route` in the `Complete` transaction and authorization runs afterward in `advanceQueuedRide`.
+2. **`Rides.stripe_merchant_id` owns `Rides.payment_intent_id`.** Both are written together by `AddRidePaymentIntent`. Broken when concurrent accepts both pass the unbumped revision check.
+3. **The PaymentIntent's `metadata.driver_id` equals `Rides.driver_id` while assigned.** Checked by `reuseRideAuthorization`. Broken by the concurrent-accept race above.
+4. **At most one live hold per ride.** Rematch cancels the previous driver's hold before creating a new one. Broken by `CancelUnmatchedConfirmedRides`, which never releases a requeued ride's hold, and by Stripe timeouts on `NewPaymentIntent`.
+5. **`pre_auth_amount` equals the Stripe `amount` divided by 100.** Both come from `authAmount`, but the Stripe amount is truncated to cents and `pre_auth_amount` is stored as `real`.
+
+### Settlement
+
+6. **A `complete` paid ride without cancellation has a captured PaymentIntent.** Broken when `payment_intent_id` is null, because `confirmPaymentIntent` skips capture silently.
+7. **`driver_payout` equals what the connected account received for the fare, plus any tip.** Written by `Ride.Complete`, the tip paths, and the webhook. Broken when the fare's `payment_intent.succeeded` arrives after an over-buffer tip.
+8. **`tip_amount` is nonzero only if a tip was collected.** Enforced by writing it only after a successful capture or a `succeeded` tip intent. Broken in reverse: an in-buffer capture followed by a DB failure collects the tip but records `tip_amount = 0`.
+9. **Every ride in `pending_rider_rating` leaves it within 24 hours plus one sweeper tick.** Broken for rides without a `payment_intent_id`, which the sweeper doesn't select, and for rides whose capture fails permanently.
+10. **Canceled rides with a fee have `driver_payout` equal to the fee.** Only the webhook writes it, so it's null until the webhook lands and stays null if the webhook fails.
+
+### Accounts and QR
+
+11. **Each `stripe_merchant_id` belongs to exactly one user, or to one or more fleets that are clones.** Not enforced by a unique constraint. `AccountUpdated` takes the fleet path whenever any fleet matches.
+12. **`Fleets.stripe_status = complete` implies the account can take charges.** Only `payouts_enabled` and requirement lists are checked, not `charges_enabled`.
+13. **Each Checkout Session produces at most one `QrPayments` row.** Enforced by the unique `stripe_session_id`.
+14. **`QrPayments.fleet_id` is the fleet that received the money.** Broken for owner-operator driver links, which tag the driver's fleet while paying the driver's own account.
+
+## Investigating a ride
+
+<Steps>
+  <Step title="Read the ride row">
+    Check `status`, `cancel_phase`, `payment_intent_id`, `stripe_merchant_id`, `pre_auth_amount`, `tip_amount`, `tip_payment_intent_id`, `driver_payout`, `tips_enabled`, and `tip_window_expires_at`.
+  </Step>
+  <Step title="Read the ride events">
+    Filter for `merchant_selected`, `payment_intent_created`, `payment_processing_failed`, `payment_confirmed`, `payment_canceled` (recorded for every cancel with a hold, with `cancellation_fee`), `tip_captured`, `tip_window_expired`, and `ride_canceled`. The dashboard ride timeline shows them. See [Rides](/dashboard/rides).
+  </Step>
+  <Step title="Read Stripe">
+    Open the PaymentIntent on the connected account in `stripe_merchant_id`. Compare `amount`, `amount_capturable`, `amount_received`, `status`, and `metadata`. For tips, open `tip_payment_intent_id` too.
+  </Step>
+  <Step title="Look for orphans">
+    Search the connected account's PaymentIntents for `metadata.ride_id` equal to the ride. More than one uncaptured intent means a race or a timeout left a stray hold. Cancel strays from the Stripe Dashboard.
+  </Step>
+</Steps>
+
+## Signals worth alerting on
+
+These log messages and metrics indicate money is stuck or out of sync. Search for them in Cloud Logging, or wire them to alerts. See [Observability](/engineering/observability).
+
+| Signal | Source | Meaning |
+| --- | --- | --- |
+| `manual reconciliation required` | `handleCompleteDBFailure` | A capture succeeded but the ride isn't complete |
+| `needs manual review` | `handleCompleteDBFailure`, `AutoCaptureTipWindowExpired` | A hold is stuck past its expected settlement |
+| `Failed to release obsolete ride authorization` | `persistPaymentIntent` | A stray hold is still authorized |
+| `CompleteTip failed after capture` | `autoCaptureSingleRide` | A rating and the sweeper raced. Usually harmless |
+| `failed to cancel prior tip payment intent` | `createTipCharge` | An abandoned tip intent may still be open |
+| `[stripe-webhook] signature verification failed` | `HandleStripeEvent` | Secret or API version mismatch. All webhooks are failing |
+| `CIRCUIT_BREAKER_TRIPPING` with component `stripe` | `circuitbreaker.NewSettings` | Wrapped Stripe calls are failing fast for 60 seconds |
+| `Stripe reconciliation coverage` at warning level | `reconciliationDispatchWorker` | Accounts are failed or overdue by more than 25 hours |
+
+There's no admin endpoint to recapture, cancel, or refund. All manual fixes happen in the Stripe Dashboard, and the Yelo row must be corrected separately, because refunds and cancellations made in Stripe don't flow back through webhooks.
+
+## Where this lives in code
+
+| Concern | Location |
+| --- | --- |
+| Authorization failures and cleanup | `yelo-api/internal/service/ride/driver.go` (`clonePaymentMethodToMerchant`, `createPaymentIntent`, `persistPaymentIntent`, `handleCompleteDBFailure`) |
+| Cancellation ordering | `yelo-api/internal/service/ride/ride.go` (`Cancel`, `handleCancellationPayment`) |
+| Unmatched expiry | `yelo-api/internal/data/repository/ride_lifecycle.go` (`CancelUnmatchedRides`), `queries/ride_lifecycle.sql` (`CancelUnmatchedConfirmedRides`) |
+| Tip failures | `yelo-api/internal/service/ride/tip_charge.go`, `tip_capture.go` |
+| Webhook failures | `yelo-api/internal/server/http/payment/payment_handler.go`, `yelo-api/internal/service/payment/payment.go`, `yelo-api/internal/service/earnings/webhook.go` |
+| Breaker alerts | `yelo-api/internal/utilities/circuitbreaker/circuitbreaker.go` |
+| Ride payment events | `yelo-api/internal/service/ride/events.go`, `yelo-api/internal/models` (`RideEvent*` constants) |
+
+## Gotchas and edge cases
+
+- **Stripe is called before the database.** Accept, cancel, complete, and tip paths all mutate Stripe first and write Yelo second. Any DB failure after a Stripe success leaves the two out of sync, and only some paths compensate.
+- **No durable command journal.** `RideOperations` exists in the schema, but `RideOperationJournal` isn't wired into service construction. Nothing replays a half-finished money operation after a crash.
+- **In-process sweeper.** `TipCapture` runs in every API instance with no leader election. Correctness relies on `charge_already_captured` handling and the `status = 'pending_rider_rating'` guard.
+- **Retries on declines.** Capture and cancel use a retrier that retries every Stripe error, including permanent ones, three times with backoff. That adds seconds of latency to requests that were never going to succeed.
+- **No refunds in code.** Nothing in the API issues a refund, so a rider refund is always a manual Stripe action followed by a manual DB fix.

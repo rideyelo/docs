@@ -1,0 +1,193 @@
+---
+title: "Ride timeline walkthrough"
+description: "One ride from confirm to accept, second by second, listing every Postgres table, Redis key, external call, ride event, and push it touches, for both a manual accept and an auto-queue assignment."
+---
+
+This walkthrough follows one ride through matching. Use it to line up logs, `RideEvents` rows, and Redis state when you debug a real ride. Times are relative to confirm. Loop ticks land at arbitrary offsets, so this example assumes an `Operational` tick at 10 s past each 30-second mark.
+
+The ride is a paid, non-discounted ride in fleet `F`, with no direct request. Default activation config. One API instance.
+
+## Setup
+
+- **Rider** `R` has a saved card and a requested ride from `POST /ride/v2`.
+- **Driver** `D1` is online under fleet `F`, idle, with `auto_queue = false`.
+- **Driver** `D2` is online under fleet `F`, idle, with `auto_queue = true` and no pause.
+- **Drivers** `O1` to `O6` are offline members of `F` within 8 km.
+
+## Confirm (t = 0)
+
+`POST /ride/i/{id}/confirm` runs `RideService.ConfirmRide`.
+
+| Step | Code | Touches |
+| --- | --- | --- |
+| Load rider and ride, pick price and fleet | `prepareConfirmRide`, `determineEffectiveRidePrice` | `Users`, `Rides`, pricing tables and caches |
+| Confirm code | `generateConfirmCodeForFleet` | `Fleets.requires_confirmation_code` |
+| Card checks | `validatePaymentMethod`, `processPaymentMethodParallel` | Stripe payment method read |
+| Commit | `Ride.Confirm` | See below |
+| Timeline | `ride_confirmed` | `RideEvents`, written asynchronously by `EventRecorder` |
+| Board | `rideBoard.AddRide` | Redis `SADD rides:community:{c}`, `HSET ride:details`, `SET rides:refresh:{c} EX 10` |
+| Timeline | `ride_board_added` | `RideEvents` |
+| T0 | `notifyDriversAboutNewRide` | See below |
+
+`Ride.Confirm` transaction:
+
+1. `ListRideCommandParticipants` returns `[R]`. `R`'s `Users` row is locked, then the ride row.
+2. `HasConflictingRideOperation` on `RideOperations`.
+3. Rider must own the ride and it must be `requested`. `CountOtherActiveRiderRides` must be 0.
+4. `ConfirmRequestedRide` sets `status = 'confirmed'`, `confirm_time`, `payment_consent_at`, `confirm_code`, `vehicle_type`, `price`, `discounted_price`, `discount_id`, `payment_method_id`, `rider_ip_address`, `rider_user_agent`, `fleet_id`, `payment_method_brand`, and `is_discounted`.
+5. Finalizer: `Rides.lifecycle_revision + 1`, `Users.ride_state_revision + 1` for `R`, and a `ride_state_changed` River job when `RIDE_STATE_SNAPSHOT_ENABLED` is on.
+
+T0:
+
+1. `ListRideT0NotificationTargets(rideID)` joins `Rides`, `Communities`, `Fleets`, `Users`, `FleetDrivers`, `DriverApplications`, `DriverSessions`, `Vehicles`, `FleetVehicles`, and `AvailableDriverVehicles`. It returns `D1`, `D2`, and `O1` to `O6` if they all pass.
+2. `notify.Emit(ride_available)` inserts a `notify_orchestrate` River job in its own transaction, with event key `ride_available:{rideId}:fleet-t0:{F}`.
+3. Redis `SADD ride:notified:{rideId}` with all eight drivers and `EXPIRE 1800`.
+4. `notification_dispatched` event with `tier: 0` in `RideEvents`.
+
+Later, the orchestrator writes `Notifications`, `NotificationCohorts`, and `NotificationDeliveries`, and the send job calls Expo.
+
+## Board polls (t = 0 to 90 s)
+
+`D1`'s app polls `GET /ride/v2/board` every 10 seconds, and immediately after the `ride_request` push invalidates it.
+
+| Step | Touches |
+| --- | --- |
+| `User.GetByID(D1)` | `Users` |
+| `GetDriverSession(D1)` | `DriverSessions` |
+| `GetEligibleEnrichedRideBoard` | `Rides`, `Users` (rider), `Schools`, rider rating subquery on `Rides` |
+| Pickup ETAs | One Mapbox matrix call |
+
+No writes happen.
+
+## Tick at t = 10 s and t = 40 s
+
+`ProcessUnmatchedRides`:
+
+| Step | Touches |
+| --- | --- |
+| `ListUnmatchedRidesForActivation` | `Rides` |
+| `loadConfig` | Redis `GET activation_config:{c}`. On a miss, `ActivationConfigs` then `SET ... EX 300` |
+| `determineTierIdx` | Redis `HGET ride:notify:{rideId} tier`, which returns nothing, so tier 0 |
+| Tier check | 10 s and 40 s are both under 45 s, so nothing fires |
+| Auto-queue pass | Skipped, because the ride is under 2 minutes old |
+
+`CancelUnmatchedRides` and `PurgeOfflineDrivers` run concurrently on the same tick. They don't select this ride.
+
+## Tick at t = 70 s: tier 1
+
+| Step | Touches |
+| --- | --- |
+| `determineTierIdx` | `HGET ride:notify:{rideId}` is empty, 70 s is at least 45 s, so tier 1 |
+| `buildExcludeSet` | `SMEMBERS ride:notified:{rideId}`, which returns the eight T0 drivers |
+| Warm pool | `ZRANGEBYSCORE community:warm:{c}`, then `ZREMRANGEBYSCORE` to trim. Empty |
+| `rideFleetIsCommunityPrimary` | `Communities.primary_fleet_id` |
+| `ListNearbyInactiveDrivers` | `Users`, `DriverApplications`, `Vehicles`, `FleetDrivers` |
+| Filter | Drops `O1` to `O6`, which are in the exclude set. Other offline drivers in range pass |
+| Cooldown | `SET driver:activation_cd:{id} 1 NX EX 900` per passing driver |
+| Names | `GetNamesByIDs` on `Users` |
+| Timeline | `activation_tier_reached` with `tier: 1` |
+| Push | River job, event key `unclaimed_ride:{rideId}:tier:1:recipients:{hash}` |
+| Bookkeeping | `SADD ride:notified:{rideId}`, then `HSET ride:notify:{rideId} tier 1 ts {now}` and `EXPIRE 1200` |
+
+If every nearby offline driver was a T0 recipient, the tier finds nobody. It still writes `tier = 1` and records the event with `drivers_notified: 0`.
+
+<Tabs>
+  <Tab title="D1 accepts manually at t = 90 s">
+    `POST /ride/i/{id}/accept` runs `RideService.AcceptRide`.
+
+    | Step | Code | Touches |
+    | --- | --- | --- |
+    | Driver, session, fleet | `GetByID`, `getDriverSessionAndFleet` | `Users`, `DriverSessions`, `Fleets` |
+    | Availability | `validateDriverAvailability` | In-memory checks on the loaded driver |
+    | Ride | `GetByID`, `validateRideRequestAcceptance`, `validateRideFleet` | `Rides` projection |
+    | Pickup route | `getPickupRoute` | Mapbox `GetDistance` and Google Maps `GetRoute` in parallel |
+    | Timeline | `pickup_route_calculated` | `RideEvents` |
+    | Rider | `GetByID(R)` | `Users` |
+    | Merchant | `selectStripeMerchantID` | Fleet merchant if custom payouts, else `D1`'s |
+    | Timeline | `merchant_selected` | `RideEvents` |
+    | Clone card | `ClonePaymentMethod` | Stripe |
+    | Authorize | `NewPaymentIntent`, manual capture, fare plus `TipBuffer` if tips are on | Stripe |
+    | Persist intent | `Ride.AddPaymentIntent` | Locks `R` and the ride, checks `lifecycle_revision`, writes `payment_intent_id`, `payment_intent_client_secret`, `pre_auth_amount`, `cloned_payment_method_id`, `stripe_merchant_id` |
+    | Timeline | `payment_intent_created` | `RideEvents` |
+    | Assign | `Ride.Accept` | See below |
+    | Timeline | `ride_accepted` | `RideEvents` |
+    | Queue summary | `recalculateDriverQueueSummary(D1)` | `ListDriverQueuedRides` is empty, so `DEL driver:queue_summary:{D1}` and `DEL driver:queue_ride_etas:{D1}` |
+    | Board | `RemoveRide` | `SREM rides:community:{c}`, `HDEL ride:details`, `SET rides:refresh:{c} EX 10` |
+    | Timeline | `ride_board_removed` with reason `accepted` | `RideEvents` |
+    | Rider push | `notifyRiderOfRideUpdate` | `HasRideNotification` on `RideNotifications`, River job for `ride_confirmed` with status `driver_en_route`, then `InsertRideNotification` |
+
+    `Ride.Accept` transaction:
+
+    1. Participants: `R`, `D1`, and riders of any rides `D1` has in progress. Lock `Users` rows in UUID order, rediscover, lock the ride.
+    2. `HasConflictingRideOperation`.
+    3. `status` must be `confirmed`.
+    4. `GetRideCommandDriverAvailability(D1)` for `is_online_driver`. `GetDriverSessionOwnership` needs exactly one open session matching `D1`'s vehicle and fleet.
+    5. `CanAcceptDirectRide` passes because there's no hold.
+    6. `GetRideOperationPaymentDecision` checks the fleet. `GetRideAcceptingDriver` returns `queue_length = 0` and the drive count.
+    7. `AssignAcceptedRideToDriver` sets `status = 'driver_en_route'`, `auto_queued = false`, `driver_id`, `driver_vehicle_id`, `fleet_id`, `match_time`, `driver_drive_count`, the pickup fields, and clears `potential_driver` and `offer_time`.
+    8. Finalizer: `lifecycle_revision + 1`, `assignment_generation + 1`, and `ride_state_revision + 1` for `R` and `D1`.
+
+    Redis keys left behind: `ride:notified:{rideId}` expires 30 minutes after the last add, `ride:notify:{rideId}` 20 minutes after tier 1. Cooldowns on tier 1 drivers last 15 minutes and block them from other rides.
+  </Tab>
+  <Tab title="Nobody accepts, D2 auto-queued at t = 130 s">
+    The tick at 100 s does nothing new. The tick at 130 s fires tier 2 first, the same way as tier 1 with a 13 km radius, target 10, and a warm age of 60. Then the auto-queue pass runs, because the ride is at least 120 s old.
+
+    | Step | Code | Touches |
+    | --- | --- | --- |
+    | Flag | `HasAutoQueueAttempted` | `EXISTS ride:aq_attempted:{rideId}` |
+    | Candidates | `ListAutoQueueEligibleDrivers` | `Users`, `DriverApplications`, `Vehicles`, `DriverSessions`. Returns `D2` |
+    | Community limits | `GetCommunityAutoQueueSettings` | `Communities` |
+    | Queue load | `GetQueueSummary(D2)` | `HMGET driver:queue_summary:{D2}`. Missing, so an empty queue |
+    | Deadhead | `GetDistances` | Mapbox matrix, one origin |
+    | Score | `scoreAutoQueueCandidates` | One candidate wins with score 0 |
+    | Session | `GetByID(D2)`, `GetDriverSession(D2)` | `Users`, `DriverSessions` |
+    | Assign | `AutoAssignRide` | See below |
+    | Board | `RemoveRide` | Same three Redis commands as a manual accept |
+    | Summary | `refreshDriverQueueSummary(D2)` | Rebuilt from Postgres |
+    | Pushes | `sendAutoQueueNotifications` | River jobs for `ride_auto_queued` to `D2` and `ride_confirmed` to `R` |
+
+    `AutoAssignRide`:
+
+    1. `Ride.AutoQueueAssign` runs the same transaction as a manual accept with `automatic = true`. It also requires `accepts_auto_queue`, passes `uuid.Nil` to `CanAcceptDirectRide`, and writes `status = 'queued'`, `auto_queued = true`, and zero pickup fields.
+    2. `ride_auto_queued` event, then a queue summary refresh. `D2`'s summary now has one ride.
+    3. `RecoverIdleQueue(D2)`. `GetDriverActiveRideInfo` returns `NotFound`, and `ListDriverQueuedRides` returns this ride.
+    4. `pg_advisory_lock` on the ride, on a dedicated connection.
+    5. Preflight `PromoteQueuedRide(nil)` runs `PromoteAutoQueuedRide` under locks, then rolls back with `ErrRidePreparationRequired`.
+    6. `prepareRidePickup`: pickup route from `D2`'s GPS, then clone card and authorize, then `AddPaymentIntent`.
+    7. `PromoteQueuedRide(preparation)`: same guards, `lifecycle_revision` must equal the preparation's, writes the pickup route, finalizer, commit. Status is now `driver_en_route`.
+    8. Queue summary refresh. `D2` has no queued rides, so both keys are deleted.
+    9. `notifyQueuePromotion`: `ride_confirmed` to `R` with `driver_en_route`, `notification_dispatched` and `queue_promoted` events.
+    10. `ride_status_changed` silent push to `D2` with key `ride_status_changed:{rideId}:driver_en_route`.
+    11. `pg_advisory_unlock`, connection returned.
+
+    Back in `sendAutoQueueNotifications`, the rider's second `ride_confirmed` has the same default event key as the one in step 9 if both land in the same 5-minute bucket, so only one reaches the rider.
+  </Tab>
+</Tabs>
+
+## If nobody ever matches
+
+| Time | Event |
+| --- | --- |
+| 300 s or later | Tier 3, 16 km, target 15 |
+| 480 s or later | Tier 4, 16 km, target 20, ignores the notified set but not cooldowns |
+| 600 s or later | Next `CancelUnmatchedRides` tick expires the ride: `status = 'complete'`, `cancel_reason = 'automatic'`, `cancel_phase = 'confirmed'`, `ride_request_no_drivers` push with key `ride_expired:{rideId}`, board removal, `no_drivers_available` event |
+
+## Where this lives in code
+
+| Step | Location |
+| --- | --- |
+| Confirm | `yelo-api/internal/service/ride/rider.go` (`ConfirmRide`, `finalizeConfirmRide`, `addToRideBoardAndNotify`, `notifyDriversAboutNewRide`), `yelo-api/internal/data/repository/ride_lifecycle.go` (`Confirm`) |
+| Board read | `yelo-api/internal/service/ride/driver.go` (`GetEnrichedRideBoard`) |
+| Activation tick | `yelo-api/internal/service/activation/activation.go` |
+| Manual accept | `driver.go` (`AcceptRide`, `processRidePayment`), `ride_lifecycle.go` (`acceptRide`, `AddPaymentIntent`), `promotion_route.go` |
+| Auto-queue | `yelo-api/internal/service/activation/auto_queue.go`, `driver.go` (`AutoAssignRide`, `RecoverIdleQueue`, `prepareAndPromoteQueuedRide`), `ride_matching.go` (`PromoteQueuedRide`) |
+| Ride events | `yelo-api/internal/service/ride/events.go`, `yelo-api/internal/service/rideevents` |
+| Expiry | `yelo-api/internal/service/ride/ride.go` (`CancelUnmatchedRides`) |
+
+## Gotchas and edge cases
+
+- **Timeline events are asynchronous.** `EventRecorder` buffers up to 500 events and drops one after 100 ms of backpressure. `RideEvents` can be missing rows or show them slightly out of order relative to Postgres state. Use `Rides` timestamps for truth.
+- **Tick phase matters.** The same ride can see tier 1 anywhere from 45 to 75 seconds after confirm, and auto-queue anywhere from 120 to 150 seconds, depending on when the loop ticks relative to confirm.
+- **Auto-queue authorizes later than manual accept.** A manual accept authorizes before assignment. Auto-queue assigns first and authorizes during promotion. A card that fails authorization is discovered after the driver has been told they have the ride.
+- **The auto-queued ride briefly has no pickup route.** Between `AutoQueueAssign` and promotion, `pickup_distance`, `pickup_duration`, and `pickup_route` are 0, 0, and empty.
+- **Every tier writes Redis even with zero recipients.** An empty tier still consumes its slot in `ride:notify:{rideId}`, so a driver who comes into range later is only reached by the next tier or the pending-ride push.

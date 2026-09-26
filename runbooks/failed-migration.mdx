@@ -1,0 +1,97 @@
+---
+title: "Failed migration"
+description: "Recover when the API release fails at the Migrate database step: read the job logs, check schema_migrations, and fix forward safely"
+---
+
+Production migrations run inside **Release API**, before the new revision is deployed. The Cloud Build step **Migrate database** deploys and runs the Cloud Run Job `yelo-api-migrate`. It uses the `Dockerfile.migrate` image (golang-migrate v4.19.1 plus `run-migrations.sh`) on the production VPC. If the step fails, the build stops. No candidate is deployed, and traffic stays on the current revision.
+
+## Symptoms
+
+- **Release API** fails, and Slack gets a release failure message.
+- The Cloud Build log shows **Migrate database** as the failed step.
+- Later pushes to `main` fail at the same step.
+
+## Diagnose
+
+<Steps>
+  <Step title="Open the build and job logs">
+    The **Release API** job summary links the Cloud Build. The job runs with `--max-retries=2`, `--task-timeout=10m`, and `-lock-timeout=60`. List its executions:
+
+    ```bash
+    gcloud run jobs executions list --job=yelo-api-migrate \
+      --region=us-central1 --project=prod-yelo
+    ```
+
+    `run-migrations.sh` ends with one of these:
+
+    | Output | Meaning |
+    | --- | --- |
+    | `Database is clean at migration version N` | Success |
+    | `Database migration state is dirty: ...` | A file failed partway. golang-migrate left the version marked dirty. |
+    | `Database migration version mismatch: current=X expected=Y` | `migrate up` finished at a different version than the release expects. |
+    | A SQL error from `migrate up` | The failing file and statement. |
+  </Step>
+  <Step title="Check the migration table">
+    **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+    SELECT version, dirty FROM schema_migrations;
+    ROLLBACK;
+    ```
+
+    - `dirty = false` at the previous version: the job failed before it applied the file, for example on the lock timeout or the connection.
+    - `dirty = true` at the failing file's version: golang-migrate marks a version dirty before running its file and clears the flag only on success. Check which statements actually took effect before you do anything else.
+  </Step>
+  <Step title="Look for non-transactional leftovers">
+    A migration with `CREATE INDEX CONCURRENTLY` can't run in a transaction and can leave an invalid index behind. **Read-only:**
+
+    ```sql
+    SELECT c.relname AS index_name, i.indisvalid, i.indisready
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE NOT i.indisvalid OR NOT i.indisready;
+    ```
+  </Step>
+  <Step title="Check that the history itself is valid">
+    Run `make migration-check` on the release commit. It fails on malformed names, missing up or down files, duplicate versions, and version gaps. The release's first step runs the same check (`check-migrations.sh`).
+  </Step>
+</Steps>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Fix the cause and re-release">
+    When `dirty = false`, the database is still at the previous version and production is unaffected. When `dirty = true`, resolve the dirty state first. See Option 2.
+
+    - **The data blocked the migration**, for example a new constraint that existing rows violate. Fix the data through a reviewed change, then re-run the release with `gh workflow run release-api.yml --repo rideyelo/yelo-api --ref main -f sha=<same-sha>`.
+    - **The migration itself is wrong.** You can't edit or delete an applied migration file, and CI treats every file already on `main` as applied. `check-migration-immutability.sh` rejects any change to an existing file under `migrations/`. Every release will retry the broken file. This needs a reviewed decision from `@rideyelo/migration-approvers`. There's no supported path in the repository.
+  </Accordion>
+  <Accordion title="Option 2: Dirty state">
+    Every release fails until the dirty flag is resolved, because `run-migrations.sh` refuses a dirty version.
+
+    <Warning>
+    The repository has no tool that forces a production migration version. `run-migrations.sh` only calls `migrate force` for one E2E bootstrap case. Forcing the version to skip an error can leave the schema out of step with its migration history. Inspect exactly which statements of the failing file took effect, and resolve it through a reviewed change. Never force the version just to get past the error. `docs/ride-cardinality-preflight.md` sets the same rule for concurrent index builds.
+    </Warning>
+  </Accordion>
+  <Accordion title="Option 3: Version mismatch">
+    `current` above `expected` means the release commit is older than the database. `migration-required.sh` normally blocks that before the job runs ("release migration version N is older than deployed version M"), so check the `migration-version` label on the serving revision. Release a commit that contains every applied migration.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+`make migrate` and `make migrate-down` run against the `DSN` in your local `.env`. Don't use them against production. The release job reads its DSN from Secret Manager (`yelo-api-migration-dsn`) and runs on the production VPC, because public Cloud Build workers can't reach the production database over IPv6.
+</Warning>
+
+## Verify
+
+- `schema_migrations` shows the expected version with `dirty = false`.
+- The job log ends with `Database is clean at migration version N`.
+- The release finishes, and the new revision carries `migration-version=N`.
+
+## Root causes seen in code
+
+- **Migrations run against live data.** A constraint or backfill that passed on a fresh test database can fail on production rows.
+- **Concurrent index builds** run outside a transaction, one per file. They can fail on duplicates or deadlocks and leave an invalid index.
+- **Lock timeouts.** The job waits 60 seconds for the migration lock, and statements can wait on long-running transactions.
+- **Immutability.** Once a failing file is on `main`, every release retries it.
+- **E2E is separate.** `cloudbuild.e2e.yaml` migrates `yelo_e2e` with its own job, `yelo-api-e2e-migrate`. A failure there doesn't affect production. See [E2E environment reset](/runbooks/e2e-environment-reset).

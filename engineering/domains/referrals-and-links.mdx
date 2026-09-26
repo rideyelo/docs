@@ -1,0 +1,242 @@
+---
+title: "Referrals, share links, and short links"
+description: "How the API generates referral codes, publishes Dub share links and signed OG cards, attributes referees, computes referral rewards, and serves the legacy path shortener and deep-link redirect."
+---
+
+Referrals connect three systems: a code on `Users.referral_code`, a Dub short link on `join.yelo.link`, and a `Referrals` row written at sign-up. Rewards are computed at read time from `ReferralRewards` and `ReferralPayouts`. Nothing is paid out automatically.
+
+This page covers the API side. For the product view, see [Growth features](/concepts/growth-features). For how a code is bound to an Auth v3 sign-in, see [Auth v3 transactions](/engineering/identity/auth-v3-transactions). Fleet join links also use Dub; see [Joins and invitations](/engineering/fleets/joins-and-invitations).
+
+## Data touched
+
+| Store | Object | Used for |
+| --- | --- | --- |
+| Postgres | `Users.referral_code` (text, default `''`) | Current code |
+| Postgres | `Users.old_referral_code` (text, nullable) | Pre-hyphen code kept after migration to the new format |
+| Postgres | `Users.has_dub_link` (bool, default `false`) | Whether the Dub link has been written |
+| Postgres | `Users.acquisition_source` | Promoted to `app_referral` by the Auth v2 referral path |
+| Postgres | `Referrals` (`referrer_id`, `referee_id`, `referral_time`) | One row per referee. `referrals_referee_id_unique` on `referee_id`. |
+| Postgres | `ReferralRewards` (PK `community_id`, `start_time`) | Per-community `rider_value` and `driver_value` with a time window |
+| Postgres | `ReferralPayouts` (`payout_id`, `user_id`, `approver_id`, `amount`, `timestamp`) | Manual payouts subtracted from earnings |
+| Postgres | `AttributionTouches.referral_code` | Code captured on the hosted sign-in page, bound to the Auth v3 transaction |
+| Postgres | `ShortenedLinks` (`encoded_path` PK, `original_path` `VARCHAR(255)`) | Legacy in-house path shortener |
+| Postgres | `ReferralLookup` | Table exists (migration 000146). No Go code reads or writes it. |
+| Dub | Links on `join.yelo.link` | Referral share links, keyed by referral code |
+| Cloudflare Worker | `yelo-og` at `OG_IMAGE_BASE_URL/og/invite` | Signed share-card image |
+
+For column types, see [Users and identity](/reference/database/users-and-identity).
+
+## Endpoints
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/referral/` | JWT + role `user` | `ReferralHandler.GetUserReferrals`. Lists the caller's referees with reward values. |
+| `GET` | `/referral/link` | JWT + role `user` | `ReferralHandler.GetReferralLink`. Returns `referral_code` and `link`, creating the Dub link if needed. |
+| `GET` | `/referral/invite/{code}` | Public | `ReferralHandler.GetInvitePreview`. Returns `user_id`, `first_name`, `referral_code`, `photo_url` for the invite landing page. |
+| `POST` | `/user/friends/connect` | JWT + role `user` | `UserHandler.ConnectFriend`. Existing user taps an invite link; creates a mutual friendship. `referral_code` is required, at most 32 characters. |
+| `POST` | `/link/encode` | Public | `LinkHandler.Encode`. Body `path`; returns an 8-character `encoded_path`. |
+| `GET` | `/link/decode` | Public | `LinkHandler.Decode`. Query `encoded_path`; returns `path`. |
+| `GET` | `/redirect` | Public | `redirect` in `router.go`. HTML page that opens the app, then falls back to the App Store. |
+
+Routes are registered in `internal/server/http/router.go`: `/referral` on `baseGroup` with an authenticated subgroup, `/link` and `/redirect` on `baseGroup` with no middleware. The service methods `GetReferrers`, `UpdateReferralReward`, `AddPayout`, `UpdatePayout`, and `GetInviterName` have no route.
+
+## Referral codes
+
+`GenerateReferralCode` in `internal/utilities/referral/generate.go` builds `INITIALS-XXXXX`:
+
+- First initial: first byte of the trimmed first name, uppercased. Empty becomes `X`.
+- Last initial: same rule for the last name.
+- Suffix: 5 characters drawn with `crypto/rand` from `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (31 characters, no `0`, `1`, `I`, `L`, `O`).
+
+That gives 31^5 = 28,629,151 suffixes per initials pair. A user named "Sam Lee" gets something like `SL-7QK2M`.
+
+Three writers assign codes. Each checks for collisions differently.
+
+| Writer | When | Collision check | Attempts |
+| --- | --- | --- | --- |
+| `AuthV2Service.generateReferralCode` (`service/authv2/profile.go`) | First Auth v2 profile setup | `GetAuthUserByReferralCode` returns not found | 10, then server error |
+| `CompleteAuthV3Profile` (`data/repository/authv3.go`) | Auth v3 profile completion, only when `referral_code` is blank | `pg_advisory_xact_lock(hashtextextended(code, 0))` then `AuthV3ReferralCodeExistsForOtherUser` (case-insensitive) | Collision returns `ErrorTypeDuplicate`; the service retry loop retries |
+| `ReferralService.GetOrCreateShareLink` | `GET /referral/link` for a code without a hyphen | `GetAuthUserByReferralCode` returns not found | 10, then 400 "Failed to generate unique code" |
+
+Auth v2 reuses an existing code on re-verify and only calls `CreateDubLinkAsync` when the user had no code before.
+
+## Share links
+
+<Steps>
+  <Step title="Build the link">
+    `GetOrCreateShareLink` loads the user and builds `https://join.yelo.link/<code>?v=3`. `shareLinkVersion` is `"3"`; bump it to force iMessage to re-scrape previews.
+  </Step>
+  <Step title="Return early if published">
+    If `has_dub_link` is true, the handler returns the code and URL without calling Dub.
+  </Step>
+  <Step title="Migrate legacy codes">
+    If the code has no hyphen, a new code is generated. The old code is passed as `oldCode` so it is kept in `old_referral_code`.
+  </Step>
+  <Step title="Upsert on Dub">
+    `createDubLink` calls `DubProvider.UpsertLink` with the request below. Any Dub error returns 500.
+  </Step>
+  <Step title="Persist">
+    `UpdateReferralCode` runs `SetUserReferralCode`, which sets `has_dub_link = true`, `referral_code`, and `old_referral_code` in one statement.
+  </Step>
+</Steps>
+
+`buildDubLinkRequest` sends:
+
+| Field | Value |
+| --- | --- |
+| `Domain` | `join.yelo.link` (`dubBaseDomain`) |
+| `Key` | The referral code |
+| `ExternalID` | The user ID |
+| `URL` | `INVITE_LANDING_BASE_URL + "/" + code`. Default base: `https://invite.yelo.link`. |
+| `FolderID` | `DUB_SYSTEM_FOLDER_ID` |
+| `Title` | `Join <first name> on Yelo` |
+| `Description` | `<first name> invited you to Yelo — tap to get the app and ride together.` |
+| `Image` | Signed OG card URL (below) |
+| `TagNames` | `system`, `referral` |
+| `TrackConversion` | `true` |
+| `Proxy` | `true` |
+
+The Dub client (`internal/data/dub/dub.go`) builds a new SDK client per call from `DUB_API_KEY`. Empty fields are omitted from the upsert body.
+
+### Background creation and refresh
+
+| Function | Trigger | Context | Retries | On success |
+| --- | --- | --- | --- | --- |
+| `CreateDubLinkAsync` | First Auth v2 profile setup | Detached, 30 s | `retry.NewNetworkRetrier`: 5 attempts, 200 ms base delay, 10 s max, full jitter | `SetHasDubLink(true)` |
+| `RefreshShareCardAsync` | `UserService.UpdateName` and `UpdateProfilePicture` (after the thumbnail is saved) | `context.Background` with 30 s timeout | None | Nothing; failures only log |
+
+`RefreshShareCardAsync` is deliberately not gated on `has_dub_link`. The upsert is keyed by code, so a refresh before creation just creates the link. It skips users with an empty `referral_code`.
+
+Auth v3 profile completion doesn't call `CreateDubLinkAsync`. Those users get their Dub link lazily on the first `GET /referral/link`, or on the first name or photo change.
+
+### Signed OG card
+
+`ogcard.InviteCardURL` (`internal/utilities/ogcard/url.go`) builds `OG_IMAGE_BASE_URL/og/invite?<params>&sig=<hmac>`.
+
+| Param | Source | Included when |
+| --- | --- | --- |
+| `n` | First name | Always |
+| `c` | `HexColor(DeterministicColor(user_id))` | Always |
+| `l` | Last name | Non-empty |
+| `p` | `PhotoThumbnailUrl` | Non-empty |
+
+The signature is HMAC-SHA256 with `OG_SIGNING_SECRET` over a canonical string, truncated to 32 hex characters (`SigLength`). The canonical string sorts keys, skips `sig`, and length-prefixes each key and decoded value in bytes, for example `1:c=6:5AC0771:n=3:Sam`. Length prefixes stop a crafted first name from forging a `p` parameter. `yelo-web/workers/og/src/sign.ts` must produce identical strings.
+
+After each upsert, `warmOGCardAsync` sends a `GET` to the image URL on a detached 15-second context. A non-200 only logs "OG card warm failed".
+
+## Applying a referral
+
+| Path | Function | Lookup | Self-referral | Failure behavior | Side effects |
+| --- | --- | --- | --- | --- | --- |
+| Auth v3 profile completion | `CompleteAuthV3Profile` calls `applyAuthV3Referral` | `GetAuthV3ReferrerIDByCode`: `upper(btrim(referral_code))`, excludes deleted and banned users | 400 "referral code is invalid" | Fails the whole profile transaction | None beyond the `Referrals` row |
+| Auth v2 profile setup | `AuthV2Service.applyReferralCode` | `GetAuthUserByReferralCode`: exact match on `referral_code` **or** `old_referral_code` | "Cannot refer yourself" | Logged and ignored; setup continues | Mutual friendship (`source = referral`), `acquisition_source` promoted from `app_organic` to `app_referral` |
+| Auth v2 community signup | `applyReferralCode` from `service/authv2/community.go` | Same as above | Same | Logged and ignored | Same, plus `fireDubTrackLead` |
+
+Both inserts use `ON CONFLICT (referee_id) DO UPDATE SET referrer_id = "Referrals".referrer_id RETURNING referrer_id`. The existing referrer is kept. If the returned ID differs, the repository returns `ErrorTypeIdentityConflict`.
+
+In Auth v3, a code captured on the transaction's earliest `AttributionTouches` row wins. Presenting a different code returns 400 "referral code is already bound to this sign-in". See [Auth v3 transactions](/engineering/identity/auth-v3-transactions).
+
+### Dub lead tracking
+
+`fireDubTrackLead` sends `Track.Lead` with event name `Sign Up`, the Dub click ID, and the user ID as the customer external ID. It runs on a detached 10-second context and is skipped when `dubID` is empty. Only the Auth v2 community path calls it.
+
+### Acquisition source
+
+`SetAcquisitionSourceIfDefault` runs `UPDATE "Users" SET acquisition_source = $source WHERE id = $id AND acquisition_source = 'app_organic'`. A more specific source is never overwritten.
+
+| Caller | Source written |
+| --- | --- |
+| `AuthV2Service.applyReferralCode` | `app_referral` |
+| `service/tipping/tipping.go` (two paths) | `qr_payment` |
+| `service/worldcup/world_cup.go` | `event_link` |
+
+Migration 000220 backfilled null values in order: `app_referral` for any referee, then `event_link` for event attendees, then `qr_payment` by case-insensitive email match on `QrPayments.customer_email`.
+
+## Rewards
+
+Rewards are derived by `GetUserReferrals` and `GetReferrers` in `queries/referral.sql`. Nothing is stored per referral.
+
+- A referee counts as an active driver if they have any ride as driver with `status = 'complete'` and `cancel_phase IS NULL`.
+- Otherwise they count as an active rider if they have such a ride as rider.
+- The reward row is the one for the referee's community whose window contains `referral_time` (`BETWEEN start_time AND end_time`).
+- Driver activity earns `driver_value`. Rider-only activity earns `rider_value`. No completed ride earns 0.
+- Outstanding is total earned minus `SUM(ReferralPayouts.amount)` for the referrer.
+
+`UpdateReferralReward` closes the open row (`end_time = 'infinity'`) at `now()` and inserts a new row starting at the same instant, in one transaction.
+
+**Worked example.** A community has `rider_value = 5` and `driver_value = 20`. A referrer has three referees:
+
+| Referee | Completed rides | Value |
+| --- | --- | --- |
+| A | 2 as rider | 5 |
+| B | 1 as rider, 4 as driver | 20 |
+| C | None | 0 |
+
+Total earned is 25. With one payout of 10, outstanding is 15.
+
+The two queries differ:
+
+| Aspect | `GetUserReferrals` (app) | `GetReferrers` (no route) |
+| --- | --- | --- |
+| Reward community | Referee's `community_id` | Referee's `home_community_id` |
+| Ride filter | Any community | `Rides.community_id` equals the requested community |
+| `DriverApplications` join | Inner join; referees without a row are dropped | Left join |
+| Scope | One referrer | Referrers whose `community_id` matches, with at least one referee |
+
+Driver leads have a separate referrer (`DriverLeads.referrer_user_id` or `referrer_name`), set with `PATCH /dashboard/leads/drivers/{id}/referrer` (Clerk role `admin` or `intern`). See [Driver leads](/dashboard/driver-leads).
+
+## Invite preview and in-app connect
+
+`GetInvitePreview` calls `GetInviterCard`, which resolves the code with `GetAuthUserByReferralCode` and then loads the user. Unknown codes return 404. The response echoes the path `code`, not the user's current code.
+
+`UserService.ConnectFriend` resolves the same way and calls `Friendship.AddMutual` with source `referral`. It rejects unknown codes ("This invite link is invalid or has expired.") and self-invites.
+
+On the client side, `ReferralCaptureObserver` in `yelo-frontend` calls Dub `trackOpen` 750 ms after the app becomes interactive. It stores the link key as the captured code in AsyncStorage (`@yelo/referral_code`). `normalizeInviteCode` uppercases only codes matching the generated format. The invite site (`yelo-web/src/sites/invite`) sends Apple devices without the app to the App Store with `ct=<code>`.
+
+## Path shortener
+
+`LinkService.Encode` stores `NewShortenedPathRecord(path)`: an 8-character code from `math/rand` over `[a-zA-Z0-9]` (62^8 possible values). `Decode` reads it back. There is no TTL and no ownership.
+
+The mobile app decodes these in `app/(app)/link.tsx`. It handles `com.rideyelo://link?yeloLink=<code>`, waits 1 second, then navigates to the decoded path. `SocialContext.encodeLink` builds `http://redirect.rideyelo.com/?deepLink=com.rideyelo://link?yeloLink=<code>`, but no component calls it.
+
+## Deep-link redirect
+
+`GET /redirect` renders the inline `redirectTemplate` in `router.go`. It sets `window.location.href` to `APP_URL_SCHEME` (default `com.rideyelo://`), then to `APP_STORE_URL` after 1,000 ms. It ignores query parameters.
+
+`internal/server/http/redirect.html` is a different page. It reads `deepLink` and `appStore` from the query string. No Go code references it. The mobile app links to `http://redirect.rideyelo.com/?deepLink=...` (`lib/navigation/deepLink.ts`, `SocialContext.tsx`), which matches the query-string variant.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Share link and Dub upsert | `internal/service/referral/referral.go` | `GetOrCreateShareLink`, `buildDubLinkRequest`, `createDubLink` |
+| Background link jobs | `internal/service/referral/referral.go` | `CreateDubLinkAsync`, `RefreshShareCardAsync`, `warmOGCardAsync` |
+| Card snapshot | `internal/service/referral/card.go` | `cardFromUser` |
+| OG signing | `internal/utilities/ogcard/url.go` | `CanonicalString`, `Sign`, `InviteCardURL` |
+| Referral HTTP | `internal/server/http/referral/referral_routes.go`, `referral_handler.go` | `RegisterAuthenticatedRoutes`, `RegisterUnauthenticatedRoutes` |
+| Dub client | `internal/data/dub/dub.go` | `Client.UpsertLink`, `CreateLink`, `UpdateLinkDestination`, `TrackLead` |
+| Code generation | `internal/utilities/referral/generate.go` | `GenerateReferralCode` |
+| Auth v2 attribution | `internal/service/authv2/profile.go`, `community.go` | `applyReferralCode`, `generateReferralCode`, `fireDubTrackLead` |
+| Auth v3 attribution | `internal/data/repository/authv3.go` | `CompleteAuthV3Profile` path, `applyAuthV3Referral` |
+| Referral SQL | `internal/data/repository/queries/referral.sql`, `referral.go` | `AddReferral`, `GetUserReferrals`, `GetReferrers`, `UpdateReferralReward` |
+| Code lookup | `internal/data/repository/queries/user_profile.sql` | `GetAuthUserByReferralCode`, `SetUserReferralCode`, `PromoteUserAcquisitionSource` |
+| Friend connect | `internal/service/user/friends.go` | `ConnectFriend` |
+| Path shortener | `internal/service/link/link.go`, `internal/models/link.go`, `data/repository/link.go` | `Encode`, `Decode`, `NewShortenedPathRecord` |
+| Redirect page | `internal/server/http/router.go` | `redirect`, `redirectTemplate` |
+
+`internal/models/invite.go` isn't part of referrals. It defines `InviteUserRequest` for dashboard staff invites (roles `intern`, `fleet`, `admin`).
+
+## Gotchas and edge cases
+
+- **Legacy codes are only migrated once.** `GetOrCreateShareLink` returns early when `has_dub_link` is true, before the hyphen check. A user with a flag set and a pre-hyphen code keeps it.
+- **Lookups disagree on legacy codes.** `GetAuthUserByReferralCode` matches `old_referral_code` and is case-sensitive. `GetAuthV3ReferrerIDByCode` ignores `old_referral_code`. An old code previews fine on the invite page but fails Auth v3 sign-up with "referral code is invalid".
+- **The preview echoes the path code.** `GetInvitePreview` returns `ReferralCode: code`. The mobile invite screen stores `preview.referral_code`, so a legacy code stays legacy.
+- **`GetAuthUserByReferralCode` has no limit or status filter.** It is a `:one` query with no `ORDER BY`. Deleted or banned users still resolve in Auth v2, preview, and connect paths.
+- **A user without a code gets one from `GET /referral/link`.** An empty code has no hyphen, so a new code is generated and `old_referral_code` is set to the empty string.
+- **Missing Dub key fails the request.** The `dubClient == nil` guard never fires because `service.go` always constructs a client. With `DUB_API_KEY` unset, `GET /referral/link` returns 500 for users without a link.
+- **First-byte initials.** `GenerateReferralCode` takes `trimmed[0]`, a byte. A name starting with a multi-byte character such as "Élise" produces a Latin-1 rune (`Ã`), not `E`.
+- **Refresh races.** If `CreateDubLinkAsync` writes after a concurrent `RefreshShareCardAsync`, the card reverts to the older snapshot until the next name or photo change. The code comments accept this.
+- **Reward boundaries overlap.** `BETWEEN` is inclusive at both ends, and a reward switch sets the old `end_time` equal to the new `start_time`. A referral at exactly that instant matches both rows.
+- **Shortener errors are 500s.** `GetByEncodedPath` wraps "no rows" as a server error, so an unknown code returns 500, not the documented 404. `Insert` doesn't retry on a primary-key collision; `ShortenedPathRecord.Regenerate` is never called. Paths longer than 255 characters fail the insert with 500.
+- **The shortener is unauthenticated.** Anyone can write rows to `ShortenedLinks` through `POST /link/encode`.
+- **Friendship on referral is Auth v2 only.** The Auth v3 path writes only the `Referrals` row. It doesn't add the friendship or promote `acquisition_source`.

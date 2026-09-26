@@ -1,0 +1,222 @@
+---
+title: "User social graph and saved places"
+description: "Server internals for contact upload and hashing, mutual contact matching, invite-code friendships, the friend list, liked places, and recently selected locations under /user."
+---
+
+These endpoints share the `user` HTTP package and `UserService` with the profile routes on [User profile, status, and account lifecycle](/engineering/domains/user-profile-and-status). They cover who a user knows (contacts and friends) and which places they care about (likes and recents).
+
+For the mobile side of contact sync and invites, see [Social and contacts](/engineering/mobile/social-and-contacts). For how likes and recents feed search and top-location ranking, see [Search and places](/engineering/location/search-and-places). For the friends map layer, see [Map layers and mobility](/engineering/location/map-layers-and-mobility).
+
+## Data touched
+
+| Store | Keys or tables | Used for |
+| --- | --- | --- |
+| Postgres | `UserContacts` (`owner_id`, `contact_phone_hash`, unique pair) | The caller's current contact snapshot, hashed |
+| Postgres | `Users.contacts_snapshot_hash`, `contacts_synced_at`, `contacts_last_attempt` (jsonb), `contacts_matched_at` | Snapshot digest and match diagnostics |
+| Postgres | `Friendships` (`user_low`, `user_high`, `source`, `created_at`, `CHECK user_low < user_high`) | One row per friend pair |
+| Postgres | `LikedLocations`, `RecentLocations`, `PlaceIdentities` | Saved places and their Yelo place identity |
+| Redis | `contacts_match:{userID}:{YYYYMMDDHH}` | Hourly contact upload counter, 1-hour TTL |
+| Redis | `user:profile:{userID}` | Caller's own phone number during matching |
+| Env | `CONTACT_HASH_PEPPER` | HMAC key for phone hashes. Read with `os.Getenv` on every call |
+| Notify | `friends` map-change scope | Emitted by `mapchanges.Service.SocialChanged` |
+
+## Endpoints
+
+All routes use the user JWT middleware and require the `user` role. They are registered in `internal/server/http/user/user_routes.go`.
+
+| Method | Path | Auth | Handler and purpose |
+| --- | --- | --- | --- |
+| POST | `/user/friends/contacts` | User JWT | `MatchContacts`: replace the contact snapshot and return matched friends |
+| POST | `/user/friends/connect` | User JWT | `ConnectFriend`: befriend the owner of a referral code |
+| GET | `/user/friends` | User JWT | `GetFriends`: `{ friends: [...] }`, newest first |
+| GET | `/user/likes` | User JWT | `GetLikes` |
+| POST | `/user/likes` | User JWT | `CreateLike`: idempotent by place identity |
+| DELETE | `/user/likes/{id}` | User JWT | `DeleteLike`: 404 when the like isn't the caller's |
+| GET | `/user/recent-locations` | User JWT | `GetRecentLocations`: up to 50 |
+| POST | `/user/recent-locations/sync` | User JWT | `SyncRecentLocations`: merge up to 50 selections, return the latest 50 |
+
+## Contact matching
+
+`POST /user/friends/contacts` takes `phone_numbers` (raw device strings), optional `default_region`, and optional `snapshot_complete`.
+
+### Request validation
+
+`ContactMatchRequest.Validate` rejects the request with 400 when:
+
+- `phone_numbers` has more than 5,000 entries.
+- Any number is longer than 32 bytes.
+- `default_region` is set and `phone.IsSupportedRegion` rejects it.
+
+An empty array is valid and clears the stored snapshot. An omitted `snapshot_complete` is treated as `true` for older clients.
+
+### Pipeline
+
+`UserService.MatchContacts` in `internal/service/user/contacts.go` wraps `matchContacts` and records each stage name on a `ContactMatchAttempt`.
+
+<Steps>
+  <Step title="configuration">
+    An empty `CONTACT_HASH_PEPPER` returns 500 **contact matching is not configured**.
+  </Step>
+  <Step title="rate_limit">
+    `contactUploadRateLimited` increments `contacts_match:{userID}:{UTC hour}` with a 1-hour TTL. A count above 30 (`contactUploadsPerHour`) returns 429 **Slow down**. When Redis is disabled or errors, the check fails open.
+  </Step>
+  <Step title="incomplete_snapshot">
+    `snapshot_complete: false` returns 400 **incomplete contact snapshot; stored contacts were not replaced**. Nothing is written.
+  </Step>
+  <Step title="profile">
+    The caller's profile comes from `UserProfileCache.Get`, which avoids a cross-region `Users` read on every upload.
+  </Step>
+  <Step title="snapshot">
+    `normalizeContacts` converts each number with `phone.NormalizeWithRegion` (default region `US`), drops unparseable numbers and the caller's own number, dedupes by E.164, and hashes each with HMAC-SHA256 keyed by the pepper. `ReplaceContacts` stores the hashes.
+  </Step>
+  <Step title="lookup">
+    `ListUserIDsByPhoneNumbers` finds non-deleted users whose `phone_number` equals any normalized E.164 value. The caller is removed from the candidates.
+  </Step>
+  <Step title="friendship">
+    `linkMutualContacts` hashes the caller's own number and runs `ListContactOwnersHolding` to find candidates whose stored snapshot contains it. `AddMutualFriendships` inserts one row per mutual pair with source `contact_match`.
+  </Step>
+  <Step title="friends">
+    `FriendsAmong` returns every candidate who is already a friend, by any source. `buildContactMatchResult` maps each to the raw strings the client submitted.
+  </Step>
+</Steps>
+
+Matching is strictly mutual. If Alice uploads Bob's number but Bob hasn't uploaded Alice's, no friendship is created. When Bob later uploads a snapshot that contains Alice, his `OwnersHolding` lookup finds Alice's stored hash, and the edge is created on Bob's request.
+
+### Snapshot replacement
+
+`sqlUserContactsRepository.ReplaceContacts` in `internal/data/repository/user_contacts.go` runs one transaction:
+
+1. Sort the hashes and compute a SHA-256 digest of them joined by newlines.
+2. `LockUserContactSnapshot` takes `FOR UPDATE` on the `Users` row and reads `contacts_snapshot_hash`. This serializes concurrent uploads from two devices.
+3. If the digest is unchanged, `TouchUserContactSnapshot` only bumps `contacts_synced_at`.
+4. Otherwise `DeleteUserContacts`, `InsertUserContacts` (skipped when empty), and `SetUserContactSnapshotHash`.
+
+### Response and diagnostics
+
+The response is `ContactMatchResult`:
+
+| Field | Meaning |
+| --- | --- |
+| `sync_id` | New UUID per request, also stored in the attempt record |
+| `matches` | `{ user_id, matched_phone_numbers }` per friend, sorted by user ID string |
+| `matched_phone_numbers` | Flattened raw strings, kept for older clients |
+
+After every request, `RecordMatchAttempt` writes the attempt JSON (counts and stage only, never numbers or hashes) to `Users.contacts_last_attempt`. It uses a 2-second timeout on a context detached from cancellation. It only overwrites an older `started_at`, and it advances `contacts_matched_at` only on success.
+
+Example: a user submits three strings with no region. Two are different formats of the same number, such as `(802) 555-0142` and `802-555-0142`, and the third fails to parse. Both valid strings normalize to one E.164 value and one hash. `submitted_count` is 3 and `normalized_count` is 1. If that number belongs to a mutual contact, the match lists both original strings in `matched_phone_numbers`.
+
+## Friends
+
+### Invite-code friendships
+
+`POST /user/friends/connect` takes `referral_code`, which must be non-empty and at most 32 characters. `ConnectFriend` in `internal/service/user/friends.go`:
+
+- Looks up the inviter with `GetAuthUserByReferralCode`, which matches `referral_code` or `old_referral_code`.
+- Returns 400 **Invalid invite code** when no user matches.
+- Returns 400 **Cannot friend yourself** when the code is the caller's own.
+- Calls `AddMutualFriendship` with source `referral`.
+
+### Storage rules
+
+- Rows are stored as `LEAST(a, b)`, `GREATEST(a, b)`. A to B and B to A collapse into one row.
+- `ON CONFLICT (user_low, user_high) DO NOTHING`. The first source wins and later matches never change it.
+- There is no endpoint to remove a friend.
+
+### Friend list
+
+`GET /user/friends` runs `ListFriends`. It returns the other user's `id`, `first_name`, `last_name`, `photo_url` (actually `photo_thumbnail_url`, blank when missing), `source`, and `created_at`, excluding deleted users, ordered by `created_at DESC`. Empty results serialize as `[]`.
+
+## Likes
+
+`POST /user/likes` validates that `name` is non-empty and that `latitude` and `longitude` are non-zero. `address`, `mapbox_id`, and `categories` are optional.
+
+`UserService.CreateLike` in `internal/service/user/likes.go` first calls `findExistingLike`:
+
+| Mode | Dedup rule |
+| --- | --- |
+| `PlaceCatalog` present (production wiring in `repository/storage.go`) | `PlaceCatalog.Ensure(name, coords, mapbox_id)` resolves or creates a `PlaceIdentities` row. The service then scans all of the user's likes for the same `yelo_place_id` |
+| `PlaceCatalog` nil (tests) | Only when `mapbox_id` is set: `FindLikedLocationByMapboxID`, then a case-insensitive trimmed name match and both coordinates within 0.00001 degrees |
+
+A match returns the existing like with 200. Otherwise `CreateLikedLocation` inserts (null `categories` becomes an empty array). The `attach_yelo_place` trigger fills `yelo_place_id`. On success, `SocialChanged` notifies the user and their friends.
+
+`DELETE /user/likes/{id}` deletes only where both `id` and `user_id` match. Zero rows returns 404 **liked location not found**. Success also emits `SocialChanged`.
+
+There is no cap on likes.
+
+## Recent locations
+
+Recents are the user's explicit place selections. They are independent of ride history and community.
+
+### Sync validation
+
+`SyncRecentLocationsRequest.Validate` in `internal/server/http/user/requests/recent_locations.go`:
+
+| Field | Rule |
+| --- | --- |
+| `locations` | Required, not null, at most 50 (`models.RecentLocationsLimit`). An empty array just returns the current list |
+| `yelo_place_id` | Optional. Must be a non-nil UUID when present |
+| `name` | Required, non-blank, at most 256 bytes, no NUL |
+| `address` | Required, non-blank, at most 1,024 bytes, no NUL |
+| `mapbox_id` | Optional, at most 512 bytes, no NUL. May be a Mapbox or Google ID |
+| `latitude`, `longitude` | Required pointers. -90 to 90 and -180 to 180. Zero is valid. NaN fails |
+| `last_selected_at` | After the Unix epoch and no more than 5 minutes past server time |
+| `categories` | At most 32, each non-blank and at most 64 bytes |
+
+### Normalization and the location key
+
+`UserService.SyncRecentLocations` in `internal/service/user/recent_locations.go` trims `name`, `address`, and `mapbox_id`, strips a `places/` prefix from `mapbox_id`, and truncates `last_selected_at` to microseconds in UTC. It then computes `location_key`:
+
+- With a provider ID: `place:{mapbox_id}`.
+- Without one: `coordinates:{lat},{lng}:{address}`. Each coordinate is rounded to 6 decimals (about 11 cm), negative zero becomes zero, and the address is lowercased with whitespace collapsed.
+
+Example: `latitude` 40.7218681, `longitude` -73.9902799, address `57  Stanton  St` gives `coordinates:40.721868,-73.990280:57 stanton st`. A later selection at 40.72186812 lands on the same key.
+
+### Merge and prune
+
+`sqlLocationRepository.SyncRecentLocations` runs one transaction:
+
+<Steps>
+  <Step title="Lock the user">
+    `LockRecentLocationsUser` selects the user `FOR NO KEY UPDATE` where `is_deleted = FALSE`. A deleted or missing user returns 404 **user not found**. The lock serializes concurrent devices and account deletion.
+  </Step>
+  <Step title="Upsert each selection">
+    `UpsertRecentLocation` conflicts on `(user_id, location_key)`. The update applies only when the incoming `last_selected_at` is at or after the stored one. Name, address, ID, and coordinates change only when strictly newer. Categories change when the new ones are known and either newer or replacing unknown stored categories.
+  </Step>
+  <Step title="Prune">
+    `PruneRecentLocations` deletes everything past the 50 newest by `last_selected_at DESC, location_key`.
+  </Step>
+  <Step title="Return">
+    `ListRecentLocations` reads the latest 50 inside the same transaction, resolving categories through `resolved_place_categories`.
+  </Step>
+</Steps>
+
+Replays are safe. A retry with the original timestamp is a no-op for content, and omitted locations are never deleted except by the prune. Success means the writes committed, even if a selection was immediately pruned.
+
+## Where this lives in code
+
+| Concern | File | Function or type |
+| --- | --- | --- |
+| Routes | `internal/server/http/user/user_routes.go` | `registerFriendRoutes`, `registerLikeRoutes`, `registerRecentLocationRoutes` |
+| Handlers | `internal/server/http/user/user_handler.go`, `recent_locations.go` | `MatchContacts`, `ConnectFriend`, `CreateLike`, `SyncRecentLocations` |
+| Request validation | `internal/server/http/user/requests/contacts.go`, `friends.go`, `liked_location.go`, `recent_locations.go` | `ContactMatchRequest`, `ConnectFriendRequest`, `CreateLikedLocationRequest`, `SyncRecentLocationsRequest` |
+| Contact matching | `internal/service/user/contacts.go` | `MatchContacts`, `normalizeContacts`, `hashPhone`, `contactUploadsPerHour` |
+| Contact storage | `internal/data/repository/user_contacts.go`, `queries/contacts.sql` | `ReplaceContacts`, `OwnersHolding`, `RecordMatchAttempt` |
+| Phone normalization | `internal/utilities/phone/phone.go` | `NormalizeWithRegion` |
+| Friends | `internal/service/user/friends.go`, `internal/data/repository/friendship.go`, `queries/account_utilities.sql` | `ConnectFriend`, `AddMutual`, `ListFriends`, `ListFriendsAmong` |
+| Likes | `internal/service/user/likes.go`, `internal/data/repository/liked_locations.go` | `CreateLike`, `findExistingLike`, `DeleteLikedLocation` |
+| Recents | `internal/service/user/recent_locations.go`, `internal/data/repository/recent_locations.go`, `queries/recent_locations.sql` | `recentLocationKey`, `UpsertRecentLocation`, `PruneRecentLocations` |
+| Change fan-out | `internal/service/mapchanges/mapchanges.go` | `SocialChanged` |
+| Models | `internal/models/friendship.go`, `contact_matching.go`, `recent_location.go` | `Friend`, `ContactMatchResult`, `ContactMatchAttempt`, `RecentLocation` |
+
+## Gotchas and edge cases
+
+- The client's `yelo_place_id` on a recent-location sync is validated but never stored. `ToModels` copies it, but `UpsertRecentLocation` has no such column parameter. The `attach_yelo_place` trigger derives the ID from name, coordinates, and `mapbox_id`.
+- Contact matching reads the caller's phone number from the 5-minute profile cache. Right after a phone change, mutual matching can hash the old number.
+- The self-number filter compares E.164 strings. If the caller's stored number is empty, no mutual edges are created at all (`linkMutualContacts` returns early), but the snapshot is still stored.
+- US numbers of the form `555XXXXXXX` bypass libphonenumber validation and normalize to `+1555...`, so test numbers can match each other.
+- `FriendsAmong` returns any existing friendship with a candidate. A friend added by invite code still appears in `matches` once you upload their number, even though the upload created nothing.
+- `GetAuthUserByReferralCode` doesn't exclude deleted users, and deletion doesn't clear `referral_code`. Redeeming a deleted user's code creates a friendship that `ListFriends` then hides.
+- Account soft-deletion leaves `UserContacts` hashes and `Friendships` rows in place. Only recents are cleared by trigger.
+- `findExistingLike` with the place catalog writes a `PlaceIdentities` row before deciding whether to insert. Two concurrent likes for the same place can both miss and insert duplicates, because `LikedLocations` has no unique constraint on `(user_id, yelo_place_id)`.
+- Like validation treats exactly 0 latitude or longitude as missing, while recents accept zero.
+- Recents with equal `last_selected_at` keep the stored snapshot. Only strictly newer selections change name, address, or coordinates.

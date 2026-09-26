@@ -1,0 +1,160 @@
+---
+title: "Map rendering"
+description: "How the rider app and dashboard draw maps: Mapbox styles, staged layer mounting, layer order, polling cadence, vehicle animation, offline cache warming, and the dashboard's Mapbox GL layers and drawing tools."
+---
+
+Both clients use Mapbox. The rider app uses `@rnmapbox/maps` with two custom Studio styles. The dashboard uses `mapbox-gl` with the stock Mapbox light and dark styles. This page covers how each client mounts layers, how often it refreshes them, and the tuning constants that affect what users see.
+
+For the server payloads behind these layers, see [Map layers and mobility feeds](/engineering/location/map-layers-and-mobility).
+
+## Tokens and styles
+
+| Client | Token | Styles |
+| --- | --- | --- |
+| Rider app | A public `pk.` token set once in `lib/map/mapbox.ts` (`MapboxGL.setAccessToken`) | `YELO_MAP_STYLE_URL` for the home map, ride and drive screens, and route previews. `LEGACY_MAP_STYLE_URL` for `LocationMap`, the community switch screen, and `RideDetailsModal` |
+| Dashboard | `VITE_MAPBOX_API_KEY`, read in `src/components/communitymap/useMapboxMap.ts`, `RidesExplorerMap.tsx`, and `src/sites/event/lib/staticMap.ts` | `mapboxStyleForTheme` in `src/lib/mapbox-theme.ts`: `mapbox/light-v11` or `mapbox/dark-v11`. `PresenceMap` and `ZoneEditor` are fixed to `light-v11` |
+
+Without `VITE_MAPBOX_API_KEY`, the dashboard map components skip creating a map. `PresenceMap` and `CommunityBoundingBoxPicker` show a "Mapbox token is missing" style placeholder, and the **Map** page checks `HAS_MAPBOX_TOKEN`.
+
+## Rider app basemap
+
+`CustomMapView` (`components/map/CustomMapView.tsx`) renders the main map. It configures the style's `basemap` import:
+
+| Config | Value |
+| --- | --- |
+| `lightPreset` | `night` in dark mode, else `day` |
+| `showPlaceLabels`, `showRoadLabels` | `true` |
+| `showTransitLabels` | `false` |
+| `showPointOfInterestLabels`, 3D objects, buildings, trees, landmarks, facades | Only after the style enhancements stage |
+
+Mapbox attribution, the logo, and the scale bar are hidden. All gestures are disabled while `mapInteractionsEnabled` is false.
+
+### Camera and frame rate
+
+`components/map/customMapView/constants.ts`:
+
+| Constant | Value | Purpose |
+| --- | --- | --- |
+| `DEFAULT_ZOOM` | 17 | Resting zoom for ride and drive screens. The map tab passes a wider initial zoom |
+| `MIN_USER_FOCUS_ZOOM` | 13 | Zoom to restore when the map started at a broad location fallback |
+| `TILT_PITCH`, `MAX_PITCH` | 25°, 60° | Default tilt and gesture cap |
+| `MAP_FPS_HIGH`, `MAP_FPS_IDLE` | 60, 20 | Frame-rate ladder while interacting and idle |
+| `FPS_IDLE_DELAY_MS` | 1,100 | Drop to idle this long after the last activity |
+| `CAMERA_FRAME_EPS_DEG`, `_ZOOM`, `_ANGLE` | 1e-5 degrees, 1e-3, 0.01 | Camera changes smaller than this are treated as render jitter and not forwarded |
+
+### Staged mounting
+
+`useMapStageProgression` (`components/map/layout/useMapStageProgression.ts`) delays heavy work until the basemap has painted. Each stage advances in an idle callback after `MAP_STAGE_DELAYS_MS = [350, 250, 250]`:
+
+| Stage | Unlocks |
+| --- | --- |
+| 1, details | Style enhancements: POI labels and 3D |
+| 2, sprites | POI pin images and the data layers in `MapDataLayers` |
+| 3, overlays | The community bounding box outline, then offline cache warming |
+
+### Data layer order
+
+`MapDataLayers` (`components/map/layout/MapDataLayers.tsx`) mounts these once sprites are ready and no route request is active, from bottom to top:
+
+1. `CommunityHeatLayer`: a native heatmap from `/map/community`.
+2. `CommunityPoisLayer`: community POI pins.
+3. `PinnedMarkersLayer`: the user's pinned spots.
+4. `FeaturedSpotAuraLayer`: the glow around the featured spot.
+5. `CommunityMovesLayer`: "heading to" dots.
+6. `VehiclesLayer`: Yelo and third-party vehicles.
+
+Zone outlines are drawn separately in the `top` slot, and the `community-zone-labels` layer is always mounted as an ordering anchor. See [Zones geometry](/engineering/location/zones-geometry#rendering).
+
+### Zoom thresholds
+
+| Constant | Value | Applies to |
+| --- | --- | --- |
+| `POI_DOT_MIN_ZOOM` | 9 | Vehicle dots and move dots appear |
+| `POI_ICON_MIN_ZOOM` | 11.5 | Vehicle icons replace dots |
+
+The heatmap fades out as you zoom in. Opacity interpolates from 0.55 at zoom 10 to 0.35 at zoom 15 and 0 at zoom 16.5. Radius grows from 18 px to 40 px between zoom 10 and 16. Weight maps cell counts of 3, 10, 20, and 40 users to 0.2, 0.5, 0.75, and 1.
+
+## Polling cadence
+
+| Data | Interval | Source |
+| --- | --- | --- |
+| `/map/vehicles` | 60 seconds | `VEHICLES_LAYER_POLL_MS` in `lib/map/mapLayers.ts` |
+| `/map/friends` | 60 seconds | `FRIENDS_LAYER_POLL_MS` |
+| `/map/community` | Stale after 5 minutes | `COMMUNITY_LAYER_STALE_MS` |
+| Community POIs | 5 minutes, stale after 30 minutes | `components/map/poi/queryConfig.ts` |
+| Community zones | 5 minutes while a live map is visible | `providers/QueryPollers.tsx` |
+| Ride map details | 3 seconds for riders during an active ride | `providers/RideProvider.tsx` |
+
+Layer query keys append the community ID (and user ID for friends), so switching community never replays the previous community's cached layer. POIs, friends, and likes are also invalidated on map entry (`refreshMapContent`) and by `map_content_changed` pushes. Pollers pause in the background.
+
+## Vehicle animation
+
+`VehiclesLayer` (`components/map/VehiclesLayer.tsx`) and `lib/map/vehicleMotion.ts`:
+
+- Yelo vehicles are golden (`#F5C518`). GBFS and GTFS vehicles are blue (`#4A90D9`).
+- On each poll, `partitionVehicleUpdates` tweens a vehicle from its previous position over 2 seconds (`VEHICLE_MOVE_DURATION_MS`) when it moved at least 1 screen pixel and either endpoint is visible.
+- At most 30 vehicles animate per update (`MAX_ANIMATED_VEHICLES`). The selected vehicle is always first in line. The rest jump.
+- The selected vehicle is drawn at 2.2× scale. Each marker has a 44 × 44 point hit box.
+
+## Offline cache warming
+
+`warmMapCacheSafely` (`components/map/mapCacheWarm.ts`) runs 8 seconds (`MAP_CACHE_WARM_DELAY_MS`) after the overlays stage:
+
+- Only on Wi-Fi or Ethernet (`shouldWarmMapCache`).
+- It downloads an offline pack named `map-community-{communityId}-v1`: the current center ± 0.04°, clipped to the community box, for zooms 10 to 14.
+- An existing pack whose stored center is within 0.02° on both axes is reused, and resumed if incomplete. Otherwise it is deleted and replaced.
+
+## Ride and route maps
+
+`RouteMap` (`components/map/RouteMap.tsx`) draws previews with a `lineSource` and `lineLayer`, plus `pickup-marker` and `dropoff-marker`. `RoutePulseLayer` animates a gradient along the active route line. During a ride, `RideProvider` sets pickup, drop-off, route, and driver markers on `CustomMapView`. See [Driver location tracking](/engineering/location/driver-location-tracking#rendering-on-the-rider-app).
+
+## Dashboard maps
+
+| Component | Used on | Notes |
+| --- | --- | --- |
+| `useMapboxMap` | **Map** page and pricing zone map | One long-lived map per page. Community switches call `fitBounds` with 40 px padding and a 250 ms animation instead of recreating the map. A theme change calls `setStyle` and waits for `style.load` before layers re-add |
+| `communitymap/use*Layer.ts` | **Map** page | One hook per layer: zones, locations, bounding box, users, ride destinations, historical ride routes, community content, and mobility |
+| `ZoneEditor`, `useZonesLayer` | Zones | `@mapbox/mapbox-gl-draw` with only the polygon and trash controls |
+| `CommunityBoundingBoxPicker` | **Communities** editor | Draw mode disables drag-pan and lets you drag out the service-area rectangle |
+| `PresenceMap` | **Supply & Demand**, **Presence** tab | `light-v11`. The page polls every 10 seconds |
+| `RidesExplorerMap` | Rides explorer | Themed style |
+
+On the **Map** page, the mobility layer refetches every 60 seconds only while it's toggled on (`CommunityMapPage.tsx`). The Mapbox child-layer hooks check `isMapRemoved(map)` in cleanup because React can run child effects after the parent has destroyed the map.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Token and style URLs | `yelo-frontend/lib/map/mapbox.ts` |
+| Main map | `yelo-frontend/components/map/CustomMapView.tsx`, `customMapView/constants.ts` |
+| Stages and layer composition | `yelo-frontend/components/map/layout/useMapStageProgression.ts`, `MapDataLayers.tsx`, `constants.ts` |
+| Layers | `yelo-frontend/components/map/VehiclesLayer.tsx`, `CommunityHeatLayer.tsx`, `CommunityMovesLayer.tsx`, `CommunityZonesLayer.tsx`, `poi/CommunityPoisLayer.tsx` |
+| Layer polling and view models | `yelo-frontend/lib/map/mapLayers.ts`, `lib/map/cacheFreshness.ts`, `components/map/poi/queryConfig.ts` |
+| Vehicle motion | `yelo-frontend/lib/map/vehicleMotion.ts` |
+| Offline cache | `yelo-frontend/components/map/mapCacheWarm.ts` |
+| Dashboard map hook and theme | `yelo-web/src/components/communitymap/useMapboxMap.ts`, `src/lib/mapbox-theme.ts` |
+| Dashboard layers | `yelo-web/src/components/communitymap/`, `src/components/ZoneEditor.tsx`, `PresenceMap.tsx`, `CommunityBoundingBoxPicker.tsx` |
+| Dashboard map page | `yelo-web/src/sites/dashboard/pages/CommunityMapPage.tsx` |
+
+## Gotchas and edge cases
+
+<AccordionGroup>
+  <Accordion title="Two app styles drift independently">
+    The legacy style still backs the community switch screen, ride details, and `LocationMap`. Studio edits to the main Yelo style don't reach those screens.
+  </Accordion>
+  <Accordion title="Data layers hide during route requests">
+    `MapDataLayers` unmounts every data layer while `requestRouteActive` is true. Vehicles, POIs, and the heatmap disappear during stop selection and return afterward.
+  </Accordion>
+  <Accordion title="Polling faster doesn't help">
+    The server caches vehicles for 60 seconds and the community layer for 300 seconds. The client cadences match those TTLs on purpose. Shorter intervals only re-read the same Redis entry.
+  </Accordion>
+  <Accordion title="Large feeds jump instead of glide">
+    Only 30 vehicles tween per update. In a community with a large bike-share feed, most markers jump to their new positions.
+  </Accordion>
+  <Accordion title="Presence map ignores dark mode">
+    `PresenceMap` and `ZoneEditor` hard-code `light-v11`, while the **Map** page follows the dashboard theme.
+  </Accordion>
+  <Accordion title="One offline pack per community">
+    The pack name only includes the community ID. When the map center is more than 0.02° from the pack's stored center on either axis, the old pack is deleted and a new one downloads. A user who moves around a large community on Wi-Fi keeps re-downloading packs, and never has more than one area cached.
+  </Accordion>
+</AccordionGroup>

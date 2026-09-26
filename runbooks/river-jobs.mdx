@@ -1,0 +1,107 @@
+---
+title: "River job failures"
+description: "Find failed, stuck, and missing River jobs, decide whether to retry or cancel them, and confirm periodic work is running again"
+---
+
+River is the Postgres-backed job queue inside the API process. It runs notifications, Stripe reconciliation, contact sync, calendar sync, top locations, and more. See [Background jobs](/engineering/api/background-jobs#river-jobs) for every kind, and [Jobs](/dashboard/jobs) for the River UI.
+
+<Note>
+The in-process tickers (ride expiry, offline drivers, tip capture, scheduled broadcasts) aren't River jobs and don't appear in River UI. Their failures only show in logs. See [In-process ticker loops](/engineering/api/background-jobs#in-process-ticker-loops).
+</Note>
+
+## Symptoms
+
+- Pushes stop, or arrive late.
+- Contact sync, calendar hours, top locations, or Stripe status stop updating.
+- River UI shows many `retryable` or `discarded` jobs of one kind.
+- A recurring kind stops appearing.
+
+## Diagnose
+
+<Steps>
+  <Step title="Open River UI">
+    In the dashboard, expand **Administration** and click **Jobs**. Filter by state and kind. Open a job to see its arguments, attempts, and the error from each attempt.
+  </Step>
+  <Step title="Summarize by kind">
+    **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT kind, state, count(*) AS jobs, max(created_at) AS newest
+    FROM river_job
+    WHERE created_at > now() - interval '24 hours'
+    GROUP BY kind, state
+    ORDER BY kind, state;
+
+    -- Latest error on recently discarded or retrying jobs
+    SELECT id, kind, queue, state, attempt, max_attempts, scheduled_at,
+           errors[array_length(errors, 1)] ->> 'error' AS last_error
+    FROM river_job
+    WHERE state IN ('discarded', 'retryable')
+    ORDER BY scheduled_at DESC
+    LIMIT 50;
+
+    ROLLBACK;
+    ```
+
+    `args` can contain user IDs and notification variables. Select it only for the job you're investigating. River deletes finalized jobs after a retention period, so old completed rows are missing on purpose.
+  </Step>
+  <Step title="Check periodic jobs">
+    Periodic kinds insert a new job every interval, and River's leader election keeps one instance doing it. If a kind in the [recurring jobs table](/dashboard/jobs#recurring-jobs) has no job newer than a few intervals, the leader isn't enqueuing it. Check that the kind's feature is configured: some periodic jobs are skipped when their service isn't set up, such as contact sync or Google Play release checks.
+  </Step>
+  <Step title="Check the process">
+    River runs inside every API instance with its own pool of 12 connections. Look in Cloud Logging for River errors, pool exhaustion warnings, and restarts. River logs job failures at info level through the API logger. In E2E mode (`E2E_ENABLED=true`, `E2E_BACKGROUND_JOBS_ENABLED=false`), River workers and River UI don't run at all.
+  </Step>
+</Steps>
+
+### State reference
+
+| State | Meaning |
+| --- | --- |
+| `available` | Ready to run. |
+| `scheduled` | Waiting for `scheduled_at`, including snoozed jobs. |
+| `running` | Claimed by a worker. |
+| `retryable` | Failed and waiting for backoff. |
+| `pending` | Reserved by River for upcoming functionality. |
+| `completed` | Done. |
+| `cancelled` | Canceled by an operator or by code, such as stale notification jobs. |
+| `discarded` | Used up `max_attempts`. |
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Fix the cause, then retry">
+    Most failures are a provider or configuration problem: Stripe, Expo, Resend, Quo, Google, or a missing credential. Fix that first. Then open a `discarded` job in River UI and retry it.
+
+    | Kind | Safe to retry? |
+    | --- | --- |
+    | `stripe_reconcile_account`, `stripe_drive_fee_repair` | Yes. Both re-read Stripe and write idempotently. |
+    | `notify_send` | Yes. Delivery rows are unique per notification and user. |
+    | `notify_orchestrate` for a time-sensitive code | No. Anything older than 15 minutes is rejected. |
+    | `contact_sync_user`, `quo_sync_user`, `calendar_sync`, `top_locations_refresh` | Yes. They sync the current state. |
+
+    <Warning>
+    River UI actions change production immediately. A retry repeats the job's side effects. Read the job's arguments before retrying anything that isn't listed here.
+    </Warning>
+  </Accordion>
+  <Accordion title="Option 2: Cancel or delete">
+    Cancel jobs that would do harm if they ran late, such as a pile of old notification jobs after an outage. Cancel the individual jobs in River UI. At startup, the API already cancels time-sensitive `notify_orchestrate` jobs that are older than 15 minutes (`CancelStaleOrchestrationJobs`).
+  </Accordion>
+  <Accordion title="Option 3: Periodic work stopped">
+    Periodic jobs use `RunOnStart: true`, so a new API revision or instance enqueues them again. If a kind stays missing after a fresh revision starts, the job is disabled by configuration. For example, `STRIPE_RECONCILIATION_ENABLED=false` stops `stripe_reconciliation_dispatch`. See [Disabling background work](/engineering/api/background-jobs#disabling-background-work).
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- The summary query shows new `completed` jobs of the kind and no new `discarded` ones.
+- Downstream effects resume: deliveries reach `sent`, `StripeReconciliation.last_succeeded_at` advances, and contact sync progress moves on **Contact sync**.
+
+## Root causes seen in code
+
+- **Provider failures and circuit breakers.** Jobs that call an open breaker fail fast and back off.
+- **Exponential backoff after outages.** Without `CancelStaleOrchestrationJobs`, high-attempt notification jobs could stay retryable for days and deliver stale alerts.
+- **Integration cooldowns.** Stripe reconciliation sets a shared cooldown after rate limits and snoozes jobs.
+- **Configuration gates.** Contact sync queues only run on replicas that have credentials for that destination, and several periodic jobs return nothing when their service isn't configured.
+- **Connection pressure.** The River pool is capped at 12 connections per instance. Long jobs can starve other jobs on that instance.
