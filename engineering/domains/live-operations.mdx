@@ -104,6 +104,8 @@ The page also reads these endpoints outside `/dashboard/live`:
 | GET | `/dashboard/rides?status=<filter>&recent_only=true&limit=50&offset=` | **Completed · 24h**, **Cancelled · 24h**, **All rides · 24h** | `recent_only` restricts to `request_time` in the last 24 hours |
 | GET | `/dashboard/communities/{id}/locations/user-coords` | Last-known user locations and rider fallback positions | Admin-only in the handler |
 | GET | `/dashboard/communities/{id}/zones` | Zone polygons on the map | |
+| GET | `/dashboard/driver-ops/drivers/{id}` | Driver operations sheet: dispatch queue, active ride, Stripe balances | See [Driver operations detail](#driver-operations-detail) |
+| GET | `/dashboard/users/detail/{id}` | Driver operations sheet: profile, drive history, cancellations, awaiting-rating earnings | See [Dashboard directory and scope](/engineering/domains/dashboard-directory-and-scope#user-detail-and-edits) |
 | GET | `/dashboard/pricing/overview` | Pricing config table and **Avg 3 mi** quotes | |
 | GET | `/dashboard/communities` | Market navigation catalog | `is_active && !rides_disabled` |
 
@@ -133,7 +135,7 @@ The page also reads these endpoints outside `/dashboard/live`:
 
 ### `MarketDriver` shape
 
-`id`, `first_name`, `last_name`, `phone`, `photo_url`, `latitude`, `longitude`, `fleet_name`, `vehicle_type`, `tags`, `rides_today`, `is_online`, `status` (`online`, `warm`, `offline`), `last_heartbeat`, `session_end_time`, and `decline_reasons` (`{ ride_id, reason, created_at }[]`). `decline_reasons` is always an array, never `null`.
+`id`, `first_name`, `last_name`, `phone`, `photo_url`, `latitude`, `longitude`, `location_updated_at`, `fleet_name`, `vehicle_type`, `tags`, `rides_today`, `is_online`, `status` (`online`, `warm`, `offline`), `last_heartbeat`, `session_start_time`, `session_end_time`, and `decline_reasons` (`{ ride_id, reason, created_at }[]`). `decline_reasons` is always an array, never `null`. `location_updated_at` is when the stored `Users` coordinates were last written. `session_start_time` is the latest session's start, or the Unix epoch when the driver has no session. The web treats anything before 2020 as unavailable.
 
 ## Market cards
 
@@ -242,7 +244,41 @@ The service enriches each row from Redis:
 4. `decline_reasons` are `RideDeclineReasons` rows since today's start.
 5. Rows sort online, warm, offline, then `rides_today` descending, then last active.
 
-`LiveTables` (`src/components/live/LiveTables.tsx`) derives the displayed status. A driver with an uncanceled ride in `queued`, `driver_en_route`, `driver_waiting`, or `in_progress` in the live rides list is **On trip**. Otherwise `online` is **Idle**, `warm` is **Recently active**, and `offline` is **Offline**. `LivePage` filters the table to drivers whose map position is inside the market plus 10 km, or who have no usable coordinates.
+`driverStatus` (`src/components/live/driverStatus.ts`) derives the displayed status. A driver with an uncanceled ride in `queued`, `driver_en_route`, `driver_waiting`, or `in_progress` in the live rides list is **Driving**. Otherwise `online` is **Idle**, and `warm` and `offline` are both **Offline**.
+
+`LivePage` filters the table with `driverInPeriod`: online drivers always pass, and other drivers pass when their last activity falls inside the **Performance** period. Last activity is the later of `last_heartbeat` and `session_end_time`. **All time** applies no activity limit. The table also keeps only drivers whose map position is inside the market plus 10 km, or who have no usable coordinates.
+
+`LiveTables` defaults to the **Online** filter. `inOnlineView` keeps **Driving** and **Idle** drivers plus drivers whose last activity was within 4 hours. **Offline** shows only the **Offline** status, and **All** shows every row.
+
+### Driver operations detail
+
+`GET /dashboard/driver-ops/drivers/{id}` (operation ID `dashboard.GetDriverOpsDetail`, OpenAPI tag **Dashboard Driver Ops**) returns one driver's live operations context. It's admin-only: the handler calls `requireAdmin` and returns 403 for other roles. A non-UUID `{id}` returns a validation error.
+
+```bash
+curl "$API_BASE_URL/dashboard/driver-ops/drivers/<driver_id>" \
+  -H "Authorization: Bearer <clerk_session_token>"
+```
+
+`DriverOpsService.GetDriverSnapshot` loads the user, runs `GetMarketDrivers` for the user's community, and finds the driver in that list. A driver who isn't in the market list returns 404 **Driver is not available in this market**. Unlike the fleet-wide `/dashboard/driver-ops` snapshot, which only reads queue and payout context for online drivers, this endpoint reads it for every status:
+
+| Field | Source |
+| --- | --- |
+| `status`, `rides_today`, `decline_reasons`, `last_heartbeat`, `tags`, `fleet_name`, `vehicle_type` | The `MarketDriver` row |
+| `aq_on` | Auto-queue flag in the presence cache |
+| `active_ride` | `{ status, since }` for the driver's current ride |
+| `queue` | `QueueDetailRide[]` in dispatch order, always an array |
+| `earnings` | Stripe `{ available_cents, pending_cents }`, or `null` |
+| `payout` | `{ uptime_start, uptime_seconds, amount_owed_cents }`, or `null` when the auto-queue log isn't available |
+
+`LiveDriverSheet` (`src/components/live/LiveDriverSheet.tsx`) opens from the **Recent activity** cell. It combines three queries:
+
+| Query | Endpoint | Interval |
+| --- | --- | --- |
+| Operations | `/dashboard/driver-ops/drivers/{id}` | 15 s |
+| Notifications | Driver notification log, 20 at a time, up to 100 | 15 s |
+| User detail | `/dashboard/users/detail/{id}` | 30 s |
+
+The sheet reuses the user-detail sections (`SectionToggle` from `UserDetailSection.tsx`, fleet memberships, driver application, and Quo) instead of duplicating them. The **Earnings** row shows `awaiting_rating_earnings` from user detail next to the Stripe balances from `earnings`. `awaiting_rating_earnings` is already in dollars. It sums `driver_payout` for uncanceled `pending_rider_rating` rides and isn't a Stripe balance. When a refresh fails after data has loaded, the sheet keeps the previous data instead of showing an error.
 
 ### Map layers
 
@@ -257,6 +293,10 @@ The service enriches each row from Redis:
 
 `hasCoordinates` rejects non-finite values, out-of-range values, and `0,0`. `isNearMarket` applies the same 10 km bounding-box padding as the API's `nearLiveMarket`.
 
+Driver markers also pass `driverInMapPeriod`. It's `driverInPeriod` with `all` replaced by `30d`, so **All time** doesn't turn the map into a history of every driver location. Online drivers always pass. The layer panel legend states the active limit.
+
+Each marker carries an observed timestamp for its popup (`locationPopup.ts`): `last_seen` on `/presence/map` markers (from `presence:{id}.ts`), and `location_updated_at` on `MarketDriver` rows and `user-coords` entries. The popup shows **Live presence location** or **Last known location**, the relative and absolute time, or **Location timestamp unavailable**.
+
 `LiveMap` (`src/components/live/LiveMap.tsx`) renders:
 
 | Layer toggle | Rendering | Data |
@@ -270,6 +310,8 @@ The service enriches each row from Redis:
 | **Zones** | `useZonesLayer`, read-only | `/communities/{id}/zones` |
 
 Routes are the stored quoted paths from `include_routes`, at most 256 coordinates per ride. They are not GPS traces. The map refits when the content bounds change or a point falls outside the view, with 60 px padding and a max zoom of 15. With no content it centers on the market bounds at zoom 12.
+
+Auto-fit stops once the user moves, zooms, or rotates the map. `LiveMap` sets a `manualCamera` flag on user-originated `movestart`, `zoomstart`, and `rotatestart` events, and clears it when the market changes or the locate button bumps `fitVersion`. The map also enables Mapbox cooperative gestures, so scroll-to-zoom needs a modifier key.
 
 `useUserCoords` is enabled only when **Last known users** is on, when a presence marker lacks coordinates, or when there is at least one live ride.
 
@@ -342,6 +384,7 @@ Queries use TanStack Query. `useLiveData` (`src/components/live/useLiveData.ts`)
 | Pricing overview | generated | 60 s | Always |
 | Competitor quotes | `['live','competitor-prices',{community_id,period}]` | 5 min | Always |
 | User coordinates | `['dashboard-user-coords',id]` | 10 s | See [Map layers](#map-layers) |
+| Driver operations | generated | 15 s | The driver sheet is open |
 
 Other client behavior:
 
@@ -385,7 +428,9 @@ The web app has no Live-specific environment variables. The map needs the dashbo
 | Models | `yelo-api` | `internal/models/live.go`, `supply_demand.go` | `LiveAnalytics`, `MarketSummary`, `MarketDriver`, `SetSurgeRequest` |
 | Ride list filters | `yelo-api` | `internal/data/repository/queries/analytics.sql`, `internal/server/http/dashboard/rides/` | `ListDashboardRides` `live` and `recent_only` |
 | Page | `yelo-web` | `src/sites/dashboard/pages/LivePage.tsx` | `LivePage` |
-| Components | `yelo-web` | `src/components/live/` | `LiveMap`, `LiveTables`, `LivePricing`, `SurgeSlider`, `RideFunnel`, `LiveOperatingHours` |
+| Components | `yelo-web` | `src/components/live/` | `LiveMap`, `LiveTables`, `LiveDriverSheet`, `LivePricing`, `SurgeSlider`, `RideFunnel`, `LiveOperatingHours` |
+| Driver status and period filters | `yelo-web` | `src/components/live/driverStatus.ts` | `driverStatus`, `driverInPeriod`, `driverInMapPeriod`, `inOnlineView` |
+| Driver operations detail | `yelo-api` | `internal/server/http/dashboard/driver_ops/`, `internal/service/dashboard/driver_ops.go` | `getDriverSnapshot`, `GetDriverSnapshot` |
 | Data hooks | `yelo-web` | `src/components/live/useLiveData.ts`, `src/hooks/useLive.ts` | `liveDataOptions`, `useLiveMarkets`, `useLiveDrivers`, `useSetSurge` |
 | Marker merge | `yelo-web` | `src/components/live/liveMarkers.ts`, `useDriverPhotoMarkers.ts` | `liveMarkers`, `isNearMarket`, `hasCoordinates` |
 
