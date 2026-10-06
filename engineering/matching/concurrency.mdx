@@ -13,7 +13,7 @@ This page goes deeper than [Rides implementation](/engineering/api/rides-impleme
 | --- | --- | --- | --- |
 | 1 | `SELECT ... FOR UPDATE` on `Users` rows, sorted by UUID string | Every participant of the command | Every ride command, offline purge, expiry sweep |
 | 2 | `SELECT ... FOR UPDATE` on the `Rides` row | The target ride | Every ride command with a ride ID |
-| 3 | `pg_advisory_lock(key)` on a dedicated connection | Queue head preparation | `prepareAndPromoteQueuedRide` only |
+| 3 | `pg_advisory_lock(key)` on a dedicated connection | Manual accept, queue head preparation | `AcceptRide`, `prepareAndPromoteQueuedRide` |
 | 4 | Redis `SET NX` | Activation cooldowns, rescue alerts | Activation loop |
 
 Levels 1 and 2 are always taken in that order. The advisory lock is taken before any row locks, outside the transaction.
@@ -110,21 +110,30 @@ release := func() {
 }
 ```
 
-It exists so two preparers don't both call Mapbox and Stripe for the same queue head. It isn't a correctness lock. The guarded promotion rechecks everything under row locks, so a missing advisory lock would cost a duplicate authorization, not a double promotion.
+It has two users, both keyed on the ride ID:
 
-It holds a pool connection for the whole preparation, including network calls to Mapbox and Stripe. `RefreshQueueSummaries` runs up to 10 recoveries at once per instance, so it can hold up to 10 connections.
+- **Manual accept.** `AcceptRide` takes the lock after the driver availability checks and holds it for the rest of the accept, including the pickup route and Stripe authorization. A duplicate accept waits for the first one to finish instead of placing a second hold on the rider's card.
+- **Queue head preparation.** Two preparers don't both call Mapbox and Stripe for the same queue head.
+
+It isn't a correctness lock. The transactions recheck everything under row locks, so a missing advisory lock would cost a duplicate authorization, not a double assignment.
+
+It holds a pool connection for the whole accept or preparation, including network calls to Mapbox and Stripe. `RefreshQueueSummaries` runs up to 10 recoveries at once per instance, so it can hold up to 10 connections.
 
 ## Race scenarios
 
 <AccordionGroup>
   <Accordion title="Two drivers tap accept on the same ride">
-    Both pass the service checks, which read without locks. For a paid ride, both run `processRidePayment`:
+    Both pass the driver checks, which read without locks. Both then call `AcquireLock` on the ride's advisory lock:
 
-    1. Both see `payment_intent_id` null and create separate Stripe intents on their own merchants.
-    2. Both call `AddPaymentIntent` with the same expected revision. They serialize on the ride lock, both pass the revision check, and the second write overwrites the first.
-    3. Both call `Ride.Accept`. The first commits the assignment. The second sees `status = 'queued'` or `driver_en_route` and fails with "Ride request no longer valid".
+    1. The first accept takes the lock, reads the ride, authorizes payment, and commits the assignment in `Ride.Accept`.
+    2. The second waits on the lock. Once it gets the lock, it reads the ride, sees `status = 'queued'` or `driver_en_route`, and fails with "Ride request no longer valid".
 
-    The loser gets a 400. Their Stripe intent stays authorized and isn't cancelled by `AcceptRide`. If the loser wrote the intent last, the ride now references the loser's intent and merchant while the winner is assigned. `Complete` captures through the winner's merchant. Treat this as a suspected bug: the revision check in `AddPaymentIntent` doesn't catch it, because `AddPaymentIntent` doesn't bump the revision.
+    The loser gets a 400 before `processRidePayment` runs, so no second Stripe intent is created on the loser's merchant.
+  </Accordion>
+  <Accordion title="Driver retries an accept">
+    A driver's app can send the same accept twice, for example after a lost response or a double tap. The second request waits on the ride's advisory lock until the first finishes. It then reads the ride. If the ride is assigned to the calling driver and its status is `queued` or `driver_en_route`, `AcceptRide` returns success without doing anything else. It doesn't create another payment intent, change the assignment, or notify the rider again.
+
+    If `AddPaymentIntent` rejects the write because the ride's lifecycle revision moved on, `persistPaymentIntent` cancels the new Stripe intent and returns the lifecycle conflict to the driver. Before [#295](https://github.com/rideyelo/yelo-api/pull/295), this path returned a 500.
   </Accordion>
   <Accordion title="Manual accept races auto-queue">
     Both reach `acceptRide`. The ride row lock serializes them. The first to commit wins. If auto-queue loses, `assignWinner` logs "may have been claimed" and doesn't set the attempted flag. The ride is no longer unmatched, so it isn't retried. If the driver loses, they see "Ride request no longer valid".
@@ -167,7 +176,7 @@ It holds a pool connection for the whole preparation, including network calls to
 | Lock and discovery SQL | `yelo-api/internal/data/repository/queries/ride_command.sql` (`ListRideCommandParticipants`, `LockRideCommandParticipant`, `LockRideCommandState`) |
 | State validation | `ride_command.go` (`validateRideExpectation`, `validateRideDriverCommand`, `validateRideAssignmentDriver`, `validateRideAssignmentAdmission`) |
 | Revision finalizer | `yelo-api/internal/data/repository/ride_revision.go` |
-| Advisory lock | `yelo-api/internal/data/repository/ride.go` (`AcquireLock`), `queries/ride_driver.sql` |
+| Advisory lock | `yelo-api/internal/data/repository/ride.go` (`AcquireLock`), `queries/ride_driver.sql`, `internal/service/ride/driver.go` (`AcceptRide`) |
 | Revision compare-and-set | `yelo-api/internal/data/repository/ride_lifecycle.go` (`AddPaymentIntent`), `ride_matching.go` (`PromoteQueuedRide`) |
 | Operation journal | `yelo-api/internal/data/repository/ride_operation.go` |
 | Regression tests | `yelo-api/internal/data/repository/ride_command_regression_test.go`, `ride_assignment_admission_test.go`, `ride_transition_matrix_test.go`, `idle_auto_queue_test.go` |
@@ -175,7 +184,7 @@ It holds a pool connection for the whole preparation, including network calls to
 ## Gotchas and edge cases
 
 - **Admission failures surface as 500s.** `acceptRide` wraps `validateRideAssignmentAdmission` errors with `NewServerErrorFromError`. A fleet mismatch or a full queue detected under lock returns "Something Went Wrong" instead of a 400 conflict.
-- **Service-level reads are advisory.** `AcceptRide` reads the driver, session, and ride without locks. Every check is repeated in the transaction except payment, which runs between the reads and the transaction.
+- **Service-level reads are advisory.** `AcceptRide` reads the driver and session without locks, and reads the ride under the advisory lock only. Every check is repeated in the transaction except payment, which runs between the reads and the transaction.
 - **External calls happen outside transactions.** Mapbox and Stripe calls never run while row locks are held. They do run while the advisory lock is held.
 - **Four retries isn't much under churn.** A driver whose queue changes on every attempt, for example during a burst of auto-queue assignments, can see "This ride has changed" without any real conflict on the ride itself.
 - **Payment failure on a manual accept doesn't cancel the ride.** `clonePaymentMethodToMerchant` and `createPaymentIntent` call `RideService.Cancel` with the accepting driver as the request user. The driver isn't assigned yet, so `Cancel` returns "User is not authorized to cancel this ride" and the error is only logged. The ride stays `confirmed` on the board, despite the "ride canceled" wording in the cancel reason.
