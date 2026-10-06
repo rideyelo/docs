@@ -55,7 +55,7 @@ flowchart LR
 
 ### Freshness
 
-Time-sensitive codes stop retrying after 15 minutes (`orchestrateFreshness`), because a late "driver arrived" is worse than none. These include `ride_confirmed`, `driver_arrived`, `ride_canceled_by_*`, `ride_requeued`, `ride_available`, `unclaimed_ride*`, `ride_auto_queued`, `driver_renew_online`, `friend_bump`, and `dashboard_ping_*`. Payout, broadcast, and chat notifications never expire.
+Time-sensitive codes stop retrying after 15 minutes (`orchestrateFreshness`), because a late "driver arrived" is worse than none. These include `ride_confirmed`, `driver_arrived`, `ride_canceled_by_*`, `ride_requeued`, `ride_available`, `unclaimed_ride*`, `ride_auto_queued`, `driver_renew_online`, `friend_bump`, and `dashboard_ping_*`. Payout, broadcast, `friend_joined`, and chat notifications never expire.
 
 ## Notification codes
 
@@ -70,7 +70,7 @@ Codes are defined in `internal/notify/codes.go`. Each code has a seeded template
 | Silent refresh | `ride_status_changed`, `ride_state_changed`, `map_content_changed` |
 | Driver application | `driver_application_approved` |
 | Payouts | `payout_paid`, `payout_failed`, `payout_canceled` |
-| Friends | `friend_bump`, `friend_bump_sms` |
+| Friends | `friend_bump`, `friend_bump_sms`, `friend_joined` |
 | Operator | `community_broadcast`, `dashboard_send`, `dashboard_ping_driver`, `dashboard_ping_rider` |
 | Growth | `welcome_to_yelo`, `waitlist_cleared` (seeded, but no code emits them today) |
 
@@ -125,7 +125,7 @@ The API can also notify a whole market or ping one driver or rider. These emit `
 ## Limits, cooldowns, and quiet hours
 
 - **Cooldowns.** Templates can set per-user and per-community cooldowns. Seeded values include 900 seconds for `unclaimed_ride*` and 300 seconds for `friend_bump`. `ride_available`, `message_sent`, and the silent refresh codes always bypass cooldowns.
-- **Quiet hours.** Quiet hours apply only when a template uses `defer` and is either `marketing` or `community_broadcast`. Deferred deliveries send at the end of the community's quiet window. If that is later than `max_defer_seconds`, they are dropped as `quiet_hours_expired`.
+- **Quiet hours.** Quiet hours apply only when a template uses `defer` and is either `marketing` or `community_broadcast`. The seeded `marketing` templates are `community_broadcast` and `friend_joined`. Deferred deliveries send at the end of the community's quiet window. If that is later than `max_defer_seconds`, they are dropped as `quiet_hours_expired`.
 
 <Note>
   Quiet hours and per-community cooldown overrides come from the `NotificationPolicies` table. No dashboard page or API route edits that table today, so quiet hours are off unless a row is added directly.
@@ -138,6 +138,10 @@ A friend bump tells a friend where you are heading. `POST /notification/bump` se
 - **SMS first.** Each recipient who can receive SMS gets a text through a River job, with up to 3 attempts.
 - **Push fallback.** Recipients who can't receive SMS, or whose SMS fails for good, get the `friend_bump` push.
 - **Limits.** 20 bumps per sender per hour, one SMS per recipient every 5 minutes, and texts older than 15 minutes are dropped.
+
+## New friend pushes
+
+When a new friendship is created, Yelo sends the `friend_joined` push ("Alice is on Yelo 👋") to the other side of the friendship. It opens the map. This covers mutual contact matches, signup referrals, and accepted invite links. The user who acted never gets the push. `friend_joined` is a `marketing` template, so it waits for the end of quiet hours when the community has them configured.
 
 ## Internal Slack alerts
 
