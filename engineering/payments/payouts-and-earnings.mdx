@@ -1,6 +1,6 @@
 ---
 title: "Payouts and earnings internals"
-description: "How the /earnings API reads a driver's connected account, computes instant payout fees and eligibility, deduplicates cash-outs, changes payout schedules, enriches the activity feed with rides, and backfills Stripe fees onto rides."
+description: "How the /earnings API reads a driver's connected account, computes instant payout fees and eligibility, deduplicates cash-outs, changes payout schedules, enriches the activity feed with rides and pending rides, estimates Stripe fees, and backfills actual Stripe fees onto rides."
 ---
 
 The driver earnings hub reads live data from the driver's Stripe Express account. Yelo stores almost none of it. This page covers how each endpoint maps Stripe data, the fee and idempotency rules for instant payouts, and the background job that copies Stripe fees onto rides. The endpoint list is in [Tips and earnings](/concepts/tips-and-earnings#driver-earnings).
@@ -20,8 +20,10 @@ Only the driver's **own** account is read. Rides paid to a fleet account with cu
 
 | Endpoint | Stripe call | Mapping |
 | --- | --- | --- |
-| `GET /earnings/balance` | `Balance.Get` | `available`, `pending`, `instant_available` take the **first** entry of each Stripe array (`primaryAmount`). An empty array reads as 0 `usd` |
+| `GET /earnings/balance` | `Balance.Get` | `available`, `pending`, `instant_available` take the **first** entry of each Stripe array (`primaryAmount`). An empty array reads as 0 `usd`. `uncaptured` and `uncaptured_rides` come from Postgres, not Stripe |
 | `GET /earnings/external-account` | `Accounts.GetByID` | `pickDefaultExternalAccount` returns the first entry with `default_for_currency`, else the first bank or card. None returns 404 |
+
+`uncaptured` is the net earnings, in cents, of the driver's completed rides on this account whose fare is authorized but not captured (`ListDriverUncapturedRides`). `uncaptured_rides` is their count. Neither is part of Stripe's balance, and neither can be paid out, so clients label them as pending and estimated. A failed lookup is logged and reads as 0. See [Pending rides](/engineering/domains/driver-earnings-and-activity#pending-uncaptured-rides).
 
 `InstantEligible` on the external account is true when Stripe's `available_payout_methods` includes `instant`, for both bank accounts and debit cards.
 
@@ -105,7 +107,10 @@ The estimate ignores `delay_days`, holidays, and the time of day Stripe runs pay
     `buildActivityPage` groups rows by UTC date (`2006-01-02`) and sums `net` per day. It also computes a page-local week total and ride count.
   </Step>
   <Step title="Enrich">
-    `enrichActivityWithRides` collects PaymentIntent IDs and runs `GetRideEarningsByPaymentIntents`, matching `Rides.payment_intent_id`. Matched rows get `ride_id`, `rider_name`, `tip_amount` in cents, and `gross` from `driver_payout`. Lookup failures leave bare rows.
+    `enrichActivityWithRides` collects PaymentIntent IDs and runs `GetRideEarningsByPaymentIntents`, matching `Rides.payment_intent_id`. Matched rows get `ride_id`, `rider_name` (first name and last initial), `tip_amount` in cents, `gross` from `driver_payout`, and `earnings` from `ride_driver_earnings_cents`. Lookup failures leave bare rows.
+  </Step>
+  <Step title="Add pending rides">
+    On the first page only, `addPendingRides` adds one `pending: true` row per uncaptured ride, keyed `pending_{rideID}`, and re-sorts groups and rows newest first.
   </Step>
   <Step title="Replace the headline">
     On the first page only (`cursor` empty), `weeklySummary` replaces the page-local totals.
@@ -114,7 +119,7 @@ The estimate ignores `delay_days`, holidays, and the time of day Stripe runs pay
 
 ### Weekly headline
 
-`GetDriverWeekEarnings` sums `driver_payout` and counts rows where:
+`GetDriverWeekEarnings` sums net earnings (`ride_driver_earnings_cents`, gross less Stripe fees) and counts rows where:
 
 - `driver_id` is the driver,
 - `status` is `complete` or `pending_rider_rating`,
@@ -127,16 +132,45 @@ Canceled rides have `status = complete` too. A cancellation fee ride counts once
 
 `payout.paid`, `payout.failed`, and `payout.canceled` on a connected account send the driver a push through `NotifyPayout`, deduplicated by `{eventType}:{eventID}`. See [Stripe webhooks](/engineering/payments/webhooks).
 
+## Stripe fee estimates
+
+Driver earnings subtract Stripe's processing fee per charge. Until Stripe reports the actual fee, Yelo uses an estimate of 2.9% + 30¢ (`stripe_fee_estimate_cents`) on the authorized amount. A tips-enabled ride authorizes fare + $5.00, so its fare charge is estimated on that total.
+
+The payout writers snapshot the estimate when they write `driver_payout`:
+
+| Writer | Column | Estimated on |
+| --- | --- | --- |
+| `CompleteRideForRating`, `CompleteRideTip` | `estimated_stripe_fee_cents` | Fare, plus the $5.00 buffer when tips are enabled (`ride_fare_fee_estimate_cents`) |
+| `RecordCompletedRideTip` | `estimated_tip_stripe_fee_cents` | The dedicated tip charge alone |
+| Cancellation fee operation | `estimated_stripe_fee_cents` | The cancellation fee |
+
+`ride_driver_earnings_cents` prefers the actual fee, then the stored estimate, then a live estimate. The full formula is on [Driver earnings and activity](/engineering/domains/driver-earnings-and-activity#net-earnings-after-stripe-fees).
+
 ## Stripe fee backfill
 
-Drive history shows a per-ride Stripe fee from `Rides.stripe_fee_cents`. Two River jobs fill it from balance transactions:
+Drive history and every net earnings figure use the actual Stripe fee once it's known. Two River jobs fill `Rides.stripe_fee_cents` (fare charge) and `Rides.tip_stripe_fee_cents` (dedicated tip charge) from balance transactions:
 
 | Job | Schedule | Queue | Work |
 | --- | --- | --- | --- |
-| `stripe_drive_fee_scan` | Every 10 minutes, `RunOnStart`, unique by 9-minute period | `stripe`, 2 workers | `GetDriversWithMissingStripeFees`: up to 100 driver and merchant pairs with rides that have a `payment_intent_id`, no fee, and a due `stripe_fee_repair_after`. Enqueues one repair job per pair |
+| `stripe_drive_fee_scan` | Every 10 minutes, `RunOnStart`, unique by 9-minute period | `stripe`, 2 workers | `GetDriversWithMissingStripeFees`: up to 100 driver and merchant pairs with rides that have a `payment_intent_id` and no `stripe_fee_cents`, or a `tip_payment_intent_id` with `tip_amount > 0` and no `tip_stripe_fee_cents`, and a due `stripe_fee_repair_after`. Enqueues one repair job per pair |
 | `stripe_drive_fee_repair` | On demand | `stripe` | Pages balance transactions from `oldest missing request_time - 8 days`, 100 per page, up to 10 pages per run |
 
-Each repair page runs `PersistStripeFees`, which maps `source.charge.payment_intent` to `fee` and updates matching rides. Then:
+Each repair page runs `PersistStripeFees`, which maps `source.charge.payment_intent` to `fee`. It updates `stripe_fee_cents` on rides whose `payment_intent_id` matches, and `tip_stripe_fee_cents` on rides whose `tip_payment_intent_id` matches. For every charge where the actual fee differs from the stored estimate, the worker logs a warning with the message `Stripe fee differs from stored estimate` and these fields:
+
+```json
+{
+  "event": "stripe_fee_estimate_mismatch",
+  "ride_id": "8c1f0f6e-...",
+  "payment_intent_id": "pi_...",
+  "stripe_merchant_id": "acct_...",
+  "tip_charge": false,
+  "estimated_fee_cents": 79,
+  "actual_fee_cents": 80,
+  "difference_cents": 1
+}
+```
+
+The actual fee is already stored and wins. A steady stream of these warnings means `stripe_fee_estimate_cents` needs its rate or rounding adjusted in a new migration. Then:
 
 - No rides left missing: done.
 - Stripe has no more pages: `DeferMissingStripeFeeRepair` sets `stripe_fee_repair_after = now + 24h` for the rest.
@@ -160,8 +194,9 @@ Jobs are unique by merchant, driver, and cursor across active states (`activeJob
 ## Gotchas and edge cases
 
 - **Headline versus balance.** The weekly headline counts every ride the driver drove, including rides paid to a fleet account. The balance and activity only show the driver's own account.
-- **Overwritten tips.** The headline sums `driver_payout`, which the fare webhook can reset after an over-buffer tip. See [Ride tip charging](/engineering/payments/ride-tips#races).
-- **Dedicated tip charges.** Tip PaymentIntents aren't in `payment_intent_id`, so their activity rows aren't enriched and their fees never land in `stripe_fee_cents`.
+- **Overwritten tips.** The headline is computed from `driver_payout`, which the fare webhook can reset after an over-buffer tip. See [Ride tip charging](/engineering/payments/ride-tips#races).
+- **Dedicated tip charges.** Tip PaymentIntents aren't in `payment_intent_id`, so their activity rows aren't enriched. Their fees land in `tip_stripe_fee_cents`, not `stripe_fee_cents`.
+- **Pending isn't payable.** `uncaptured` is an estimate from Postgres. The next payout and instant cash-out read only Stripe's buckets.
 - **Never-resolving rides.** Rides whose hold was canceled have a `payment_intent_id` but no charge, so the fee backfill can't resolve them. They're deferred and rescanned every 24 hours indefinitely.
 - **Multi-currency.** `primaryAmount` takes the first currency entry. A connected account holding a second currency would show only one.
 - **Cached errors.** Stripe replays the first response for a reused idempotency key, including an error. A failed cash-out retried within the same minute returns the same failure.

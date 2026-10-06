@@ -1,6 +1,6 @@
 ---
 title: "Migrations log"
-description: "Every yelo-api SQL migration from 000001 to 000347, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
+description: "Every yelo-api SQL migration from 000001 to 000352, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
 ---
 
 This page indexes every file in `yelo-api/migrations/`. Use it to find when a table or column appeared, which pull request shipped it, and which migrations rewrote or removed data. For the current shape of each table, see the [database reference](/reference/database/overview). For how migrations run in production, see [Deployment](/engineering/deployment) and [Failed migration](/runbooks/failed-migration).
@@ -25,6 +25,7 @@ This page indexes every file in `yelo-api/migrations/`. Use it to find when a ta
 | [Zones, social, and durable notifications](#zones-social-and-durable-notifications-summer-2026) | 000216 to 000253 | 2026-06 to 2026-07 | Zones and zone pricing, friendships and contacts, notification templates and deliveries, River. |
 | [Auth v3 and hardening](#auth-v3-and-hardening-august-2026) | 000254 to 000299 | 2026-08 to 2026-09 | Auth v3 storage and sessions, phone normalization, bumps and SMS consent, map layers, education verification, history indexes, Quo outbox, E2E runs. |
 | [Durable domain systems](#durable-domain-systems-september-2026) | 000300 to 000347 | 2026-09 | Durable messaging, school mapping, Stripe reconciliation, driver leads, recents, calendars, contact sync, place identity, fleet-owned vehicles, ride state protocol, canonical top locations. |
+| [Driver net earnings](#driver-net-earnings-october-2026) | 000348 to 000352 | 2026-10 | Stripe fee estimates and net driver earnings, dedicated tip charge fees, share link state. |
 
 ## Migrations by domain
 
@@ -34,7 +35,7 @@ Use this map to jump to the migrations that shaped a domain.
 | --- | --- |
 | Rides and lifecycle | 001, 006, 019, 033, 098, 107, 108, 162, 183, 186, 191, 288, 289, 298, 338 to 340 |
 | Pricing | 012, 077, 147, 159, 163, 166, 187, 196, 198, 199, 209, 210, 224, 225, 297, 311, 324, 325 |
-| Payments and tips | 017, 023, 024, 048 to 050, 173, 203 to 205, 207, 219, 236, 251, 287, 290, 291, 304 |
+| Payments and tips | 017, 023, 024, 048 to 050, 173, 203 to 205, 207, 219, 236, 251, 287, 290, 291, 304, 348 to 350, 352 |
 | Identity and auth | 001, 013, 014, 036, 054, 090, 114, 115, 254 to 258, 261 to 263, 266, 267, 280, 284, 294 |
 | Drivers and applications | 030, 109, 116, 117, 126, 135, 184, 222, 232, 233, 282, 306 |
 | Fleets and vehicles | 025, 035, 082, 083, 157 to 160, 168, 170, 177, 200, 208, 231, 299, 316, 321, 333 to 335, 343, 344, 346 |
@@ -86,7 +87,7 @@ These migrations rewrite existing rows. Rehearse a new backfill on a representat
 - **Messaging and notifications**: 190 (Quo contact ID), 195 (duplicate push tokens), 249 and 250 (notification receipts and policies), 286 (push tokens from telemetry), 300 (message ordinals and streams).
 - **Schools and communities**: 230 (test community), 301 and 307 (school community remapping), 315 (timezone history and cache invalidations), 336 (synthetic E2E schools).
 - **Sync seeds**: 332 enqueues a contact sync request for every nondeleted, nontest user. The contact sync workers make the provider calls later. The Quo and contact sync triggers in 292, 308, and 323 only enqueue future changes.
-- **Rides**: 340 (`payment_consent_at` from `confirm_time`).
+- **Rides**: 340 (`payment_consent_at` from `confirm_time`), 352 (re-estimates `estimated_stripe_fee_cents` on tips-enabled rides with no actual fee yet).
 - **Other**: 178 (publish draft events), 233 (`activated_at` from review times), 306 (driver leads from existing applicants).
 
 ## Quirks and incidents
@@ -96,7 +97,7 @@ These migrations rewrite existing rows. Rehearse a new backfill on a representat
 - **000267 applied before it merged.** `000267_auth_v3_web_sessions` reached production from an unmerged branch. [#74](https://github.com/rideyelo/yelo-api/pull/74) copied the exact migration pair into `main` so the release runner saw a clean version 267.
 - **000270 failed in production.** A B-tree index on `Locations.mapbox_id` hit a 3,584-byte legacy value, above the 2,704-byte B-tree entry limit, and left `schema_migrations` dirty at 270. [#93](https://github.com/rideyelo/yelo-api/pull/93) added 271 to replace it with a hash index and made release failures visible.
 - **000280 failed in production.** A legacy user with a zero-UUID `school_id` broke the education proof backfill. The migration rolled back and the marker was repaired to 279. [#119](https://github.com/rideyelo/yelo-api/pull/119) filtered the backfill to existing schools.
-- **Concurrent indexes.** 165, 189, 270, and 288 to 291 use `CREATE INDEX CONCURRENTLY`. Keep one concurrent statement per file, because golang-migrate submits a whole file as one execution.
+- **Concurrent indexes.** 165, 189, 270, 288 to 291, 349, and 350 use `CREATE INDEX CONCURRENTLY`. Keep one concurrent statement per file, because golang-migrate submits a whole file as one execution.
 - **Schema drift repair in 000347.** Production already had a unique constraint on `Locations.address` that no migration created. 347 adds it only where it's missing.
 - **River tables are vendored.** 242 to 248 reproduce River's schema migrations v1 to v7 as golang-migrate files. No code runs River's own migrator (`rivermigrate`), so a River upgrade that changes its schema needs a new numbered migration.
 
@@ -490,6 +491,18 @@ Durable ride messaging, automatic school mapping, Stripe reconciliation, driver 
 | `000345_canonical_top_locations` | 2026-09-25 | [#265](https://github.com/rideyelo/yelo-api/pull/265) | Canonical top locations: `PlaceProfiles`, `CommunityTopLocations`, settings; migrates up to four legacy slots per community. | Backfill |
 | `000346_fleet_archive_reference_guards` | 2026-09-25 | [#273](https://github.com/rideyelo/yelo-api/pull/273) | Fleet archive reference guard triggers. |  |
 | `000347_restore_location_address_constraint` | 2026-09-25 | [#274](https://github.com/rideyelo/yelo-api/pull/274) | Adds the unique `Locations.address` constraint that production already had outside migration history. It is a no-op where the constraint exists. |  |
+
+### Driver net earnings (October 2026)
+
+Driver-facing earnings become net of Stripe processing fees, with stored estimates per charge and actual fees for dedicated tip charges.
+
+| Migration | Date | PR | Change | Flags |
+| --- | --- | --- | --- | --- |
+| `000348_ride_driver_earnings` | 2026-10-05 | [#298](https://github.com/rideyelo/yelo-api/pull/298) | Adds `Rides.estimated_stripe_fee_cents`, `estimated_tip_stripe_fee_cents`, and `tip_stripe_fee_cents`. Creates `stripe_fee_estimate_cents` (2.9% + 30¢) and the 8-argument `ride_driver_earnings_cents`. |  |
+| `000349_tip_stripe_fee_repair_index` | 2026-10-05 | [#298](https://github.com/rideyelo/yelo-api/pull/298) | Concurrent partial index `rides_missing_tip_fee_driver_idx` for dedicated tip charges missing their actual fee. |  |
+| `000350_tip_stripe_fee_payment_intent_index` | 2026-10-05 | [#298](https://github.com/rideyelo/yelo-api/pull/298) | Concurrent partial index `rides_missing_tip_fee_payment_intent_idx` on `tip_payment_intent_id`. |  |
+| `000351_user_share_link_state` | 2026-10-05 | [#300](https://github.com/rideyelo/yelo-api/pull/300) | Adds `Users.share_link_created_at` and `share_link_fingerprint`; seeds `share_link_created_at` for users with a Dub link. | Backfill |
+| `000352_ride_fee_estimate_authorized_amount` | 2026-10-05 | [#301](https://github.com/rideyelo/yelo-api/pull/301) | Creates `ride_fare_fee_estimate_cents` (fee on the authorized amount, fare + $5.00 when tips are on) and the 9-argument `ride_driver_earnings_cents`. Re-estimates stored fare fees that have no actual fee yet. | Backfill |
 
 ## Related pages
 

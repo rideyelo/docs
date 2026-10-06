@@ -246,15 +246,15 @@ The auto-queue explainer uses the driver order: `driver_profile_picture_thumbnai
 
 ## History
 
-`GET /user/ride-history` and `GET /user/drive-history` call `GetRideHistoryByRiderID` and `GetRideHistoryByDriverID` in `queries/ride_history.sql`. Both return at most 200 rows with status `complete` or `pending_rider_rating`, newest `request_time` first. Neither filters on `cancel_phase`, so cancelled rides that ended in `complete` appear. Each record carries `stripe_fee_cents` as `FeeCents`, which the drive fee jobs backfill. Empty results serialize as `[]`.
+`GET /user/ride-history` and `GET /user/drive-history` call `GetRideHistoryByRiderID` and `GetRideHistoryByDriverID` in `queries/ride_history.sql`. Both return at most 200 rows with status `complete` or `pending_rider_rating`, newest `request_time` first. Neither filters on `cancel_phase`, so cancelled rides that ended in `complete` appear. Drive history records carry `driver_earnings` (net of Stripe fees), `fee_cents` (gross less `driver_earnings`, actual fees where known, else estimates), and `pending` for rides whose fare isn't captured yet. `rider_name` is the rider's first name and last initial. Rider history records carry no fee: `fee_cents` is null. See [Drive history](/engineering/domains/driver-earnings-and-activity#drive-history). Empty results serialize as `[]`.
 
 ### Drive fee repair jobs
 
 `internal/service/user/drive_fee_jobs.go` registers two River workers on the `stripe` queue. The periodic scan runs every 10 minutes with `RunOnStart` (`internal/notify/queue/queue.go`). Timing and page limits are documented in [Payouts and earnings](/engineering/payments/payouts-and-earnings). The key rules:
 
-- `GetDriversWithMissingStripeFees` selects up to 100 (driver, merchant) pairs with a `payment_intent_id`, null `stripe_fee_cents`, and a due `stripe_fee_repair_after`.
+- `GetDriversWithMissingStripeFees` selects up to 100 (driver, merchant) pairs with a due `stripe_fee_repair_after` and either a `payment_intent_id` with null `stripe_fee_cents`, or a `tip_payment_intent_id` with `tip_amount > 0` and null `tip_stripe_fee_cents`.
 - Each repair job lists balance transactions with `created >= oldest missing request_time - 8 days` (`driveFeeCaptureCushion`), 100 per page.
-- After each page it calls `PersistStripeFees`, then stops as soon as `HasMissingStripeFees` is false.
+- After each page it calls `PersistStripeFees`, which writes fare and tip charge fees and logs `stripe_fee_estimate_mismatch` for each fee that differs from its stored estimate. It stops as soon as `HasMissingStripeFees` is false.
 - When Stripe has no more pages, `DeferMissingStripeFeeRepair` pushes the unresolved rides 24 hours out.
 - After 10 pages it enqueues a continuation with the cursor, 1 second later, `MaxAttempts` 25.
 - Jobs are unique by args across available, pending, running, retryable, and scheduled states.

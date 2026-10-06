@@ -108,7 +108,7 @@ Earnings reads only the driver's own connected account. Fares and tips for drive
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /earnings/balance` | Available, pending, and instantly available balance. |
+| `GET /earnings/balance` | Available, pending, and instantly available balance, plus `uncaptured` and `uncaptured_rides` for completed rides whose fare isn't captured yet. |
 | `GET /earnings/external-account` | The default bank account or debit card, and whether it supports instant payouts. Returns `404` when none is set. |
 | `GET /earnings/payout-schedule` | Current cadence and next expected payout date. |
 | `PUT /earnings/payout-schedule` | Set `daily`, `weekly`, `monthly`, or `manual`. Weekly defaults to Friday. |
@@ -125,9 +125,19 @@ Earnings reads only the driver's own connected account. Fares and tips for drive
 
 ### Activity feed
 
-`GET /earnings/activity` lists Stripe balance transactions, classified as charge, payment, payout, refund, adjustment, fee, or other. Each charge row is matched to its ride through the PaymentIntent. When a match is found, the row gets the rider's name, the tip amount, the ride ID, and the gross amount from `driver_payout`.
+`GET /earnings/activity` lists Stripe balance transactions, classified as charge, payment, payout, refund, adjustment, fee, or other. Each charge row is matched to its ride through the PaymentIntent. When a match is found, the row gets the rider's first name and last initial, the tip amount, the ride ID, the gross amount from `driver_payout`, and `earnings`, what the driver keeps after Stripe's fee.
 
-On the first page, the "earned this week" headline and ride count come from the database, not Stripe. They sum `driver_payout` for the driver's `complete` and `pending_rider_rating` rides since Monday 00:00 UTC. Stripe books the full pre-authorization on partial-capture rides, so its totals would overstate earnings.
+On the first page, the "earned this week" headline and ride count come from the database, not Stripe. They sum net earnings for the driver's `complete` and `pending_rider_rating` rides since Monday 00:00 UTC. Stripe books the full pre-authorization on partial-capture rides, so its totals would overstate earnings. The first page also lists rides still in their tip window as rows with `pending: true`, because Stripe has no transaction for them until the fare is captured.
+
+### Net earnings
+
+Stripe's processing fee comes out of the driver's connected account. Every driver-facing amount (ride cards, queue, drive history, status poll earnings, the weekly headline, and activity `earnings`) is net of that fee and is returned as `driver_earnings` or `earnings`. Riders keep seeing the price they paid.
+
+- **Estimate**: 2.9% + 30¢ per charge, on the amount Stripe authorized. A tips-enabled ride authorizes the fare plus the $5.00 tip buffer, so a $12.00 fare has an estimated fee of 79¢ whether or not the rider tips inside the buffer.
+- **Dedicated tip charges** carry their own fee. An $8.00 over-buffer tip adds an estimated 53¢ fee.
+- **Actual fees win.** Once the fee backfill job reads Stripe's actual fee for a charge, it replaces the estimate.
+
+For the formula and every surface that uses it, see [Driver earnings and activity](/engineering/domains/driver-earnings-and-activity#net-earnings-after-stripe-fees).
 
 ### Payout notifications
 
