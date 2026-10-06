@@ -1,0 +1,222 @@
+---
+title: "Accessibility"
+description: "What the mobile app does today for screen readers, Dynamic Type, Reduce Motion, and touch targets, with usage counts from the code and the places where coverage is uneven."
+---
+
+This page describes the accessibility support that exists in `yelo-frontend` today. It is a survey of the code, not a standard the app meets. There is no accessibility test suite, and coverage differs a lot between folders.
+
+For the component kit these props live on, see [UI system](/engineering/mobile/ui-system#design-system-components). For how `testID`s drive automation, see [E2E environment](/engineering/qa/e2e#authoring-rules).
+
+## Survey
+
+The counts below are line matches across the 469 non-test `.tsx` files in `app/` (100) and `components/` (369).
+
+| Prop or API | Lines | Files | Notes |
+| --- | --- | --- | --- |
+| `accessibilityLabel` | 201 | 117 | Includes prop declarations and pass-throughs in shared components |
+| `accessibilityRole` | 145 | 90 | 127 of the literal values are `"button"` |
+| `accessibilityState` | 13 | 11 | `selected`, `disabled`, and one `busy` |
+| `accessibilityHint` | 9 | 4 | `YeloActionTile`, `ReferralSharePill`, `ContactsAccessTile`, `ContactsAccessRow` |
+| `accessibilityLiveRegion` | 3 | 2 | `ChangeStopBottomSheet`, `WhyDriveStories` |
+| `accessibilityValue` | 1 | 1 | `ProgressTrack` |
+| `accessibilityElementsHidden` and `importantForAccessibility` | 8 each | 7 | Always set together, on decorative layers |
+| `accessible={false}` | 15 | 10 | Bottom sheets, the glass button wrapper, and a few wrapper views. See [Bottom sheets](#bottom-sheets-and-glass-containers). |
+| `testID` | 481 | 209 | See [Test IDs](#test-ids) |
+| `hitSlop` | 82 | 39 | See [Touch targets](#touch-targets) |
+| `maxFontSizeMultiplier` | 55 | 33 | See [Font scaling](#font-scaling) |
+| `adjustsFontSizeToFit` | 18 | 11 | Shrinks single-line text to fit |
+| `allowFontScaling` | 4 | 3 | One JSX use on the entry screen title in `app/(auth-v3)/index.tsx`, the root default in `app/_layout.tsx` described below, and a comment in `YeloText.tsx` |
+
+The app does not use `accessibilityActions`, `accessibilityViewIsModal`, `AccessibilityInfo.announceForAccessibility`, or `AccessibilityInfo.isScreenReaderEnabled`. No code branches on whether a screen reader is running.
+
+## Screen reader support
+
+### Roles
+
+Literal `accessibilityRole` values in the code:
+
+| Role | Count | Where |
+| --- | --- | --- |
+| `button` | 127 | Pressables across the app |
+| `alert` | 10 | Inline error and status text. See [Alerts and live regions](#alerts-and-live-regions). |
+| `progressbar` | 3 | `ProgressTrack`, `StoriesProgressBar`, `PoiSheet` |
+| `header` | 1 | Entry screen title in `app/(auth-v3)/index.tsx` |
+| `image` | 1 | Logo slot on the entry screen, labeled "Yelo" |
+| `radio` | 1 | Delay options in `BumpTimeSheet` |
+| `text` | 1 | `PlaceholderRow`, labeled "Empty pinned slot" |
+
+Only one element in the app has the `header` role. Screen titles are otherwise plain text.
+
+### Labels
+
+Several design-system components set a role and label for you:
+
+| Component | What it sets |
+| --- | --- |
+| `YeloGlassIconButton`, `YeloGlassPillButton` | `accessibilityRole="button"` and the `accessibilityLabel` prop you pass. Icon-only buttons have no fallback label. |
+| `YeloGlassButton` | `accessibilityRole="button"` on each action |
+| `YeloGlowButton` | `button` role. The label defaults to its text children. |
+| `YeloTileRow` | `button` role, a label of `title, subtitle`, and `accessibilityState={{ disabled, selected }}` |
+| `YeloActionTile` | `button` role, the title as label, an optional hint, and `accessibilityState={{ disabled }}` |
+| `YeloPaymentRow`, `RidePillButton` | `button` role and a label. `RidePillButton` defaults to "Get ride with yelo". |
+| `YeloSelect` | `button` role on the trigger and on each option. Options are labeled with their display value. |
+| `YeloAlertDialog` | `button` role on each action, and a backdrop labeled "Dismiss" |
+| `ActionBar` buttons | The button text as label |
+| `ProgressTrack` | `progressbar` role with a 0 to 100 `accessibilityValue` |
+
+A few feature components build a spoken label that differs from the visible text:
+
+- `RideOptionCard` and `CompactRideOptionCard` join the vehicle name, seats, and price, including the original price when discounted. They also set `accessibilityState={{ selected }}`.
+- `RideAcceptButton` reads "Accept ride for" followed by the price.
+- The vehicle tile in `GoOnlineConfirmationSheet` reads "Vehicle:" followed by the vehicle. It drops the `button` role for owner-operators, who cannot change it.
+
+### Alerts and live regions
+
+Ten elements use `accessibilityRole="alert"`. All are inline text that appears after a failure or status change:
+
+- The confirmation error on the request sheet (`app/(app)/(tabs)/map/request.tsx`)
+- The inline error on the entry screen and the code error in `CustomCodeField`
+- Status messages on the rate screen and in `RiderCancelButton`
+- The recovery message in `app/(app)/profile/accounts.tsx`
+- The fallback text in `FeatureErrorBoundary`
+- The PIN error in `SecurityPinBottomSheet`
+- "Reconnecting to ride requests…" in `DriverMapOverlay`
+- The story announcer in `WhyDriveStories`, which also sets `accessibilityLiveRegion="polite"`
+
+`ChangeStopBottomSheet` marks two status lines with `accessibilityLiveRegion="polite"`.
+
+### Hidden decorative layers
+
+Seven files hide decorative views from assistive technology with `accessibilityElementsHidden` plus `importantForAccessibility`: `DitherReveal`, `EntryDitherReveal`, `EntryParallaxBackground`, `NestedCardConnector`, `StoriesProgressBar`, `AnnotatedMarker` (while a marker is hidden), and `MapSearchBar` (the results layer, while the bar is not focused).
+
+### Bottom sheets and glass containers
+
+`YeloBottomSheet` and `GlassBottomSheet` pass `accessible={false}` to the underlying sheet. The source comments explain why: the sheet library otherwise collapses the whole sheet into one accessibility element, which hides every inner label and `testID` from VoiceOver and UI automation. `DriverShiftSheet` and `CurrentRideBottomSheet` set the same prop.
+
+`YeloGlassButton` sets `accessible={false}` on its glass wrapper for the same reason, so the inner touchable is the element.
+
+## Font scaling
+
+The app honors the OS text size up to a cap, then stops.
+
+- `MAX_FONT_SIZE_MULTIPLIER` in `lib/theme/index.ts` is `1.2`.
+- `YeloText` and `YeloTextInput` read `PixelRatio.getFontScale()`. When the OS scale exceeds the cap, they multiply `fontSize` by `cap / osScale`, so the text lands at exactly the cap after the OS scales it. `YeloText` shrinks `lineHeight` by the same factor.
+- A `maxFontSizeMultiplier` prop on `YeloText` or `YeloTextInput` changes that cap for one call site. `YeloText` does not forward it to the native `Text`.
+- `cappedFontScale(cap?)` returns the same factor for raw inputs. `FlowTextInput`, `YeloRawTextInput`, `PhoneNumberPicker`, `MapSearchBar`, `MessageInputBar`, and `FriendBubble` use it.
+
+Call sites that tighten or loosen the cap:
+
+| Cap | Where |
+| --- | --- |
+| `1` | App labels in `AppsSection` (`APP_LABEL_MAX_FONT_SCALE`), stat values in `QueueSummaryCard` (`STAT_MAX_FONT_SCALE`), and two literal call sites |
+| `1.1` | Nine literal call sites |
+| `1.15` | Driver marketing stories (`MARKETING_HERO_MAX_FONT_SCALE`), `FriendBubble` labels, and three literal call sites |
+| `1.2` | The default, plus the phone field (`PHONE_FONT_CAP`) and nine literal call sites |
+| `1.3` | Stat labels in `QueueSummaryCard` (`LABEL_MAX_FONT_SCALE`) and three literal call sites |
+
+Two components change layout instead of capping text. `RideOptionCard` and `CompactRideOptionCard` drop the vehicle image when `PixelRatio.getFontScale()` is `1.3` or higher.
+
+<Note>
+`app/_layout.tsx` sets `Text.defaultProps.allowFontScaling = false` under a "Disable Font Scaling for the entire app" comment. The comment in `YeloText.tsx` says this assignment has no effect under React 19 and that the native `maxFontSizeMultiplier` is not honored in this setup. The JavaScript pre-shrink is what enforces the cap.
+</Note>
+
+## Reduce Motion
+
+`hooks/useReduceMotion.ts` exports two hooks:
+
+| Hook | Returns |
+| --- | --- |
+| `useReduceMotion()` | `true` when the OS Reduce Motion setting is on, or when `EXPO_PUBLIC_DISABLE_ANIMATIONS` is `'true'` |
+| `useReduceMotionState()` | `{ reduceMotion, determined }`. `determined` is `false` until the async OS query resolves. |
+
+The hook reads `AccessibilityInfo.isReduceMotionEnabled()` on mount and subscribes to `reduceMotionChanged`, so a settings change applies without a restart. The env flag is set only in the `e2e-simulator` profile in `eas.json`, which keeps E2E screenshots deterministic.
+
+Use `determined` when you swap in a heavier animated asset. `app/(app)/referral-share.tsx` renders the static ticket while `reduceMotion || !determined`, so a Reduce Motion user never sees a frame of the animation.
+
+Motion handling is split across three mechanisms:
+
+- 22 files in `app/` and `components/` import the Yelo hook. They include the map layers (`RoutePulseLayer`, `VehiclesLayer`, `PinnedSymbolsLayer`, `AnnotatedMarker`, `OpenPoiMarker`, `FriendMapAnnotation`), the matching screens, `RideOptionsSkeleton`, and `OnlineSheetContent`.
+- 5 files use Reanimated's `useReducedMotion` instead: `app/(auth-v3)/index.tsx`, `DitherReveal`, `BumpSendOverlay`, `YeloShimmer`, and `EntryParallaxBackground`. That hook does not read `EXPO_PUBLIC_DISABLE_ANIMATIONS`.
+- `WhyDriveStories` subscribes to `AccessibilityInfo` directly and also ignores the env flag.
+
+The hooks gate decorative and looping animation. Nothing in the app applies Reduce Motion globally, so an animation that calls none of these still runs.
+
+## Touch targets
+
+`components/design-system/glassTouchArea.ts` enlarges the hit area of glass controls without moving them.
+
+| Export | Value | Use |
+| --- | --- | --- |
+| `GLASS_HIT_SLOP` | `12` on every side | Default for a standalone glass control |
+| `GLASS_INLINE_HIT_SLOP` | 12 top and bottom, 4 left and right | Separate buttons in a row with an 8pt gap, so each owns at most half the gap |
+| `GLASS_STACKED_HIT_SLOP` | 4 top and bottom, 12 left and right | Separate buttons in a column |
+| `GLASS_SCROLL_STYLE`, `GLASS_SCROLL_CONTENT_STYLE` | Margins of -12 and -4, padding of 12 and 4 | A `ScrollView` clips hit testing to its viewport. These give inline buttons real space without moving the row. |
+| `glassTouchInsets(hitSlop)` | Four non-negative insets | Normalizes a number or `Insets` |
+| `glassTouchAreaStyle(hitSlop)` | Padding plus equal negative margin | Grows the native bounds with no change to the layout footprint |
+| `glassSegmentHitSlop(index, count, direction, hitSlop, isRTL)` | Insets for one segment | Connected actions expand only along the group's outer edge, never across a divider. Handles right-to-left rows. |
+
+`YeloGlassButton`, `YeloGlassIconButton`, and `YeloGlassContainer` default to `GLASS_HIT_SLOP`. `ActionBar` applies the inline and scroll constants.
+
+Outside the glass kit, `hitSlop` values are ad hoc. Of the 82 `hitSlop` lines, 28 name a glass constant. The rest use literals such as `8`, `4`, `12`, or `rem(0.5)`. The code defines no minimum target size and nothing checks one.
+
+## Test IDs
+
+`testID` is the most common of these props, because the agent-device E2E flows select elements by `id`. Three styles coexist:
+
+| Style | Example | Count | Notes |
+| --- | --- | --- | --- |
+| Semantic kebab-case | `where-to`, `otp-input`, `method-phone`, `driver-board-reconnecting` | Most of the 261 distinct literals | The style E2E flows and the [manual QA checklists](/engineering/qa/manual-qa-checklists) rely on |
+| Generic | `press`, `press-2`, `back`, `continue`, `dismiss` | `press` alone appears 30 times | Not unique across the tree. Scope the selector or prefer a semantic ID. |
+| Generated-looking | `HapticPressable-pressable-0`, `YeloModal-icon-button-0`, `test-1` | 62 `Component-element-N` literals and 4 `test-N` | Defaults on primitives such as `HapticPressable` and `HapticTouchableOpacity`. A caller's `testID` overrides them. |
+
+Another 71 lines set the ID from an expression, either a forwarded `testID` prop or a computed value, for example `` `bump-delay-${minutes}` `` or `` `${testID}-option-${item}` `` in `YeloSelect`.
+
+## Where coverage is uneven
+
+A file counts as unlabeled below when it renders `Pressable`, a `Touchable*`, `HapticPressable`, or `HapticTouchableOpacity` and contains neither `accessibilityLabel` nor `accessibilityRole`. This is a file-level heuristic. It misses files that label some controls and not others, and it flags files whose touchables wrap visible text.
+
+Across `app/` and `components/`, 165 files render one of those touchables and 78 of them have neither prop.
+
+| Folder | Files | With a label | With a role | Touchable files with neither |
+| --- | --- | --- | --- | --- |
+| `app/(app)` | 85 | 20 | 18 | 9 of 27 |
+| `app/(auth-v3)` | 8 | 1 | 2 | 1 of 2 |
+| `components/drive` | 37 | 20 | 18 | 9 of 25 |
+| `components/ride` | 20 | 9 | 9 | 0 of 8 |
+| `components/driver-earnings`, `driver-hub`, `driver`, `driver-flow` | 24 | 10 | 9 | 0 of 9 |
+| `components/save-location` | 5 | 3 | 3 | 0 of 2 |
+| `components/design-system` | 60 | 13 | 13 | 14 of 25 |
+| `components/bottom-sheets` | 30 | 12 | 5 | 8 of 16 |
+| `components/map` | 82 | 13 | 5 | 15 of 23 |
+| `components/onboarding` | 26 | 5 | 2 | 2 of 2 |
+| `components/ride-matching` | 18 | 0 | 0 | 7 of 7 |
+| `components/feed` | 10 | 0 | 0 | 4 of 4 |
+| `components/modals` | 10 | 0 | 0 | 2 of 2 |
+
+What the table shows:
+
+- **Driver and ride-option surfaces are the best covered.** The driver sheets, the ride option cards, and the driver hub set roles and labels consistently.
+- **The matching screens have none.** No file in `components/ride-matching` sets a label or role, including `RouteMatchingLayout` and both `DriverCard` components.
+- **Feed cards and modals have none.** `components/feed` and `components/modals` set no labels or roles.
+- **Core primitives are neutral.** `HapticPressable`, `HapticTouchableOpacity`, `YeloRoundedButton`, `BottomButton`, `BlackWhiteButton`, `YeloMultiButton`, `SelectionGroup`, `SpotRow`, and `YeloModal` set no role or label themselves. A screen built on them gets a role only if the caller passes one.
+
+## Where this lives in code
+
+| Area | Path |
+| --- | --- |
+| Reduce Motion | `hooks/useReduceMotion.ts`, `eas.json` (`e2e-simulator` env) |
+| Touch targets | `components/design-system/glassTouchArea.ts`, `YeloGlassButton.tsx`, `YeloGlassIconButton.tsx`, `YeloGlassContainer.tsx`, `ActionBar.tsx` |
+| Font scaling | `lib/theme/index.ts` (`MAX_FONT_SIZE_MULTIPLIER`, `cappedFontScale`), `components/design-system/YeloText.tsx`, `YeloTextInput.tsx`, `YeloRawTextInput.tsx`, `app/_layout.tsx` |
+| Labeled primitives | `components/design-system/YeloTileRow.tsx`, `YeloActionTile.tsx`, `YeloGlowButton.tsx`, `YeloAlertDialog.tsx`, `YeloPaymentRow.tsx`, `YeloSelect.tsx`, `ProgressTrack.tsx` |
+| Spoken labels | `components/ride/RideOptionCard.tsx`, `components/ride/CompactRideOptionCard.tsx`, `components/drive/RideAcceptButton.tsx`, `components/drive/GoOnlineConfirmationSheet.tsx` |
+| Sheets | `components/design-system/YeloBottomSheet.tsx`, `components/bottom-sheets/GlassBottomSheet.tsx` |
+| Lint config | `.oxlintrc.json` lists the `jsx-a11y` plugin |
+
+## Gotchas and edge cases
+
+- **Text stops growing at 120%.** A user on the largest OS text size sees text at 1.2 times the base size, or less where a call site caps tighter. Some labels do not scale at all.
+- **Raw `Text` bypasses the JavaScript cap.** The cap lives in `YeloText`, `YeloTextInput`, and `cappedFontScale()`. Seven files outside `YeloText.tsx` import React Native's `Text` directly: `app/(auth-v3)/index.tsx`, `referral-share.tsx`, `QRBottomSheet.tsx`, and four driver story screens. The story screens pass the native `maxFontSizeMultiplier` instead, which the `YeloText` comment says is not honored.
+- **Two Reduce Motion sources disagree in E2E.** Components on Reanimated's `useReducedMotion` or a direct `AccessibilityInfo` listener still animate in an E2E build, because only the Yelo hook reads `EXPO_PUBLIC_DISABLE_ANIMATIONS`.
+- **A new bottom sheet needs `accessible={false}`.** Use `YeloBottomSheet` or `GlassBottomSheet`. A raw sheet collapses into one element and hides its children from VoiceOver and from E2E selectors.
+- **Icon-only glass buttons need a label.** `YeloGlassIconButton` passes through whatever `accessibilityLabel` it receives, including none.
+- **`press` is not a selector.** Thirty elements share that `testID`. Add a semantic ID before writing a flow or checklist step against one.

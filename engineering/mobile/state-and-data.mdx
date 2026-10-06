@@ -27,7 +27,7 @@ There is no Redux, XState, or WebSocket layer.
 Two platform hooks make React Query behave correctly on React Native:
 
 - `focusManager` listens to `AppState`. Without it, the app is "focused" forever and background polling never pauses.
-- `onlineManager` listens to NetInfo, so retries and refetches pause without a network.
+- `onlineManager` listens to NetInfo, so retries and refetches pause without a network. See [Offline behavior](#offline-behavior).
 
 ### Persistence
 
@@ -63,6 +63,84 @@ Use `invalidateFresh(client, filters)` from `lib/query/invalidateFresh.ts` when 
 - Requests to `/user/status` send `X-Ride-State-Protocol: 1` and, when a snapshot is cached, `X-Ride-State-Minimum-Revision`.
 - Responses are validated before the query sees them. A snapshot for a different user, with an unsupported `protocol_version`, or with an invalid revision throws an error. A snapshot older than the cached one never replaces it: the cache keeps the higher `session_revision`.
 - The accepted snapshot is projected back onto the legacy fields (`user_status`, `current_ride_id`, `current_ride_status`, `queued_rides`, `driver_is_online`) so existing readers keep working.
+
+## Offline behavior
+
+The app has no offline mode. It has no offline banner, no connectivity hook for components, and no queue for failed mutations. What it does have is a connectivity signal for React Query, cached data that survives a relaunch, and a few features that retry on reconnect.
+
+### Connectivity signal
+
+`app/_layout.tsx` is the only file that imports `@react-native-community/netinfo`. At module load it registers one listener:
+
+```ts
+onlineManager.setEventListener((setOnline) =>
+  NetInfo.addEventListener((state) => setOnline(state.isInternetReachable ?? state.isConnected ?? true)),
+);
+```
+
+- `isInternetReachable` wins when NetInfo knows it. Otherwise `isConnected` decides. If both are unknown, the app assumes it is online.
+- No query or mutation in the app sets `networkMode`, so every one uses React Query's default handling of `onlineManager`.
+- Nothing renders from this signal. The only other readers are `refreshRecentLocations` in `hooks/useRecentLocations.ts` and `RecentLocationsSync`.
+
+### What still works without a network
+
+| Data | Source | Behavior |
+| --- | --- | --- |
+| Profile, community, feed, POIs, events, likes, zones | Persisted React Query cache. See [Persistence](#persistence). | Restored from AsyncStorage on launch, so the map can paint. `SessionProvider` treats the restored profile as presentation-only. |
+| Map tiles | Mapbox offline pack built by `components/map/mapCacheWarm.ts` | The native SDK reads the pack on its own. The code does not check whether a pack exists before rendering. |
+| Recent locations | AsyncStorage key `recent-locations:v1:<userId>` | Read from disk. New selections are saved locally and sent later. |
+| Rideshare provider sessions | SecureStore key `ride_tokens_<provider>` | Kept through transient failures. See [Provider tokens](#provider-tokens). |
+
+### Map tile cache
+
+`useMapStageProgression` schedules `warmMapCacheSafely` once the map overlays are ready, after an idle delay of 8 seconds (`MAP_CACHE_WARM_DELAY_MS`).
+
+- **Unmetered only.** `shouldWarmMapCache` reads `expo-network` and requires a connected network of type `WIFI` or `ETHERNET` that is not known to be unreachable. On cellular it does nothing.
+- **One pack per community.** The pack is named `map-community-<communityId>-v1`, or `map-community-nearby-v1` without a community.
+- **Bounds.** The pack covers 0.04 degrees in each direction from the current map center, clipped to the community bounds when the center is inside them. Zoom levels are 10 to 14.
+- **Reuse.** If a pack exists and its stored center is within 0.02 degrees of the current center, the code keeps it and resumes it if it is under 100%. Otherwise it deletes the pack and creates a new one.
+- **Failures are logged, never shown.** Errors log `startup.map.cacheWarmError`. Completion logs `startup.map.cacheWarmComplete` with bytes and tile count.
+
+### Revalidation on reconnect
+
+`lib/map/cacheFreshness.ts` exports `MAP_CONTENT_REVALIDATION`:
+
+```ts
+{ refetchOnWindowFocus: 'always', refetchOnReconnect: 'always' }
+```
+
+The POI query (`useCommunityPois`), the friends layer (`useFriendLocations`), and the likes query in `useMapCacheFreshness` spread it into their options. These queries refetch when the app returns to the foreground or the network returns, even if their data is not stale yet.
+
+`useMapCacheFreshness` is mounted once, in the map tab layout. It also calls `refreshMapContent` on entry, which invalidates the POI, friends layer, and `/user/likes` keys, and it owns the 5-minute `POI_REFRESH_INTERVAL` timer.
+
+### Recent locations
+
+Recent locations are the one feature with a local outbox. `stores/recentLocationsStore.ts` wires `RecentLocationsController` (`lib/search/recentLocations.ts`) to AsyncStorage and `/user/recent-locations`.
+
+- `record` adds the selection to both `locations` and `pending`, then writes them to disk. The search UI shows it immediately.
+- `sync` persists the outbox before any request. It sends `pending` if there is any, and fetches otherwise. It skips the request when nothing is pending and the last sync was under 60 seconds ago (`RECENTS_FRESH_MS`).
+- A failure sets `retryAt` with exponential backoff: 30 seconds, doubling, capped at 5 minutes.
+- `refreshRecentLocations` in `hooks/useRecentLocations.ts` calls `sync` only when `onlineManager.isOnline()` and `focusManager.isFocused()` are both true.
+- `RecentLocationsSync`, mounted in the root layout, calls it on mount, on every focus and online change, on a `map_content_changed` push with scope `place_metadata`, and when `retryAt` elapses. It does not poll.
+
+### Provider tokens
+
+`lib/ride/tokenStore.ts` stores rideshare aggregator OAuth sessions in SecureStore. `getValidAccessToken` separates a dead session from a network failure:
+
+- A refresh rejected with 400, 401, or 403 clears the stored tokens, so the card falls back to its log-in prompt.
+- Any other refresh failure, including a network error or a 5xx, keeps the tokens and returns `null`. The next call tries again.
+
+Despite the name, `isConnected(provider)` in this file reports whether tokens are stored. It says nothing about the network.
+
+### What the user sees
+
+There is no dedicated offline UI. A user without a network sees cached content and each screen's own loading or error state.
+
+- Screens that read persisted queries show the last data. Queries outside the persisted list have nothing to show until a request succeeds.
+- Requests that fail surface through the same paths as any other failure: an inline message on the screen, or the opt-in error modal from `AxiosErrorInterceptor`. No message says the device is offline.
+- A few ride screens show reconnect wording when a ride status check fails, for example "Reconnecting to check your ride status." on the leave-queue and rate screens. These react to a failed request, not to NetInfo.
+- `DriverMapOverlay` shows "Reconnecting to ride requests…" (`driver-board-reconnecting`) when the ride board query has an error while the driver is online.
+- `useMapLoadRecovery` releases the map screen 5 seconds after a Mapbox load error. See [Load recovery](/engineering/mobile/map-tab-internals#load-recovery).
 
 ## Generated API client
 

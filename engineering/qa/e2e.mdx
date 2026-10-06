@@ -237,6 +237,26 @@ A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`,
 4. It deletes the fixture, then resets each device: app reinstall, keychain reset, known location and permission grants, and XCTest cleanup.
 5. It returns the slots and writes the aggregate manifest.
 
+### Legacy rigs
+
+A rig is the older paired-test format. The scheduler still accepts it, but new tests belong in a suite.
+
+`e2e/rigs/auth-rider-driver.json` is the only rig. It has `schemaVersion: 1`, a `name`, one `scenario` (`auth_rider_driver_pair`), and a `roles` list instead of `tests`. Its two roles both run `e2e/flows/auth-existing-actor.ad`: `driver` with no delay and `rider` with `startDelayMs: 750`.
+
+`loadSuiteDefinition` in `scripts/e2e-suite.mjs` converts a rig into a suite named `<name>-compatibility`. It creates `E2E_PAIRS` copies of the test, with ids `<name>-1`, `<name>-2`, and so on. `E2E_PAIRS` times the role count must fit in `E2E_MAX_DEVICES`, or the load fails. The converter copies only `scenario` and `roles`, so a rig can't carry `rideTransitions`, `freshDeviceState`, or a `coverageCatalog`.
+
+`scripts/e2e-rig.mjs` has no logic of its own. It imports `scripts/e2e-scheduler.mjs`, which reads the definition path from `E2E_SUITE`, then `E2E_RIG`, then its first argument.
+
+| Target | Runs | Prefer |
+| --- | --- | --- |
+| `make e2e-rig` | `node ./scripts/e2e-rig.mjs` against a supplied app | `make e2e-suite` |
+| `make e2e-rig-local` | `./scripts/e2e-local.sh`, which calls `e2e-rig.mjs` when `E2E_RIG` is set and `E2E_SUITE` is not | `make e2e-suite-local` |
+| `make e2e-rig-publish` | The local run with `E2E_PUBLISH=1` | `make e2e-suite-publish` |
+
+All three default `RIG` to `e2e/rigs/auth-rider-driver.json` and `PAIRS` to `1`. They don't pass `MAX_DEVICES`, so the scheduler default of 8 applies.
+
+`agent-device.json` at the repo root is a separate two-key file: `platform: "ios"` and `snapshotDepth: 8`. No script, Makefile target, or workflow in the repo references it by name. The runner passes `--platform ios` on its own `agent-device` calls.
+
 ### Evidence
 
 Each run writes `.artifacts/e2e/<run-id>/`, with roles under `scenarios/<index>-<test-id>/<role>/`. A run passes only with an MP4, at least one PNG, a non-empty timeline, JUnit XML, and a manifest. Missing evidence, a failed fixture, a failed role, or a failed cleanup fails the scenario and the aggregate.
@@ -377,6 +397,7 @@ Follow the [E2E environment reset](/runbooks/e2e-environment-reset) runbook. In 
 | Deploy | `yelo-api/cloudbuild.e2e.yaml`, `.github/workflows/release-e2e.yml` |
 | Background job switch | `yelo-api/cmd/api/main.go` |
 | Flows, suites, catalog | `yelo-frontend/e2e/` |
+| Legacy rig | `yelo-frontend/e2e/rigs/auth-rider-driver.json`, `scripts/e2e-rig.mjs`, `scripts/e2e-suite.mjs` (`loadSuiteDefinition`) |
 | Runner | `yelo-frontend/scripts/e2e-*.mjs`, `e2e-run.sh`, `e2e-local.sh` |
 | Workflow | `yelo-frontend/.github/workflows/e2e-agent-device.yml` |
 | Build profile and API guard | `yelo-frontend/eas.json`, `yelo-frontend/lib/config.ts` |

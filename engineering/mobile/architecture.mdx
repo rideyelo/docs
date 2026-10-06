@@ -68,6 +68,106 @@ A few rules the linter enforces:
 - No `as never` on routes. Type dynamic targets as `Href`.
 - Persisted storage keys are an on-device contract. Never rename an existing AsyncStorage or SecureStore key.
 
+## Build tooling
+
+The bundler, compiler, and lint configs live at the repo root.
+
+| File | What it configures |
+| --- | --- |
+| `metro.config.js` | Metro bundler: Sentry debug IDs, the SVG transformer, and extra asset extensions |
+| `babel.config.js` | Babel preset and the production-only Paper plugin |
+| `declarations.d.ts` | The `*.svg` module type, and `process.env` values typed as `string \| undefined` |
+| `.oxlintrc.json` | The main oxlint rule set |
+| `.oxlintrc.typeaware.json` | The type-aware oxlint pass |
+| `eslint.config.js` | The rules oxlint can't run: React Hooks, React Native, and the color literal ban |
+| `pnpm-workspace.yaml` | Build-script allowlist, release-age exclusions, overrides, package extensions, and patches |
+
+### Metro
+
+`metro.config.js` starts from `getDefaultConfig` in `expo/metro-config` and changes three things:
+
+- It registers Sentry's `unstableBeforeAssetSerializationDebugIdPlugin` under `unstable_beforeAssetSerializationPlugins`.
+- It sets `transformer.babelTransformerPath` to `react-native-svg-transformer`.
+- It removes `svg` from `assetExts` and adds it to `sourceExts`. It also adds `ttf` and `avif` to `assetExts`, and `ttf` to `sourceExts`.
+
+### SVG imports
+
+Because `svg` is a source extension, an `.svg` import resolves to a React component, not an asset id. `declarations.d.ts` types it as `React.FC<SvgProps>` from `react-native-svg`.
+
+```tsx
+import StudIDLogo from '@/assets/icons/studid.svg';
+```
+
+PNG and other raster files still load through `require()` as assets.
+
+### Babel
+
+`babel.config.js` uses one preset, `babel-preset-expo`, with `jsxRuntime: 'automatic'`.
+
+- Don't add `react-native-reanimated/plugin`. The preset already injects the worklets plugin, and a second transform breaks worklets.
+- `react-native-paper/babel` runs in the `production` env only.
+- `api.cache(true)` caches the computed config.
+
+### Lint configs
+
+`make lint` runs `npx oxlint` and then `npx eslint .`. `make lint-types` runs `npx oxlint --type-aware -c .oxlintrc.typeaware.json`. For how CI runs them, see [Mobile tests](/engineering/qa/mobile-tests#ci-gates).
+
+| Config | Scope |
+| --- | --- |
+| `.oxlintrc.json` | Sets the `correctness`, `suspicious`, `pedantic`, `perf`, and `style` categories to `error`, with the `react`, `react-perf`, `typescript`, `unicorn`, `jsx-a11y`, `import`, `promise`, `node`, and `oxc` plugins. A long `rules` block then turns individual rules off. It ignores `api/generated`, `dist`, `.expo`, `ios`, `android`, `node_modules`, `scripts`, `e2e`, and `lib/dev/colorInventory.generated.ts`. |
+| `.oxlintrc.typeaware.json` | Eight `typescript` rules that need type information: `no-floating-promises`, `await-thenable`, `no-misused-promises` (with `checksVoidReturn: false`), `no-base-to-string`, `restrict-template-expressions`, `no-unsafe-call`, `no-unsafe-argument`, and `no-unsafe-return`. It also ignores `*.config.js`. |
+| `eslint.config.js` | Parses `**/*.{ts,tsx}` with `@babel/eslint-parser` and `babel-preset-expo`. It runs `eslint-plugin-react-hooks` (`recommended-latest`) and two `@react-native` rules, `platform-colors` and `no-deep-imports`. |
+
+The repo conventions that `.oxlintrc.json` enforces:
+
+- `eslint/no-console` is an error.
+- `eslint/no-restricted-imports` bans `expo-haptics`, `@react-native-clipboard/clipboard`, `@expo/vector-icons`, the `@/libs/*` and `@/utils/*` path groups, and the bare `date-fns` entry point.
+- `typescript/no-non-null-assertion` and `typescript/no-non-null-asserted-optional-chain` are errors.
+- `eslint/eqeqeq` is an error, with `null` comparisons exempt.
+
+It has three overrides:
+
+| Files | Change |
+| --- | --- |
+| `**/*.test.ts`, `**/*.test.tsx` | Turns off `unicorn/no-useless-undefined` and `unicorn/no-zero-fractions` |
+| `lib/platform/haptics.ts` | Turns off the restricted-imports rule, so this file can import `expo-haptics` |
+| `components/design-system/**` | Replaces the restricted-imports rule. It bans `expo-haptics`, any `../` import, `@/components/*` paths other than `design-system`, and `@/providers`, `@/hooks`, `@/stores`, and `@/app`. See [UI system](/engineering/mobile/ui-system). |
+
+`eslint.config.js` keeps the React Hooks rules split by intent:
+
+| Setting | Rules |
+| --- | --- |
+| `error` | `rules-of-hooks`, `purity`, `static-components`, `exhaustive-deps`, `preserve-manual-memoization`, `use-memo` |
+| `off` | `refs`, `set-state-in-effect`, `immutability` |
+
+The three disabled rules are advisory and don't gate the React Compiler. The config comments explain each one: latest-ref patterns, sticky query state, and Reanimated shared-value writes.
+
+The same file bans the hex literals `#fff`, `#ffffff`, `#000`, and `#000000` through `no-restricted-syntax`. It exempts `components/map/**`, `components/design-system/LocationMap.tsx`, `lib/theme/**`, and `lib/dev/colorInventory.generated.ts`.
+
+oxlint has `react-hooks/exhaustive-deps` turned off, because ESLint owns that rule.
+
+### pnpm workspace settings
+
+`pnpm-workspace.yaml` has no workspace packages. It holds install policy for the single app.
+
+| Key | Entries |
+| --- | --- |
+| `allowBuilds` | `@sentry/cli`, `esbuild`, `sharp`, and `unrs-resolver` may run build scripts |
+| `minimumReleaseAgeExclude` | A pinned list of `expo` and `expo-*` package versions (plus `@expo/*` and `unimodules-app-loader`) that skip the minimum release age check |
+| `overrides` | `react-native-play-install-referrer: 2.0.1` and `sharp: ^0.33.5` |
+| `packageExtensions` | Adds `semver: ^7` to `react-native-bootsplash`, and `@babel/generator` and `@babel/traverse` (`^7.29.0`) to `react-native-worklets` |
+| `patchedDependencies` | Two patches under `patches/` |
+
+The comments in the file give the reasons:
+
+- `@dub/react-native` still declares `react-native-play-install-referrer` `^1.1.9`. Version `2.0.1` fixes AGP 8 metadata and referrer callback hangs.
+- `react-native-bootsplash` 7.3.2 requires `semver` at runtime but only lists it as a dev dependency.
+- The `react-native-worklets` 0.10.3 Babel plugin imports the two Babel packages without declaring them.
+
+The patched packages are `expo-glass-effect@57.0.4` and `expo-linear-gradient@57.0.2`. For what the patches do and how to treat them, see [Native config](/engineering/mobile/native-config#config-plugins).
+
+`isBlockedReleasePath` in `scripts/release-policy.mjs` lists `pnpm-workspace.yaml` and `patches/` next to `package.json` and the lockfile. A change to any of them is a native change, not an OTA change. See [Mobile releases](/engineering/mobile/releases#ota-versus-native-rebuild).
+
 ## Root layout and provider tree
 
 `app/_layout.tsx` runs module-level setup, then renders the provider tree around `<Slot />`.

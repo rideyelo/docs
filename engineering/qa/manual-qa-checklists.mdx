@@ -1,6 +1,6 @@
 ---
 title: "Manual QA checklists"
-description: "Release QA passes for the rider flow, driver flow, payments with Stripe test cards, fleet join, and a dashboard smoke test, written against the real screens and controls in the apps"
+description: "Release QA passes for the rider flow, driver flow, payments with Stripe test cards, fleet join, a dashboard smoke test, and mobile accessibility and offline checks, written against the real screens and controls in the apps"
 ---
 
 Use these checklists before a store build or a risky OTA, and for changes that E2E suites don't cover yet. Each step names a real screen, control label, or `testID` from the code, so a failed step points at a specific component. Screen and route details are in the [Screen catalog](/engineering/mobile/screen-catalog).
@@ -206,12 +206,75 @@ Sign in with Clerk as an admin, then repeat the role checks with an intern and a
   </Step>
 </Steps>
 
+## Accessibility
+
+Run this on a real device. These steps check what the app implements today. Known gaps are listed in [Accessibility](/engineering/mobile/accessibility#where-coverage-is-uneven). Record them, but don't treat them as regressions.
+
+<Steps>
+  <Step title="Larger text">
+    - Set the OS text size to its largest value and relaunch the app.
+    - Expect text to grow, but only up to 1.2 times its normal size. Some labels are capped lower.
+    - On the request sheet, expect ride option cards without the vehicle image. Check the name, seats, and price are not clipped.
+    - Check the entry screen, phone and code inputs, the driver offline and online sheets, and the ride card for clipped or overlapping text.
+  </Step>
+  <Step title="Reduce Motion">
+    - Turn on Reduce Motion in the OS settings while the app is open. The change applies without a restart.
+    - Request a ride. Expect the looping decorative animation on the matching screens to stop.
+    - Open the referral share screen. Expect the static ticket, with no animation frame first.
+    - As a driver, go online. Expect the online sheet without its looping animation.
+  </Step>
+  <Step title="Screen reader">
+    - Turn on VoiceOver or TalkBack.
+    - On the request sheet, focus a ride option. Expect the vehicle name, seats, and price, and a selected state on the chosen option.
+    - Open a bottom sheet. Expect to reach each control inside it, not one element for the whole sheet.
+    - As a driver, expect "Go online" on the offline sheet, and "Accept ride for $X" and "Decline ride" on the ride card.
+    - Enter a wrong PIN on **Start ride**. Expect the error to be announced.
+  </Step>
+  <Step title="Touch targets">
+    - Tap just outside the visible edge of a glass icon button. It responds within about 12 points.
+    - In a row of glass buttons, tap in the gap between two. The nearer button responds, and never both.
+  </Step>
+</Steps>
+
+## Offline
+
+The app has no offline mode and no offline banner. This pass checks that cached data shows and that the app recovers. See [Offline behavior](/engineering/mobile/state-and-data#offline-behavior).
+
+<Steps>
+  <Step title="Prepare the cache">
+    - On Wi-Fi, sign in and open the map. Leave it idle for at least 10 seconds so the map tile pack can start downloading. The pack isn't built on cellular.
+    - Search for a destination and select it, so a recent location exists.
+  </Step>
+  <Step title="Relaunch without a network">
+    - Turn on airplane mode, force-quit the app, and reopen it.
+    - Expect the app to open on cached data, with no crash and no blank screen. Note what renders.
+    - If the tile pack finished downloading, expect map tiles around the area you viewed on Wi-Fi.
+    - Open search. Expect your recent locations.
+    - Expect no banner or message that says the device is offline.
+  </Step>
+  <Step title="Act without a network">
+    - Open a screen that needs fresh data, such as ride history. Expect that screen's own loading or error state.
+    - Confirm the app doesn't crash and you can navigate back.
+  </Step>
+  <Step title="Reconnect">
+    - Turn airplane mode off with the app in the foreground.
+    - Expect places and friends on the map to refresh without a manual reload.
+    - Select a new destination in search, then check it's still in recent locations after a relaunch.
+  </Step>
+  <Step title="Driver reconnect">
+    - As an online driver, drop the network briefly. If the ride board request fails, expect "Reconnecting to ride requests…" (`driver-board-reconnecting`).
+    - Restore the network. Expect the message to clear and ride requests to arrive again.
+  </Step>
+</Steps>
+
 ## Gotchas and edge cases
 
 - **Reserved numbers work in production.** Any `+1555` number with `12345` signs in on production and creates a real, non-test account. Reuse the same numbers so you don't create extras.
-- **Accept auto-fires.** The ride card accepts itself after 30 seconds. Decline before then if the step needs an unaccepted ride.
+- **Unanswered cards decline.** The ride card declines itself with reason `No response` after 30 seconds, and the ride doesn't return for that drive session. Accept before then if the step needs the ride.
 - **The Apple Pay sheet overstates the total.** It shows a pending $5.00 tip authorization on every ride. That's expected.
 - **3D Secure happens only at confirm.** A card that needs authentication for every charge fails later at accept, with no prompt to the rider.
+- **Reduce Motion doesn't stop every animation.** Only components that read a Reduce Motion hook change. A remaining animation is a gap to record, not necessarily a regression.
+- **Offline map tiles depend on Wi-Fi.** A device that has only used cellular has no tile pack, so the offline map shows only what Mapbox cached on its own.
 - **Background jobs affect timing.** Ride expiry and auto-queue depend on API workers. If your local API runs without them, unmatched rides never expire on their own.
 
 ## Where this lives in code
@@ -225,4 +288,6 @@ Sign in with Clerk as an admin, then repeat the role checks with an intern and a
 | Driver sheets | `yelo-frontend/components/drive/` (`OfflineSheetContent`, `GoOnlineConfirmationSheet`, `RideRequestCard`, `CurrentRideBottomSheet`, `SecurityPinBottomSheet`, `GoOfflineConfirmationSheet`), `components/driver-flow/DriverCancelPopup.tsx` |
 | Payment sheet | `yelo-frontend/components/ride/StripePaymentScreen.tsx`, `lib/payments/` |
 | Fleet join | `yelo-frontend/app/fleet-join/[code].tsx`, `yelo-web/src/components/FleetDriverJoinLinkCard.tsx` |
+| Accessibility helpers | `yelo-frontend/hooks/useReduceMotion.ts`, `components/design-system/glassTouchArea.ts`, `components/design-system/YeloText.tsx` |
+| Offline wiring | `yelo-frontend/app/_layout.tsx`, `components/map/mapCacheWarm.ts`, `lib/map/cacheFreshness.ts`, `hooks/useRecentLocations.ts`, `components/RecentLocationsSync.tsx` |
 | Dashboard navigation and role matrix | `yelo-web/src/components/Sidebar.tsx`, `src/sites/dashboard/App.test.tsx` |
