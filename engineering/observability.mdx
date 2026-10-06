@@ -87,6 +87,25 @@ To send traces to Jaeger from `make run`, set `OTEL_OTLP_ENDPOINT=localhost:4317
 - **PostHog.** Only the signup site's Auth v3 flow uses `posthog-js` (`src/sites/signup/auth-v3/analytics.ts`). It initializes only when `VITE_POSTHOG_KEY` is set and `VITE_APP_ENV` permits capture, disables autocapture and pageviews, masks inputs and error text in session replay, and strips email from event context.
 - **Mobile telemetry.** The dashboard's telemetry page charts the device telemetry the mobile app reports to the API.
 
+### Dashboard Sentry settings
+
+The `Sentry.init` call in `src/sites/dashboard/main.tsx` passes an explicit `dataCollection` object. A code comment says it preserves the v10 data-collection defaults when upgrading to v11. The values in code:
+
+| Key | Value |
+| --- | --- |
+| `userInfo` | `false` |
+| `cookies` | `false` |
+| `httpHeaders.request` | `{ deny: ['forwarded', '-ip', 'remote-', 'via', '-user'] }` |
+| `httpHeaders.response` | `{ deny: ['forwarded', '-ip', 'remote-', 'via', '-user'] }` |
+| `httpBodies` | `[]` |
+| `urlQueryParams` | `{ deny: ['forwarded', '-ip', 'remote-', 'via', '-user'] }` |
+| `genAI` | `{ inputs: false, outputs: false }` |
+| `databaseQueryData` | `false` |
+| `queues` | `false` |
+| `graphQL` | `{ document: false, variables: false }` |
+
+`tracePropagationTargets` is `['localhost', /^https:\/\/tf-api\.rideyelo\.com/]`. `integrations` is `[Sentry.browserTracingIntegration(), Sentry.replayIntegration()]`, `tracesSampleRate` is `1.0`, `replaysSessionSampleRate` is `0.1`, and `replaysOnErrorSampleRate` is `1.0`. The call sets no `environment` or `release`.
+
 ## Mobile
 
 - **Logging.** Import `log` from `@/lib/observability/logger`. It uses `react-native-logs` at `debug` level in development. When `EXPO_PUBLIC_IS_PRODUCTION=true`, it logs at `info` level to the console and to daily files in the cache directory. Files rotate at 2 MB with up to seven archives, and files older than seven days are deleted. Lint bans `console.*`. Use dotted event names and pass errors through `serializeError(error)`.

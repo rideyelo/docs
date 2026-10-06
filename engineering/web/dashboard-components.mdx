@@ -54,7 +54,7 @@ Its search box filters only string fields of the rows already loaded, and sortin
 | Component or hook | File | Use it for |
 | --- | --- | --- |
 | `CommunityDropdown` | `src/components/CommunityDropdown.tsx` | Picking one community from a list you pass in. Props: `communities`, `value`, `onChange(id, community)`, `isLoading`, `disabled`, `variant`, `placeholder`. `SidebarCommunityScope` uses it with the role-filtered list. |
-| `CommunityFilterDropdown` + `useGlobalCommunityFilter` | `src/components/CommunityFilterDropdown.tsx`, `src/hooks/useGlobalCommunityFilter.ts` | Pages that default to **All Communities**. The hook returns `communityId`, `setCommunityId`, `communityParam` (`undefined` for all), and `isAll`. Used by `TelemetryPage`. |
+| `CommunityFilterDropdown` + `useGlobalCommunityFilter` | `src/components/CommunityFilterDropdown.tsx`, `src/hooks/useGlobalCommunityFilter.ts` | Pages that default to **All Communities**. The hook returns `communityId`, `setCommunityId`, `communityParam` (`undefined` for all), and `isAll`. `TelemetryPage` renders the dropdown but keeps the value in its own `useState('all')`; nothing imports the hook. |
 | `useActivityCommunity` | `src/hooks/useActivityCommunity.ts` | Community analytics inside `/rides`. Returns `needsCommunity` when an admin is on the global scope so the page can render `ActivityMarketPrompt` instead of guessing. |
 | `FleetDropdown` | `src/components/FleetDropdown.tsx` | Picking a fleet within a community. Pair it with `rememberFleetId` from `useCommunity()` so the choice survives navigation. |
 | `TimeRangeSelector` | `src/components/TimeRangeSelector.tsx` | `last_24_hours`, `last_7_days`, `last_14_days`, `last_30_days`, `all_time`. These are the only `range` values `GetKPIsRequest.Validate` accepts. Every selector lists all five. |
@@ -94,6 +94,33 @@ Detail and edit surfaces use the shadcn `Sheet` from the right. The recurring sh
 | Confirmations (`AlertDialog`) | `CommunityDeleteDialog`, `CancelNotificationDialog`, `SilentCancelRide`, `UserFleetMemberships`, and inline confirms in `ManageFleetsPage`, `FleetDriverJoinLinkCard`, `SurgeSlider`, `UserDetailSheet`. `NotifyMarketDialog` and `PingDialog` in `components/live/` have no routed caller. |
 
 `UserDetailSheet` is a role wrapper: it renders nothing unless `useRole().isAdmin`, then mounts `AdminUserDetailSheet`. Follow that pattern when a sheet's endpoints are admin-only, so interns never fire requests that the API rejects.
+
+### ManualPaymentDialog
+
+`src/components/users/ManualPaymentDialog.tsx` sends a one-time payment to a driver's Stripe account. `UserDetailSheet` is its only caller. It is a `Dialog`, not a sheet, and it does not follow the invalidate-on-success pattern above: it invalidates no query.
+
+**Gating.** `UserDetailSheet` renders the **Manual payment** row and its **Send payment** button only when `stripeAccountId && canSendManualPayments && userId`. `useRole()` computes `canSendManualPayments` as `role === 'admin' && user.publicMetadata?.manual_payments === true`, so the admin role alone doesn't show the button. The API applies the same pair in `manualPaymentAdmin` (`yelo-api/internal/service/dashboard/manual_payment.go`), which guards both endpoints and returns `403` with `Manual payment permission required`.
+
+**Structure.** `ManualPaymentDialog` owns only a `sending` flag. The form state lives in the inner `ManualPaymentForm`, which mounts with the dialog content, so every open starts blank. While `sending` is true, `onOpenChange` is ignored. `onInteractOutside` always calls `preventDefault`, so an outside click never closes the dialog.
+
+| Call | Endpoint | Options |
+| --- | --- | --- |
+| `useDashboardGetManualPaymentFundSources` | `GET /dashboard/users/manual-payments/fund-sources` | `staleTime: 0`, `retry: false`. The query has no `enabled` flag; it runs when the form mounts. Loading shows **Loading Stripe balances…**. An error shows a **Retry** button that calls `refetch()`, and no source can be selected. |
+| `dashboardSendManualPayment(userId, body)` in a local `useMutation` | `POST /dashboard/users/detail/{id}/manual-payment` | Body: `amount` (cents), `description`, `internal_note`, `source_type`, `idempotency_key`. The response carries `amount`, `transfer_id`, and `title_applied`. |
+
+The sources response lists `source_type`, `currency`, and `available` (cents). `SOURCE_LABELS` maps `card` to **Card balance** and `bank_account` to **Bank account balance**; any other value renders as the raw string.
+
+**Validation.** `parseAmountCents` accepts an optional `$`, one to six digits, and up to two decimals, and returns `null` for zero. `MAX_MANUAL_PAYMENT_CENTS` is `500_00` and the title input has `maxLength` 40 (`MAX_DESCRIPTION_LENGTH`); the API enforces both again as `manualPaymentMaxCents` and `manualPaymentMaxDescriptionLen`. The form also blocks an amount above the selected source's `available`. **Review payment** enables only with a valid amount, a trimmed title, a trimmed internal note, and a selected source. The confirm step requires typing the amount, compared in cents through `parseAmountCents`, before **Send** enables.
+
+**Idempotency key rules.** The form holds `attempt = { signature, key }`.
+
+- **Review payment** computes `signature = JSON.stringify([amountCents, title, note, sourceType])`. A changed signature stores a new `crypto.randomUUID()` key. An unchanged signature keeps the key, including after **Back**.
+- On a `4xx` response, `onError` replaces the key with a new UUID and shows `getApiErrorMessage(error, 'Payment was not sent')`.
+- On any other failure (no response, timeout, `5xx`), the key is kept. The toast tells the admin to press **Send** again, and stays for 15 seconds.
+- The key lives in component state, so closing the dialog discards it.
+- The API trims the key, rejects an empty key or one over 100 characters, and passes `manual-payment:<key>` to Stripe.
+
+On success, the toast is `toast.success` when `title_applied` is true and `toast.warning` with "Do not send it again" when it is false. The dialog then closes.
 
 ## Maps
 
@@ -172,6 +199,40 @@ The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
 | `yelo-avatars-v2` | Cache Storage | `avatarCache` |
 | Route boundary retry counters | `sessionStorage` | `main.tsx`, `RouteBoundary` |
 
+## Wrapper hooks in `src/hooks`
+
+These hooks wrap generated operations from `@/generated/dashboard/endpoints/dashboard/dashboard` with hand-written query keys. Pages that need nothing extra call the generated `use…` hooks directly, which key on the request path. Where a factory has an `all` key, use it to invalidate the whole family.
+
+| Hook file · exports | Query key factory | Endpoints wrapped | Main consumers |
+| --- | --- | --- | --- |
+| `useAccess.ts` · `useAccessUsers`, `useUpdateAccessUser`, `useInviteAccessUser` | `accessKeys`: `all` `['dashboard-access']`, `users(role)` | `GET /dashboard/access/users?role=`, `PATCH /dashboard/access/users/{clerkUserId}`, `POST /dashboard/access/invite`. Both mutations invalidate `accessKeys.all`. | `AccessPage`, `InternDetailSheet`, `FleetManagerDetailSheet`, `InviteUserSheet` |
+| `useDriverLeads.ts` · `useDriverLeads`, `useDriverLeadDetail`, `useDriverLeadMessages`, plus plain functions `importDriverLeads`, `appendDriverLeadNote`, `updateDriverLeadReferrer`, `updateDriverLeadTags`, `disqualifyDriverLead`, `activateDriverLead` | `driverLeadKeys`: `all` `['driver-leads']`. The hooks append `'global'` or the community ID, the lead ID, and `'messages'`. | `GET /dashboard/leads/drivers`, `/{id}`, `/{id}/messages`; `POST .../import`, `/{id}/notes`, `/{id}/disqualify`, `/{id}/activate`; `PATCH /{id}/referrer`; `PUT /{id}/tags`. The plain functions invalidate nothing. | `LeadsPage`, `NextActionQueue`, `ImportLeadsDialog` |
+| `useDriverOps.ts` · `useDriverOps` | `driverOpsKeys`: `all` `['driver-ops']`, `snapshot()` | `GET /dashboard/driver-ops`, 20 s poll | The unrouted `DriverOpsPage`. `SilentCancelRide` imports `driverOpsKeys` to invalidate. |
+| `useEvents.ts` · `useEventsList`, `useEventDetail`, `useCreateEvent`, `useUpdateEvent`, `useUpdateEventStatus`, `useUploadEventPhoto` | `eventKeys`: `all` `['dashboard-events']`, `list(communityId, params?)`, `detail(eventId)` | `GET`/`POST /dashboard/communities/{id}/events`, `GET`/`PUT .../events/{eventId}`, `PUT .../status`, `POST .../photo` | `EventsTab`, `EventFormSheet`, `SpotFormSheet`. Nothing imports `useEventDetail`. |
+| `useFeed.ts` · `useCommunityFeed` | `feedKeys`: `all` `['dashboard-feed']`, `list(communityId, page)` | `GET /dashboard/communities/{id}/feed?page=` | `FeedPreview` |
+| `useHistoricalRideRoutes.ts` · `useHistoricalRideRoutes` | None. Delegates to the generated `useDashboardGetCommunityHistoricalRideRoutes` and its key. | `GET /dashboard/communities/{id}/map/ride-routes?days=`, 60 s stale | `CommunityMapPage`, `PricingZoneMap` |
+| `useInactiveDrivers.ts` · `useGlobalInactiveDrivers` | None. Inline `['global-inactive-drivers']`. | `GET /dashboard/drivers/global/inactive`, 10 min stale | `DriversPage` |
+| `useIssueRows.ts` · `useIssueRows` | None. Inline `['ride-issues', kind, communityId, range]`. | `GET /dashboard/community/{id}/cancellations` or `.../uncompletes` through `useInfiniteQuery`, 100 rows per page, 30 s stale | `CancellationsPage`, `UncompletesPage` (the `/rides` Issues tab) |
+| `useLive.ts` · `useLiveMarkets`, `useLiveDrivers`, `useSetSurge`, `useSurgeHistory`, `useNotifyMarket`, `usePingDriver`, `usePingRider` | `liveKeys`: `all` `['live']`, `markets()`, `drivers(id)`, `surgeHistory(id)` | `GET /dashboard/live/markets`, `.../markets/{id}/drivers` (both 10 s poll); `POST .../markets/{id}/surge` (invalidates `liveKeys.all`); `GET .../markets/{id}/surge-history`; `POST .../markets/{id}/notify`, `/dashboard/live/drivers/{id}/ping`, `/dashboard/live/riders/{id}/ping` | `LivePage`, `SurgeSlider`. `useNotifyMarket`, `usePingDriver`, and `usePingRider` are imported only by `NotifyMarketDialog`, `PingDialog`, and `DriverOpsPage`. Nothing imports `useSurgeHistory`. |
+| `useLocations.ts` · `useLocationsList`, `useLocationDetail`, `useCreateLocation`, `useUpdateLocation`, `useImportLocations`, `useDeleteLocation` | `locationKeys`: `all` `['dashboard-locations']`, `list(communityId, params?)`, `detail(locationId)` | `GET`/`POST /dashboard/communities/{id}/locations`, `GET`/`PUT`/`DELETE .../locations/{locationId}`, `POST .../locations/import` | `CommunityMapPage`, `LocationFormSheet`, `EventFormSheet`, `SpotFormSheet`. Nothing imports `useLocationDetail`. |
+| `useNotifications.ts` · `useNotificationHistory`, `useScheduledNotifications` | None. Generated keys, plus inline `['notification-history-global', page, pageSize]`. | `GET /dashboard/{id}/notifications/history`, `GET /dashboard/notifications/history`, `GET /dashboard/{id}/notifications/scheduled` | `NotificationsPage` uses `useScheduledNotifications`. Nothing imports `useNotificationHistory`. |
+| `useRideDestinations.ts` · `useRideDestinations` | `rideDestinationsKeys`: `list(communityId)` → `['dashboard-ride-destinations', id]` | `GET /dashboard/communities/{id}/locations/ride-destinations`, 5 min stale | `CommunityMapPage` |
+| `useRideEvents.ts` · `useRideEvents` | None. Inline `['ride-events', rideId]`. | `GET /dashboard/rides/{id}/events` | `RideDetailSheet` |
+| `useRideRoute.ts` · `useRideRoute` | None. Inline `['dashboard-ride-route', rideId]`. | `GET /dashboard/rides/{id}/route` | `RideRouteMapPanel` |
+| `useRides.ts` · `useRidesList` | `ridesKeys`: `all` `['dashboard-rides']`, `list(params)` | `GET /dashboard/rides`. The caller passes `refetchInterval`. | `RidesTab`, `RecentPricingActivity`, `NotificationFilterSelect`. `SilentCancelRide` imports `ridesKeys` to invalidate. |
+| `useSpot.ts` · `useActiveSpot`, `useSpotHistory`, `useCreateSpot`, `useUpdateSpot`, `useUploadSpotPhoto`, `useDeleteSpot` | `spotKeys`: `all` `['dashboard-spot']`, `active(communityId)`, `history(communityId)` | `GET`/`POST /dashboard/communities/{id}/spot`, `GET .../spot/history`, `PUT`/`DELETE .../spot/{spotId}`, `POST .../spot/{spotId}/photo`. Every mutation invalidates `active` and `history`. | `SpotTab`, `SpotFormSheet`. Nothing imports `useDeleteSpot`. |
+| `useUserCoords.ts` · `useUserCoords` | `userCoordsKeys`: `list(communityId)` → `['dashboard-user-coords', id]` | `GET /dashboard/communities/{id}/locations/user-coords`. `staleTime` is the passed `refetchInterval`, or 60 s. | `CommunityMapPage`, `LivePage` |
+| `useVehicleTypes.ts` · `useVehicleTypes`, `useActiveVehicleTypes`, `useCreateVehicleType`, `useUpdateVehicleType`, `useDeactivateVehicleType` | `vehicleTypeKeys`: `all` `['vehicle-types']`, `admin()`, `active()`, `detail(id)` | `GET /dashboard/vehicle-types/all`, `GET`/`POST /dashboard/vehicle-types`, `PATCH`/`DELETE /dashboard/vehicle-types/{id}`. Mutations invalidate `admin()` and `active()`. | `VehiclesPage`, `VehicleTypeFormSheet`, `FleetFormSheet`, `VehicleInventory`, `CommunityEditor` |
+| `useZones.ts` · `useZonesList` | `zoneKeys`: `list(communityId)` → `['dashboard-zones', id]` | `GET /dashboard/communities/{id}/zones` through `communityGetCommunityZonesDashboard` | `RidesTab`, `PricingZoneMap`, `CommunityMapPage`, `LiveMap`, `RideRouteMapPanel`, `ZonePricingEditor`, `ZonePricingBacktest` |
+
+Three hooks in the folder issue no request of their own:
+
+| Hook | Returns | Main consumers |
+| --- | --- | --- |
+| `useRole` | `role`, `isAdmin`, `isIntern`, `isFleetManager`, `canSendManualPayments`, `communityId`, `fleetId`, `fleetAssignments`, `isOnboarded`, `isLoaded`, all read from Clerk `publicMetadata` | 34 non-test files |
+| `useActivityCommunity` | The community for `/rides` analytics, and `needsCommunity`. It reads the shared `useCommunityGetAllCommunities` query. | `RidesKpisTab`, `CancellationsPage`, `UncompletesPage`, `SearchesPage` |
+| `useGlobalCommunityFilter` | Local **All Communities** filter state | None |
+
 ## Domain folders in `src/components`
 
 | Folder | Contents | Used by |
@@ -192,7 +253,7 @@ The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
 | `rides/` | Ride detail sheet, silent cancellation, status badge, formatting helpers | `/rides`, `/live`, `/pricing` |
 | `search/` | Search heatmap, top locations manager | `/rides` Searches tab |
 | `spot/` | Spot card, form, history | `/events` |
-| `users/` | User sheet, profile editor, tags, Quo messages, contact matching | `/users`, `/rides`, `/drivers` |
+| `users/` | User sheet, profile editor, tags, Quo messages, contact matching, manual payment dialog | `/users`, `/rides`, `/drivers` |
 | `zones/` | Zone edit dialog, zone pricing editor | `/map`, `/pricing` |
 
 ## Where this lives in code
@@ -203,6 +264,8 @@ The same `cmdk` primitive powers `TagCombobox` and `NotificationFilterSelect`.
 | shadcn primitives | `src/components/ui/`, `components.json` |
 | Dashboard-only components | `src/sites/dashboard/components/` |
 | Table features | `src/lib/table.ts` |
+| Wrapper hooks and key factories | `src/hooks/*.ts` |
+| Manual payment dialog | `src/components/users/ManualPaymentDialog.tsx`, `src/hooks/useRole.ts` (`canSendManualPayments`) |
 | Map hook and layers | `src/components/communitymap/` |
 | Search | `src/sites/dashboard/search/`, `tools/vite/dashboard/search-index.ts` |
 | Shell | `src/components/DashboardLayout.tsx`, `Topbar.tsx`, `Sidebar.tsx`, `src/sites/dashboard/DashboardTitle.tsx`, `RecentViews.tsx` |

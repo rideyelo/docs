@@ -1,0 +1,143 @@
+---
+title: "Dashboard access and loading problems"
+description: "Diagnose the Unauthorized message, 401s after a role change, missing fleet assignments, Coming Soon pages, stuck skeletons, missing Mapbox tokens, and stale chunks after a deploy"
+---
+
+The dashboard gates pages twice. The web app reads `user.publicMetadata` from Clerk (`useRole`) to decide what renders. The API reads the `metadata` claim in the Clerk session token and runs `getDashboardScopeMiddleware` on every `/dashboard/*` request. Most access problems come from those two reads disagreeing. Most loading problems come from an error boundary that retries behind a skeleton. Read [Dashboard roles and access](/administration/dashboard-roles) and [Dashboard identity with Clerk](/engineering/identity/dashboard-clerk) first.
+
+## Symptoms
+
+| What the user sees | Cause in code |
+| --- | --- |
+| **Unauthorized** ("You do not have a valid role assigned.") | `RootRoute` in `App.tsx`. The role in public metadata isn't `admin`, `intern`, or `fleet`. `useRole` returns `unknown` when `role` is empty. |
+| A link opens the role's home page instead of the page | `ProtectedRoute`. The role isn't in the route's `allowedRoles`. It sends `fleet` to `/fleets` and everyone else to `/`. |
+| The page renders but its data fails with 401 | The API scope gate rejected the request. The session token's `metadata` claim is missing, stale, or malformed. |
+| "You are not assigned to a fleet." | `FleetsPage.tsx`. The user isn't an admin and `useRole` found no usable fleet assignment. |
+| **Coming Soon** ("This page is currently under development.") | The catch-all `path="*"` route in `App.tsx`. The URL matches no route. |
+| Sidebar stays, page content is a skeleton that never fills | `RouteBoundary` caught a page error and used up its retries. The screen-reader text is "Restoring this page". |
+| Whole screen is a skeleton, sidebar included | The root `Sentry.ErrorBoundary` in `main.tsx` caught an error outside the page. The screen-reader text is "Restoring the dashboard". |
+| "Mapbox is not configured.", "Mapbox token missing.", or a similar map message | The bundle was built without `VITE_MAPBOX_API_KEY`. |
+| A page won't open in a tab that was open during a deploy | The dynamic import for the page's chunk failed. |
+| Blank white page | Clerk hasn't loaded (`DashboardSession` renders nothing until then), or the bundle was built without `VITE_CLERK_PUBLISHABLE_KEY` and `main.tsx` threw "Missing Clerk Publishable Key". |
+
+## Diagnose
+
+<Steps>
+  <Step title="Read the user's Clerk public metadata">
+    Open the user in Clerk and compare their public metadata with the shapes in [Assign a role](/administration/dashboard-roles#assign-a-role).
+
+    | What you see | Result |
+    | --- | --- |
+    | No `role`, or a value other than `admin`, `intern`, or `fleet` | **Unauthorized** at `/`. Every sidebar item is dimmed. Every API call returns 401. |
+    | `role: "intern"` with no `community_id`, or one that isn't a non-nil UUID | The intern pages render. Every API call returns 401. |
+    | `role: "fleet"` with no `fleet_assignments` entry that has both IDs, and no legacy `fleet_id` plus `community_id` pair | "You are not assigned to a fleet." on **Fleet**. Every API call returns 401. |
+    | `role: "fleet"` with non-empty IDs that aren't valid UUIDs | **Fleet** renders, because `useRole` only checks for non-empty strings. Every API call returns 401. |
+    | An intern who used to be a fleet manager still has `fleet_assignments` | The API scopes them to the first assignment's community, not `community_id`. See [Gotchas and edge cases](/engineering/identity/dashboard-clerk#gotchas-and-edge-cases). |
+  </Step>
+  <Step title="Check the failing request in the browser">
+    Open the browser's network panel and reload the page.
+
+    | Response | Meaning |
+    | --- | --- |
+    | 401 on every `/dashboard/*` call | The Clerk JWT didn't verify, or `dashboardScopeAllows` rejected the role or assignment. |
+    | 401 on some paths only | The path isn't on the allowlist for that role. See [Scope gate](/engineering/api/authentication#scope-gate). |
+    | 403 | `getRequireClerkRoleMiddleware` or a handler rejected the role. The token and assignment are fine. |
+    | No request sent | `ClerkAxiosInterceptor` rejects the request when Clerk's `getToken` throws. Check the Clerk session. |
+
+    If the metadata in Clerk is correct and every role gets 401, check the Clerk session token customization. `ClerkCustomClaims` only reads public metadata from a claim named `metadata`.
+  </Step>
+  <Step title="Check the URL">
+    **Coming Soon** means the path has no route. Routes match exactly, so `/rides/<id>` shows it too. Only `/manage/:fleetId` takes a path segment. `/supply-demand` has no route. Compare the path with [Route and role map](/engineering/web/dashboard-architecture#route-and-role-map) and [Moved pages](/administration/dashboard-roles#moved-pages). The catch-all isn't wrapped in `ProtectedRoute`, so every signed-in user sees it, with or without a role.
+  </Step>
+  <Step title="Check the recovery counters">
+    In the browser's session storage, look for these keys. Each holds the number of recovery attempts so far.
+
+    | Key | Written by |
+    | --- | --- |
+    | `yelo:dashboard:route-recovery:<pathname>` | `RouteFallback` in `src/components/RouteBoundary.tsx` |
+    | `yelo:dashboard:root-recovery` | `AppRecoveryFallback` in `src/sites/dashboard/main.tsx` |
+
+    A value of `3` means the boundary stopped retrying. `RouteBoundary` removes the route key 3 seconds after you open a path, even when the page is still failing, so a missing route key doesn't prove the page recovered. The root key stays while the full-screen skeleton shows. Both boundaries are `Sentry.ErrorBoundary`. `Sentry.init` only runs when the build has `VITE_SENTRY_DSN`. Without it, read the error in the browser console.
+  </Step>
+  <Step title="Check the map message">
+    Every dashboard map reads `import.meta.env.VITE_MAPBOX_API_KEY` at build time. Each component has its own fallback text:
+
+    | Message | Component | Where it renders |
+    | --- | --- | --- |
+    | "Mapbox is not configured." | `src/components/CommunityManagementMap.tsx` | The overview map on **Communities** and **Pricing** |
+    | "Mapbox token missing." | `src/components/map/RouteZonesMap.tsx` | The ride route map in ride details (`RideDetailSheet`) and the pricing backtest dialog (`ZonePricingBacktest`) |
+    | "Mapbox token is missing." | `src/sites/dashboard/components/pricing/PricingZoneMap.tsx` | The zone map on **Pricing** |
+    | "Mapbox token is missing. Please check your environment variables." | `CommunityMapPage.tsx`, `ZoneEditor.tsx`, `search/SearchHeatmap.tsx`, `CommunityMap.tsx` | **Map**, the zone editor, and the search heatmap |
+    | "Mapbox token is missing. Set VITE_MAPBOX_API_KEY to choose a bounding box." | `src/components/CommunityBoundingBoxPicker.tsx` | The bounding box picker in `CommunityEditor` |
+    | "Map access token unavailable." | `src/components/live/LiveMap.tsx` | **Live** |
+    | "The zone map is unavailable. Use the zone prefixes and descriptions below." | `src/components/calendar/CalendarZoneMap.tsx` | The calendar zone map (`CalendarZones`) |
+
+    `RouteZonesMap`, `PricingZoneMap`, `CommunityMapPage`, `LiveMap`, and `CalendarZoneMap` share `HAS_MAPBOX_TOKEN` from `src/components/communitymap/useMapboxMap.ts`. The others read the variable themselves. One missing variable produces all of these messages at once.
+  </Step>
+</Steps>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Missing or malformed role">
+    Set the role and its assignment in the user's Clerk public metadata. Use the shapes in [Assign a role](/administration/dashboard-roles#assign-a-role). An admin can also change the role, intern community, or fleet assignments through `PATCH /dashboard/access/users/{clerk_user_id}`. See [Invite and access endpoints](/engineering/identity/dashboard-clerk#invite-and-access-endpoints).
+
+    <Warning>
+    `UpdateAccessUser` in `internal/service/dashboard/dashboard.go` writes the IDs it receives without checking that they're UUIDs. The scope gate rejects anything `uuid.FromString` can't parse. Copy IDs, don't type them.
+    </Warning>
+
+    When public metadata changes, `DashboardSession` remounts `DashboardData`, because its key is `JSON.stringify([user.id, user.publicMetadata])`. The React Query client is recreated and the old cache is cleared. The user doesn't need to reload for the sidebar to update.
+  </Accordion>
+  <Accordion title="Option 2: 401s right after a role change">
+    The web app sees new public metadata at once. The API only sees it when the browser sends a session token that carries the new `metadata` claim. Until then, the sidebar shows the new role's pages and their API calls return 401.
+
+    Nothing in the web app forces a token refresh. `ClerkAxiosInterceptor` calls `getToken()` with no options for each request. Session tokens are short-lived: a comment in the API's `internal/server/http/router.go` puts the Clerk JWT lifetime at about 60 seconds. Ask the user to wait a minute and reload. If the 401s continue, ask them to sign out and sign in again.
+
+    If 401s continue after a new sign-in, the metadata is malformed. Go back to step 1 of **Diagnose**.
+  </Accordion>
+  <Accordion title="Option 3: Not assigned to a fleet">
+    Add a `fleet_assignments` entry with both `fleet_id` and `community_id`. `useRole` drops any entry where either value is empty or not a string. It only accepts the legacy single `fleet_id` when `community_id` is also set.
+
+    `UpdateAccessUser` only writes `fleet_assignments` when the request includes them. Changing a user to the `fleet` role without sending assignments leaves them in this state, unless older assignments are still in their metadata.
+  </Accordion>
+  <Accordion title="Option 4: Coming Soon on a bad URL">
+    Send the user the current URL. Old paths that still redirect are listed in [Moved pages](/administration/dashboard-roles#moved-pages). There's nothing to fix in the account.
+  </Accordion>
+  <Accordion title="Option 5: Skeleton that never fills">
+    The boundaries recover on their own first. Each calls `resetError` after 100 ms, 200 ms, and 400 ms, then stops.
+
+    - **Page skeleton ("Restoring this page").** Select another sidebar page. `RouteBoundary` is keyed by pathname, so navigating clears the failed page. Its counter for a path is removed 3 seconds after you open that path, so a reload after that gets three fresh attempts.
+    - **Full-screen skeleton ("Restoring the dashboard").** Reload the tab. The counter lives in `sessionStorage`, so it survives a reload. It's removed only after the app stays mounted for 3 seconds (`RootRecoveryReset`). If the error returns immediately, the reload shows the skeleton with no retries. Close the tab and open a new one, or delete the `yelo:dashboard:root-recovery` key.
+
+    If the same page fails again after a fresh tab, it's a bug in that page. Capture the console error and the pathname.
+  </Accordion>
+  <Accordion title="Option 6: Mapbox messages">
+    Set the `VITE_MAPBOX_API_KEY` repository variable and redeploy the dashboard. The value is inlined at build time, so a running build can't pick it up.
+
+    `src/sites/dashboard/project.json` lists `VITE_MAPBOX_API_KEY` in `requiredBuildEnv`. `scripts/require-site-env.mjs` fails the `ci.yml` and `firebase.yml` runs with "Missing GitHub repository variable(s) for dashboard" when it's unset. A build that shows these messages was built outside those workflows, for example from a local machine without the variable. See [Web deployment](/engineering/deployment#web-deployment).
+  </Accordion>
+  <Accordion title="Option 7: Stale chunks after a deploy">
+    Each page is a lazy chunk loaded through `lazyDashboardRoute` in `src/sites/dashboard/routeModules.ts`. A tab that was open before a deploy still asks for the previous build's chunk files. When the import fails, `lazyDashboardRoute` tries again after 150 ms and 500 ms, then throws the first error. `RouteBoundary` catches it and shows the page skeleton.
+
+    Ask the user to reload the tab. The dashboard's Hosting config in `firebase.json` serves everything except `/assets/**` with `Cache-Control: no-cache, no-store, must-revalidate`, so a reload fetches the current `index.html` and its chunk names.
+
+    The sidebar prefetches chunks on idle, hover, focus, and pointer down with `prefetchDashboardRoute`. A failed prefetch is swallowed and its cache entry is deleted, so it doesn't block a later navigation.
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- The user opens the dashboard root and lands on their home page: `/live` for an admin, `/community` for an intern, `/fleets` for a fleet manager.
+- `/dashboard/*` requests return 200 in the network panel.
+- The page shows content instead of a skeleton, and session storage has no `yelo:dashboard:root-recovery` key a few seconds after the page loads.
+- **Communities** and **Map** render a map instead of a Mapbox message.
+
+## Root causes seen in code
+
+- **Two sources for one role.** The web app reads `publicMetadata`. The API reads the session token's `metadata` claim. They disagree until the token carries the change, and permanently if the claim isn't mapped.
+- **The web check is looser than the API check.** `useRole` accepts any non-empty string as an ID. `dashboardScopeAllows` requires a non-nil UUID. A typo passes the web app and fails every API call.
+- **Unknown roles can still sign in.** Clerk sign-in succeeds without a role. `RootRoute` shows **Unauthorized** only at `/`. Other URLs redirect there through `ProtectedRoute`.
+- **The catch-all says Coming Soon, not "not found".** A mistyped or removed URL looks like an unfinished feature.
+- **Recovery is silent.** Both boundaries show only a skeleton. The "Restoring" text is `sr-only`, and neither boundary shows an error message or a retry button after the third attempt.
+- **Root recovery survives a reload.** The counter is in `sessionStorage` and is cleared only after 3 seconds of a healthy mount.
+- **Map fallback text isn't shared.** Ten components use seven different missing-token messages, so the same cause looks like different problems.
