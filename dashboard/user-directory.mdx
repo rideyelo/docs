@@ -61,7 +61,7 @@ If none exist, Yelo uses the signup date. Background app activity counts, so a r
 Admins can select a row to open the user detail sheet. The sheet shows:
 
 - **Tags**. See [Tags](#tags).
-- **Profile**, with school, community, home community, graduation year, join date, and last active time.
+- **Profile**, with school, community, home community, graduation year, join date, and last active time. See [Move a user to the Yelo test community](#move-a-user-to-the-yelo-test-community).
 - **Fleet membership**, where admins edit the fleets a driver belongs to. See [Manage fleet memberships](#manage-fleet-memberships).
 - **Driver Info** for drivers, including the payout fleet, active fleet, rating, drives, and cancels.
 - **Driver fleet enrollment**, where admins assign a payout-ready fleet.
@@ -115,12 +115,46 @@ Yelo rejects the change when:
 - The phone number belongs to another account or lead. The error reads "This phone number is already assigned to an account or lead."
 - The user or a selected community is no longer available.
 
+## Move a user to the Yelo test community
+
+**Move to Yelo** sets a user's home community to **Yelo**, the internal test community. It does not mark the user as a test account.
+
+<Steps>
+  <Step title="Open the user">
+    Open the user's detail sheet. In the profile rows, find **Home Community**.
+  </Step>
+  <Step title="Move the user">
+    Select **Move to Yelo**. The **Move user to Yelo?** dialog explains the change.
+  </Step>
+  <Step title="Confirm">
+    Select **Move to Yelo** again. The dashboard shows **User moved to the Yelo test community** and refreshes the sheet and the directory.
+  </Step>
+</Steps>
+
+The button is admin-only. It's hidden when the user's home community is already **Yelo**. The move changes the home community only. The user's active community stays the same.
+
+There is no matching button to move a user back. To undo the move, [edit the profile](#edit-a-profile) and pick another **Home community**.
+
+### Move to Yelo and Test account
+
+The two controls are independent. Neither one sets the other.
+
+| | **Move to Yelo** | **Test account** |
+| --- | --- | --- |
+| Where | **Home Community** row in the profile | **Operations** |
+| What it changes | The user's home community | The user's `is_test` flag |
+| Effect | The user's home community becomes **Yelo**. Their active community doesn't change. | Free rides. The user is excluded from production KPIs. |
+| Undo | Edit the profile and pick another **Home community** | Turn the switch off |
+| API | `POST /dashboard/users/detail/{id}/move-to-yelo` | `PUT /dashboard/users/detail/{id}/test-status` |
+
+Both endpoints require the `admin` role.
+
 ## Send a manual payment
 
 Admins with the manual payments grant can send a one-time payment to a driver's Stripe connected account. Use it for bonuses, corrections, or reimbursements that don't come from a ride. The payment reaches the driver's bank with their next Stripe payout.
 
 <Note>
-The dashboard side is merged, but the API endpoints it calls ([yelo-api#302](https://github.com/rideyelo/yelo-api/pull/302)) are not. Until they ship, **Send payment** can't load balances or send a payment. The cap, balance check, and retry handling below describe what the dashboard enforces.
+  The API enforces the rules below itself, so they hold even if a request skips the dashboard. Both endpoints return `403 Forbidden` unless the caller is an `admin` with the manual payments grant. `POST /dashboard/users/detail/{id}/manual-payment` returns `400 Bad Request` for an amount over $500.00 or not above zero, a title over 40 characters, an internal note over 500 characters, or a driver with no Stripe connected account. The balance check is the exception: only the dashboard compares the amount with the selected balance. See `internal/service/dashboard/manual_payment.go` in `yelo-api`.
 </Note>
 
 ### Prerequisites

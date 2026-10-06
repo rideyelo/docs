@@ -1,0 +1,216 @@
+---
+title: "Navigate the dashboard"
+description: "Use the sidebar scope control, the command palette, Recent views, and the theme buttons in the Yelo dashboard, and learn which pages save the selected community in the URL"
+---
+
+Every dashboard page sits inside the same shell: a sidebar on the left and a top bar above the page. Use this page to learn how the shell decides which community you're looking at, and how to move between pages quickly.
+
+For what each role can open, see [Dashboard roles and access](/administration/dashboard-roles). For how the shell is built, see [Dashboard architecture](/engineering/web/dashboard-architecture).
+
+## Prerequisites
+
+- A dashboard account with the `admin`, `intern`, or `fleet` role. An account without one of these roles sees **Unauthorized** and "You do not have a valid role assigned."
+
+## Sidebar
+
+The top of the sidebar shows **Yelo Dashboard** and a label for your role: **Admin Portal**, **Intern Portal**, or **Fleet Portal**. Click it to open your home page. See [Dashboard home page](/dashboard/overview#dashboard-home-page). Your account button sits next to it.
+
+Pages are grouped under **Global**, **Community**, **Configuration**, and **Administration**. Click a group name to collapse or expand it. **Administration** sits at the bottom and starts collapsed. Collapsed groups reset when you reload the page.
+
+Click the sidebar button at the left of the top bar, or press <kbd>Cmd</kbd>+<kbd>B</kbd> (<kbd>Ctrl</kbd>+<kbd>B</kbd> on Windows), to shrink the sidebar to icons. Hover over an icon to see the page name. The scope control is hidden while the sidebar is collapsed. The sidebar opens expanded again when you reload the dashboard.
+
+### Dimmed sidebar items
+
+Every role sees every sidebar item. Items your role can't open are dimmed and can't be clicked.
+
+| Role | Items you can open | Dimmed items |
+| --- | --- | --- |
+| Admin | All | None |
+| Intern | **Drivers**, **Users**, **Rides**, **Map**, **Events**, **Community** | **KPI**, **Live**, **Fleet**, and everything under **Configuration** and **Administration** |
+| Fleet manager | **Fleet**, **Drivers**, **Rides** | Everything else |
+
+If you open the URL of a page your role can't use, the dashboard sends you back to your home page. A URL that doesn't match any page shows **Coming Soon**.
+
+Admins also see a red count next to **Drivers**. It's the number of drivers ready for review across all communities.
+
+## Scope control
+
+The control under the sidebar header shows which community the dashboard is scoped to. It looks different for each role.
+
+| Role | What you see | Can you change it? |
+| --- | --- | --- |
+| Admin | A community dropdown that lists every community. | Yes. |
+| Intern | A card labeled **Assigned community** with the community name. | No. Interns are locked to one community. |
+| Fleet manager | A card with the current fleet name and, below it, the community name. It reads **Assigned fleet** until the fleet name loads. | Not from the sidebar. See [Fleet managers](#fleet-managers). |
+
+If the community list can't load, the dashboard shows **Failed to load communities**.
+
+### Admins
+
+Pick a community in the dropdown to scope the dashboard to it. The dashboard remembers the choice in your browser, so it's still selected after a reload. It also remembers the last community you used on each page until you reload. If you've never picked one, the dashboard selects the first community in the list.
+
+The dropdown shows different text when no single community applies:
+
+| Text | When it appears |
+| --- | --- |
+| **All markets** (in the dropdown) | On **Pricing**, **Communities**, **Rides**, or **Drivers** when no community is in effect. This is the normal state on **Communities** before you open a community, and on **Rides** when you view every market. |
+| **All markets** (plain label with a globe, no dropdown) | On **KPI**. Global KPIs always cover every market, so there's nothing to pick. See [Global KPIs](/dashboard/overview#global-kpis). |
+| **New community** | On those four pages while the URL has `?community=new`, for example while you create a community. |
+| **Select Community** | On any other page before a community is selected. |
+
+### Fleet managers
+
+The card shows the fleet the current page is using. If you haven't picked a fleet on that page, it shows your first assigned fleet in the selected community.
+
+- To switch fleets inside a community, use the fleet dropdown on the **Fleet** page or the **Fleet** selector on the **Drivers** page.
+- To switch communities, open the [command palette](#command-palette), type the community name, and select it under **Communities**. The dashboard opens **Fleet** for that community.
+
+The dashboard starts on the community of your first fleet assignment. After that, it remembers the community you last selected in your browser. See [Fleet manager quickstart](/fleets/fleet-manager-guide).
+
+## Pages that save the community in the URL
+
+Four admin pages write the selected community to the page URL as `?community=<community ID>`. A link copied from one of these pages opens with the same community selected.
+
+| Page | What writes `?community=` |
+| --- | --- |
+| **Pricing** | The sidebar dropdown, and picking a community on the page. The page also adds the parameter on load if the URL doesn't have one. |
+| **Communities** | The sidebar dropdown, and opening a community on the page. Closing the community removes the parameter, and starting a new community sets it to `new`. |
+| **Rides** | The sidebar dropdown, the market menu on the **Trips** map, and the **Choose a market** prompt on **KPIs**, **Issues**, and **Searches**. |
+| **Drivers** | The sidebar dropdown. |
+
+On **Rides**, the URL also carries `scope`. The map and the **Choose a market** prompt set `scope=community` when you pick a market. Clearing the market on the map removes `community` and sets `scope=global`. Picking a community in the sidebar removes `scope`. See [Choose a market](/dashboard/rides#choose-a-market).
+
+On every other page, picking a community in the sidebar changes the page but not the URL.
+
+Opening any dashboard URL that contains `?community=<community ID>` selects that community. For interns and fleet managers, this only works for a community they're assigned to.
+
+## Show all communities
+
+Two pages have their own **Show all communities** switch. It appears only for admins, and it overrides the sidebar community for that page only. The switch isn't saved in the URL and turns off when you reload.
+
+| Page | What changes when the switch is on |
+| --- | --- |
+| **Drivers** (the **Drivers** tab) | The subtitle reads "Viewing drivers across all communities". An **All Communities** filter appears next to the switch so you can narrow the lists to one community. The directory gains a **Community** column and loses the **Status** column. An **Inactive** metric and an **Inactive** tab appear. See [Browse the driver directory](/dashboard/drivers#browse-the-driver-directory). |
+| **Notifications** | The subtitle reads "Viewing notifications across all communities". The switch is hidden on the **Activation** tab. **Send Notification** is disabled until you pick a community in the sidebar or turn the switch on. See [Notifications](/dashboard/notifications). |
+
+## Command palette
+
+The command palette jumps to a page, a section of a page, a community, a fleet, or a user.
+
+<Steps>
+  <Step title="Open the palette">
+    Click **Search…** in the top bar, or press <kbd>Cmd</kbd>+<kbd>K</kbd> (<kbd>Ctrl</kbd>+<kbd>K</kbd> on Windows). The same shortcut closes it.
+  </Step>
+  <Step title="Type what you're looking for">
+    The prompt reads **Where would you like to go?** and accepts up to 120 characters. Before you type, the palette lists the pages your role can open.
+
+    Every word you type must match the result's title, description, or keywords. Words of four or more letters tolerate one typo, and words of eight or more tolerate two.
+  </Step>
+  <Step title="Open a result">
+    Use the arrow keys to choose a result and press <kbd>Enter</kbd>, or click it. Press <kbd>Esc</kbd> to close without opening anything.
+  </Step>
+</Steps>
+
+Results are grouped under these headings. You only see results your role can open.
+
+| Group | Who sees it | What a result opens |
+| --- | --- | --- |
+| **Pages** | Everyone, limited to their role's pages. | The page. |
+| **Sections** | Everyone, limited to their role's pages. | The page, scrolled to that section. The **Rides** sections open a specific tab instead. |
+| **Communities** | Admins see every community. Interns see their assigned community. Fleet managers see their assigned communities. | Admins: the community on the **Communities** page. Interns: **Community**. Fleet managers: **Fleet**. Selecting a community also makes it the sidebar community. |
+| **Fleets** | Admins only. | The fleet in **Fleet Management**. The result shows the fleet's community. |
+| **Users** | Admins, and interns in a limited form. | The user on the **Users** page. |
+
+The palette shows at most 24 page, section, community, fleet, and recently loaded user results. If nothing matches, it shows "No matches. Try a page, setting, or community name."
+
+### Page and section results
+
+The page and section results are generated from the dashboard's own page headings when the dashboard is built. A few results have names or destinations you might not expect:
+
+| Result | Opens | Roles |
+| --- | --- | --- |
+| **Overview** | Your home page. | Admin, intern |
+| **Fleets** | The **Fleet** page for one fleet. | Admin, fleet manager |
+| **Fleet Management** | The **Fleets** page under **Configuration**. | Admin |
+| **Global KPIs** | **KPI**. | Admin |
+| **Pricing Management** | **Pricing**. | Admin |
+| **Schools** | **Communities**, on the schools tab. | Admin |
+| **Activation** | **Notifications**, on the **Activation** tab. | Admin |
+| **Vehicle Types** | **Fleet Management**, on the vehicles tab. | Admin |
+| **Searches** | The standalone searches page, which has no sidebar item. | Admin, intern |
+
+The section results are:
+
+| Result | Opens | Roles |
+| --- | --- | --- |
+| **User Directory** | **Users**, scrolled to the directory. | Admin, intern |
+| **Schools Management** | **Communities**, on the schools tab. | Admin |
+| **Communities** (described as **Pricing Management**) | **Pricing**, scrolled to the **Communities** section. | Admin |
+| **Next action queue** | **Drivers**, on the priority follow-ups tab. | Admin, intern |
+| **Ride history** | **Rides** > **Trips**. | Admin, intern, fleet manager |
+| **Ride KPIs** | **Rides** > **KPIs**. | Admin, intern, fleet manager |
+| **Ride issues** | **Rides** > **Issues**. | Admin, intern, fleet manager |
+| **Ride searches** | **Rides** > **Searches**. | Admin, intern, fleet manager |
+
+<Note>
+  Fleet managers see **Ride KPIs**, **Ride issues**, and **Ride searches** in the palette, but all three open the **Trips** tab. The **Rides** page only has **Trips** for fleet managers.
+</Note>
+
+### User results
+
+User results differ by role.
+
+- **Admins**: after you stop typing for a moment, the palette searches every Yelo user by name, phone number, or ID and adds up to 15 matches. Each result shows the user's phone number, or their ID if they have none. While it searches, the palette shows **Searching users…**. If the search fails, it shows "User search is unavailable. Try again."
+- **Interns**: the palette doesn't search all users. It only offers users the **Users** page has already loaded for your community in this session, described as **User · recently loaded**. Selecting one opens the **Users** page.
+- **Fleet managers**: no user results.
+
+See [Global search](/dashboard/user-directory#global-search).
+
+### Fleet results
+
+Fleet names load when an admin opens the palette. Until they arrive, the footer shows **Loading fleets…**. If they can't load, it shows **Fleet names unavailable** and the other groups keep working.
+
+## Recent views
+
+The strip to the right of **Search…** in the top bar is **Recent views**. It works like a row of tabs for the pages you've visited since you loaded the dashboard.
+
+- Each page appears once, with the most recently visited page first.
+- The label is the page name, followed by the scope and the selected tab when the page reports them. For example, the **Fleet** page adds the fleet name, and the **Drivers** tab adds the community name or **All communities**. Hover over a shortened label to read it in full.
+- Click a view to go back to that page exactly as you left it, including the community, tab, and filters saved in its URL.
+- Click the **x** on a view to remove it. Removing the page you're on takes you to the next most recent view. You can't remove the last remaining view.
+- If the strip is wider than the top bar, scroll it sideways.
+
+Recent views aren't saved. Reloading the dashboard clears the strip.
+
+The browser tab title uses the same parts: page name, scope, selected tab, then **Yelo**.
+
+## Theme
+
+The sidebar footer has three theme buttons.
+
+| Button | Effect |
+| --- | --- |
+| **Light** | Always uses the light theme. |
+| **Dark** | Always uses the dark theme. |
+| **System** | Follows your operating system's light or dark setting, and switches when it changes. This is the default. |
+
+The dashboard saves your choice in your browser. When the sidebar is collapsed, the buttons show icons only.
+
+## Source files
+
+All paths are in `yelo-web`.
+
+| File | What it controls |
+| --- | --- |
+| `src/components/Sidebar.tsx` | Sidebar groups, dimmed items, the pending driver count, and theme buttons. |
+| `src/components/SidebarCommunityScope.tsx` | The scope control for each role, and the `?community=` write from the sidebar. |
+| `src/contexts/CommunityProvider.tsx` | The remembered community and fleet, and the `?community=` read. |
+| `src/components/Topbar.tsx` | The top bar layout. |
+| `src/sites/dashboard/search/GlobalSearch.tsx` | The command palette, its shortcut, and community, fleet, and user results. |
+| `src/sites/dashboard/search/search.ts` | Result matching and ranking. |
+| `tools/vite/dashboard/search-index.ts` | The generated page and section results. |
+| `src/sites/dashboard/search/SearchNavigation.tsx` | Scrolling to a section result. |
+| `src/sites/dashboard/RecentViews.tsx` | The **Recent views** strip. |
+| `src/sites/dashboard/DashboardTitle.tsx` | The browser tab title. |
+| `src/contexts/ThemeProvider.tsx` | Saving and applying the theme. |
+| `src/sites/dashboard/App.tsx` | Routes, role redirects, and the **Unauthorized** and **Coming Soon** screens. |

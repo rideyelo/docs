@@ -57,7 +57,7 @@ A pricing config sets the fare for one fleet and vehicle type in a community.
 2. Select the **Community**, **Fleet**, and **Vehicle type**. You can't change these after you create the config.
 3. Choose a **Pricing type**. See [Pricing types](#pricing-types).
 4. Choose a **Fare adjustment**. See [Fare adjustment modes](#fare-adjustment-modes).
-5. Enter the **Base price ($)** and **Price per minute ($)**, and add any distance tiers.
+5. Enter the **Base price ($)** and **Price per minute ($)**, and add any distance tiers. See [Distance tiers](#distance-tiers).
 6. Optionally set the rider-facing **Rider title** and **Vehicle artwork**. See [Rider-facing ride options](#rider-facing-ride-options).
 7. Turn on **Always shown** to show this ride option even when no matching driver is online.
 8. Save the config.
@@ -76,6 +76,55 @@ When you change the pricing type, the dashboard resets **Fare adjustment** to th
 <Warning>
   Rider quotes and confirmed fares only load **Per ride** configs (`ListActiveRidePriceParameters` in `queries/community.sql`). A **Per person** config saves and shows in the dashboard, but riders never see it and it never prices a ride.
 </Warning>
+
+## Distance tiers
+
+The **Distance tiers** table in the config form sets the per-mile rate for each stretch of a ride. A new config starts with one open-ended tier from 0 miles at $1.50 per mile.
+
+| Column | Description |
+| --- | --- |
+| **#** | The tier's position. |
+| **From (mi)** | Where the tier starts. You can't edit it. The dashboard sets it to the previous tier's **Up to (mi)** value, and to `0.00` for the first tier. |
+| **Up to (mi)** | Where the tier ends. The last tier shows **∞** because it has no upper limit. |
+| **$/mi** | The price per mile inside the tier. |
+
+To change the tiers:
+
+- **Add a tier**: Click **+ Add tier**. The dashboard closes the current last tier one mile after its start and adds a new open-ended tier with the same rate. Then edit **Up to (mi)** and **$/mi**.
+- **Remove a tier**: Click the trash icon on the row. Removing the last tier makes the tier before it open-ended. Removing any other tier extends the next tier down to cover its range. You can't remove the only tier.
+
+The dashboard checks the tiers as you type and shows the first problem below the table. **Save** stays disabled until you fix it.
+
+| Rule | Message |
+| --- | --- |
+| A config has at least one tier. | "Pricing config must include at least one tier." |
+| The first tier starts at 0 miles. | "First tier must start at 0 miles." |
+| No tier has a negative **$/mi**. | "Tier N has a negative price per mile." |
+| Every tier except the last has an **Up to (mi)** value. | "Only the last tier may be open-ended." |
+| The last tier has no **Up to (mi)** value. | "Last tier must be open-ended (leave Up to blank)." |
+| **Up to (mi)** is greater than **From (mi)**. | "Tier N: Up to must be greater than From." |
+| Tiers don't leave a gap or overlap. | "Tier N: gap between tier N-1 and tier N." or "Tier N: overlap between tier N-1 and tier N." |
+
+The API runs the same checks when you save. See [Validation](/engineering/domains/pricing-configuration#validation). For how tiers feed into a fare, see [Pricing](/concepts/pricing#the-pricing-model).
+
+## Preview a config
+
+The **Live preview** section at the bottom of the config form quotes three fixed trips with the values currently in the form. Nothing is saved until you click **Save**.
+
+| Card | Trip |
+| --- | --- |
+| **Short** | 1 mi · 3 min |
+| **Average** | 3 mi · 9 min |
+| **Long** | 6 mi · 18 min |
+
+Each card shows the price the rider pays. When the "was" price is different, hover over the amount to see it as **Strikethrough**.
+
+The preview needs a selected **Community**. It refreshes about 300 ms after you stop changing the community, base price, per-minute price, tiers, or fare adjustment. It uses the community's current surge multiplier.
+
+- If the tiers or fare adjustment are invalid, the section shows "Fix errors above to see preview."
+- If the request fails, the section shows "Failed to compute preview:" followed by the error.
+
+The preview ignores pricing zones and discounts. See [Preview quotes](/engineering/domains/pricing-configuration#preview-quotes) and [Dashboard previews](/concepts/pricing#dashboard-previews).
 
 ## Fare adjustment modes
 
@@ -169,3 +218,158 @@ For example, to show a "Downtown Shuttle" option with shuttle artwork:
   "image_asset": "shuttle.png"
 }
 ```
+
+## Compare quotes in the configs table
+
+The selected community's workspace lists its live pricing configs in a table. Use the quote columns to compare ride options without opening each config.
+
+| Column | Description |
+| --- | --- |
+| **Fleet** | The fleet the config belongs to. |
+| **Vehicle** | The vehicle type. |
+| **Rider option** | The rider title and artwork file. Shows **Default** and **Default image** when they're blank. |
+| **Pricing** | **per ride** or **per person**. |
+| **Base** | The base price. |
+| **$/min** | The price per minute. |
+| **Tiers** | The number of distance tiers. Click the number to see each tier's range and per-mile rate. |
+| **Short (1mi)** | The quote for a 1-mile, 3-minute trip. |
+| **Avg (3mi)** | The quote for a 3-mile, 9-minute trip. |
+| **Long (6mi)** | The quote for a 6-mile, 18-minute trip. |
+| **Featured** | Shows **Always shown** when the option appears even with no matching driver online. |
+| **Status** | **Active** or **Inactive**. |
+
+Each quote shows the price the rider pays. When the "was" price is different, hover over the amount to see it as **Strikethrough**. The dashboard hides the three quote columns when no config in the table has quotes.
+
+You can't sort the table. `PricingConfigsTable.tsx` keeps sorting state, but the column headings have no click handler.
+
+The header above the table shows the community's surge multiplier, the number of configs, and **Avg ride**. **Avg ride** is the lowest and highest **Avg (3mi)** quote across the community's configs, or one amount when they match.
+
+Click a row, or its pencil icon, to open **Edit pricing config**. For how the API computes these quotes, see [Overview quotes](/engineering/domains/pricing-configuration#overview-quotes).
+
+## View history or delete a config
+
+### View history
+
+1. In the configs table, click the **More** (three dots) button on the config's row.
+2. Click **View history**.
+
+The **Pricing config history** dialog lists earlier versions for the same fleet, vehicle type, and pricing type.
+
+| Column | Description |
+| --- | --- |
+| **Effective dates** | When the version started and ended. A version with no end shows "no end date". |
+| **Rider option** | The rider title and artwork file. Shows **Default title** and **Default image** when they're blank. |
+| **Base** | The base price. |
+| **$/min** | The price per minute. |
+| **Tiers** | Each tier's range and per-mile rate. |
+
+The history doesn't include the live version shown in the table. It lists versions that have ended, versions that haven't started yet, and versions for a fleet that no longer has an active service in the community (`ListDashboardRidePriceParameterHistory` in `queries/community.sql`). The dialog shows "No history for this config." when there are none.
+
+Yelo adds a version each time you save an edit. See [Config versioning](/engineering/domains/pricing-configuration#config-versioning).
+
+### Delete a config
+
+1. In the configs table, click the trash icon on the config's row.
+2. In the **Delete pricing config?** dialog, click **Delete**.
+
+Deleting deactivates the config. It doesn't erase it. The config leaves the table and its versions stay in the history. This is the same action as turning off **Enabled** in the config form.
+
+<Warning>
+  Riders fall back to whichever config remains active. A community with no pricing config uses fallback fares. See [Fallback pricing](/concepts/pricing#fallback-pricing).
+</Warning>
+
+If the delete fails, the dialog stays open so you can retry.
+
+## Review recent real-world pricing
+
+The **Recent real-world pricing** card sits below the configs for the selected community. It shows the 12 most recently requested rides, so you can compare your configs with what riders were actually quoted and charged.
+
+Three metrics summarize those rides:
+
+| Metric | Description |
+| --- | --- |
+| **Average charged** | The average price charged across the listed rides. It uses the discounted price when a ride has one. |
+| **Recent rides** | The number of rides listed. |
+| **Price-related declines** | Driver declines with a price-related reason, out of all declines on the listed rides. **Top** shows the most common price-related reason. |
+
+A decline counts as price-related when its reason mentions words such as "price", "pricing", "fare", "pay", "payout", "too low", "too high", "not enough", "expensive", or "cheap".
+
+The table has one row per ride:
+
+| Column | Description |
+| --- | --- |
+| **When** | When the rider requested the ride. |
+| **Real ride** | The pickup and destination names. |
+| **Option** | The fleet and vehicle type. Shows **Unassigned** when the ride has no fleet. |
+| **Trip** | The trip distance in miles and estimated duration in minutes. |
+| **Quoted** | The price quoted for the ride's vehicle type and fleet, taken from the ride's most recent `price_calculated` timeline event. When the charged price is different, it appears below as "charged". When the timeline has no matching quote, the column shows the charged price. |
+| **Declines** | The number of driver declines, and how many were price-related. The badge is red when at least one was price-related. Hover over it to read the price-related reasons. |
+| **Status** | The ride's current status. |
+
+Click a row to open **Ride Details** with the route, zones, and full event history. See [Open ride details](/dashboard/rides#open-ride-details).
+
+The card shows "No recent rides for this community." when the community has no rides.
+
+<Note>
+  `RecentPricingActivity.tsx` hides decline data and ride details from non-admins, and shows **Admin only** in **Price-related declines**. You can't reach that state today, because only admins can open **Pricing Management** (`ProtectedRoute` in `src/sites/dashboard/App.tsx`).
+</Note>
+
+## Zone pricing overrides and backtest
+
+A zone override changes a fleet's rates inside one pricing zone. The backtest shows what the current overrides would have done to recent rides. Both appear below the configs table. For how zones change a fare, see [Pricing zones](/concepts/pricing#pricing-zones).
+
+### Set a zone override
+
+The **Zone pricing overrides** section lists each zone in the community. Under each zone, there's one row for each fleet that has a pricing config in the community.
+
+1. Find the zone, then the fleet's row.
+2. Enter any of the three values:
+
+   | Field | Effect |
+   | --- | --- |
+   | **$/mi** | Replaces the tier rates for miles driven inside the zone. Enter `0` for a free zone. |
+   | **$/min** | Replaces the config's per-minute rate inside the zone. |
+   | **flat $** | Charged once when the route enters the zone. |
+
+3. Click **Save**. **Save** is disabled until you change a value in the row.
+
+Leave a field blank to inherit the fleet's config. The dashboard also treats a non-numeric entry as blank. Saving replaces all three values, so a blank field clears any value saved earlier. The API rejects negative values, and the dashboard shows "Failed to save zone pricing".
+
+To remove an override, click **Clear** on its row. **Clear** only appears on rows that have a saved override.
+
+The section shows a message instead of the rows in two cases:
+
+- "No zones for this community. Draw zones on the map to set zone pricing." See [Edit zones inline](#edit-zones-inline).
+- "No fleets configured for this community." Add a pricing config for the fleet first.
+
+### Run a backtest
+
+The **Pricing backtest** section re-prices recent completed rides with the current zone overrides.
+
+1. Save the zone overrides you want to test.
+2. Click **Run backtest**.
+
+The dashboard requests up to 100 rides. Rides without a matching pricing config are left out. Simulated prices exclude surge and jitter, so the difference between the two simulated columns is the effect of the zones alone.
+
+| Column | Description |
+| --- | --- |
+| **Route** | The pickup and destination names. |
+| **Fleet** | The fleet that served the ride. |
+| **Vehicle** | The vehicle type. |
+| **Distance** | The ride distance in miles. |
+| **Charged** | What the rider was charged. |
+| **Sim (no zones)** | The simulated price with no zone overrides. |
+| **Sim (zoned)** | The simulated price with the current zone overrides. |
+| **Zone Δ** | **Sim (zoned)** minus **Sim (no zones)**. Green means the zones lower the fare. Red means they raise it. |
+
+The footer row shows the number of rides, the total of each simulated column, and the total difference.
+
+Click a row to open a dialog with the ride's distance, **Charged**, **Zoned**, and **Δ** values, and a map of the route over the community's zones.
+
+If no rides qualify, the section shows "No completed rides with a matching price config to backtest."
+
+<Warning>
+  After the first run, the button reads **Re-run**, but clicking it doesn't request new results. It sets the same state that **Run backtest** already set (`ZonePricingBacktest.tsx`). To backtest again after you change an override, reload the page and click **Run backtest**.
+</Warning>
+
+For the ride selection and simulation rules, see [Zone backtest](/engineering/domains/pricing-configuration#zone-backtest) and [Zone pricing overrides](/engineering/domains/pricing-configuration#zone-pricing-overrides).
