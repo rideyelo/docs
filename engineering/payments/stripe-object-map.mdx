@@ -9,10 +9,10 @@ This page is the index for Yelo's Stripe integration. It lists every Stripe obje
 
 Yelo uses **Stripe Connect with direct charges**. There are two kinds of Stripe accounts in play:
 
-- **The platform account.** Owns rider customers, SetupIntents, ephemeral keys, and the rider's original payment methods. The API authenticates with `STRIPE_API_KEY`, which is a platform key.
+- **The platform account.** Owns rider customers, SetupIntents, ephemeral keys, the rider's original payment methods, and manual payment transfers. The API authenticates with `STRIPE_API_KEY`, which is a platform key.
 - **Connected Express accounts.** One per driver who self-onboards, one per fleet that uses the `fleet_merchant` payment model. Every ride PaymentIntent, tip PaymentIntent, QR Checkout Session, product, price, payment link, balance, and payout lives on one of these.
 
-Every connected-account call sets the `Stripe-Account` header through `params.SetStripeAccount(merchantID)`. No call sets `application_fee_amount` or creates a transfer, so Yelo takes nothing from ride charges on `main`. Because charges are direct, Stripe processing fees are debited from the connected account, not the platform.
+Every connected-account call sets the `Stripe-Account` header through `params.SetStripeAccount(merchantID)`. No call sets `application_fee_amount`, so Yelo takes nothing from ride charges on `main`. The only transfer in the code is an admin's [manual payment](/engineering/payments/payouts-and-earnings#manual-payments), which moves platform funds to a driver and isn't tied to a ride. Because charges are direct, Stripe processing fees are debited from the connected account, not the platform.
 
 ```mermaid
 flowchart LR
@@ -54,6 +54,8 @@ flowchart LR
 | Product, Price, Payment Link | Connected (fleet) | `QrPaymentService.CreateConfig` and `UpdatePricing` | `QrPaymentConfigs.stripe_product_id`, `stripe_price_id`, `stripe_payment_link_id`, `stripe_payment_link_url` |
 | Checkout Session | Connected (fleet or driver) | `TippingService.createCheckout` | `QrTipVisits.stripe_checkout_session_id` for signed-in tippers, `QrPayments.stripe_session_id` after the webhook |
 | Payout | Connected (driver) | `Client.CreatePayout` from `POST /earnings/payouts/instant`, or Stripe's automatic schedule | Not stored |
+| Transfer (manual payment) | Platform | `Client.CreateTransfer` from `DashboardService.SendManualPayment`, with metadata `kind = manual_payment`, `user_id`, `actor_id`, `internal_note` | Not stored. `transfer_id` is returned to the dashboard and logged |
+| Destination payment (manual payment) | Connected (driver) | Stripe, from the transfer. `Client.UpdateConnectedPayment` then sets its description and `kind = manual_payment` | Not stored |
 | Balance transaction | Connected | Stripe | Only the fee: `Rides.stripe_fee_cents` (fare charge) and `Rides.tip_stripe_fee_cents` (dedicated tip charge), filled by the drive fee repair job |
 
 <Note>
@@ -108,6 +110,9 @@ Calls use one of three wrappers. They are not applied consistently, so check thi
 | `GetExpressAccount` | Yes. 400, 404, 429, and caller cancellation are excluded from breaker accounting | None | n/a |
 | Account links, login links | Yes | None | None |
 | `CreatePayout` | Yes | None | `payout:{account}:{method}:{amount}:{minuteBucket}` |
+| `CreateTransfer` | Yes. Stripe refusals become input errors, which the breaker doesn't count | None | `manual-payment:{idempotency_key}`, where the client supplies the key |
+| `UpdateConnectedPayment` | Yes. Same refusal mapping | None | None |
+| `GetPlatformBalance` | Yes | None | n/a |
 | Balance, payouts list, balance transactions, payout schedule | Yes | None | n/a |
 | Product, price, payment link, checkout session | Yes | None | None |
 
@@ -148,6 +153,7 @@ The provider exposes methods with no production callers on `main`. Don't assume 
 - `CancelPayout`
 - `PaymentIntentRepository.Create` and the `PaymentIntents` table
 - `PaymentService.Attached`
+- The ride operation journal methods in `ride_authorization.go`, `ride_existing_authorization.go`, `ride_capture.go`, `ride_void.go`, `ride_clone.go`, and `ride_tip.go`. Only the unwired journal calls them. See [Ride operation journal](/engineering/payments/ride-operation-journal#what-is-live-today)
 
 ## Where this lives in code
 
@@ -161,6 +167,7 @@ The provider exposes methods with no production callers on `main`. Don't assume 
 | Connected accounts and links | `yelo-api/internal/data/stripe/account.go` |
 | Products, prices, links, Checkout | `yelo-api/internal/data/stripe/payment_link.go`, `checkout.go` |
 | Balance and payouts | `yelo-api/internal/data/stripe/payout.go` |
+| Transfers, platform balance, connected payment update | `yelo-api/internal/data/stripe/transfer.go` |
 | Breaker and retry | `yelo-api/internal/utilities/circuitbreaker/`, `yelo-api/internal/utilities/retry/` |
 | Config | `yelo-api/internal/utilities/config/config.go` (`Stripe` struct) |
 | Ride payment columns | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` |

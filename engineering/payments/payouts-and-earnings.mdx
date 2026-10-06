@@ -1,6 +1,6 @@
 ---
 title: "Payouts and earnings internals"
-description: "How the /earnings API reads a driver's connected account, computes instant payout fees and eligibility, deduplicates cash-outs, changes payout schedules, enriches the activity feed with rides and pending rides, estimates Stripe fees, and backfills actual Stripe fees onto rides."
+description: "How the /earnings API reads a driver's connected account, computes instant payout fees and eligibility, deduplicates cash-outs, changes payout schedules, enriches the activity feed with rides and pending rides, estimates Stripe fees, backfills actual Stripe fees onto rides, and how admins send manual payments to drivers."
 ---
 
 The driver earnings hub reads live data from the driver's Stripe Express account. Yelo stores almost none of it. This page covers how each endpoint maps Stripe data, the fee and idempotency rules for instant payouts, and the background job that copies Stripe fees onto rides. The endpoint list is in [Tips and earnings](/concepts/tips-and-earnings#driver-earnings).
@@ -178,6 +178,122 @@ The actual fee is already stored and wins. A steady stream of these warnings mea
 
 Jobs are unique by merchant, driver, and cursor across active states (`activeJobUniqueOpts`).
 
+## Manual payments
+
+A manual payment is a one-off transfer from the platform balance to a driver's own connected account, sent by an admin from the dashboard user detail sheet. It's the only code path that creates a Stripe transfer. Yelo writes no database row for it: the transfer, its metadata, and two log lines are the whole record.
+
+### Routes and authorization
+
+| Route | Handler | Purpose |
+| --- | --- | --- |
+| `GET /dashboard/users/manual-payments/fund-sources` | `GetManualPaymentFundSources` | Platform sub-balances a payment can draw from |
+| `POST /dashboard/users/detail/{id}/manual-payment` | `SendManualPayment` | Send one payment to the driver in `{id}` |
+
+Both sit on the `/dashboard/users` group, which `router.go` gates with `getRequireClerkRoleMiddleware(["admin"])`. Both service methods then call `manualPaymentAdmin`, which requires two things:
+
+- Clerk role `admin`.
+- `CanSendManualPayments` on the Clerk user context. `populateClerkUserContext` copies it from the `metadata.manual_payments` session claim.
+
+Either one missing returns a forbidden error with the message `Manual payment permission required`. The grant is per person, and the admin role alone isn't enough. No API route writes `manual_payments`, so someone sets it on the user's Clerk public metadata directly. The dashboard mirrors the check in `useRole` (`canSendManualPayments`) to decide whether to show **Send payment**. See the [authorization matrix](/engineering/security/authorization-matrix#route-matrix).
+
+### Fund sources
+
+`GetManualPaymentFundSources` calls `GetPlatformBalance`, which is `Balance.Get` with no `Stripe-Account` header. It sums `available[].source_types` across the `usd` entries and always returns two rows, in this order:
+
+| `source_type` | `currency` | `available` |
+| --- | --- | --- |
+| `card` | `usd` | Cents available in the platform's card sub-balance |
+| `bank_account` | `usd` | Cents available in the platform's bank account sub-balance |
+
+A source Stripe doesn't report reads as 0. The chosen `source_type` becomes the transfer's `source_type`. The server doesn't compare the amount with the available figure. The dashboard does, and Stripe rejects a transfer the sub-balance can't cover.
+
+### Request and validation
+
+The body carries `amount` in cents, `description`, `internal_note`, `source_type`, and `idempotency_key`. `SendManualPayment` trims the three strings, then `validateManualPayment` checks in this order:
+
+| Field | Rule | Constant |
+| --- | --- | --- |
+| `amount` | Greater than 0, at most 50000 cents ($500.00) | `manualPaymentMaxCents` |
+| `description` | Required, at most 40 characters | `manualPaymentMaxDescriptionLen` |
+| `internal_note` | Required, at most 500 characters, Stripe's limit for a metadata value | `manualPaymentMaxNoteLen` |
+| `source_type` | `card` or `bank_account` | `ManualPaymentSourceCard`, `ManualPaymentSourceBankAccount` |
+| `idempotency_key` | Required, at most 100 bytes | `manualPaymentMaxKeyLen` |
+
+The $500.00 cap is a constant, not configuration. The dashboard mirrors it as `MAX_MANUAL_PAYMENT_CENTS` in `ManualPaymentDialog.tsx`, so raise both together.
+
+The destination is `Users.stripe_merchant_id`, read through `GetDriverApplicationDetails`. A driver with no account of their own gets "driver has no Stripe account of their own to pay". Fleet accounts are never a destination.
+
+### Transfer
+
+```mermaid
+sequenceDiagram
+    participant D as Dashboard
+    participant A as API
+    participant S as Stripe
+    D->>A: POST /dashboard/users/detail/{id}/manual-payment
+    A->>A: manualPaymentAdmin, validateManualPayment
+    A->>A: log "admin sending manual driver payment"
+    A->>S: Transfers.New on the platform, key manual-payment:{idempotency_key}
+    S-->>A: transfer with destination_payment
+    A->>S: Charges.Update on the connected account, description + kind
+    S-->>A: ok or error
+    A->>A: log "admin sent manual driver payment"
+    A-->>D: transfer_id, amount, title_applied
+```
+
+`CreateTransfer` calls `Transfers.New` on the platform account with the amount, `usd`, the driver's account as `destination`, `description`, and `source_type`. The transfer metadata is:
+
+| Key | Value |
+| --- | --- |
+| `kind` | `manual_payment` (`models.ManualPaymentKind`) |
+| `user_id` | The driver's Yelo user ID |
+| `actor_id` | The admin's Clerk user ID |
+| `internal_note` | The trimmed internal note. The driver never sees it |
+
+The first log line is written before the Stripe call, so an attempt Stripe refuses, or one whose outcome is lost, still names who tried to pay whom. Both lines carry `actor_id`, `user_id`, `source_type`, and `amount`. The second adds `transfer_id`.
+
+`stripeRefusal` turns a Stripe rejection of the request itself into a bad-request error that carries Stripe's message. That covers any Stripe error whose type isn't `api_error` and that has a message, such as insufficient funds or an idempotency key reused with different parameters. Those errors are input errors, so they don't count against the shared circuit breaker. Stripe-side faults and transport errors stay server errors.
+
+### Idempotency
+
+The Stripe idempotency key is:
+
+```text
+manual-payment:{idempotency_key}
+```
+
+The client picks `idempotency_key`. A retry with the same key and the same parameters returns the original transfer instead of paying twice. The dashboard generates a `crypto.randomUUID()` for each distinct combination of amount, title, note, and source, and keeps it across retries of that payment. On a 4xx it rotates the key, because nothing was sent and Stripe replays the refusal for the old key. On a timeout or 5xx it keeps the key, because the payment may have gone through.
+
+### Title follow-up and `title_applied`
+
+A transfer's own description stays on the platform. The driver's activity row reads the destination payment on the connected account, so the title needs a second call.
+
+When the transfer has a `destination_payment`, `UpdateConnectedPayment` calls `Charges.Update` on the connected account. It sets the payment's `description` to the title and its metadata to `kind = manual_payment`.
+
+The response is `transfer_id`, `amount`, and `title_applied`:
+
+| Case | `title_applied` | Response |
+| --- | --- | --- |
+| Title call succeeded | `true` | 200 |
+| Title call failed | `false` | 200. Warning log `manual payment sent but driver-facing title was not applied` with `actor_id`, `user_id`, and `transfer_id` |
+| Transfer has no destination payment | `false` | 200. No title call and no warning |
+
+A title failure never fails the request. The money has already moved, and an error would invite a second send. The dashboard shows a warning toast ending in "Do not send it again." See [Payout issues](/runbooks/payout-issues#manual-payment-problems).
+
+### Driver activity
+
+The payment reaches the driver as a balance transaction on their account, so it appears in `GET /earnings/activity` and in the Stripe balance. `mappers.go` treats it differently from a ride:
+
+- `isManualPayment` is true when the transaction's expanded source charge has metadata `kind = manual_payment`.
+- `mapBalanceTransaction` uses the source charge's `description` for a manual payment when it's set. Ride and tip rows keep the balance transaction's own description.
+- `buildActivityPage` adds the net to the day's group total and to the page-local week total, but skips the page-local ride count.
+
+The row has no ride PaymentIntent, so `enrichActivityWithRides` leaves it without `ride_id`, `rider_name`, or `earnings`. The mobile app titles a row with the rider name, then the description, then `Ride`, so a titled manual payment shows the admin's title.
+
+The first-page headline comes from `Rides` (`GetDriverWeekEarnings`), so a manual payment doesn't count in it. If that query fails, the page-local totals stand in and the payment's net is included. The payment is part of the driver's Stripe balance either way.
+
+When `title_applied` is false, the destination payment has neither the title nor the `kind` marker. The row then keeps the balance transaction's own description. It also counts in the page-local ride count when its type maps to `charge` or `payment`.
+
 ## Where this lives in code
 
 | Concern | Location |
@@ -189,6 +305,11 @@ Jobs are unique by merchant, driver, and cursor across active states (`activeJob
 | Stripe balance and payout calls | `yelo-api/internal/data/stripe/payout.go` (`CreatePayout`, `payoutIdempotencyKey`, `ListBalanceTransactions`, `FeeByPaymentIntent`) |
 | Dev override gate | `yelo-api/internal/service/service.go` (`earningsOverrideForEnv`) |
 | Fee backfill jobs | `yelo-api/internal/service/user/drive_fee_jobs.go`, `yelo-api/internal/data/repository/queries/ride_history.sql` |
+| Manual payment service and validation | `yelo-api/internal/service/dashboard/manual_payment.go`, `yelo-api/internal/models/manual_payment.go` |
+| Manual payment routes | `yelo-api/internal/server/http/dashboard/users/routes.go`, `handler.go`, `yelo-api/internal/server/http/router.go` |
+| Manual payment grant | `yelo-api/internal/server/http/clerk_middleware.go` (`ClerkCustomClaims`, `populateClerkUserContext`) |
+| Transfer, platform balance, title call | `yelo-api/internal/data/stripe/transfer.go` (`CreateTransfer`, `GetPlatformBalance`, `UpdateConnectedPayment`, `stripeRefusal`) |
+| Manual payment dialog | `yelo-web/src/components/users/ManualPaymentDialog.tsx`, `UserDetailSheet.tsx`, `yelo-web/src/hooks/useRole.ts` |
 | Mobile hub | `yelo-frontend/app/(app)/driver-earnings/`, `yelo-frontend/hooks/driver-earnings/` (`useInstantCashOut`, `useUpdatePayoutSchedule`) |
 
 ## Gotchas and edge cases
@@ -200,4 +321,6 @@ Jobs are unique by merchant, driver, and cursor across active states (`activeJob
 - **Never-resolving rides.** Rides whose hold was canceled have a `payment_intent_id` but no charge, so the fee backfill can't resolve them. They're deferred and rescanned every 24 hours indefinitely.
 - **Multi-currency.** `primaryAmount` takes the first currency entry. A connected account holding a second currency would show only one.
 - **Cached errors.** Stripe replays the first response for a reused idempotency key, including an error. A failed cash-out retried within the same minute returns the same failure.
+- **Manual payments leave no Yelo row.** Find one through the transfer metadata in Stripe or the `admin sent manual driver payment` log line. Nothing in the API reverses a transfer.
+- **An untitled manual payment looks like a ride.** With `title_applied` false, the activity row has no `kind` marker. A `charge` or `payment` row then counts in the page-local ride count.
 - **Fleet accounts.** There's no earnings API for fleet accounts. Fleet admins use the Express dashboard login link from `GET .../stripe/status`.
