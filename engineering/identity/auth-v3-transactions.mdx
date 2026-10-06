@@ -89,7 +89,7 @@ Because accept sets `accepted_at`, an attempt can't be rotated after the user ta
 6. Creates an `AttributionTouches` row only on the first acceptance.
 7. Retries the whole serializable transaction up to 5 times on `40001` or `40P01`.
 
-The HTTP handler also resolves a coarse location from the requester IP (`CoarseIPResolver`) and stores it with `location_source = 'ip'`. A geolocation failure never blocks acceptance.
+The HTTP handler also asks its `CoarseIPResolver` for a coarse location and stores it with `location_source = 'ip'`. A geolocation failure never blocks acceptance. See [Coarse location for acceptance](#coarse-location-for-acceptance).
 
 <Note>
 The hosted page calls accept only when the user taps a method, never on page load (`ensureAccepted` in `AuthV3Page.tsx`). The acceptance is the legal record, so it must follow a user action.
@@ -212,6 +212,105 @@ The `AuthV3Runtime` background loop runs `RuntimeCleanupService.Run` every 5 min
 
 All deletes use `FOR UPDATE SKIP LOCKED`, so the loop never blocks live sign-ins. Deleting a transaction cascades to its phone attempt and handoff code and sets `auth_transaction_id` to null on legal acceptances and attribution touches.
 
+## Funnel instrumentation
+
+The Auth v3 sign-in and onboarding handlers each report one outcome per call, so you can chart the sign-in funnel without reading `AuthTransactions`. The label and property catalogs live in [Metrics](/reference/metrics#metric-catalog) and [Analytics events](/reference/analytics-events#metrics-provider-events). This section covers how the pieces connect.
+
+```mermaid
+sequenceDiagram
+  participant M as FunnelContextMiddleware
+  participant H as Handler
+  participant S as Service
+  participant C as Funnel carrier
+  participant P as Metrics provider
+  M->>C: WithFunnelCarrier (empty)
+  M->>H: request context
+  H->>H: defer handler.step(ctx, step)
+  H->>S: service call
+  S->>C: SetFunnelTransactionID, SetFunnelProperty
+  H->>P: IncrementCounter(authv3.step, labels)
+  P->>C: PostHog provider reads the carrier
+```
+
+### Step counter
+
+`handler.step` in `internal/server/http/authv3/telemetry.go` tags the request span with `authv3.step` and returns a finisher. Handlers defer the finisher against a named error return, so every early return is counted exactly once.
+
+The finisher sets the span attribute `authv3.outcome` and increments the counter `authv3.step` by 1 with these labels:
+
+| Label | Value |
+| --- | --- |
+| `step`, `stage`, `operation` | The step name. All three carry the same value |
+| `outcome` | `ok`, or the result of `outcomeFor` |
+| `result` | `success` or `failure` |
+| `failure_reason` | Empty on success. The same value as `outcome` on failure |
+
+`outcomeFor` returns the error's `ErrorType` for the API's own error type and the literal `error` for anything else. Labels are limited to these closed sets. Transaction IDs, user IDs, phone numbers, provider subjects, and IPs must never become labels.
+
+Steps along the lifecycle on this page:
+
+| `step` | Handler | Lifecycle section |
+| --- | --- | --- |
+| `authorize` | `Authorize` | [Authorize](#authorize) |
+| `accept` | `Accept` | [Accept legal terms](#accept-legal-terms) |
+| `provider_start` | `startProvider`, `nativeAppleStart` | [Start a provider](#start-a-provider) |
+| `phone_send`, `phone_verify` | `SendPhone`, `VerifyPhone` | [Start a provider](#start-a-provider) |
+| `callback` | `GoogleCallback`, `AppleCallback`, `nativeAppleCallback` | [Callback and resolution](#callback-and-resolution) |
+| `token` | `Token` | [Token exchange](#token-exchange) |
+| `resume` | `Resume` | [Resume](#resume) |
+| `profile` | `FinishProfile` | [Finish profile](#finish-profile) |
+
+The other recorded steps are `configuration`, `authorize_link`, `status`, and `community_resolve`. `StepSessionRefresh` (`session_refresh`) is declared, but no handler records it. `RecordTouch`, `RefreshSession`, `LogoutSession`, and the connected-identity and student-verification handlers don't call `handler.step`.
+
+A handler built without `WithMetrics` uses `noopFunnelMetrics` and counts nothing. `internal/server/http/router.go` passes `WithMetrics(s.service.Metrics)` to the public, onboarding, and authenticated route sets.
+
+### Funnel carrier
+
+Handlers learn the transaction ID partway through a request, after the request context exists. A plain context value can't carry it back to the deferred finisher, so `internal/utilities/metrics/funnel.go` uses a mutable carrier.
+
+- `FunnelContextMiddleware` calls `metrics.WithFunnelCarrier` on every request. `router.go` mounts it on the `/authv3` group, which exists only when Auth v3 is enabled.
+- `metrics.SetFunnelTransactionID` stores the transaction ID.
+- `metrics.SetFunnelProperty` stores one string property. It ignores an empty key or an empty value.
+- Both setters do nothing when no carrier is installed.
+
+| Property | Set by |
+| --- | --- |
+| Transaction ID | `recordTransaction` in the handler package, and `recordTransactionContext` in `internal/service/authv3/telemetry.go` |
+| `client_id`, `channel` | `recordFunnelRequest` in `Authorize`, from the request body. `recordTransactionContext` sets them again from the stored transaction |
+| `attempt_id` | `recordAttempt`, in both packages |
+| `provider` | `recordFunnelProvider`, in the provider start, Google and Apple callback, and phone handlers |
+| `auth_surface` | `recordTransactionContext`. `native` for an app transaction with `native_phone_step`, otherwise `hosted` |
+| `is_test`, `is_internal` | `recordUserClassification`, after resolution. `is_internal` is true for an `@rideyelo.com` email. The email itself is never recorded |
+
+The transaction ID and attempt ID also go onto the span as `authv3.transaction_id` and `authv3.attempt_id`, so one ID is enough to find the server trace.
+
+### PostHog event
+
+`PostHogMetricsProvider.enqueueCapture` in `internal/utilities/metrics/posthog.go` reads the carrier. For `authv3.step`, it adds `event_schema_version: 2`, `surface: api`, `platform: server`, `environment`, and every carrier property. It adds `transaction_id` and `request_id` when they are known.
+
+The distinct ID is the authenticated user ID when the request has one. Otherwise it is the transaction ID, and with neither it is the shared server identity. The last two set `$process_person_profile: false`, so one sign-in's steps share an ID without creating a person.
+
+The carrier properties reach only PostHog. They never become counter labels.
+
+### Coarse location for acceptance
+
+`TrustedGeoHeaderResolver` in `internal/server/http/authv3/trusted_geo_resolver.go` is the only `CoarseIPResolver` implementation outside test mocks. It feeds [Accept legal terms](#accept-legal-terms), not the funnel event.
+
+`newAuthV3CoarseIPResolver` in `internal/service/authv3_composition.go` builds it only when `AUTH_V3_TRUSTED_GEO_HEADER` is set. An empty value leaves the handler's resolver nil, and `Accept` records no location. Config validation requires the value to be one valid HTTP header name and requires `AUTH_V3_TRUSTED_PROXY_CIDRS`.
+
+`Resolve` trusts the header only from a trusted proxy:
+
+| Condition | Result |
+| --- | --- |
+| The immediate peer (`RemoteAddr`) isn't in the trusted CIDRs | No location, no error |
+| The header is absent | No location, no error |
+| The header is repeated, empty, or longer than 128 bytes | Error `trusted geo header is invalid` |
+| The value isn't two comma-separated numbers | Same error |
+| A number is NaN or infinite, latitude is outside -90 to 90, or longitude is outside -180 to 180 | Same error |
+| Otherwise | `CoarseIPLocation` with the latitude and longitude |
+
+The resolver never reads forwarding headers to decide trust, and it never reads the request body. `Accept` calls `AcceptWithServerLocation` only when the resolver returns a location without an error. In every other case it calls plain `Accept`, so a bad header never blocks acceptance.
+
 ## Where this lives in code
 
 | Concern | Path |
@@ -225,6 +324,9 @@ All deletes use `FOR UPDATE SKIP LOCKED`, so the loop never blocks live sign-ins
 | Profile completion | `yelo-api/internal/service/authv3/onboarding.go`, `CompleteAuthV3Profile` in `yelo-api/internal/data/repository/authv3.go` |
 | Cleanup | `yelo-api/internal/service/authv3/runtime_cleanup.go`, `DeleteExpiredAuthV3RuntimeState` |
 | HTTP handlers and redirects | `yelo-api/internal/server/http/authv3/handler.go` |
+| Funnel step counter | `yelo-api/internal/server/http/authv3/telemetry.go`, `yelo-api/internal/service/authv3/telemetry.go` |
+| Funnel carrier and PostHog event | `yelo-api/internal/utilities/metrics/funnel.go`, `yelo-api/internal/utilities/metrics/posthog.go` |
+| Coarse location header | `yelo-api/internal/server/http/authv3/trusted_geo_resolver.go` |
 | SQL | `yelo-api/internal/data/repository/queries/authv3.sql` |
 
 ## Gotchas and edge cases

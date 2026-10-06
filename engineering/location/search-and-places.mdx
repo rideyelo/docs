@@ -121,6 +121,80 @@ If the request carries `yelo_place_id`, the handler skips all of this and calls 
   Candidates need a score of at least 0.65 (`minimumPOIEvidence`). Scores are compared in bands of 0.02, and Google's order breaks ties. The top 3 are fetched in detail and re-validated against the snapshot. A detail cached under `place:{id}` is reused only if it has the same place ID and name as the candidate and lies within 5 m of it. Otherwise it is fetched again and re-cached.
 - **Name similarity** (`poi_names.go`) combines token overlap with edit distance for words of 4 characters or more, and penalizes explicit sub-facility and branch-number mismatches. A generic label such as "Cafe" can also match on Google's category names.
 
+## POI replay harness
+
+The replay harness measures Mapbox basemap tap enrichment against recorded Google responses, without calling a provider. It has a production log event, two Python scripts, two fixtures, and two Go tests.
+
+### Capture log
+
+`POIDetails` defers `logUnenrichedMapSelection` (`internal/service/mapping/poi_replay_log.go`) on every call. It writes the info event `place.replay.unenriched_map_selection` only when all of these hold:
+
+- The request `provider` is `mapbox`.
+- The name is non-blank and at most 256 bytes.
+- The coordinates are finite and in range.
+- The call returned an error, or returned no `PlaceID`.
+
+| Field | Value |
+| --- | --- |
+| `selection_name` | The tapped label |
+| `selection_latitude`, `selection_longitude` | The tapped coordinates |
+| `outcome` | `resolution_error` when the call failed, otherwise `snapshot_only` |
+
+The event carries no user, community, trace, or request ID, no saved snapshot, and no provider error text. Successful enrichments aren't logged. `poi_replay_log_test.go` asserts both rules.
+
+### Scripts
+
+Both scripts are in `scripts/poi-replay/`. Their unit tests run in `make check-generated`.
+
+| Script | Input | Output |
+| --- | --- | --- |
+| `export_failures.py <logs> <output> [--count 100]` | A JSON array of Cloud Logging entries | A failure cohort: `schema_version`, `available_failure_requests`, `requested_count`, `selection`, and `cases`, newest first |
+| `capture_candidates.py <fixture> <output> [--address]` | A reviewed selection fixture, plus `GOOGLE_MAPS_API_KEY` | The same fixture with fresh `candidates`, `address_candidates`, and `address_query`, and a new `captured_at` |
+
+`export_failures.py` reads two kinds of entry:
+
+- **Replay events.** Each becomes a case with `selected_input` (label and coordinates) and `replay_status` `captured_public_mapbox_input_requires_expected_profile_review`. The case ID is a hash of the entry's `insertId`.
+- **Legacy request logs** for `/mapping/poi-details`, grouped by `request_id`. A group counts when it has a `failed to get POI details:` message. Its `place.resolution.candidate_rejected` events contribute `candidate_id`, `distance_m`, and `name_matches`. These cases have `selected_input: null` and `replay_status` `missing_selected_name_and_coordinates`.
+
+When any replay events are present, the export keeps only those and drops the legacy cases, so the same failure isn't counted twice. Case IDs are the first 16 hex characters of a SHA-256 hash. The script keeps no user IDs, IPs, tokens, or free-form error text. It exits with an error instead of padding when fewer than `--count` cases exist.
+
+Legacy failure messages map to a fixed `reason`:
+
+| Message contains | `reason` |
+| --- | --- |
+| `place repair is cooling down` | `cooldown` |
+| `resolved place does not match the saved location` | `snapshot_mismatch` |
+| `no unique Google profile for map selection` | `candidate_rejection` |
+| `place identifier is still unavailable` | `identifier_unavailable` |
+| `ambiguous map selection` | `candidate_page_rejection` |
+| Anything else | `other` |
+
+`capture_candidates.py` runs three selections at a time. For each, it calls Google Places text search (2,000 m bias circle, 20 results) and nearby search (500 m, ranked by distance), then merges both lists by place ID. With `--address` it also reverse-geocodes the point for a `street_address` or `premise` result and runs one more text search for the label plus that address. It never writes `expected_id` or `provenance`. Those stay as a reviewer set them.
+
+### Fixtures
+
+Both files are in `internal/service/mapping/testdata/poi-replay/`.
+
+| File | Contents |
+| --- | --- |
+| `failures-100.json` | 100 legacy failed requests, selected from 205 available. Every case has `selected_input: null`. Reasons: 42 `candidate_rejection`, 38 `snapshot_mismatch`, 9 `cooldown`, 6 `identifier_unavailable`, 5 `candidate_page_rejection` |
+| `public-selections.json` | 25 reviewed selections with `label`, coordinates, recorded `candidates` and `address_candidates`, `expected_id`, `provenance`, and `failure_cases`. 21 expect a Google place ID. 4 have an empty `expected_id` and expect a snapshot-only result |
+
+Ten selections have `provenance` `inferred_from_logged_candidate_distance_and_mapbox_point`. Together their `failure_cases` name 25 of the 100 cohort case IDs. The other 15 selections are `expanded_public_mapbox_sample` and link to no failure case.
+
+### Tests
+
+`internal/service/mapping/poi_replay_test.go` has no build tag and runs with the mapping package's unit tests. `internal/service/mapping` isn't in `INTEGRATION_PKGS`.
+
+`replayPOI` builds a mapping service with mocked Google Places, returns the recorded `candidates` from `SearchPOICandidates`, and calls `POIDetails` with provider `mapbox`. It serves `address_candidates` only when `selectGooglePOI` finds no match in the first list, and asserts the address search isn't called otherwise. It then requires the result's `PlaceID` to equal `expected_id`, and the name and coordinates to equal the tapped ones.
+
+| Test | What it checks |
+| --- | --- |
+| `TestPOIPublicSelectionReplay` | Replays every selection as a subtest. Logs how many matched from the ordinary search alone and how many matched after address recovery |
+| `TestPOIHistoricalFailureReplay` | Requires exactly 100 cohort cases and exactly 25 replayable ones. Each replayable case must have a non-empty `expected_id`. The other 75 skip, because the legacy logs didn't record the selected name or coordinates |
+
+Set `POI_REPLAY_FIXTURE` to replay a different selections file. `TestPOIHistoricalFailureReplay` always reads `failures-100.json` and pins the count at 25, so changing how many selections link to cohort cases fails it until you update the constant.
+
 ## Reverse geocoding
 
 | Use | Method | Details |
@@ -198,6 +272,7 @@ River runs a dispatcher every 5 minutes (`topLocationDispatchPeriodic`) that enq
 | --- | --- |
 | Mapping service | `yelo-api/internal/service/mapping/mapping.go` (`SearchSuggestions`, `SearchResult`, `googleRetrieve`, `providerForLocationId`, `registerSelection`) |
 | POI enrichment | `yelo-api/internal/service/mapping/poi_details.go`, `poi_google_authority.go`, `poi_names.go` |
+| POI replay harness | `yelo-api/internal/service/mapping/poi_replay_log.go`, `poi_replay_test.go`, `testdata/poi-replay/`, `yelo-api/scripts/poi-replay/` |
 | Search analytics | `yelo-api/internal/service/mapping/analytics.go` |
 | Handlers and validation | `yelo-api/internal/server/http/mapping/mapping_handler.go`, `requests/` |
 | Google Places client | `yelo-api/internal/data/googleplaces/googleplaces.go`, `poi_candidates.go`, `poi_details.go` |

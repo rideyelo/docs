@@ -157,6 +157,19 @@ Feed URLs are operator-supplied and fetched from inside Cloud Run, so the client
 - A `mobilitydatabase.org` feed page URL for `gtfs` is rewritten to `https://files.mobilitydatabase.org/{id}/latest.zip`.
 - `gtfs_rt` rejects any URL on `files.mobilitydatabase.org` or ending in `.zip`.
 
+### Management endpoints
+
+Feed rows are managed through four dashboard routes registered in `internal/server/http/dashboard/mobilityfeed/mobilityfeed_routes.go`. They sit under `/dashboard`, behind `getClerkAuthMiddleware` and `getDashboardScopeMiddleware`. `dashboardScopeAllows` passes only admins: the intern and fleet scopes don't list `mobility-feeds`, so those roles get a 401 before the handler runs.
+
+| Method | Path | Role | Handler and purpose |
+| --- | --- | --- | --- |
+| `GET` | `/dashboard/communities/{id}/mobility-feeds` | Admin | `ListMobilityFeeds`. Every feed on the community, active or not, newest first. |
+| `POST` | `/dashboard/communities/{id}/mobility-feeds` | Admin | `CreateMobilityFeed`. Body is `source`, `name`, `feed_url`, and `vehicle_type`. |
+| `PATCH` | `/dashboard/communities/{id}/mobility-feeds/{feed_id}` | Admin | `UpdateMobilityFeed`. Every field is optional: `source`, `name`, `feed_url`, `vehicle_type`, `is_active`. |
+| `DELETE` | `/dashboard/communities/{id}/mobility-feeds/{feed_id}` | Admin | `DeleteMobilityFeed`. Hard delete. |
+
+The request structs carry no validation tags. `service/mobilityfeed` validates `source`, `name`, and `feed_url` once for both create and update. For those rules, see [Mobility feeds](/engineering/domains/events-and-feed#mobility-feeds). In `yelo-web`, `MobilityFeedsPanel.tsx` calls all four routes.
+
 ### Catalog suggestions
 
 `DiscoverMobilityFeeds` downloads `https://files.mobilitydatabase.org/feeds_v2.csv` (cached in process for 6 hours) and returns active, unauthenticated GTFS Schedule and GTFS-RT VehiclePositions feeds whose bounds overlap the community box, sorted by provider then source. A suggestion is marked enabled if its latest or direct URL already exists on the community.

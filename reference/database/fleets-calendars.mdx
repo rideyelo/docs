@@ -86,6 +86,26 @@ All eight tables have row level security enabled with no policies, so only the t
 | `"Communities"` | `calendar_geography_dirty` (geography revision, timezone status, active, or archive change) | Every connection in the community |
 | `"Zones"` | `calendar_zone_dirty` (active, geometry, or community change) | Every connection in the zone's community |
 
+### Snapshot and alias guard triggers
+
+Migration `000318_calendar_snapshots` creates the snapshot guards. Migration `000319_editable_calendar_prefixes` drops `calendar_alias_immutable` and replaces it with the two alias triggers below. All of them are `BEFORE ... FOR EACH ROW` triggers.
+
+| Trigger | Table | Fires before | Function | Result |
+| --- | --- | --- | --- | --- |
+| `calendar_snapshot_insert` | `"CalendarSnapshots"` | Insert | `guard_calendar_snapshot_insert()` | Raises `Calendar revision is immutable or lease expired` (SQLSTATE `23514`) unless the connection is enabled, holds an unexpired lease, and has `published_revision = NEW.revision - 1` |
+| `calendar_occurrence_insert` | `"CalendarOccurrences"` | Insert | `guard_calendar_snapshot_insert()` | Same check, against the row's `connection_id` and `revision` |
+| `calendar_occurrence_zone_insert` | `"CalendarOccurrenceZones"` | Insert | `guard_calendar_snapshot_insert()` | Same check |
+| `calendar_snapshot_immutable` | `"CalendarSnapshots"` | Update | `calendar_immutable()` | Always raises |
+| `calendar_occurrence_immutable` | `"CalendarOccurrences"` | Update | `calendar_immutable()` | Always raises |
+| `calendar_occurrence_zone_immutable` | `"CalendarOccurrenceZones"` | Update | `calendar_immutable()` | Always raises |
+| `calendar_alias_update` | `"CalendarScopeAliases"` | Update | `guard_calendar_alias_update()` | Raises `Calendar prefix zone identity is immutable` (SQLSTATE `23514`) when `connection_id`, `community_id`, `zone_id`, `created_by`, or `created_at` changes |
+| `calendar_alias_delete` | `"CalendarScopeAliases"` | Delete | `calendar_immutable()` | Always raises |
+| `guard_calendar_connection` | `"CalendarConnections"` | Update | `guard_calendar_connection()` | See the function table above |
+
+- The insert guard takes `FOR UPDATE` on the `"CalendarConnections"` row, so an insert into a revision waits for the writer that holds the connection lock.
+- No trigger fires on delete for the three snapshot tables. Old revisions are removed with a plain `DELETE` on `"CalendarSnapshots"`, and the `ON DELETE CASCADE` foreign keys remove their occurrences and occurrence zones.
+- Once a revision is published, `published_revision` no longer equals `revision - 1`, so the insert guard also closes that revision to new rows.
+
 ## CalendarConnections
 
 One Google Calendar per fleet community service.
@@ -131,6 +151,7 @@ Zone prefixes that calendar event titles may use.
 
 - Primary key `(connection_id, key)`. Unique `(connection_id, zone_id)`: one prefix per zone per calendar.
 - Aliases cannot be deleted, and only the key can change. `RenameCalendarPrefix` compares against the expected old key.
+- The rename is reached through `PATCH /dashboard/fleets/{fleet_id}/communities/{community_id}/calendar/prefixes` (`fleetCalendar.RenamePrefix` in `internal/server/http/dashboard/calendar/routes.go`). The body is `key`, `expected_key`, and `zone_id`. The handler calls `CalendarAccess` with `adminOnly = true`, so only the `admin` role can rename, even though the fleet scope lets assigned fleet managers reach the path. `DashboardService.RenamePrefix` upper-cases and trims both keys, and rejects the request when the calendar importer is disabled. A key that changed or is already in use returns 409 `calendar prefix conflict`. In `yelo-web`, `CalendarPrefixes.tsx` calls it.
 - `operatinghours.ParseTitle` reads the leading `[KEY,KEY]` prefix, upper-cases each key, and resolves it through this registry. Titles without a known prefix fail validation. Alias identity survives zone renames and archival.
 
 ## CalendarSnapshots

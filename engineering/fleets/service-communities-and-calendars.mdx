@@ -95,6 +95,100 @@ Each service row can have one `CalendarConnections` row (`service_id` is unique)
 
 When either flag is off, `View` reports state `setup_required`, and attach and prefix edits are refused.
 
+### Owner OAuth flow
+
+A platform admin connects the owner account from **Access** with **Connect Google Calendar** (**Reconnect Google** once connected). The flow has three API calls. The public callback only stages encrypted credentials. Nothing is saved to `GoogleCalendarOwner` until the admin who started the flow calls the authenticated completion route.
+
+| Method | Path | Access |
+| --- | --- | --- |
+| `GET` | `/dashboard/calendar-owner` | Admin. Returns `owner_email`, `revision`, `connected_at`, and state `setup_required`, `disconnected`, or `connected`. |
+| `POST` | `/dashboard/calendar-owner/connect` | Admin. Returns `flow_id` and `authorization_url`. |
+| `GET` | `/oauth/google-calendar/callback` | Public. Registered on the root server, outside the Clerk middleware, and hidden from the OpenAPI document. |
+| `POST` | `/dashboard/calendar-owner/complete/{flow_id}` | Admin, and the same Clerk user who called `connect`. |
+
+```mermaid
+sequenceDiagram
+  participant Dash as Dashboard (Access)
+  participant API as OwnerService
+  participant DB as GoogleCalendarOAuthFlows
+  participant G as Google
+  Dash->>API: POST /dashboard/calendar-owner/connect
+  API->>API: random state and verifier, encrypt verifier
+  API->>DB: insert flow (state_hash, actor, owner_revision, status pending, 10 min)
+  API-->>Dash: flow_id, authorization_url
+  Dash->>G: redirect (state, S256 challenge, prompt=consent, login_hint)
+  G->>API: GET /oauth/google-calendar/callback?state&code
+  API->>DB: claim by SHA-256(state), pending to exchanging
+  API->>G: exchange code with verifier
+  API->>G: userinfo with access token
+  API->>DB: authorized + credential ciphertext, or failed
+  API-->>Dash: 303 GOOGLE_CALENDAR_DASHBOARD_URL?calendar_flow={id}
+  Dash->>API: POST /dashboard/calendar-owner/complete/{flow_id}
+  API->>DB: lock owner, then flow (same actor, unexpired)
+  API->>DB: save refresh token ciphertext, revision + 1, history row, flow completed
+  API-->>Dash: true
+```
+
+**Connect** (`OwnerService.Connect` in `internal/service/operatinghours/owner.go`):
+
+- `state` and the PKCE verifier are each 32 random bytes, base64url-encoded to 43 characters.
+- Only the SHA-256 hex digest of `state` is stored (`state_hash`, unique). The verifier is stored encrypted with the `GOOGLE_CALENDAR_TOKEN_KEYS` keyring.
+- `CalendarOwnerRepository.Start` creates the singleton owner row if missing, locks it, and copies its `revision` onto the flow as `owner_revision`.
+- The flow row expires 10 minutes after creation (`expires_at` default in migration `000317`). The `community_geography_maintenance` job deletes expired rows when the owner connection is enabled.
+- `OAuth.AuthorizationURL` in `internal/data/googlecalendar/oauth.go` requests scopes `openid`, `email`, and `https://www.googleapis.com/auth/calendar.readonly` with offline access, `prompt=consent`, an S256 challenge, and `login_hint` set to the configured owner email.
+- The dashboard only follows the returned URL if it is `https://accounts.google.com` (`CalendarOwnerConnection.tsx`).
+
+**Callback** (`Handler.Callback` and `OwnerService.Callback`):
+
+- The handler sets `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. It requires exactly one `state`, at most one `code`, at most one `error`, and not both `code` and `error`.
+- `ClaimCalendarOAuthFlow` moves the flow from `pending` to `exchanging` in one `UPDATE`. A second request with the same `state` matches no row, so a state is usable once.
+- A Google denial, an empty `code`, a `code` over 8,192 characters, or a flow whose owner email or client ID no longer matches configuration marks the flow `failed`.
+- `OAuth.Exchange` redeems the code with the decrypted verifier, then enforces three checks: Google returned both a refresh token and an access token, the granted `scope` string passes `HasScopes`, and the userinfo response has `email_verified`, a subject, and an email equal to the owner email (case-insensitive).
+- On success, the credentials (refresh token, subject, lowercased email, scopes) are encrypted as one JSON blob into `credential_ciphertext`. The flow becomes `authorized` and the verifier is cleared.
+- A claimed flow redirects with 303 to `GOOGLE_CALENDAR_DASHBOARD_URL` with `calendar_flow={id}` added. The redirect is the same for success, denial, and exchange failure, and carries no code, token, or Google error. The exceptions are a dashboard URL that doesn't parse and a failure that can't be recorded, which both return 400.
+
+**Complete** (`OwnerService.Complete` and `CalendarOwnerRepository.Complete`):
+
+- The request passes the dashboard Clerk middleware and `requireAdmin`. `GetCalendarOAuthFlow` filters by `actor`, so another admin's `flow_id` looks like a missing flow. Knowing a `flow_id` from the redirect URL isn't enough to finish a connection.
+- The service decrypts the staged credentials and repeats the email, subject, refresh-token, and scope checks before it writes anything.
+- The repository locks the owner row, then the flow row. It rejects the write if the owner `revision` moved since `connect`, the owner email differs, or a previously stored Google `subject` differs from the new one.
+- `SaveCalendarOwner` stores the re-encrypted refresh token, subject, client ID, and scopes, bumps `revision`, and sets `connected_at`. `AuditCalendarOwner` appends to `GoogleCalendarOwnerHistory`. The flow becomes `completed` and both ciphertext columns are cleared.
+- A repeat call for a `completed` flow returns success without writing.
+
+`Status` reports `connected` only when the stored email and client ID match configuration, a refresh token is present, and the stored scopes pass `HasScopes`. Changing `GOOGLE_CALENDAR_CLIENT_ID` therefore shows `disconnected` until an admin reconnects.
+
+#### Error responses
+
+| Route | Status | `error` text | Cause |
+| --- | --- | --- | --- |
+| Dashboard routes | 403 | **Platform admin required** | No Clerk user in context, or the role isn't `admin` (`requireAdmin`) |
+| Any | 400 | **Calendar setup unavailable** | The handler has no service |
+| `connect`, `complete` | 400 | **Google Calendar setup is not enabled yet** | `GOOGLE_CALENDAR_ENABLED` is off |
+| `connect`, `complete` | 409 | `owner revision conflict`, with title **Connection changed** | `connect`: the stored owner email isn't the configured one. `complete`: the flow's owner email or client ID no longer matches configuration, the owner revision moved, or the Google subject changed |
+| `complete` | 400 | `invalid uuid`, with title **Invalid ID** | `flow_id` isn't a UUID (`helpers.ParseUuid`) |
+| `complete` | 404 | **Calendar connection not found** | No unexpired flow with this ID started by this admin |
+| `complete` | 400 | **Google connection expired or was not authorized. Reconnect and select the configured owner with all requested permissions.** | The flow is `pending`, `exchanging`, or `failed`, or the staged credentials fail the repeated checks |
+| `connect`, `complete` | 500 | Generic server error | Encryption, decoding, or storage failed. `ownerError` replaces the cause with `calendar connection could not be saved` |
+| Callback | 400 | **Invalid calendar callback** | Missing or repeated `state`, repeated `code` or `error`, or both `code` and `error` |
+| Callback | 400 | **Calendar connection expired or could not be saved. Restart from the dashboard.** | Owner connection disabled, `state` isn't 43 characters, no pending unexpired flow matches the hash (unknown, reused, or expired), `GOOGLE_CALENDAR_DASHBOARD_URL` doesn't parse, or the failure couldn't be recorded |
+
+The service-level `calendarAdmin` check would return 401, but the handler's `requireAdmin` runs first and returns 403.
+
+#### Google error scrubbing
+
+`googlecalendar.Error` carries only a code, an HTTP status, and a retry delay. It never includes Google's response body, URL, or tokens. During the owner flow these codes stay inside the API: the callback discards the exchange error, marks the flow `failed`, and redirects. The admin sees only the generic 400 from `complete`.
+
+| Code | Raised when |
+| --- | --- |
+| `needs_auth` | The token endpoint returned `invalid_grant` (`scrubOAuthError`) |
+| `authorization_failed` | Any other token endpoint failure |
+| `offline_access_required` | The token response has no refresh token or no access token |
+| `missing_scopes` | The token response has no `scope` string, or it lacks `openid`, an email scope (`email` or `https://www.googleapis.com/auth/userinfo.email`), or the calendar read scope |
+| `identity_request` | The userinfo request couldn't be built |
+| `identity_unavailable` | The userinfo call failed or returned a non-200 status |
+| `unverified_owner` | The userinfo body didn't decode, or lacks `email_verified`, a subject, or an email |
+| `wrong_owner` | The Google account's email isn't the configured owner email |
+
 ### Endpoints and access
 
 Routes live under `/dashboard/fleets/{fleet_id}/communities/{community_id}/calendar` (`internal/server/http/dashboard/calendar/routes.go`) and send `Cache-Control: no-store`.
@@ -178,6 +272,7 @@ Only the primary fleet's calendar reaches riders. Other fleets' calendars are vi
 | Calendar schema | `yelo-api/migrations/000317_*` through `000320_*` |
 | Calendar services | `yelo-api/internal/service/operatinghours/dashboard.go`, `sync.go`, `ingest.go`, `aliases.go`, `owner.go` |
 | Calendar repositories | `yelo-api/internal/data/repository/calendar_dashboard.go`, `calendar_sync.go`, `queries/calendar_*.sql` |
+| Owner OAuth | `yelo-api/internal/server/http/dashboard/calendarowner/routes.go`, `internal/data/googlecalendar/oauth.go`, `internal/data/repository/calendar_owner.go`, `queries/calendar_owner.sql`, `yelo-web/src/components/CalendarOwnerConnection.tsx` |
 | Sync jobs | `yelo-api/internal/notify/queue/calendar_sync.go`, periodic registration in `queue.go` |
 | Rider projection | `yelo-api/internal/data/repository/community.go` |
 | Prefix renames | `yelo-api/docs/calendar-prefixes.md` |

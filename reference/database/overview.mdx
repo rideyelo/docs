@@ -110,9 +110,40 @@ When a write seems to have side effects you can't find in Go, check the table's 
 
 Row level security is enabled on 17 tables, including `Users`, `Rides`, `Communities`, `Schools`, and `EmailOTPs`, with no policies. This blocks Supabase's `anon` and `authenticated` roles. The API connects as the table owner and isn't affected.
 
+### Extensions and platform objects
+
+Every `CREATE EXTENSION` statement is in `000001_init_db`. No later migration creates or drops an extension.
+
+| Extension | Schema | Used by the migrations |
+| --- | --- | --- |
+| `pgsodium` | `pgsodium` | No |
+| `pg_graphql` | `graphql` | No |
+| `pg_stat_statements` | `extensions` | No |
+| `pgcrypto` | `extensions` | No |
+| `pgjwt` | `extensions` | No |
+| `supabase_vault` | `vault` | No |
+| `uuid-ossp` | `extensions` | Yes. Early migrations default `id` columns to `uuid_generate_v4()` |
+
+- The migrations don't create the `pgsodium`, `graphql`, `extensions`, or `vault` schemas. They assume Supabase already provides them.
+- `000001_init_db` also sets the owner of the `supabase_realtime` publication, and grants privileges on the `public` schema and its tables to the `anon`, `authenticated`, and `service_role` roles. No migration creates the publication or those roles.
+- `internal/data/migrationprep/preprocess.go` holds the rewrites for vanilla Postgres. Both targets replace `uuid_generate_v4()` with `gen_random_uuid()` and `uuid_nil()` with the zero UUID literal.
+- For the sqlc schema, it comments out every line that starts with `CREATE EXTENSION`, `ALTER PUBLICATION`, `GRANT`, or `ALTER DEFAULT PRIVILEGES`.
+- For the integration test database, it prepends `CREATE SCHEMA IF NOT EXISTS` for the four schemas and creates `uuid-ossp`. It comments out `pgsodium`, `pg_graphql`, `pg_stat_statements`, `pgjwt`, `supabase_vault`, the publication statement, the Supabase role grants, and the default privileges. `pgcrypto` and `uuid-ossp` still run.
+
+River's vendored migrations create these database objects besides its tables:
+
+| Object | Kind | Created in | Current state |
+| --- | --- | --- | --- |
+| `river_job_state` | Enum type | `000243_river_v2` | Exists. `000245_river_v4` adds the `pending` label |
+| `river_job_notify()` | Trigger function | `000243_river_v2` | Dropped by `000245_river_v4` |
+| `river_notify` | `AFTER INSERT` row trigger on `river_job` | `000243_river_v2` | Dropped by `000245_river_v4` |
+| `river_job_state_in_bitmask(bit(8), river_job_state)` | Immutable SQL function | `000247_river_v6` | Exists. Used by the partial unique index on `river_job` |
+
+While it existed, `river_job_notify()` called `pg_notify('river_insert', ...)` with the job's queue name for each inserted job in state `available`. The fully migrated schema has neither the function nor the trigger. `000245_river_v4.down.sql` recreates both. `000246_river_v5` also creates the unlogged tables `river_client` and `river_client_queue`, and `000248_river_v7` drops them. For the River tables, see [Platform and admin](/reference/database/platform-and-admin#river-job-queue).
+
 ### Migrations
 
-- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 347 versions, each with both files.
+- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 352 versions, each with both files.
 - `000001_init_db` is a `pg_dump` of the original Supabase schema, including Supabase extensions. Integration tests and the sqlc schema generator rewrite the Supabase-only statements.
 - `000242_river_v1` through `000248_river_v7` vendor River's own migrations.
 - Some migrations change data as well as schema, for example `000254_normalize_user_shape`, which backfilled missing `DriverApplications` rows.

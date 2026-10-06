@@ -101,6 +101,20 @@ The authenticated group uses `getValidatePresignupTokenMiddleware`, so it accept
 
 `QrTipVisits` is keyed by user and config, or user and recipient driver. Visits upsert `last_seen_at`. A second checkout overwrites `stripe_checkout_session_id`.
 
+### Dashboard endpoints
+
+`internal/server/http/dashboard/qrpayment/routes.go` registers the config and payment-history routes on the `/dashboard/qr` group, behind `getClerkAuthMiddleware` and `getDashboardScopeMiddleware`. The fleet scope passes every `/dashboard/qr` path and method, so each handler applies its own fleet check. The intern scope doesn't list `qr`, so interns get a 401 before the handler runs.
+
+| Method | Path | Role | Handler and purpose |
+| --- | --- | --- | --- |
+| `POST` | `/dashboard/qr/qr-configs` | Admin (`assertAdmin`) | `CreateConfig`. Creates the config and its Stripe objects. |
+| `GET` | `/dashboard/qr/qr-configs` | Admin, or fleet for assigned fleets | `GetConfigs`. Admins get every config. Fleet managers get the configs of their assigned fleets. |
+| `PATCH` | `/dashboard/qr/qr-configs/{id}/pricing` | Admin, or fleet for assigned fleets | `UpdatePricing`. Body is `pricing_mode` (required), `fixed_amount`, `custom_min`, `custom_max`, and `custom_preset`. |
+| `PATCH` | `/dashboard/qr/qr-configs/{id}/deactivate` | Admin, or fleet for assigned fleets | `DeactivateConfig` |
+| `GET` | `/dashboard/qr/qr-payments` | Admin, or fleet for assigned fleets | `GetPayments`. Query: `search`, `page`, `page_size`, `date_from`, `date_to` (RFC 3339). Only admins can filter by `fleet_id`. Fleet managers are always scoped to their assigned fleets. |
+
+Both `PATCH` routes run `authorizeConfigMutation`. For a non-admin it loads the config and returns 404 **QR payment config not found** unless the config's fleet is one of the caller's assigned fleets. The Stripe work each handler triggers is described in [QR config Stripe objects](#qr-config-stripe-objects). In `yelo-web`, `EditPricingModal.tsx` calls the pricing route.
+
 ## Clients
 
 <Tabs>
