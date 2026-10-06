@@ -7,7 +7,7 @@ Each repository ships independently. Merging to `main` deploys the API and the w
 
 | Repository | Trigger | Target | Pipeline |
 | --- | --- | --- | --- |
-| `yelo-api` | Push to `main`, or manual dispatch with a SHA | Cloud Run service `yelo-api-testflight` | `release-api.yml` then `cloudbuild.yaml` |
+| `yelo-api` | Push to `main`, or manual dispatch with a SHA | Cloud Run service `yelo-api-testflight` | `release-api.yml` then `cloudbuild.yaml`, or `release-api.yml` with `scripts/release/deploy-production.sh` on the [direct release backend](#direct-release-backend) |
 | `yelo-api` legacy update gate | Manual | App Engine, project `prod-yelo` | `gcloud app deploy` |
 | `yelo-web` sites | Push to `main` | Firebase Hosting, project `yelo-dashboard-v2` | `firebase.yml` |
 | `yelo-web` workers | Manual | Cloudflare Workers | `pnpm worker:<name>:deploy` |
@@ -24,12 +24,15 @@ Each repository ships independently. Merging to `main` deploys the API and the w
 
 `release-api.yml` serializes releases in the `production-api` concurrency group. A running release is never cancelled. Additional pushes coalesce into the newest pending SHA, which contains every earlier change.
 
+The workflow has two release backends. The repository variable `API_RELEASE_BUILDER` selects one. Cloud Build is the default in the workflow file: every value other than `blacksmith`, including an unset variable, takes the Cloud Build branch. See [Direct release backend](#direct-release-backend) for the other branch.
+
 ```mermaid
 flowchart TD
   A["Push to main"] --> B["release-api.yml<br/>resolve SHA and PR metadata"]
   B --> C{"Already deployed<br/>or superseded?"}
   C -- "yes" --> Z["Skip"]
-  C -- "no" --> D["Cloud Build trigger<br/>yelo-api-release-manual"]
+  C -- "no" --> X{"API_RELEASE_BUILDER<br/>is blacksmith?"}
+  X -- "no (default)" --> D["Cloud Build trigger<br/>yelo-api-release-manual"]
   D --> E["Build image and push by digest"]
   E --> F{"Migration version changed?"}
   F -- "yes" --> G["Run Cloud Run Job<br/>yelo-api-migrate"]
@@ -39,6 +42,16 @@ flowchart TD
   I --> J["Guard: newest release build?"]
   J --> K["Promote to 100%"]
   K --> L["Slack notification"]
+  X -- "yes" --> P["deploy-production.sh prepare<br/>on a Blacksmith runner"]
+  P --> Q["Build and push image<br/>with the Blacksmith Docker builder"]
+  Q --> R{"Migration version changed?"}
+  R -- "yes" --> S["Build migration image, run<br/>Cloud Run Job yelo-api-migrate"]
+  R -- "no" --> T
+  S --> T["Deploy candidate revision<br/>0% traffic"]
+  T --> U["Verify image digest, smoke /healthcheck<br/>and /healthcheck/deep"]
+  U --> V["Guard: serving revision unchanged?"]
+  V --> W["Promote to 100%"]
+  W --> Y["Slack notification"]
 ```
 
 The Cloud Build steps in `cloudbuild.yaml` do the following:
@@ -51,7 +64,7 @@ The Cloud Build steps in `cloudbuild.yaml` do the following:
 6. **Guard newest release.** Refuses to promote if a newer `production-api-release` build exists.
 7. **Promote.** Routes 100% of traffic to the candidate, verifies it, removes the candidate tag, and posts to Slack with the startup time read from the `Server is ready` log line.
 
-Runtime configuration lives on the Cloud Build trigger as `_RUNTIME_ENV_VARS` and `_RUNTIME_SECRET_REFS`. Secret payloads stay in Secret Manager. See [configuration](/engineering/api/configuration) for the variables themselves.
+On the Cloud Build backend, runtime configuration lives on the Cloud Build trigger as `_RUNTIME_ENV_VARS` and `_RUNTIME_SECRET_REFS`. Secret payloads stay in Secret Manager. See [configuration](/engineering/api/configuration) for the variables themselves.
 
 To release a specific commit manually:
 
@@ -59,11 +72,43 @@ To release a specific commit manually:
 gh workflow run release-api.yml --repo rideyelo/yelo-api --ref main -f sha=<FULL_GIT_SHA>
 ```
 
+### Direct release backend
+
+When `vars.API_RELEASE_BUILDER == 'blacksmith'`, `release-api.yml` never starts Cloud Build. The **Production** job runs on `blacksmith-4vcpu-ubuntu-2404`, builds the images itself, and calls `gcloud` directly through the phases of `scripts/release/deploy-production.sh`. The metadata, authentication, and **Check release order** steps, the **Resolve promoted revision** step, and the failure notification are shared with the Cloud Build backend.
+
+<Note>
+The workflow file only shows that Cloud Build is the fallback. It doesn't show the variable's value. Check `API_RELEASE_BUILDER` in the `yelo-api` Actions variables to see which backend production uses.
+</Note>
+
+| | Cloud Build backend (default) | Direct backend |
+| --- | --- | --- |
+| Selected when | `API_RELEASE_BUILDER` is anything but `blacksmith` | `API_RELEASE_BUILDER` is `blacksmith` |
+| Job runner | `ubuntu-latest` | `blacksmith-4vcpu-ubuntu-2404` |
+| Release logic | Steps in `cloudbuild.yaml` | Workflow steps that call `deploy-production.sh {prepare\|migrate\|deploy\|verify\|smoke\|promote}` |
+| Image build | `docker buildx` on an `E2_HIGHCPU_8` Cloud Build worker, with the `:buildcache` registry cache | `useblacksmith/build-push-action` for `linux/amd64`, on a `useblacksmith/setup-docker-builder` builder with `cache-key: yelo-api-production` |
+| Runtime configuration | Trigger substitutions `_RUNTIME_ENV_VARS` and `_RUNTIME_SECRET_REFS` | `production` environment secret `API_RUNTIME_ENV_VARS` and variable `API_RUNTIME_SECRET_REFS` |
+| Revision name | `yelo-api-testflight-<short_sha>-<first segment of the build ID>` | `yelo-api-testflight-<short_sha>-<run ID>-<run attempt>` |
+| Revision labels | `managed-by=cloud-build`, `gcb-build-id` | `managed-by=github-actions`, `github-run-id` |
+| Promotion guard | Fails if a newer `production-api-release` build exists | Fails if the revision serving 100% changed since `prepare` |
+| Success message to Slack | Posted by the Cloud Build **Notify Slack** step | Posted by the workflow step **Notify Slack on direct release success** |
+
+Both backends push to the same Artifact Registry images, run the same Cloud Run Job `yelo-api-migrate`, deploy the candidate by digest with `--no-traffic` and a `candidate-<short_sha>` tag, label the revision with `commit-sha` and `migration-version`, and smoke it with `scripts/release/smoke-candidate.sh`.
+
+The direct backend runs its release scripts from a second checkout at `.release-tools`, pinned to the workflow's own commit. The image build context comes from `git archive` of the release SHA, so it contains committed files only.
+
+`scripts/release/prepare-blacksmith.py` is a one-time setup script. It copies the runtime bindings from the Cloud Build trigger into the GitHub `production` environment and grants the release service account the roles the direct backend needs. It doesn't set `API_RELEASE_BUILDER`, and no workflow runs it.
+
+<Warning>
+The promote guard in `deploy-production.sh` relies on the `production-api` concurrency group to order releases. A comment in that script states that Cloud Build triggers must be disabled before you opt into this backend.
+</Warning>
+
+See [Release pipelines](/engineering/ci/release-pipelines#direct-release-backend) for each step.
+
 ### Migrations and rollback
 
 - Migrations run before the new revision receives traffic. Write them so the currently serving revision keeps working against the new schema.
 - Applied migration files are immutable. CI rejects any change to an existing file under `migrations/`, and `CODEOWNERS` requires `@rideyelo/migration-approvers` to review new ones.
-- Rollback means routing traffic back to an earlier schema-compatible revision. The promote step prints the exact command:
+- Rollback means routing traffic back to an earlier schema-compatible revision. On both backends, the promote step prints the previous revision as `Rollback revision: <previous-revision>`. Use it in this command:
 
   ```bash
   gcloud run services update-traffic yelo-api-testflight \

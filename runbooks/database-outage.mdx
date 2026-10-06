@@ -1,0 +1,198 @@
+---
+title: "Database outage"
+description: "What fails when Postgres is unreachable or a connection pool is exhausted, how to read the deep health check and pool metrics, and how to confirm recovery"
+---
+
+Postgres is the source of truth for rides, users, sessions, payments, and River jobs. Nothing in the API falls back when it's gone. Each API instance opens two pools against the same `DSN`: the `api` pool (10 connections) for requests and ticker loops, and the `river` pool (12 connections) for the job queue and notification repositories. See [Connection pools](/engineering/api/data-layer#connection-pools) for the settings.
+
+This runbook covers two failure shapes. In an outage, Postgres doesn't answer at all. In pool exhaustion, Postgres is healthy but every connection in a pool is in use, so callers wait and time out.
+
+## Symptoms
+
+- `GET /healthcheck/deep` returns 503 with `components.postgres.status: "unhealthy"`. `GET /healthcheck` still returns `OK`, because it doesn't touch Postgres.
+- Requests that read or write Postgres return 500, and `http_server_errors_total` climbs.
+- Logs show `database pool utilization high` or `potential connection leaks detected - tracker count exceeds pool acquisition count`.
+- Logs show `background task failed` for every ticker group, or `skipping background task: previous run still in progress`.
+- Pushes stop, and no new rows appear in `river_job`.
+- A new revision fails to start, or **Release API** fails its smoke test on the deep check.
+
+## Diagnose
+
+<Steps>
+  <Step title="Call the deep health check">
+    `GET /healthcheck/deep` needs no auth. It pings Postgres through the `api` pool with a 5-second timeout and returns the pool counters (`DeepHealth` in `internal/server/http/healthcheck/healthcheck_handler.go`).
+
+    | Field under `data.components.postgres` | Meaning |
+    | --- | --- |
+    | `status` | `healthy` when the ping succeeded, `unhealthy` otherwise. An unhealthy value sets the top-level `status` to `unhealthy` and the HTTP status to 503. |
+    | `latency_ms` | How long the ping took, including the wait for a connection. |
+    | `pool.max_conns` | Pool size, 10 for the `api` pool. |
+    | `pool.total_conns` | Open connections. |
+    | `pool.idle_conns` | Open connections not in use. |
+    | `pool.acquired_conns` | Connections in use. |
+    | `pool.constructing_conns` | Connections being opened. |
+    | `pool.empty_acquire_count` | Cumulative acquires that had to wait because the pool was empty. |
+    | `pool.acquire_duration_ms` | Cumulative time spent waiting to acquire. |
+
+    Read the two shapes apart with these fields:
+
+    | Shape | What you see |
+    | --- | --- |
+    | Postgres unreachable | `status: "unhealthy"` while `acquired_conns` is below `max_conns`. `latency_ms` is at most about 5000, the ping timeout. |
+    | Pool exhausted | `acquired_conns` equal to `max_conns`, `idle_conns` at 0, `empty_acquire_count` rising between calls. The ping can still time out waiting for a connection, which also reports `unhealthy`. |
+
+    <Note>
+    The response comes from one instance, and only describes that instance's `api` pool. The `river` pool isn't in the health check. The check also covers disk and runtime, and it doesn't check Redis.
+    </Note>
+  </Step>
+  <Step title="Read the pool metrics">
+    Two goroutines publish pool gauges for the `api` pool. See [Metrics](/reference/metrics#metric-catalog) for the full catalog.
+
+    | Metric | Source | Interval |
+    | --- | --- | --- |
+    | `pool.max`, `pool.total`, `pool.idle`, `pool.acquired` with `pool="postgres"` | Pool stats goroutine in `cmd/api/main.go` | `POOL_STATS_INTERVAL_S` (default 15 seconds) |
+    | `db.pool.total_conns`, `db.pool.idle_conns`, `db.pool.acquired_conns`, `db.pool.max_conns`, `db.pool.utilization` | `monitorPostgresPool` in `internal/data/repository/storage.go` | `POSTGRES_POOL_LOG_INTERVAL` (default `30s`) |
+    | `db.pool.leaked_conns` | Same | Set only when at least one connection has been held longer than 5 minutes |
+
+    `db.pool.utilization` is acquired divided by max. `db.pool.empty_acquire_count` and `db.pool.acquire_duration` record pgx's cumulative totals on every tick, so don't read them as rates.
+
+    The `river` pool is opened without the monitor, and the pool stats goroutine reads only the `api` pool. No metric describes the `river` pool.
+  </Step>
+  <Step title="Search the logs">
+    | Message | Level | Meaning |
+    | --- | --- | --- |
+    | `PostgreSQL connection pool status` | Info | Emitted every `POSTGRES_POOL_LOG_INTERVAL` with `acquired_conns`, `idle_conns`, `total_conns`, `max_conns`, and `utilization` |
+    | `database pool utilization high` | Warn | Utilization above 0.8 |
+    | `potential connection leaks detected - tracker count exceeds pool acquisition count` | Warn | A connection has been held longer than 5 minutes. `leaked_count` gives the number. |
+    | `connection leak details` | Warn | One line per held connection, with `held_duration` and the `stack_trace` of the goroutine that acquired it |
+    | `network operation retry` | Warn | Startup is retrying pool creation or its first ping |
+    | `background task failed` | Error | A ticker task returned an error. Fields: `group`, `task`, `duration`. |
+
+    The `stack_trace` on `connection leak details` names the code path that is holding the connection. Start there for an exhausted pool.
+  </Step>
+  <Step title="Count connections by pool">
+    Every connection sets `application_name` to `yelo-api-<role>-<revision>`, where the role is `api`, `river`, or `cli` and the revision is `K_REVISION`. The release migration job uses `yelo-api-migration-<execution>`. If Postgres still answers, group by that name.
+
+    **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT application_name, state, count(*) AS connections
+    FROM pg_stat_activity
+    WHERE application_name LIKE 'yelo-api-%'
+    GROUP BY application_name, state
+    ORDER BY connections DESC;
+
+    ROLLBACK;
+    ```
+
+    The comment on the pool constants in `storage.go` gives the budget: the production database allows 90 connections with 3 reserved, and each instance takes up to 22. A `cli` pool comes from a one-shot operator tool in `cmd/` and holds at most 2.
+  </Step>
+</Steps>
+
+## What stops working
+
+Every repository goes through the `api` pool. When the pool is exhausted, a query waits for a connection until its context ends. Many repository methods wrap their context in `WithPostgresTimeout` (`DefaultPostgresTimeout`, 5 seconds), so they fail after 5 seconds. Other queries wait on the request context. The HTTP server's read and write timeouts are 30 seconds.
+
+| Area | Behavior while Postgres is down or the pool is exhausted |
+| --- | --- |
+| HTTP requests | Any handler that reaches Postgres returns 500. `GET /healthcheck` keeps returning `OK`. |
+| API startup | `openPostgresDb` retries pool creation and a 30-second ping up to 5 times with the network retrier. If every attempt fails, the process panics. A failed `river` pool, template seed, stale-job cancel, or vehicle type registry load also ends startup. |
+| Releases | `scripts/release/smoke-candidate.sh` polls `/healthcheck/deep` 6 times, 5 seconds apart, and requires `status` and `components.postgres.status` to be `healthy`. A candidate that can't reach Postgres isn't promoted. |
+| River | See [River](#river). |
+| Ticker loops | See [Ticker loops](#ticker-loops). |
+| Ride events | `EventRecorder.processEvents` logs `Failed to insert ride event` and drops the event. Nothing retries it, so the ride timeline has gaps. |
+| Pool gauges | Keep publishing. They read in-memory pool statistics, not Postgres. |
+
+### River
+
+River stores every job in `river_job` and runs on the `river` pool. `notifyqueue.New` builds the client with queue sizes, workers, a logger, and periodic jobs. It sets no custom timeout, retry, or rescue options, so River's defaults apply.
+
+- **Enqueue.** Enqueuing is an insert into `river_job`. `notify.Emit` does it inside the caller's transaction. With Postgres down, the insert fails and no job exists. The notification is never queued, so it isn't sent after recovery.
+- **Workers.** Workers can't fetch, complete, or reschedule jobs. Jobs that were already queued stay in `river_job` and run after recovery.
+- **Periodic jobs.** The periodic inserts fail, so no new job of a recurring kind appears during the outage.
+- **Logs.** River logs through the API logger (`logger.NewSlogHandler`), so its errors appear in Cloud Logging with the API's logs.
+- **River UI.** The **Jobs** page reads the same database and fails with it.
+
+An exhausted `api` pool doesn't stop River, and an exhausted `river` pool doesn't fail HTTP requests, because the pools are separate. The notification repositories (templates, variants, cohorts, policies, deliveries, recipients) use the `river` pool, so long-running jobs can starve notification work on that instance.
+
+### Ticker loops
+
+A ticker task that can't query Postgres returns the error. `executeBackgroundTask` logs `background task failed` and the loop keeps ticking, so every task resumes on its own. Each run has a 2-minute timeout. A run that is still waiting when the next tick fires is skipped with `skipping background task: previous run still in progress`.
+
+| Group | Interval | Task | Effect while it fails |
+| --- | --- | --- | --- |
+| `Operational` | 30 seconds | `PurgeOfflineDrivers` | Inactive drivers aren't set offline, and renew reminders aren't sent |
+| `Operational` | 30 seconds | `CancelUnmatchedRides` | Unmatched rides aren't expired |
+| `Operational` | 30 seconds | `ProcessUnmatchedRides` | No driver activation or auto-queue for unmatched rides |
+| `Refresh` | 2 minutes | `RefreshFeed` | Community feed caches aren't rebuilt |
+| `Notifications` | 1 minute | `ProcessScheduledNotifications` | Scheduled dashboard notifications aren't sent |
+| `QueueRefresh` | 3 minutes | `RefreshQueueSummaries` | Queue summary caches aren't rewritten |
+| `TipCapture` | 5 minutes | `AutoCaptureTipWindowExpired` | Fares and tips with a closed tip window aren't captured |
+| `MapHeat` | 5 minutes | `RefreshHeatmaps`, `PurgeExpiredBumps` | Heatmaps aren't recomputed, and expired bumps aren't deleted |
+| `Mobility` | 1 minute | `RefreshMobilityFeeds` | The vehicles layer isn't refreshed |
+| `AuthV3Runtime` | 5 minutes | `RuntimeCleanupService.Run` | Expired Auth v3 rows aren't deleted |
+| `AuthV3OtpFallback` | `TWILIO_OTP_SWEEP_INTERVAL` | `PhoneFallbackService.Run` | Undelivered OTPs aren't re-sent |
+
+The vehicle type registry refresh (every 5 minutes) logs its error and keeps the last loaded registry. See [In-process ticker loops](/engineering/api/background-jobs#in-process-ticker-loops) for what each task does.
+
+<Warning>
+During a database outage, Cloud Run instances that scale up or restart can't start. Avoid deploying until Postgres is back. Instances already running keep their process and reconnect on their own.
+</Warning>
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Postgres is unreachable">
+    The API has no switch, fallback, or read replica for Postgres. Restore the database at the provider. The repository contains no backup, restore, or failover tooling, so this runbook can't describe one.
+
+    You don't need to restart the API afterward. pgx opens new connections on demand, checks idle ones every minute (`HealthCheckPeriod`), and recycles each connection after 1 hour (`MaxConnLifetime`).
+  </Accordion>
+  <Accordion title="Option 2: The api pool is exhausted">
+    1. Find the holder. `connection leak details` logs the stack trace of every connection held longer than 5 minutes.
+    2. Check whether Postgres itself is out of slots with the `pg_stat_activity` query. Two serving instances plus a rollout candidate use up to 66 connections. Extra revisions, operator tools, or a migration job add to that.
+    3. If one instance holds leaked connections, replace it by rolling out a new revision. A restart closes the pool and releases every connection. See [Deploy rollback](/runbooks/deploy-rollback) if the leak arrived with a release.
+
+    The pool sizes are constants in `storage.go` (`apiPoolMaxConns`, `riverPoolMaxConns`). No environment variable changes them, so a different size needs a code change and a release.
+  </Accordion>
+  <Accordion title="Option 3: The river pool is exhausted">
+    No metric or health check shows this pool. Infer it from the `pg_stat_activity` query (12 connections named `yelo-api-river-<revision>`, none idle) and from jobs that stop moving in River UI. River holds a connection for the whole job transaction, so a few long jobs can use the pool. Follow [River job failures](/runbooks/river-jobs) to find the job kind.
+  </Accordion>
+  <Accordion title="Option 4: Clean up after recovery">
+    - **River jobs** that were queued before the outage run again. At startup, the API cancels time-sensitive `notify_orchestrate` jobs that expired (`CancelStaleOrchestrationJobs`). That only runs when an instance starts, so check River UI for old notification jobs. See [River job failures](/runbooks/river-jobs).
+    - **Notifications emitted during the outage** were never queued. Nothing replays them.
+    - **Ride events** dropped during the outage are missing from ride timelines. Nothing backfills them.
+    - **Unmatched rides and offline drivers** are swept by the `Operational` group on its next tick.
+    - **Tip captures** are picked up by `AutoCaptureTipWindowExpired` on its next run, up to 50 rides per run.
+
+    Then check for stuck rides. See [Stuck or ghost ride](/runbooks/stuck-ride).
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- `GET /healthcheck/deep` returns 200 with `components.postgres.status: "healthy"` and a low `latency_ms`.
+- `pool.acquired` for `pool="postgres"` is below `pool.max`, and `db.pool.utilization` is below 0.8.
+- Logs show `background task completed successfully` for each ticker group, and no new `background task failed`.
+- New `completed` rows appear in `river_job` for the periodic kinds.
+
+## Alerts
+
+`monitoring/prometheus/alert-rules.yml` defines two database rules. Both read series the API exports.
+
+| Alert | Expression | For | Severity |
+| --- | --- | --- | --- |
+| `DatabaseUnreachable` | `pool_total{pool="postgres"} == 0` | 1 minute | critical |
+| `DatabasePoolExhausted` | `pool_acquired{pool="postgres"} / pool_max{pool="postgres"} > 0.9` | 5 minutes | critical |
+
+These rules are only loaded by the local Prometheus in `docker-compose.yml`. A third rule, `SlowDBQueries`, reads `db_query_duration_bucket`, which the API never records. See [Alert rules](/reference/metrics#alert-rules).
+
+## Root causes seen in code
+
+- **No fallback for Postgres.** Redis caches some reads, but every write and every job needs the database.
+- **Startup requires Postgres.** A pool that can't connect after 5 attempts panics the process, so scaling events during an outage reduce capacity.
+- **Small fixed pools.** The `api` pool has 10 connections per instance. A handful of slow queries or held transactions can fill it.
+- **The river pool is unobserved.** It has no monitor, no gauges, and no health check field.
+- **Outage-time work is lost, not queued.** Notification emits and ride events fail with the database and aren't replayed.
+- **The deep check is per instance.** A healthy response from one instance says nothing about another instance's pool.

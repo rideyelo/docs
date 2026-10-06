@@ -68,13 +68,50 @@ The web and mobile repositories look for the API at `../yelo-api` relative to th
     | --- | --- |
     | `make run` / `make runb` | Run from source, or build `bin/api` and run it |
     | `make rund` | Run the API plus Prometheus, Grafana, and Jaeger with Docker Compose |
-    | `make tf` | Unit tests in parallel, then integration tests sequentially |
+    | `make tf` | Unit tests in parallel, then integration tests with package parallelism `INTEGRATION_PARALLELISM` (default `2`) |
     | `make lf` | Lint with auto-fix |
     | `make a` | `tidy`, `mocks`, `lint-fix`, `test-fast` in one pass |
     | `make check` | Every CI gate, serialized. This is what the pre-commit hook runs |
     | `make openapi` | Regenerate the committed `openapi.json` |
     | `make sqlc-generate` / `make mocks` | Regenerate sqlc queries or mocks |
     | `make migrate-down` | Revert the last applied migration, with confirmation |
+
+    The `Makefile` defines more targets than the ones above:
+
+    | Target | What it does |
+    | --- | --- |
+    | `make build` | `go build -o ./bin/api ./cmd/api` |
+    | `make tidy` / `make i` | `go mod tidy` |
+    | `make all` / `make alld` | `make a`, then `make runb` or `make rund` |
+    | `make lint` | Run the pinned golangci-lint with `.golangci.yml`. Installs it first if the version differs |
+    | `make lint-fix` | The same with `--fix`. `make lf` is its alias |
+    | `make lint-info` | Print the working directory, config, Go version, and golangci-lint binary and version |
+    | `make test` | `go test -v ./...` without the `integration` build tag |
+    | `make test-unit` | Unit tests through `gotestsum` with `-p 8 -parallel 4 -count 1`, skipping `/mocks` packages |
+    | `make test-integration` | The packages in `INTEGRATION_PKGS` with `-tags=integration`. Needs Docker |
+    | `make test-fast` | The full name of `make tf` |
+    | `make test-fast-clean` / `make tfc` | `go clean -testcache`, then `make test-fast` |
+    | `make cover-unit-profile` | Unit tests with coverage into `coverage-unit.out`, then `go test ./cmd/...` |
+    | `make cover-integration-profile` | Integration tests with coverage into `coverage-int.out`. Needs Docker |
+    | `make coverage-merge` | Merge both profiles into `coverage.out` and print the total. Fails if either profile is missing |
+    | `make coverage-floor` | Fail if the total in `coverage.out` is below `COVERAGE_FLOOR` |
+    | `make cover` | `cover-unit-profile`, `cover-integration-profile`, then `coverage-merge` |
+    | `make cover-check` | `make cover`, then `coverage-floor` |
+    | `make cover-unit` | Unit-only coverage into `coverage-unit.out`. Understates the real number and isn't the gate |
+    | `make cover-integration` | Integration coverage for `internal/data/repository`, `redis`, and `stripe`, merged with unit coverage for `redis` and `stripe` into `coverage-integration.out`. Needs Docker |
+    | `make check-migration-policy` | `migration-check`, the migration immutability check against `BASE_REF` (default `origin/main`), the release script tests in `scripts/release`, and `scripts/school-catalog-dry-run_test.sh` |
+    | `make check-generated` | Generator script tests, then `openapi-check`, `sqlc-install`, `sqlc-check`, and `mocks-check` |
+    | `make migration-check` | Validate migration filenames, pairs, and versions with `scripts/release/check-migrations.sh`, and print the latest version |
+    | `make openapi-check` | Fail if the committed `openapi.json` is stale |
+    | `make openapi-download` | Download `/swagger/openapi.json` from a running local API into `bin/openapi.runtime.json`. Diagnostics only |
+    | `make sqlc-check` | Fail if `internal/data/sqlc` is stale or has untracked files, then run `sqlc vet` and the `sqlc` and `repository` package tests |
+    | `make sqlc-schema` | Run `scripts/sqlc/generate-schema.sh`, which writes `internal/data/sqlc/schema.sql` from `migrations/`. `make sqlc-generate` runs it first |
+    | `make sqlc-version-check` | Fail if `bin/sqlc` isn't the version pinned in the `Makefile` |
+    | `make mocks-check` | Run `scripts/mocks.py` without `--write`, to check mocks instead of regenerating them |
+    | `make proto-photon` | Regenerate the Photon iMessage gRPC client in `internal/data/photon/gen/imessagev1` with `buf generate` |
+    | `make bruno` / `make bruno-test` | Generate and run the Bruno collection. See [Bruno collection](/engineering/openapi-and-clients#bruno-collection) |
+
+    `make check` runs `check-migration-policy`, `check-generated`, `lint`, `cover-unit-profile`, `cover-integration-profile`, and `coverage-merge coverage-floor`, in that order. See [testing](/engineering/testing) for the coverage floor and the integration package list.
 
     See [configuration](/engineering/api/configuration) for every environment variable and feature flag.
   </Tab>

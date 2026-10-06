@@ -1,13 +1,17 @@
 ---
 title: "Release pipelines"
-description: "Step-by-step release flow for the API (GitHub Actions to Cloud Build to Cloud Run), the web sites (Nx and Firebase Hosting, Cloudflare Workers), and the mobile app (EAS builds, submit, OTA stage and promote)"
+description: "Step-by-step release flow for the API (GitHub Actions to Cloud Run, through Cloud Build or the direct backend), the web sites (Nx and Firebase Hosting, Cloudflare Workers), and the mobile app (EAS builds, submit, OTA stage and promote)"
 ---
 
 This page traces each release from the triggering event to the running artifact, including the guard scripts and their exact rules. [Deployment](/engineering/deployment) is the summary. [Deploy rollback](/runbooks/deploy-rollback) is the incident procedure. [GitHub Actions workflows](/engineering/ci/workflows) lists every trigger and input.
 
 ## API
 
-An API release has two halves. GitHub Actions decides whether and what to release. Cloud Build builds, migrates, and shifts traffic.
+An API release has two halves. GitHub Actions decides whether and what to release. A release backend then builds, migrates, and shifts traffic.
+
+The repository variable `API_RELEASE_BUILDER` selects the backend. Cloud Build is the default in `release-api.yml`: stage 2 below runs for every value except `blacksmith`, including an unset variable. When the value is `blacksmith`, the workflow runs the [direct release backend](#direct-release-backend) instead. The workflow file doesn't show which value the repository holds.
+
+The diagram shows the Cloud Build backend.
 
 ```mermaid
 sequenceDiagram
@@ -34,7 +38,7 @@ sequenceDiagram
 
 ### Stage 1: GitHub decides
 
-`release-api.yml` runs on every push to `main`, or manually with a `sha`. The concurrency group `production-api` never cancels a running release. Pushes that arrive meanwhile collapse into one pending run for the newest SHA.
+`release-api.yml` runs on every push to `main`, or manually with a `sha`. The concurrency group `production-api` never cancels a running release. Pushes that arrive meanwhile collapse into one pending run for the newest SHA. Stage 1 is the same on both backends.
 
 `scripts/release/release-required.sh <release_sha> <deployed_sha>` compares the requested SHA with the `commit-sha` label on the revision serving 100% of traffic:
 
@@ -45,7 +49,7 @@ sequenceDiagram
 | Neither | Error | The run fails with "Release and deployed SHAs have diverged" |
 | Either SHA missing from history | Error | The run fails |
 
-When a release is required, `resolve-release-build.sh` runs `gcloud builds triggers run yelo-api-release-manual --sha=<sha> --region=global` and returns the build ID. Set `RELEASE_MANUAL_TRIGGER` to override the trigger name. `wait-release-build.sh` polls `gcloud builds describe` every 10 seconds (`RELEASE_BUILD_POLL_SECONDS`) and prints the build log on any terminal status other than `SUCCESS`.
+When a release is required on the Cloud Build backend, `resolve-release-build.sh` runs `gcloud builds triggers run yelo-api-release-manual --sha=<sha> --region=global` and returns the build ID. Set `RELEASE_MANUAL_TRIGGER` to override the trigger name. `wait-release-build.sh` polls `gcloud builds describe` every 10 seconds (`RELEASE_BUILD_POLL_SECONDS`) and prints the build log on any terminal status other than `SUCCESS`.
 
 ### Stage 2: Cloud Build releases
 
@@ -111,9 +115,109 @@ When a release is required, `resolve-release-build.sh` runs `gcloud builds trigg
 
 After Cloud Build succeeds, the GitHub job confirms the 100% revision carries the release SHA and writes the revision and startup time to the job summary.
 
+### Direct release backend
+
+When `vars.API_RELEASE_BUILDER == 'blacksmith'`, the **Production** job runs on `blacksmith-4vcpu-ubuntu-2404` and replaces stage 2 with its own steps. The **Build, migrate, smoke, and promote** step that starts Cloud Build is skipped. Each phase of `scripts/release/deploy-production.sh` runs as a separate workflow step, so build and deploy times stay visible in the run.
+
+```mermaid
+sequenceDiagram
+  participant GH as GitHub Actions<br/>release-api.yml on Blacksmith
+  participant CR as Cloud Run<br/>yelo-api-testflight
+  participant AR as Artifact Registry
+  participant JOB as Cloud Run Job<br/>yelo-api-migrate
+  participant SL as Slack
+
+  GH->>CR: Read 100% revision and its commit-sha label
+  GH->>GH: release-required.sh
+  GH->>CR: Read 100% revision and migration-version label (prepare)
+  GH->>AR: Build and push image (and migrate image if needed)
+  GH->>JOB: Deploy and execute, only if migration needed (migrate)
+  GH->>CR: Deploy candidate at 0% with candidate tag (deploy)
+  GH->>AR: Inspect image index if digests differ (verify)
+  GH->>CR: Smoke /healthcheck and /healthcheck/deep (smoke)
+  GH->>CR: Confirm 100% revision is unchanged (promote)
+  GH->>CR: Route 100% to candidate, remove tag (promote)
+  GH->>CR: Confirm 100% revision matches SHA
+  GH->>SL: Deploy message
+```
+
+`deploy-production.sh` requires `RELEASE_SHA` to be a full 40-character SHA, and requires `GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT`. It changes into `RELEASE_SOURCE_DIR`, which the workflow sets to the workspace, and keeps state between phases in `.release/` there.
+
+<Steps>
+  <Step title="Check out release tooling">
+    A second `actions/checkout` puts `scripts/release` from `github.workflow_sha` into `.release-tools`. Every direct step runs its scripts from there. The workspace itself holds the release SHA. For a manual run with a `sha` input, the tooling comes from the ref you dispatched and the source comes from `sha`.
+  </Step>
+  <Step title="Prepare direct release">
+    `deploy-production.sh prepare` fails unless `RUNTIME_ENV_VARS` and `RUNTIME_SECRET_REFS` are set. The workflow fills them from the secret `API_RUNTIME_ENV_VARS` and the variable `API_RUNTIME_SECRET_REFS`.
+
+    It then runs `check-migrations.sh ./migrations`, resolves the serving revision with `revision-state.py serving`, reads that revision's `migration-version` label, and runs `migration-required.sh` with the same rules as the Cloud Build backend. `revision-state.py` fails unless exactly one revision serves 100% of traffic.
+
+    It writes `latest-migration`, `previous-revision`, `migration-required`, `image-base`, and `migration-image-base` to `.release/`, and sets the step output `migration_required`.
+
+    The step then extracts `git archive <release SHA>` into `$RUNNER_TEMP/api-build-context`. That directory is the Docker build context, so untracked and ignored files never reach the image.
+  </Step>
+  <Step title="Build and push images">
+    `useblacksmith/setup-docker-builder` sets up the builder with `cache-key: yelo-api-production`. `gcloud auth configure-docker us-central1-docker.pkg.dev` gives Docker access to Artifact Registry.
+
+    `useblacksmith/build-push-action` builds `Dockerfile` for `linux/amd64` and pushes `us-central1-docker.pkg.dev/prod-yelo/yelo-images/yelo-api/yelo-api-testflight:<sha>`. This backend doesn't read or write the `:buildcache` registry tag.
+
+    When `migration_required` is `yes`, a second build pushes `Dockerfile.migrate` as `.../yelo-api/yelo-api-migrate:<sha>`.
+
+    **Record immutable images** writes both digests to `.release/build-metadata.json` and `.release/migration-build-metadata.json`. Later phases deploy by digest, not by tag.
+  </Step>
+  <Step title="Migrate production database">
+    Runs only when `migration_required` is `yes`. `deploy-production.sh migrate` deploys the Cloud Run Job `yelo-api-migrate` with the same image-by-digest, service account, `MIGRATION_DSN` secret, `EXPECTED_MIGRATION_VERSION`, network, retry, and timeout settings as the Cloud Build backend. The job labels are `managed-by=github-actions`, `commit-sha`, and `github-run-id`. It then runs `gcloud run jobs execute --wait`.
+  </Step>
+  <Step title="Deploy zero-traffic candidate">
+    `deploy-production.sh deploy` deploys the image by digest with `--no-traffic`, `--max-instances=2`, `--update-env-vars`, and `--update-secrets`.
+
+    | Property | Value |
+    | --- | --- |
+    | Revision name | `yelo-api-testflight-<short_sha>-<run ID>-<run attempt>` |
+    | Traffic tag | `candidate-<short_sha>` |
+    | Labels | `managed-by=github-actions`, `commit-sha`, `github-run-id=<run ID>-<run attempt>`, `migration-version` |
+
+    `<short_sha>` is the first 8 characters of the release SHA. The phase records the requested image reference and the image Cloud Run reports for the revision. It fails if Cloud Run returns no URL for the candidate tag.
+  </Step>
+  <Step title="Verify candidate image">
+    `deploy-production.sh verify` fails unless both image references end in `@sha256:` followed by 64 hex characters. If they differ, it pipes `docker buildx imagetools inspect --raw` into `verify-image.py`. That script passes only when both references name the same repository and the deployed digest is a manifest in the requested index with platform `linux/amd64`.
+  </Step>
+  <Step title="Smoke candidate">
+    `deploy-production.sh smoke` runs `smoke-candidate.sh` against the candidate URL with the default attempts and timeouts from the [Cloud Build smoke step](#stage-2-cloud-build-releases).
+  </Step>
+  <Step title="Guard and promote candidate">
+    `deploy-production.sh promote` reads the serving revision again. If it isn't the revision recorded by `prepare`, the phase exits with "Production changed while the candidate was being verified; refusing promotion" and doesn't touch traffic.
+
+    Otherwise it routes 100% of traffic to the candidate, verifies it, and removes the candidate tag. The step log ends with `Rollback revision: <previous revision>`. If verification fails, it prints the `update-traffic` rollback command and exits.
+  </Step>
+  <Step title="Resolve promoted revision and notify Slack">
+    The shared **Resolve promoted revision** step confirms the 100% revision carries the release SHA. It reads `startup_duration` from the `Server is ready` log line with up to two tries, 5 seconds apart.
+
+    **Notify Slack on direct release success** formats the message with `format-deploy-slack.sh` and posts it to the webhook in the secret `yelo-api-deploy-slack-webhook`. A Slack failure only logs a warning.
+  </Step>
+</Steps>
+
+If any step fails after authentication, **Notify Slack on release failure** posts a message whose second link is labeled **Blacksmith build** and points at the GitHub Actions run. The status in that message is always `failed`, because there is no Cloud Build status to read.
+
+`scripts/release/release_pipeline_test.py` exercises the `prepare`, `migrate`, `verify`, and `promote` phases against a fake `gcloud`, and unit-tests `verify-image.py` and `revision-state.py`. It runs in `make check-migration-policy`, so the **Migration Policy** CI job covers it.
+
+`scripts/release/prepare-blacksmith.py` is the one-time setup for the direct backend. It shells out to `gcloud` and `gh`, so run it by hand with both authenticated. No workflow runs it, and it doesn't change `API_RELEASE_BUILDER`.
+
+| Action | Target |
+| --- | --- |
+| Read `_RUNTIME_ENV_VARS` and `_RUNTIME_SECRET_REFS` | Cloud Build trigger `yelo-api-release-manual`. Fails if either is empty |
+| `gh secret set API_RUNTIME_ENV_VARS --env production` | `rideyelo/yelo-api` |
+| `gh variable set API_RUNTIME_SECRET_REFS --env production` | `rideyelo/yelo-api` |
+| Grant `roles/run.developer` | Service `yelo-api-testflight` and job `yelo-api-migrate` |
+| Grant `roles/artifactregistry.writer` | Artifact Registry repository `yelo-images` |
+| Grant `roles/iam.serviceAccountUser` | Service account `798668004250-compute@developer.gserviceaccount.com` |
+| Grant `roles/secretmanager.secretAccessor` | Secret `yelo-api-deploy-slack-webhook` |
+
+Every grant goes to `yelo-api-release@prod-yelo.iam.gserviceaccount.com`. The script passes the runtime values over stdin and never prints them.
+
 ### Rollback
 
-- Traffic rollback is manual: `gcloud run services update-traffic yelo-api-testflight --region=us-central1 --to-revisions=<previous>=100`. See [Deploy rollback](/runbooks/deploy-rollback).
+- Traffic rollback is manual on both backends: `gcloud run services update-traffic yelo-api-testflight --region=us-central1 --to-revisions=<previous>=100`. See [Deploy rollback](/runbooks/deploy-rollback).
 - You can't roll back by dispatching **Release API** with an older SHA. `release-required.sh` returns `no` for any ancestor of the deployed SHA.
 - Down migrations never run in the pipeline. See [Failed migration](/runbooks/failed-migration).
 
@@ -129,13 +233,22 @@ flowchart TD
   V -- "yes" --> D{"yelo-api-e2e matches<br/>all three?"}
   D -- "yes" --> N["No-op"]
   D -- "no" --> S["Check out production SHA<br/>gcloud builds submit cloudbuild.e2e.yaml"]
-  S --> M["Build yelo-api-e2e-migrate,<br/>run Cloud Run Job yelo-api-e2e-migrate"]
-  M --> P["Deploy production image digest<br/>to yelo-api-e2e"]
-  P --> K["smoke-candidate.sh on service URL"]
+  S --> MR{"Migration version<br/>differs?"}
+  MR -- "yes" --> M["Build yelo-api-e2e-migrate,<br/>run Cloud Run Job yelo-api-e2e-migrate"]
+  MR -- "no" --> P
+  M --> P["Deploy production image digest to yelo-api-e2e<br/>0% traffic, tag e2e-candidate"]
+  P --> K["smoke-candidate.sh on the tagged URL"]
+  K --> I{"Deployed image equals<br/>production image?"}
+  I -- "no" --> F
+  I -- "yes" --> PR["Route 100% to the revision,<br/>remove e2e-candidate"]
 ```
 
-`cloudbuild.e2e.yaml` validates its inputs before it touches anything:
+The convergence works the same on both production backends, because it reads only the serving production revision's `commit-sha` label, image digest, and `migration-version` label.
 
+`cloudbuild.e2e.yaml` has a 20-minute timeout and validates its inputs before it touches anything:
+
+- `_MIGRATION_REQUIRED` is `yes` or `no`.
+- The highest migration version in the checked-out source equals `_EXPECTED_MIGRATION_VERSION`, which the workflow sets to production's `migration-version` label.
 - `_GIT_SHA` is a full 40-character SHA.
 - `_API_IMAGE` is a digest in this project's Artifact Registry.
 - `_SERVICE_ACCOUNT`, `_DATABASE_PROJECT_REF`, and `_PRODUCTION_DATABASE_PROJECT_REF` are set, and the two project refs differ.
@@ -143,7 +256,13 @@ flowchart TD
 
 The migration job adds three more guards in `run-migrations.sh` when `E2E_BOOTSTRAP_SUPABASE_SECONDARY_DATABASE=true`. It refuses a DSN containing the production project ref, requires the E2E project ref in the DSN, and requires `current_database()` to be `yelo_e2e`. It then applies `bootstrap-supabase-secondary.sql`, bridges the duplicate migration 82/83 rename on a fresh database, runs `migrate up`, and seeds `seed-e2e-baseline.sql`.
 
-The service deploys with `yelo-e2e-*` secrets, `ENVIRONMENT=e2e`, `E2E_ENABLED=true`, `E2E_BACKGROUND_JOBS_ENABLED=false`, `--min-instances=0`, `--max-instances=2`, `--concurrency=20`, and `--allow-unauthenticated`. The workflow checks out `.gitignore` from the workflow's own commit and uses it as the upload ignore file, so the upload policy doesn't depend on the older production commit. See [E2E environment reset](/runbooks/e2e-environment-reset).
+The workflow sets `_MIGRATION_REQUIRED=no` when the E2E revision's `migration-version` label already equals production's. The build then skips the migration image and the migration job.
+
+The service deploys with `yelo-e2e-*` secrets, `ENVIRONMENT=e2e`, `E2E_ENABLED=true`, `E2E_BACKGROUND_JOBS_ENABLED=false`, `--min-instances=0`, `--max-instances=2`, `--concurrency=20`, and `--allow-unauthenticated`. The revision is named `yelo-api-e2e-<short_sha>-<first segment of the build ID>` and labeled `managed-by=e2e-convergence`, `environment=e2e`, `commit-sha`, and `migration-version`. It deploys with `--no-traffic` and the tag `e2e-candidate`.
+
+The last step smokes the tagged URL with 12 `/healthcheck` attempts, 6 `/healthcheck/deep` attempts, and a 15-second request timeout. It then fails unless the revision's image equals `_API_IMAGE` exactly, routes 100% of traffic to the revision, removes the tag, and confirms the revision is the only one at 100%.
+
+The workflow checks out `.gitignore` and `cloudbuild.e2e.yaml` from the workflow's own commit. It uses them as the upload ignore file and the build config, so neither depends on the older production commit. See [E2E environment reset](/runbooks/e2e-environment-reset).
 
 ## Web
 
@@ -313,8 +432,11 @@ To ship a backport, merge the rolling PR, then run **OTA Stage** with `source_re
 ## Gotchas and edge cases
 
 - **Stale builds fail on purpose.** With two releases queued, the older Cloud Build can fail at **Guard newest release** after migrating and deploying its candidate. Its unused candidate revision stays at 0% traffic. Watch the newest build.
+- **The direct backend guards on the serving revision, not on build order.** `deploy-production.sh promote` fails when the 100% revision changed after `prepare`, for example after a manual traffic shift or a Cloud Build release. The migration has already run and the candidate stays at 0% traffic. The next release starts from the new serving revision.
+- **The direct backend needs exactly one revision at 100%.** `revision-state.py` fails `prepare` and `promote` when traffic is split or no revision serves 100%. The Cloud Build backend takes the first 100% entry instead.
+- **Direct release scripts come from the workflow commit.** A manual run that releases an older `sha` still uses the `scripts/release` directory of the ref you dispatched. **Check release order** is the exception: it runs `release-required.sh` from the release SHA.
 - **Migrations run before the smoke test.** If the candidate fails smoke, the schema is already migrated and the old revision keeps serving. Write migrations that the serving revision tolerates.
-- **Deploy Slack shows the Git author only.** `cloudbuild.yaml` doesn't set `DEPLOY_MERGED_BY`, so the API deploy message never names the merger. The web deploy message does.
+- **Deploy Slack shows the Git author only.** Neither `cloudbuild.yaml` nor the direct success step sets `DEPLOY_MERGED_BY`, so the API deploy message never names the merger. The web deploy message does.
 - **Only the E2E migration job uses a dedicated identity.** The production migration job and service run as the default compute service account. `yelo-api-e2e` and its migration job run as `yelo-api-e2e@prod-yelo.iam.gserviceaccount.com`.
 - **Staging builds and OTA use production.** Every `eas.json` profile except `e2e-simulator` uses the `production` EAS environment, and staged bundles call the production API.
 - **Finalize and promote share a queue.** Both use the `ota-production` concurrency group, so a pending finalize waits for a running promote.

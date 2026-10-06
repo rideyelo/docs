@@ -42,6 +42,30 @@ Because generation is environment-independent, the same commit always produces t
 
 See [API structure](/engineering/api/structure) for where route registration lives.
 
+## Bruno collection
+
+Two targets in the `yelo-api` `Makefile` turn the contract into a Bruno collection and run it. Both need the `bru` CLI. If it's missing, the target stops and tells you to run `brew install bruno-cli`.
+
+```bash
+make bruno       # regenerate openapi.json, then import it into ./bruno/generated
+make bruno-test  # run the collection in ./bruno against http://localhost:8080
+```
+
+| Target | What it does |
+| --- | --- |
+| `make bruno` | Runs `make openapi` first. Empties `./bruno/generated`, runs `bru import openapi --source ./openapi.json --output ./bruno/generated --collection-name "Yelo-API"`, then deletes the generated `bruno.json` and `collection.bru` |
+| `make bruno-test` | Requests `http://localhost:8080/healthcheck` and stops if the API isn't running. Then runs `bru run ./bruno --env local` |
+
+- `bruno/` is in `.gitignore`. The repository commits no collection, no `bruno.json`, and no `local` environment.
+- `make bruno-test` runs `bru run` on `./bruno` with `--env local`. `make bruno` deletes the `bruno.json` and `collection.bru` it imports, and nothing in the repository creates a `local` environment. Create the collection root files and the `local` environment under `./bruno` yourself.
+- `make bruno` depends on `make openapi`, so it rewrites `openapi.json` in your working tree.
+- Start the API with `make run` in another terminal before `make bruno-test`. The URL is fixed at `http://localhost:8080`.
+- No CI job and no `make check` step runs either target.
+
+<Note>
+Both targets print their `✓` line after `bru` exits, whatever its exit status. Read the `bru` output to see whether the import or the test run passed.
+</Note>
+
 ## Propagate the contract to consumers
 
 `.github/workflows/propagate-openapi.yml` in `yelo-api` keeps both consumers current. It runs when:

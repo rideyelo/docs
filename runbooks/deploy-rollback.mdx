@@ -27,7 +27,14 @@ Each repository ships on its own, so roll back only the surface that broke. For 
       --format="table(metadata.name, metadata.labels.commit-sha, metadata.labels.migration-version, metadata.creationTimestamp)"
     ```
 
-    Every release revision is labeled with `commit-sha` and `migration-version`. The promote step's build log prints `Rollback revision: <previous-revision>`.
+    Every release revision is labeled with `commit-sha` and `migration-version`. The promote step prints `Rollback revision: <previous-revision>`. Where you find that line depends on the [release backend](/engineering/deployment#direct-release-backend) that shipped the revision:
+
+    | Backend | Revision name | `managed-by` label | Where the rollback revision is printed |
+    | --- | --- | --- | --- |
+    | Cloud Build | `yelo-api-testflight-<short_sha>-<first segment of the build ID>` | `cloud-build` | **Promote candidate** step in the Cloud Build log |
+    | Direct | `yelo-api-testflight-<short_sha>-<run ID>-<run attempt>` | `github-actions` | **Guard and promote candidate** step in the **Release API** run |
+
+    To see the label, add `metadata.labels.managed-by` to the `--format` columns above.
   </Step>
   <Step title="Check schema compatibility">
     Compare the `migration-version` label of the revision you want to restore with the current one. Migrations run before the new revision gets traffic and are written so the older revision keeps working. That's the premise of an API rollback. Review any migration between the two versions before you roll back past it.
@@ -40,7 +47,7 @@ Each repository ships on its own, so roll back only the surface that broke. For 
   <Tab title="API">
     <Steps>
       <Step title="Shift traffic back">
-        Route 100% of traffic to the previous revision. This is the command the release pipeline prints:
+        Route 100% of traffic to the previous revision. The command is the same for both release backends. The release pipeline prints it when it can't verify a promotion:
 
         ```bash
         gcloud run services update-traffic yelo-api-testflight \
@@ -52,6 +59,12 @@ Each repository ships on its own, so roll back only the surface that broke. For 
         **Release API** runs on every push to `main`. Revert the bad change on `main`. The next release builds the revert and promotes it normally.
       </Step>
     </Steps>
+
+    <Note>
+    On the direct release backend, a rollback changes what an in-flight release does. `deploy-production.sh promote` refuses to promote when the revision serving 100% differs from the one it recorded in `prepare`. A **Release API** run that was past `prepare` when you shifted traffic fails with "Production changed while the candidate was being verified; refusing promotion". Its candidate stays at 0% traffic, and any migration it needed has already run. The Cloud Build backend has no such check. It only refuses when a newer release build exists.
+
+    Always roll back to a single revision at 100%. On the direct backend, `revision-state.py` fails the next release at `prepare` unless exactly one revision serves 100% of traffic.
+    </Note>
 
     <Warning>
     Don't try to roll back by dispatching **Release API** with an older `sha`. `release-required.sh` skips any SHA that the serving revision already contains, reporting "already deployed or superseded". If migrations moved forward, `migration-required.sh` also refuses a release whose migration version is older than the deployed one.
@@ -103,6 +116,6 @@ Each repository ships on its own, so roll back only the surface that broke. For 
 
 ## Root causes seen in code
 
-- **No automatic rollback.** Cloud Build only promotes after `/healthcheck` and `/healthcheck/deep` pass on the candidate. Anything those don't cover, including Redis, reaches production.
+- **No automatic rollback.** Both release backends only promote after `/healthcheck` and `/healthcheck/deep` pass on the candidate. Anything those don't cover, including Redis, reaches production.
 - **Coalesced releases.** Pushes that land during a release coalesce into the newest SHA, so one release can carry several pull requests.
-- **Stale promotion guard.** A build refuses to promote when a newer release build exists, and that older build's run fails. Watch the newest build instead.
+- **Stale promotion guard.** On the Cloud Build backend, a build refuses to promote when a newer release build exists, and that older build's run fails. Watch the newest build instead. On the direct backend, a run refuses to promote when the serving revision changed after its `prepare` phase.

@@ -1,0 +1,256 @@
+---
+title: "Run the school catalog sync"
+description: "Run the offline school catalog sync: dry run with the wrapper script, read the report, clear guard trips, and apply the plan to the Schools table"
+---
+
+`cmd/sync-school-catalog` is an offline command. It builds a catalog of US institutions from public sources, compares it with `Schools`, and plans three kinds of change: new schools inside active communities, coordinate backfills, and additive email-domain updates. No API route or background job runs it. Read [School catalog sync](/engineering/domains/communities-and-schools-admin#school-catalog-sync) for the sources and matching rules.
+
+The command is a dry run by default. It writes only when you pass `--dry-run=false`.
+
+## Before you start
+
+- You have a checkout of `yelo-api` with `go` installed. The wrapper script also needs `jq`.
+- You have the database connection string. The command reads `DSN` from the environment or from `.env` in the working directory (`config.Load`).
+- The database has migrations through `000307`. A dry run works on an older schema. An apply is blocked.
+- You know which database `DSN` points at. An apply changes that database and nothing else.
+
+## Run a dry run
+
+<Steps>
+  <Step title="Check the catalog alone">
+    This downloads and merges the sources without connecting to a database. Use it to confirm the upstream sources are reachable.
+
+    ```bash
+    go run ./cmd/sync-school-catalog --catalog-only
+    ```
+
+    The command prints the catalog size and how many domains the domain policy approves. It stops with `preflight blocked: catalog contains N eligible current institutions, below --min-catalog-schools=5000` when the upstream catalog is too small.
+  </Step>
+  <Step title="Run the read-only wrapper">
+    ```bash
+    scripts/school-catalog-dry-run.sh
+    ```
+
+    The wrapper builds the command from the checkout and runs it against the configured database in a read-only transaction. It accepts only these arguments and passes no other flags through:
+
+    | Argument | Effect |
+    | --- | --- |
+    | `--env-dir DIRECTORY` | Directory whose `.env` supplies `DSN`. Default: the repository root. An exported `DSN` takes precedence. |
+    | `--cache-dir DIRECTORY` | ZIP cache directory. Default: `$XDG_CACHE_HOME/yelo/school-catalog`, or `$HOME/.cache/yelo/school-catalog`. |
+    | `--no-cache` | Skips cache reads and writes. |
+    | `--ror-file ZIP` | Uses a ROR v2 ZIP you downloaded instead of fetching ROR. |
+    | `-h`, `--help` | Prints usage. |
+
+    The wrapper always runs with `--dry-run=true`, `--verbose`, `--with-supplemental-sources`, `--domain-policy=corroborated`, an ArcGIS-hosted `--edge-url`, and one `--historical-ipeds-url` for each year from `HD2015.zip` to `HD2023.zip`.
+  </Step>
+  <Step title="Read the exit code">
+    | Exit code | Meaning |
+    | --- | --- |
+    | `0` | The plan is safe. `database.safe_to_apply` is `true`. |
+    | `2` | The plan is blocked. `database.blocking_issues` lists why. |
+    | Anything else | The run or its configuration failed. It isn't a completed validation. |
+
+    The command itself exits `0` on a dry run with a blocked plan. Only the wrapper turns `safe_to_apply = false` into exit code `2`. If you run the command directly, read `safe_to_apply` in the report.
+  </Step>
+  <Step title="Open the output directory">
+    The wrapper prints a new private directory under `$TMPDIR` (or `/tmp`) named `yelo-school-dry-run.XXXXXX`.
+
+    | File | Contents |
+    | --- | --- |
+    | `dry-run.json` | The full report. |
+    | `summary.json` | Counts, blocking issues, holds grouped by reason, and identity resolutions grouped by reason. |
+    | `create-review.csv` | One row per planned new school: source ID, final name, community, domains, coordinates. |
+    | `held-review.csv` | One row per held catalog record, with the hold reason and IPEDS status. |
+    | `ambiguous-review.csv`, `resolved-review.csv` | One row per existing school whose identity was held, or resolved by review. |
+    | `ambiguous-candidates.csv`, `resolved-candidates.csv` | The same schools, one row per candidate institution with its evidence. |
+    | `domain-corrections.csv` | Reviewed domain removals or replacements. Every other domain change is additive. |
+    | `run.log`, `build.log`, `importer.log` | Wrapper, build, and command logs. |
+  </Step>
+</Steps>
+
+## Read the report
+
+`dry-run.json` has four top-level keys: `dry_run`, `domain_policy`, `sources`, and `database`. `sources` holds row counts per upstream source. `database` is the plan (`databaseReport` in `cmd/sync-school-catalog/main.go`).
+
+| `database` field | Meaning |
+| --- | --- |
+| `safe_to_apply` | `true` when `blocking_issues` is empty. |
+| `blocking_issues` | Every guard that tripped. An apply refuses to run while this has entries. |
+| `existing_schools`, `matched_existing` | Rows in `Schools`, and how many matched one catalog institution. |
+| `schools_created` | Planned inserts. |
+| `coordinates_backfilled` | Matched schools at `0, 0` that get catalog coordinates. |
+| `coordinates_overwritten` | Matched schools whose non-zero coordinates change. Only with `--overwrite-coordinates`. |
+| `approved_coordinate_changes` | Entries accepted from `--approved-coordinates-file`. |
+| `existing_domains_added`, `new_school_domains_added` | Domain additions to existing and new schools. |
+| `existing_domains_removed` | Removals from reviewed domain corrections only. |
+| `metadata_upserted` | `SchoolCatalogMetadata` rows written. |
+| `new_schools_outside_active_bounds` | Catalog institutions skipped because no active community contains them. |
+| `catalog_records_suppressed` | Catalog institutions reserved by an ambiguous or protected existing school. |
+| `changes` | One entry per planned change, with before and after values. |
+| `held_catalog_records` | Catalog institutions excluded from every automatic change, with a `reason`. |
+| `identity_reviews` | Existing schools that were `held`, `preserved`, or matched through review (`resolved_match`). |
+| `ambiguous_existing`, `unmatched_existing` | Existing school names with conflicting evidence, or with no catalog match. |
+| `protected_test_schools` | Synthetic schools. The sync never changes them. |
+| `domain_conflicts` | Domains claimed by more than one school. New assignments are suppressed and existing values are kept. |
+| `name_resolutions` | New schools renamed to avoid a duplicate name, by appending the city and state or the IPEDS ID. |
+| `reviewed_domain_corrections` | Domain repairs from the bundled `institution_decisions.json`. |
+| `coordinate_candidates`, `historical_coordinate_candidates` | Review evidence for schools still at `0, 0`. Neither is applied automatically. |
+| `geocoding_failures` | Addresses from `--geocode-addresses-file` that Mapbox couldn't resolve. |
+
+Each `changes` entry has an `action`:
+
+| Action | Writes on apply |
+| --- | --- |
+| `create` | A new `Schools` row in `community_after`, with catalog coordinates and approved domains. |
+| `update` | Merged domains on an existing school, and coordinates when it sits at `0, 0` or `--overwrite-coordinates` is set. |
+| `reviewed_domain_correction` | The exact domain list from a bundled, reviewed decision. |
+| `approved_coordinate_backfill` | Coordinates from an approved entry in `--approved-coordinates-file`. |
+
+### Hold reasons
+
+A held catalog record creates and updates nothing. Don't lower a guard to clear the list.
+
+| `reason` | Source |
+| --- | --- |
+| `not_a_current_ipeds_institution`, `successor_or_reorganization_requires_review`, `closure_evidence_requires_review`, `not_currently_active_in_ipeds`, `administrative_unit`, `unknown_institution_sector` | `School.ImportExclusion` in `internal/data/schoolcatalog/eligibility.go`. |
+| `catalog_identity_collision` | Two catalog institutions share a normalized name or website and sit within 100 meters. |
+| `possible_existing_institution` | A new institution resembles an existing school by name, by a College to University rename, or by website domain. |
+| `shared_institution_website` | Another eligible catalog institution has the same website domain. |
+
+## Clear guard trips
+
+<AccordionGroup>
+  <Accordion title="The catalog is undersized">
+    `preflight blocked: catalog contains N eligible current institutions` means an upstream source returned too little. The command stops before it opens the database and writes no report. Rerun with `--verbose` and check which source came back short. Don't lower `--min-catalog-schools` to get past a truncated download.
+  </Accordion>
+  <Accordion title="A count exceeds its limit">
+    | `blocking_issues` entry | Limit flag | Default |
+    | --- | --- | --- |
+    | `planned school creates N exceed limit M` | `--max-created-schools` | 500 |
+    | `planned coordinate changes N exceed limit M` | `--max-coordinate-changes` | 5,000 |
+    | `planned domain additions N exceed limit M` | `--max-domain-additions` | 2,000 |
+
+    Coordinate changes count backfills, overwrites, and approved changes together. Domain additions count existing and new schools together.
+
+    Review `create-review.csv` or the `changes` array first. A large count is expected after you activate a community with many campuses. Raise the limit on the apply command only after the list looks right.
+  </Accordion>
+  <Accordion title="A community has invalid or empty bounds">
+    `community "<name>" has invalid or empty bounds` names an active, non-test, non-archived community whose bounding box is out of range or has no area. Fix the service area in the dashboard. See [Communities and schools admin](/engineering/domains/communities-and-schools-admin#community-partial-update).
+  </Accordion>
+  <Accordion title="Migrations are missing">
+    `apply migrations through 000307 before applying this plan` means `SchoolCatalogMetadata`, `SchoolCoordinateProvenance`, `school_management(uuid)`, or `Schools.is_synthetic` is absent. Run the migrations, then repeat the dry run.
+  </Accordion>
+  <Accordion title="An identity safety violation is listed">
+    Entries that start with `identity safety violation:` come from `identityPlanIssues` in `cmd/sync-school-catalog/identity_review.go`. They mean a held or preserved school has a planned change, a domain correction isn't a reviewed one, or one institution has two planned owners. This is a planner defect, not an operator setting. Don't apply. Report it with the report file.
+  </Accordion>
+  <Accordion title="A bundled review is stale">
+    The command fails, even on a dry run, with messages such as `identity review is stale for "<name>"`, `identity review evidence drifted for "<name>"`, `institution decision stale for "<name>"`, or `domain correction stale for "<name>"`. The bundled `reviewed_identities.json` and `institution_decisions.json` pin the name and domains of specific schools. The school or the upstream evidence changed since the review. Re-review the school and update the bundled file in a code change. The report file is still written.
+  </Accordion>
+  <Accordion title="A source download fails">
+    Each download makes up to three attempts. The default ROR source gets four attempts across two pinned URLs. With the wrapper, successful ZIP downloads stay cached for 24 hours, so rerun the same command. If ROR stays unavailable, download the ZIP yourself and pass `--ror-file` with its path. No source is skipped silently.
+  </Accordion>
+</AccordionGroup>
+
+## Backfill coordinates for unmatched schools
+
+Schools at `0, 0` with no catalog match are never filled automatically. This flow is optional and needs a reviewer.
+
+<Steps>
+  <Step title="Collect candidates">
+    Run a dry run with `--with-supplemental-sources`, which the wrapper does. `coordinate_candidates` lists supplemental-source evidence with valid coordinates for each eligible school. Each entry carries a `fingerprint` and `"approved": false`. Only entries whose evidence source is `wikidata`, `hifld`, or `mapbox_permanent` can be applied.
+  </Step>
+  <Step title="Geocode confirmed addresses">
+    For schools with no usable candidate, write a JSON array of confirmed addresses and run the command directly with `--geocode-addresses-file`. Each entry needs `school_id`, `school_name`, `address`, `city`, `state`, `postal_code`, `evidence_url`, and `confirmed_at`.
+
+    <Warning>
+    This sends paid, permanent Mapbox geocoding requests and needs `MAPBOX_API_KEY`. `--geocode-max-requests` caps the run at 100 requests by default, and retries count toward the cap. It only runs in a dry run. The command rejects `--geocode-addresses-file` with `--dry-run=false`, and the wrapper never geocodes.
+    </Warning>
+
+    The address must be a US street address that starts with a number, isn't a PO box, has a two-letter state and a ZIP code, and was confirmed within the last 366 days. The whole file is validated before the first request. Results appear in `coordinate_candidates` with source `mapbox_permanent`.
+  </Step>
+  <Step title="Approve entries">
+    Copy the reviewed `coordinate_candidates` entries into a JSON array in a new file. Set `"approved": true` on the ones you accept. Change nothing else. The command recomputes each fingerprint and rejects an edited entry with `coordinate proposal was modified; regenerate it before approval`.
+  </Step>
+  <Step title="Dry run with the approvals">
+    Pass the file with `--approved-coordinates-file`. Accepted entries appear as `approved_coordinate_backfill` changes. The run fails if a school changed since review or is no longer eligible, has more than one approved entry, has evidence older than 366 days, or has evidence marked `closed`, `multiple_campuses`, or `inactive_or_unknown`.
+  </Step>
+</Steps>
+
+## Apply
+
+<Warning>
+`--dry-run=false` writes to the database in `DSN`. The wrapper script can't apply. Run the command directly, and only after someone has reviewed the dry-run report from the same checkout and database.
+</Warning>
+
+<Steps>
+  <Step title="Run the apply">
+    Use the same source and policy flags as the dry run you reviewed, so the plan matches.
+
+    ```bash
+    go run ./cmd/sync-school-catalog --dry-run=false --report-file=school-sync.json
+    ```
+
+    Add `--approved-coordinates-file` if you approved coordinates. Add a raised limit flag only if you cleared that guard on purpose.
+  </Step>
+  <Step title="Know what it does">
+    The apply rebuilds the catalog and the plan from scratch. It doesn't replay a saved report. It then:
+
+    1. Opens one `REPEATABLE READ` transaction with a five-second lock timeout.
+    2. Locks `Communities` and `Schools` in `SHARE ROW EXCLUSIVE` mode before it reads the plan. Downloads and geocoding never run while the lock is held.
+    3. Stops with `preflight blocked apply: ...` and writes nothing if any blocking issue exists.
+    4. Applies reviewed domain corrections, updates matched schools, applies approved coordinates, and inserts new schools.
+    5. Upserts `SchoolCatalogMetadata` for every matched and new school, and `SchoolCoordinateProvenance` for every coordinate it writes.
+    6. Commits once. Any error rolls back the whole run.
+  </Step>
+  <Step title="Keep the report">
+    `--report-file` writes the JSON report with mode `0600`. It's written on success and when the database step fails. Keep it as the record of what changed.
+  </Step>
+</Steps>
+
+## Verify
+
+- The command prints a `database:` line with `dry_run=false` and exits `0`.
+- A second dry run no longer lists the applied schools as `create` changes.
+- Review the new schools and their communities in the dashboard. See [Review school mappings](/administration/schools-and-communities#review-school-mappings).
+
+## Flag reference
+
+All flags come from `parseOptions` in `cmd/sync-school-catalog/main.go`.
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--dry-run` | `true` | Calculates changes in a read-only transaction. `false` applies them. |
+| `--catalog-only` | `false` | Downloads and merges sources without connecting to the database. Can't be combined with the two coordinate file flags. |
+| `--report-file` | empty | Path for the JSON report. |
+| `--domain-policy` | `corroborated` | `corroborated` or `union`. Any other value is rejected. |
+| `--overwrite-coordinates` | `false` | Replaces existing non-zero coordinates on matched schools with catalog coordinates. |
+| `--min-catalog-schools` | `5000` | Blocks an undersized upstream catalog. |
+| `--max-created-schools` | `500` | Maximum new schools in one apply. |
+| `--max-coordinate-changes` | `5000` | Maximum coordinate updates in one apply. |
+| `--max-domain-additions` | `2000` | Maximum domain additions in one apply. |
+| `--verbose` | `false` | Logs source requests, retries, timing, byte counts, and cache activity to stderr. |
+| `--source-cache-dir` | empty | Local ZIP cache directory. Entries are checksummed and expire after 24 hours. Only ZIP sources are cached. |
+| `--edge-url` | `DefaultEDGELayerURL` | NCES EDGE ArcGIS layer URL. |
+| `--ipeds-url` | `DefaultIPEDSURL` | IPEDS HD ZIP URL. |
+| `--swot-url` | `DefaultSWOTURL` | JetBrains SWOT `tar.gz` URL. |
+| `--hipo-url` | `DefaultHipoURL` | Hipo university domains JSON URL. |
+| `--historical-ipeds-url` | none | An older IPEDS HD ZIP for former names and historical coordinate review. Repeat it once per year. |
+| `--with-supplemental-sources` | `false` | Merges ROR, Wikidata, and HIFLD as identity and coordinate evidence. Fills any of the three URL flags left empty with its default. |
+| `--ror-url` | empty | Versioned ROR v2 data-dump ZIP URL. Setting it enables ROR on its own. |
+| `--ror-file` | empty | A ROR v2 ZIP on disk, used instead of fetching ROR. Mutually exclusive with `--ror-url`. |
+| `--wikidata-url` | empty | Wikidata SPARQL endpoint. Setting it enables Wikidata on its own. |
+| `--hifld-url` | empty | HIFLD ArcGIS point layer. Setting it enables HIFLD on its own. |
+| `--geocode-addresses-file` | empty | JSON confirmed campus addresses to geocode with Mapbox. Needs `MAPBOX_API_KEY`. Dry run only. |
+| `--geocode-max-requests` | `100` | Hard per-run limit on Mapbox requests, including retries. Must be at least 1. |
+| `--approved-coordinates-file` | empty | JSON `coordinate_candidates` entries marked approved. Only fills unchanged schools at `0, 0`. |
+
+The four limit flags must be zero or greater. The default URL constants are defined in `internal/data/schoolcatalog/catalog.go` and `supplemental.go`.
+
+## Root causes seen in code
+
+- **Dry runs succeed with a blocked plan.** `syncDatabase` returns the report without an error when `--dry-run=true`. Only `safe_to_apply` and the wrapper's exit code `2` show the block.
+- **New schools need an active community.** `loadCommunityBounds` reads only communities that are active, not default, not test, and not archived. Institutions outside every such box are counted in `new_schools_outside_active_bounds` and skipped. Run the sync again after you activate a community.
+- **The smallest containing community wins.** `containingCommunity` picks the box with the smallest area when boxes overlap.
+- **Domain updates are additive.** `mergeDomains` only adds. The only removals come from bundled, reviewed corrections.
+- **Ambiguity reserves institutions.** An existing school with conflicting evidence, or a synthetic school, reserves every catalog institution it could be. Those are counted in `catalog_records_suppressed` and aren't created as new schools.
+- **The whole run has a 15-minute timeout.** Each HTTP request has a three-minute timeout. A slow source can end the run before the database step.

@@ -1,0 +1,181 @@
+---
+title: "Maps provider outage"
+description: "What breaks when Mapbox, Google Routes, or Google Places is down or over quota, which calls fall back, what riders and drivers see, and how to confirm recovery"
+---
+
+The API uses three map providers for different jobs. Mapbox computes distance and duration and does geocoding. Google Routes computes the route polyline. Google Places serves search autocomplete and place details. Distance has a full fallback chain, autocomplete has one fallback, and the polyline has none. See [Routing, distance, and ETA providers](/engineering/location/routing-and-distance) and [Search and places](/engineering/location/search-and-places) for how each call works.
+
+## Symptoms
+
+- Slack alerts channel shows ``🔴 `mapbox` breaker tripped — requests to this dependency are being rejected.``, or the same line for `google-maps`, `google-places`, or `google-geocoding`.
+- Riders can't request a ride. The API answers ride creation with 503 or 500 titled **Route Service Unavailable**, or 500 titled **Something Went Wrong** once the breaker is open.
+- Drivers can't accept a ride, or a queued ride doesn't become the active ride.
+- Search suggestions fail or come back tagged `provider: "mapbox_fallback"`.
+- A saved, recent, or top location fails to open.
+- ETAs and distances look rough, for example a ride's distance is exactly 1.4 times the straight line.
+
+## Diagnose
+
+<Steps>
+  <Step title="Find the open breaker">
+    Each provider client wraps its calls in a breaker from `circuitbreaker.NewSettings` (`internal/utilities/circuitbreaker/circuitbreaker.go`). In Cloud Logging, filter on `jsonPayload.event` and `jsonPayload.component`.
+
+    | `event` | Message | Level |
+    | --- | --- | --- |
+    | `CIRCUIT_BREAKER_TRIPPING` | `<name> circuit breaker is tripping` | Error |
+    | `CIRCUIT_BREAKER_OPENED` | `<name> circuit breaker OPENED — requests will be rejected` | Error |
+    | `CIRCUIT_BREAKER_HALF_OPEN` | `<name> circuit breaker half-open — probing with limited requests` | Error |
+    | `CIRCUIT_BREAKER_CLOSED` | `<name> circuit breaker CLOSED — service recovered` | Warn |
+
+    Opening and closing also post to the Slack alerts channel. See [Operations alerts](/engineering/notifications/slack-alerts#operations). Breaker state is per API instance, so each instance trips and alerts on its own.
+  </Step>
+  <Step title="Check the breaker metric, for Google Routes only">
+    Only the `google-maps` breaker is built with a metrics provider. `circuit.breaker.state` with `name="google-maps"` is 0 closed, 1 half-open, and 2 open. `circuit.breaker.success` and `circuit.breaker.failure` carry `name="google-maps/routes"` and `name="google-maps/route-matrix"`.
+
+    The `mapbox`, `google-places`, and `google-geocoding` breakers record no metrics. Use logs and Slack for those.
+  </Step>
+  <Step title="Read the provider error">
+    | Provider | Log message | Useful fields |
+    | --- | --- | --- |
+    | Mapbox | `Mapbox: HTTP request failed` | `endpoint` |
+    | Mapbox | `Mapbox: non-200 response` | `status_code`, `status`, `response_body`, `endpoint` |
+    | Mapbox | `Mapbox GetDistance failed, falling back to Google Maps` | Error text |
+    | Google Routes | `Error getting route from Google Maps` | `grpc_code` |
+    | Google Routes | `Error getting route matrix from Google Maps` | `grpc_code` |
+    | Google Routes | `Google Maps GetDistance failed, falling back to haversine estimate` | Error text |
+    | Google Places | `Google Places: autocomplete failed` | `query` |
+    | Google Places | `Google Places: get place details failed` | `place_id` |
+    | Search | `Primary search provider failed; trying fallback` | `primary_provider`, `fallback_provider` |
+    | Search | `Fallback search provider failed` | Same |
+
+    A Google Routes `grpc_code` of `ResourceExhausted` means the Google project's quota is used up. A Mapbox 429 doesn't log `Mapbox: non-200 response`. It returns a rate-limit error with the message `Mapbox rate limit exceeded`.
+  </Step>
+  <Step title="Check the outbound HTTP series for Mapbox">
+    The Mapbox client uses the instrumented HTTP client, so `http.client.request.duration` and spans named `mapbox.GET api.mapbox.com` show its latency and status codes. See [Metrics](/reference/metrics#metric-catalog). The Google Routes and Places gRPC calls aren't in that series.
+  </Step>
+  <Step title="Confirm which search provider is active">
+    At startup the API logs `Mapping service search provider` with `search_provider`. `SEARCH_PROVIDER` defaults to `google`. Any value other than `google` or `mapbox` becomes `mapbox`.
+  </Step>
+</Steps>
+
+### Breaker reference
+
+All four breakers share one profile.
+
+| Setting | Value |
+| --- | --- |
+| Opens after | 5 consecutive failures |
+| Counter reset while closed | Every 1 minute |
+| Stays open | 60 seconds |
+| Half-open probes | 3 requests |
+| Counted as failure | Server errors, rate-limit errors, provider-unavailable errors, and any untyped error |
+| Not counted as failure | Input, validation, not-found, and auth-type errors |
+| Excluded from counting | A request the caller canceled (`circuitbreaker.Exclude`, used by the Google Routes client) |
+
+| Breaker | Covers |
+| --- | --- |
+| `mapbox` | Every Mapbox call: matrix, geocoding, reverse geocoding, Search Box suggest and retrieve |
+| `google-maps` | `ComputeRoutes` (polyline) and `ComputeRouteMatrix` (distance fallback) |
+| `google-places` | Places autocomplete, place details, and POI search |
+| `google-geocoding` | The Google Geocoding lookup used to qualify a POI search by address |
+
+While a breaker is open, `circuitbreaker.Execute` returns a server error without calling the provider.
+
+## What degrades
+
+### Mapbox down or rate limited
+
+| Area | Behavior |
+| --- | --- |
+| Distance and duration | `GetDistance` tries Mapbox up to 5 times, then Google `ComputeRouteMatrix`, then a haversine estimate: straight-line distance times 1.4, at 30 km/h. It never fails, so rides are still created. Each ride stores the estimate as its distance and duration. |
+| Driver board, auto-queue, driver options | `GetDistances` and `GetDistancesFromOrigin` fall back per pair through Google and then haversine. Pickup distances and auto-queue scoring use estimates. |
+| Latency | Every distance call spends its Mapbox retries first, with jittered backoff (200 ms base, 10-second cap), before it falls back. An open breaker fails each attempt immediately, but the retry delays still apply. |
+| Autocomplete | Unaffected when `SEARCH_PROVIDER=google`. With `mapbox`, `POST /mapping/search-suggestions` returns an error. |
+| Autocomplete fallback | Lost. If Google Places also fails, the Google error is returned. |
+| Opening a Mapbox place | `POST /mapping/search-result` fails for Mapbox IDs. No fallback. |
+| Reverse geocoding | `POST /mapping/reverse-geocode` fails. No fallback. |
+| Ride stop addresses | `resolveRideLocation` logs `ride.stop.address_unavailable` and creates the ride without a resolved street address for a stop that didn't send one. |
+| Stop classification | The reverse feature lookup logs `ride.stop.classification_unavailable` and returns no features. |
+| Signup alerts | The city is omitted. Logs show `Could not reverse geocode signup city`. |
+| Location imports | Rows without coordinates fail with `geocode failed: <name>` in the import summary. |
+
+A Mapbox 429 is a rate-limit error. It counts as a breaker failure and is retried. Where nothing falls back, the client gets HTTP 429.
+
+### Google Routes down or over quota
+
+| Area | Behavior |
+| --- | --- |
+| Ride creation | Fails. `prepareCreateRide` needs the polyline from `GetRoute`, and nothing replaces it. |
+| Driver accept and pickup preparation | Fail. `pickupRoute` runs the Mapbox distance and the Google polyline in parallel, and a polyline error fails `acceptLockedRide`, `prepareRidePickup`, and `prepareActiveRide`. |
+| Communities with rides disabled | `ridesDisabledRoute` logs `Rides disabled: route lookup failed, returning no route` and returns an empty `route`. No error reaches the client. |
+| Mapbox distance fallback | Loses its Google step and goes straight to haversine. |
+| Repeated pairs | A polyline already in the route cache is served from Redis for its TTL without a provider call. |
+
+The error depends on the gRPC status:
+
+| Cause | Error type | HTTP status | Retried? |
+| --- | --- | --- | --- |
+| `ResourceExhausted` (project quota) | `ProviderUnavailableError`, title **Route Service Unavailable** | 503 | No |
+| `Unavailable` | Server error, title **Route Service Unavailable** | 500 | Yes, up to 5 attempts |
+| Any other gRPC status, including deadline, auth, and bad request | Server error, title **Route Service Unavailable** | 500 | No |
+| Breaker open | Server error, title **Something Went Wrong** | 500 | No provider call |
+
+Each attempt has a 2-second timeout. The detail text is "Route calculations are temporarily unavailable. Please try again shortly."
+
+<Warning>
+A Mapbox outage moves every distance lookup onto Google `ComputeRouteMatrix`, which shares the `google-maps` breaker and the Google project quota with the polyline call. If that breaker opens or the quota runs out, ride creation and accepts start failing too. Watch `google-maps` closely whenever Mapbox is down.
+</Warning>
+
+### Google Places down or over quota
+
+| Area | Behavior |
+| --- | --- |
+| Autocomplete | One attempt with a 1.5-second timeout, then `MappingService.SearchSuggestions` falls back to Mapbox. Suggestions carry `provider: "mapbox_fallback"`. Until the breaker opens, each search waits for the Google attempt first. |
+| Opening a Google place | `POST /mapping/search-result` fails for Google place IDs. Up to 5 attempts, 3 seconds each. No fallback to Mapbox. |
+| Places without a search session | Recents, top locations, and saved locations are served from the place cache when a cached copy exists. Otherwise they fail. |
+| POI detail sheet | `POST /mapping/poi-details` returns the error. Only a not-found result falls back to the name and coordinates the client sent. An outage, throttle, or timeout doesn't. Cached details are still served. |
+
+The Places client has no special handling for quota errors. Anything other than `InvalidArgument` or `NotFound` is a server error and counts against the `google-places` breaker.
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="Option 1: Wait for the breaker to close">
+    Once the provider answers, the breaker goes half-open 60 seconds after it opened, lets 3 requests through, and closes. No restart is needed. Slack posts ``🟢 `<name>` breaker closed — dependency service recovered.``
+  </Accordion>
+  <Accordion title="Option 2: Switch autocomplete to Mapbox">
+    If Google Places is down for a long time, set `SEARCH_PROVIDER=mapbox`. Autocomplete then calls Mapbox directly and skips the 1.5-second Google attempt. It's a runtime environment variable, so the change takes a new revision. See [Deployment](/engineering/deployment).
+
+    <Warning>
+    This only changes autocomplete. `providerForLocationId` still routes IDs that start with `google:`, `places/`, or `ChIJ` to Google, and `retrieveReference` maps known places to their Google ID. Recents, top locations, and saved Google places keep failing until Places recovers. Set the value back afterward.
+    </Warning>
+  </Accordion>
+  <Accordion title="Option 3: Fix the key or quota">
+    The API reads `MAPBOX_API_KEY` and `GOOGLE_MAPS_API_KEY`. The Google key serves both Routes and Places. Startup validation fails when either is empty, and the Google clients panic without the key.
+
+    - A Mapbox 401 or 403 logs `Mapbox: non-200 response` with that `status_code` and counts as a breaker failure. The exception is the permanent reverse-geocode call used for ride stop addresses, where it becomes a forbidden error that the breaker ignores.
+    - A Google Routes `ResourceExhausted` logs with `grpc_code` and returns 503.
+
+    Raise the quota or replace the key at the provider. The API reads both keys at startup, so a new key takes a new revision.
+  </Accordion>
+  <Accordion title="No switch exists for the polyline">
+    Nothing in the code replaces Google Routes for the polyline. `mapbox.Client.GetDirections` exists, but no service calls it. While Google Routes is down, riders can't create rides and drivers can't accept them. The only repair is on the provider side.
+  </Accordion>
+</AccordionGroup>
+
+## Verify
+
+- Logs show `CIRCUIT_BREAKER_CLOSED` for the breaker, and Slack shows the recovery line.
+- `circuit.breaker.state` for `google-maps` is 0.
+- `Mapbox GetDistance failed, falling back to Google Maps` and `Primary search provider failed; trying fallback` stop appearing.
+- A ride request succeeds, and new suggestions carry `provider: "google"` or `"mapbox"`, not `"mapbox_fallback"`.
+- Rides created during the outage keep the estimated distance and duration that were stored on them. Nothing recomputes them. See [Stuck or ghost ride](/runbooks/stuck-ride) if a ride was left mid-flow.
+
+## Root causes seen in code
+
+- **The polyline has one provider.** `GetRoute` is Google only, and ride creation and accept both require it.
+- **Shared Google breaker and key.** The polyline call and the distance fallback share `google-maps`. Routes and Places share `GOOGLE_MAPS_API_KEY`.
+- **Three of four breakers have no metrics.** `mapbox`, `google-places`, and `google-geocoding` call `NewSettings` without a metrics provider, so the local `CircuitBreakerOpen` alert rule can't see them.
+- **Breakers are per instance.** One instance can be open while another is still calling the provider, and each posts its own Slack alert.
+- **Estimates are silent.** The haversine fallback returns a normal result. Only the warning logs show that a distance is an estimate.
+- **Retries add latency before fallback.** Mapbox distance calls retry up to 5 times with backoff even when the breaker is already open.

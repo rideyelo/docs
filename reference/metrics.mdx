@@ -205,6 +205,34 @@ The `resend`, `google-places`, `google-geocoding`, `twilio`, `photon`, `mapbox`,
 
 For request error rate and latency today, use `http_server_request_duration_seconds` from otelhttp or `http_server_errors_total`.
 
+### Alert rules
+
+`monitoring/prometheus/alert-rules.yml` defines 17 rules in three groups. `docker-compose.yml` mounts the file into the local Prometheus, which evaluates it every 15 seconds. The compose file has no Alertmanager, so a firing rule only shows in the Prometheus UI. Nothing in the repository loads these rules in production.
+
+"Can fire" is no when the expression reads a series from the table above that the API doesn't export.
+
+| Alert | Group | Expression summary | For | Severity | Can fire |
+| --- | --- | --- | --- | --- | --- |
+| `HighErrorRate` | `yelo-api-critical` | 5xx share of `http_server_requests_total` over 5 minutes above 1% | 5m | critical | No |
+| `APIDown` | `yelo-api-critical` | `up{job="yelo-api"} == 0` | 2m | critical | Yes |
+| `DatabaseUnreachable` | `yelo-api-critical` | `pool_total{pool="postgres"} == 0` | 1m | critical | Yes |
+| `DatabasePoolExhausted` | `yelo-api-critical` | `pool_acquired / pool_max` for `pool="postgres"` above 0.9 | 5m | critical | Yes |
+| `CircuitBreakerOpen` | `yelo-api-critical` | `circuit_breaker_state == 2` | 0m | critical | Yes, for `google-maps` and `redis` only |
+| `HighMemoryUsage` | `yelo-api-critical` | `process_runtime_go_mem_heap_alloc` above 524288000 bytes (500 MB) | 5m | critical | No |
+| `HighP99Latency` | `yelo-api-warning` | P99 of `http_server_duration_bucket` over 5 minutes above 0.5 s | 5m | warning | No |
+| `SlowRouteDetected` | `yelo-api-warning` | P99 of `http_server_duration_bucket` by `http_route`, excluding `external_dependency="true"`, above 1 s | 10m | warning | No |
+| `ElevatedErrorRate` | `yelo-api-warning` | 5xx share of `http_server_requests_total` over 5 minutes above 0.5% | 10m | warning | No |
+| `HighGoroutineCount` | `yelo-api-warning` | `process_runtime_go_goroutines` above 10000 | 5m | warning | No |
+| `RateLimiterSpike` | `yelo-api-warning` | `rate(rate_limiter_rejected_total[5m])` above 10 per second | 5m | warning | Yes |
+| `RedisCacheMissRate` | `yelo-api-warning` | `redis_cache_miss_total` share of hits plus misses over 5 minutes above 50% | 10m | warning | Yes |
+| `RedisHighLatency` | `yelo-api-warning` | P99 of `redis_operation_duration_bucket` over 5 minutes above 0.05 s | 5m | warning | No |
+| `GCPressure` | `yelo-api-warning` | `rate(process_runtime_go_gc_pause_ns_total[5m])` above 100000000 ns per second | 5m | warning | No |
+| `SlowDBQueries` | `yelo-api-warning` | P99 of `db_query_duration_bucket` by `db_table` over 5 minutes above 0.1 s | 5m | warning | No |
+| `ExternalServiceDegraded` | `yelo-api-info` | P95 of `external_call_duration_bucket` by `service` over 5 minutes above 2 s | 10m | info | No |
+| `HighRequestVolume` | `yelo-api-info` | `rate(http_server_requests_total[5m])` above twice the 1-hour rate from one day earlier | 5m | info | No |
+
+`CircuitBreakerOpen` has `for: 0m`, so it fires on the first evaluation that sees an open breaker. `circuit_breaker_state` is only set on a state change, and only the `google-maps` and `redis` breakers record it. For what to do when the database or a map provider rule matches, see [Database outage](/runbooks/database-outage) and [Maps provider outage](/runbooks/maps-provider-outage).
+
 ## Spans
 
 | Source | Tracer | Span name | Kind |
