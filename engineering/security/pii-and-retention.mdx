@@ -130,6 +130,19 @@ Cache invalidation after account changes is covered in [Data layer](/engineering
 | OpenTelemetry collector | Spans with user, ride, driver, and fleet IDs as attributes | Sent to `OTEL_OTLP_ENDPOINT` |
 | Slack | Signup alerts with name, email, city, school, graduation year, referrer. Driver application and support alerts | Production only. Test schools and `test*` emails are skipped. See [Slack alerts](/engineering/notifications/slack-alerts) |
 
+## Third-party provider diagnostics
+
+The mobile rideshare price aggregator signs riders in to Uber, Lyft, and Empower on the device. It is gated by the `rideshare-price-aggregator` experiment and its on-device disclosure. `yelo-api` receives none of this data.
+
+| Data | Where it goes | Safeguards |
+| --- | --- | --- |
+| Provider access and refresh tokens, account email, Empower passenger ID | SecureStore on the device, under `ride_tokens_<provider>` | No code sends them to `yelo-api`, and the diagnostics path never copies them. Not cleared when the Yelo session signs out |
+| Summaries of Uber and Lyft responses: product titles, fare text and amounts, pickup ETAs, HTTP status, timing | PostHog (`ride_provider_request_completed`, `ride_provider_request_options`) and Sentry breadcrumbs and throttled issues | `lib/ride/providerResponseSummary.ts` projects named fields only. No tokens, account identifiers, URLs, request bodies, or error messages |
+| Pickup and dropoff coordinates of a quote request | PostHog only | Sent only while diagnostics consent is current. Stripped from every Sentry payload |
+| Provider session changes (saved, refreshed, cleared, and why) | PostHog (`ride_provider_session_changed`) and Sentry breadcrumbs | Provider name, action, and reason only |
+
+The phone number, SMS code, and email a rider types on the Lyft connect screen go straight to Lyft. Field lists, consent rules, and volume limits are in [Rideshare aggregator](/engineering/mobile/rideshare-aggregator#provider-diagnostics).
+
 ## Third parties
 
 ```mermaid
