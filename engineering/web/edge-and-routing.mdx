@@ -21,7 +21,7 @@ Firebase Hosting site IDs come from `.firebaserc`: `yelo-dashboard-v2`, `yelo-si
 ```mermaid
 flowchart LR
   U["Browser"] --> CF{"Cloudflare zone"}
-  CF -->|"joinyelo.com/auth/v3, /pay/tip, /world-cup/claim, /_yelo/signup/*"| ER["experience-router"]
+  CF -->|"joinyelo.com/auth/v3, /pay/tip, /world-cup/claim, /i/*, /_yelo/signup/*"| ER["experience-router"]
   CF -->|"joinyelo.com/world-cup*, rideyelo.com/world-cup*"| WR["world-cup-router"]
   CF -->|"rideyelo.com/og/*"| OG["og"]
   CF -->|"other joinyelo.com paths"| HOME["yelo-home (Firebase)"]
@@ -44,6 +44,7 @@ All three Workers set `workers_dev: false` and `preview_urls: false`, enable obs
 | `joinyelo.com/auth/v3*`, `www.joinyelo.com/auth/v3*` | `joinyelo.com` |
 | `joinyelo.com/pay/tip*`, `www.joinyelo.com/pay/tip*` | `joinyelo.com` |
 | `joinyelo.com/world-cup/claim*`, `www.joinyelo.com/world-cup/claim*` | `joinyelo.com` |
+| `joinyelo.com/i/*`, `www.joinyelo.com/i/*` | `joinyelo.com` |
 | `joinyelo.com/_yelo/signup/*`, `www.joinyelo.com/_yelo/signup/*` | `joinyelo.com` |
 
 A route match only invokes the Worker. The Worker then classifies the exact path:
@@ -53,6 +54,7 @@ A route match only invokes the Worker. The Worker then classifies the exact path
 | `/auth/v3` or `/auth/v3/` | `auth-v3` | `SIGNUP_ORIGIN/auth/v3/` (always the trailing-slash form) | `experience-auth-v3` |
 | `/pay/tip` or `/pay/tip/<rest>` | `tip` | `SIGNUP_ORIGIN/tip/<rest>` | `experience-tip` |
 | `/world-cup/claim` or `/world-cup/claim/` | `world-cup` | `SIGNUP_ORIGIN/world-cup?intent=world-cup` | `experience-world-cup` |
+| `/i/<code>` (anything longer than `/i/`) | `invite` | `SIGNUP_ORIGIN/i/<code>` (same path, so attribution cookies are first-party to the `joinyelo.com` sign-up page) | `experience-invite` |
 | `/_yelo/signup/<path>` | Asset | `SIGNUP_ORIGIN/<path>` | `experience-assets` |
 | Anything else that matched a route | None | Passed through with `fetch(request)` to the zone origin | — |
 
@@ -118,12 +120,14 @@ Each site owns `src/sites/<site>/firebase.json`; `pnpm firebase:config` merges t
 | Site | Headers | Rewrites | Redirects | Ignore |
 | --- | --- | --- | --- | --- |
 | `dashboard` | `**`: `no-cache, no-store, must-revalidate`. `/assets/**`: `public, max-age=31536000, immutable`. | `**` → `/index.html` | — | `**/.*` (no `.well-known` deployed) |
-| `signup` | `.well-known` files: JSON, 1 h. `/`: no-store. `/assets/**`: immutable 1 y. `/fonts/**`: 7 d. `/auth/v3{,/**}`: `no-store`, `Referrer-Policy: no-referrer`, `nosniff`, `X-Frame-Options: DENY`, `Permissions-Policy` (camera, microphone, geolocation off), CSP. `/delete-account{,/}`: `no-store`, no-referrer, nosniff, DENY. `/world-cup`, `/tip/**`, `/web/tip/**`: no-store. | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `**` → `/index.html` | — | `firebase.json`, `node_modules` |
+| `signup` | `.well-known` files: JSON, 1 h. `/`: no-store. `/assets/**`: immutable 1 y. `/fonts/**`: 7 d. `/auth/v3{,/**}`: `no-store`, `Referrer-Policy: no-referrer`, `nosniff`, `X-Frame-Options: DENY`, `Permissions-Policy` (camera, microphone, geolocation off), CSP. `/delete-account{,/}`: `no-store`, no-referrer, nosniff, DENY. `/world-cup`, `/i/**`, `/tip/**`, `/web/tip/**`: no-store. | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `**` → `/index.html` | — | `firebase.json`, `node_modules` |
 | `event` | `/.well-known/apple-app-site-association`: JSON | `**` → `/index.html` | — | `firebase.json`, `node_modules` |
 | `home` | `.well-known`: JSON, 1 h. `/`: `no-cache`. `/assets/**`: immutable 1 y. Media and fonts by extension: 30 d. Named routes: `no-cache`. | `/partner`, `/drivers`, `/vision`, `/fleets`, `/safety`, `/privacy`, `/tos`, `/terms` (each `{,/}`) → `/<route>/index.html`; `**` → `/index.html` | — | `firebase.json`, `node_modules` |
-| `invite` | `.well-known`: JSON, 1 h | `**` → `/index.html` | `/` and `/index.html` → `https://signup.yelo.link/` (`302`) | `firebase.json`, `node_modules` |
+| `invite` | `.well-known`: JSON, 1 h | `**` → `/index.html` | `/` and `/index.html` → `https://signup.yelo.link/` (`302`). Personal invite paths redirect client-side; see below. | `firebase.json`, `node_modules` |
 | `maestro` | `/auth/v3{,/**}`: same security set as signup with a different CSP | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `**` → `/index.html` | — | `**/.*` |
 | `world-cup` | `/world-cup{,/}`: no-store | `/world-cup{,/**}` → `/world-cup/index.html` | `/` → `/world-cup` (`302`) | `**/.*` |
+
+The `invite` site has no Firebase redirect for personal invites. An inline script in `src/sites/invite/index.html` runs before the bundle and, for any single-segment path `/<code>` without a dot, calls `location.replace('https://joinyelo.com/i/<code>')` with the original query string. `/fleet/<code>` is not matched and still renders the fleet invite page.
 
 Every site except `dashboard`, `maestro`, and `world-cup` sets `appAssociation: "NONE"`, so Firebase serves the committed `.well-known` files instead of generating its own.
 

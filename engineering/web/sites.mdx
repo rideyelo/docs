@@ -14,11 +14,11 @@ There are no `pay` or `drive` sites. Both folders were removed from `yelo-web`, 
 | Site | Audience | Auth | Bootstrap | API client | Hosting site ID | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | `dashboard` | Admins, interns, fleet managers | Clerk | Bespoke `main.tsx` | `@/generated/dashboard` | `yelo-dashboard-v2` | Live |
-| `signup` | Riders and drivers signing up, tipping, or deleting accounts | Auth v3 and phone OTP, no Clerk | `renderSite` | `@/generated/signup`, `@/generated/auth-v3` | `yelo-signup` | Live |
+| `signup` | Riders and drivers signing up, opening personal invite links, tipping, or deleting accounts | Auth v3 and phone OTP, no Clerk | `renderSite` | `@/generated/signup`, `@/generated/auth-v3` | `yelo-signup` | Live |
 | `event` | Anyone with a shared event link | Public | `renderSite` | `@/generated/event` | `yelo-event` | Live |
 | `home` | Marketing visitors | Public | Plain `createRoot` | None | `yelo-home` | Live |
 | `maestro` | Engineers reviewing E2E runs | Public viewer | `renderSite` | Supabase Storage JSON | `yelo-maestro` | Internal |
-| `invite` | Recipients of referral and fleet invite links | Public | `renderSite` | `@/generated/dashboard` (two public hooks) | `yelo-invite` | Live |
+| `invite` | Recipients of fleet invite links, plus a redirect for older personal invite links | Public | `renderSite` | `@/generated/dashboard` (`useFleetJoinGetPreview`) | `yelo-invite` | Live |
 | `world-cup` | Students in the World Cup campus race | Public | `renderSite` | `@/generated/dashboard` (world-cup functions) | `yelo-world-cup` | Live |
 
 The Hosting site IDs come from `.firebaserc`. Each Hosting target has the same name as its site.
@@ -45,14 +45,15 @@ The public web entry point for account creation and several one-off flows. It ha
 | --- | --- |
 | `/auth/v3`, `/auth/v3/callback` | Auth v3 sign-in page (`auth-v3/AuthV3Page`). Normally served by the dedicated entry; the main bundle lazy-loads it as a fallback. |
 | `/delete-account` | Account deletion: phone OTP, then confirmation with the word `DELETE`. |
+| `/i/<code>` | Personal referral invite landing (`invite/InvitePage`). Apple mobile devices go to the App Store with `ct=<code>`; Android sees a Google Play link carrying the invite as install referrer; **Continue → sign up** goes to Auth v3 with the landing's allowlisted attribution parameters plus the code. |
 | `.../tip/<slug>` | Rider tip for a driver or fleet (`TipStep`). If the tip API returns unauthorized, it redirects to Auth v3 with `intent=tip`. `?status=success` shows the confirmation screen. |
 | `.../world-cup`, `.../world-cup/claim`, or `?intent=world-cup` | World Cup claim: Auth v3 sign-in, then `.edu` email verification (`EduClaimStep`). |
 | Anything else | Redirects into the Auth v3 web flow. |
 
 - **Auth:** No Clerk. Auth v3 uses its own fetch client and a request secret that `captureAuthV3RequestSecret()` strips from the URL before React mounts. Older steps use the Auth v2 phone OTP endpoints.
-- **API:** `@/generated/signup` for `authv2`, `tips`, and `user`; `@/generated/auth-v3` for Auth v3; and `worldCupClaimEducationEmail` from the dashboard client.
+- **API:** `@/generated/signup` for `authv2`, `tips`, and `user`; `@/generated/auth-v3` for Auth v3; and `worldCupClaimEducationEmail` and `useReferralGetInvitePreview` from the dashboard client. Every page except `/auth/v3` logs a link touch with `POST /authv3/attribution/touch`. See [Signup and Auth v3 site](/engineering/web/signup-and-auth-site#link-landing-touches).
 - **Required build variables:** `VITE_API_URL`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`. `VITE_APPLE_REDIRECT_URI`, `VITE_AUTH_V3_APP_SCHEME`, `VITE_APP_ENV`, `VITE_POSTHOG_KEY`, and `VITE_POSTHOG_HOST` are optional.
-- **Hosting:** Strict security headers and a Content Security Policy on `/auth/v3`, `no-store` on `/delete-account`, and `.well-known` app-association files. The `experience-router` Worker proxies `joinyelo.com/auth/v3*`, `/pay/tip*`, and `/world-cup/claim*` to this site so users see canonical `joinyelo.com` URLs.
+- **Hosting:** Strict security headers and a Content Security Policy on `/auth/v3`, `no-store` on `/delete-account` and `/i/**`, and `.well-known` app-association files. The `experience-router` Worker proxies `joinyelo.com/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, and `/i/*` to this site so users see canonical `joinyelo.com` URLs.
 
 <Tip>
 In dev, open `/?preview=all` on the signup site to see every step stacked on one page, or `/?preview=<step>` for a single step. For iPhone keyboard testing of Auth v3, run `pnpm dev:signup-device`. See [Local development](/engineering/local-development).
@@ -91,11 +92,11 @@ An internal viewer for Maestro end-to-end test runs, with video, screenshots, an
 
 ## invite
 
-Handles shared referral and fleet invite links, then hands users off to the app or the store.
+Handles fleet invite links and redirects personal referral invite links to their new home on `joinyelo.com`.
 
-- **Routes:** `/fleet/:code` renders `FleetInvitePage`; `/:code` renders `InvitePage`. The root path redirects (302) to `https://signup.yelo.link/`.
-- **API:** `useReferralGetInvitePreview` and `useFleetJoinGetPreview`, both public hooks from the dashboard client.
-- **Behavior:** Shows the inviter's first name and avatar, then redirects based on the user agent. The signup link points at `https://joinyelo.com/auth/v3?code=<code>`.
+- **Routes:** `/fleet/:code` renders `FleetInvitePage`. The root path redirects (302) to `https://signup.yelo.link/`.
+- **Personal invites:** An inline script in `index.html` redirects `/<code>` to `https://joinyelo.com/i/<code>` with the query string before the bundle loads. The referral landing lives in the `signup` site so its attribution cookies are first-party to sign-up.
+- **API:** `useFleetJoinGetPreview`, a public hook from the dashboard client.
 - **App links:** The Vite config emits an `apple-app-site-association` file with invite-specific path components so invite paths open the app.
 - **Analytics:** Dub, through `renderSite({ dubAnalytics: true })`.
 - **Required build variables:** `VITE_API_URL`.
@@ -119,7 +120,7 @@ Three Cloudflare Workers in `workers/` sit in front of some sites. They deploy s
 
 | Worker | Routes | Purpose |
 | --- | --- | --- |
-| `experience-router` | `joinyelo.com/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/_yelo/signup/*` | Proxies to the `signup` site origin (`yelo-signup.web.app`). |
+| `experience-router` | `joinyelo.com/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/i/*`, `/_yelo/signup/*` | Proxies to the `signup` site origin (`yelo-signup.web.app`). |
 | `world-cup-router` | `rideyelo.com/world-cup*`, `joinyelo.com/world-cup*` | Proxies to the `world-cup` site origin and API; other paths go to Framer. |
 | `og` | `rideyelo.com/og/*` | Renders signed Open Graph images for invite links. |
 

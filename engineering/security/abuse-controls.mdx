@@ -41,7 +41,7 @@ Raw mux mounts (`/metrics`, `/debug/pprof/`, `/riverui/`) are outside the Fuego 
 
 | Surface | Limits | Details |
 | --- | --- | --- |
-| Auth v3 HTTP | Fixed windows per coarse requester prefix (`/24` IPv4, `/56` IPv6), such as 30 authorizations per 10 minutes and 120 phone sends per hour | [HTTP limits per endpoint](/engineering/identity/phone-otp-and-rate-limits#http-limits-per-endpoint) |
+| Auth v3 HTTP | Fixed windows per coarse requester prefix (`/24` IPv4, `/56` IPv6), such as 30 authorizations per 10 minutes, 120 anonymous link touches per 10 minutes, and 120 phone sends per hour | [HTTP limits per endpoint](/engineering/identity/phone-otp-and-rate-limits#http-limits-per-endpoint) |
 | Auth v3 phone | 5 sends and 5 verifies per transaction, 30-second cooldown, 10 sends per number per hour, 20 per requester per hour | [Auth v3 phone limits](/engineering/identity/phone-otp-and-rate-limits#auth-v3-phone-limits) |
 | Auth v2 phone send | 20 per hour per requester, 60 per hour across all callers | Only while Auth v3 is enabled. With Auth v3 off, only the Redis cooldown applies |
 | Auth v2 codes | 60-second resend cooldown, 15-minute code lifetime, 5 failed verifies | Redis records under `authv2:*_otp:` |
@@ -118,6 +118,7 @@ These routes accept anonymous traffic. Each is protected only by the global buck
 | --- | --- |
 | `POST /authv2/phone/request-otp` | Sends an SMS. Durable limits apply only when Auth v3 is enabled |
 | `/authv3` public routes | Durable per-requester limits |
+| `POST /authv3/attribution/touch` | Inserts an anonymous `AttributionTouches` row per call. Durable `attribution_touch` limit of 120 per 10 minutes per requester prefix |
 | `GET /ride/{id}` | Full ride details, including rider and driver phone numbers, for any ride UUID |
 | `POST /tips/{slug}/guest-checkout` | Creates a Stripe Checkout session per call |
 | `GET /tips/{slug}` | Driver first name and photo for a tip slug |

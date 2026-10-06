@@ -1,20 +1,22 @@
 ---
 title: "Signup and Auth v3 site"
-description: "How the signup site's two bundles, the hosted Auth v3 page, tip links, World Cup claims, and account deletion work in the browser: routing, storage keys, cookies, redirects, and API calls"
+description: "How the signup site's two bundles, the hosted Auth v3 page, the referral invite landing, tip links, World Cup claims, and account deletion work in the browser: routing, storage keys, cookies, redirects, and API calls"
 ---
 
-The `signup` site (`src/sites/signup/`) is the browser half of Yelo sign-in. It hosts the Auth v3 transaction page that the app opens in a browser, runs a web-only PKCE flow for people who arrive without the app, and carries three intent flows: tipping, World Cup claims, and account deletion. The API side of Auth v3 is covered in [Identity overview](/engineering/identity/overview) and [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions). This page covers what the browser does.
+The `signup` site (`src/sites/signup/`) is the browser half of Yelo sign-in. It hosts the Auth v3 transaction page that the app opens in a browser, runs a web-only PKCE flow for people who arrive without the app, serves the personal referral invite landing at `/i/<code>`, and carries three intent flows: tipping, World Cup claims, and account deletion. The API side of Auth v3 is covered in [Identity overview](/engineering/identity/overview) and [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions). This page covers what the browser does.
 
 ## Two bundles, one site
 
 | Entry | HTML | Mounts | Loads |
 | --- | --- | --- | --- |
 | Auth v3 | `src/sites/signup/auth/v3/index.html` → `auth/v3/main.tsx` | `AuthV3Page` directly with `createRoot` | React, `posthog-js` (lazy by config), the Auth v3 fetch client. No router, React Query, axios, sonner, or Dub. |
-| Main | `src/sites/signup/index.html` → `main.tsx` | `App` through `renderSite({ query, toaster, router, dubAnalytics })` | Tip, World Cup, delete-account, and the fallback Auth v3 route |
+| Main | `src/sites/signup/index.html` → `main.tsx` | `App` through `renderSite({ query, toaster, router, dubAnalytics })` | Invite landing, tip, World Cup, delete-account, and the fallback Auth v3 route |
 
 `tools/vite/base/config.ts` adds the second Rollup input only when `SITE=signup`. Firebase rewrites `/auth/v3`, `/auth/v3/`, and `/auth/v3/callback` to `/auth/v3/index.html` and everything else to `/index.html` (`src/sites/signup/firebase.json`). `App.tsx` still lazy-loads `AuthV3Page` for those paths as a fallback if the rewrite ever misses.
 
 Both entries call `captureAuthV3RequestSecret()` before React mounts, so the `#request=` fragment never reaches Dub, PostHog, or React state.
+
+On every path that is not `/auth/v3`, the main entry (`main.tsx`) also calls `recordTouch()` before rendering. See [Link landing touches](#link-landing-touches).
 
 ## Main-bundle routing
 
@@ -24,6 +26,7 @@ Both entries call `captureAuthV3RequestSecret()` before React mounts, so the `#r
 | --- | --- |
 | `isAuthV3Path()`: `/auth/v3` or `/auth/v3/callback`, trailing slashes ignored | `AuthV3Page` (lazy) |
 | `isDeleteAccountPath()`: `/delete-account`, case-insensitive | `DeleteAccountPage` (lazy) |
+| `inviteCodeFromPath()`: `/i/<code>`, optional trailing slash | `InvitePage` (not lazy, because under the `joinyelo.com` proxy only assets referenced by the HTML are namespaced) |
 | Dev build and `?preview=all` or `?preview=<step>` | `PreviewGallery` or a single step. Stubs `GET /tips/*` with sample data. |
 | A `tip` path segment followed by a slug, and `?status=success` | `TipComplete` |
 | A `tip` segment with a slug | `TipStep`, authenticated if `?auth=complete` |
@@ -105,6 +108,31 @@ People who reach `/auth/v3` without a request secret, for example from a tip lin
 
 `authV3EntryPath()` builds the entry URL and copies only allowlisted attribution parameters (`utm_*`, `source_channel`, `channel`, `dub_id`, `ref`, `referral_code`, `code`), each truncated to 256 characters. `tip_slug` must match `[A-Za-z0-9_-]` and be at most 128 characters; `amount` must be 2 to 8 digits.
 
+## Referral invite landing
+
+Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. `invite.yelo.link/<code>` redirects here too. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
+
+`InvitePage` (`src/sites/signup/invite/InvitePage.tsx`) loads the inviter preview with `GET /referral/invite/{code}`, which returns the inviter's first name, photo, and user ID. Without a photo, the avatar color comes from an FNV-1a hash of the user ID over a five-color palette. The app and `ogcard.DeterministicColor` in `yelo-api/internal/utilities/ogcard/color.go` implement the same function, and all three must agree. The page then branches on the device:
+
+| Device | Behavior |
+| --- | --- |
+| iPhone, iPad, iPod, or touch-capable Mac | `referralFallbackURL()` replaces the location with the App Store URL plus `&ct=<code>` on mount. iOS normally opened the app from the `join.yelo.link` universal link already, so this is a store fallback. It never probes a custom scheme, because Safari shows an invalid-address alert when the app is missing. |
+| Android | Shows a **Get it on Google Play** link whose `referrer` is `deepLink=https://join.yelo.link/<code>`. The Dub SDK reads that install referrer on first open. |
+| Anything else | Shows the App Store badge with `&ct=<code>` |
+
+On every device, **Continue → sign up** links to `/auth/v3` through `authV3EntryPath()` with the landing's allowlisted attribution parameters plus `code=<code>`, so the Dub click ID and `utm_*` parameters reach sign-up along with the code. `qr=1` is not forwarded. Store URLs live in `src/sites/signup/invite/referralHandoff.ts`.
+
+## Link landing touches
+
+`recordTouch()` (`auth-v3/touch.ts`) sends `POST /authv3/attribution/touch` with the `captureAttribution()` snapshot, using `keepalive` so the request outlives an immediate App Store redirect. Errors are ignored. `main.tsx` calls it on every page that is not `/auth/v3`, including the invite landing, tip pages, and World Cup claims. The Auth v3 page reports its own attribution with legal acceptance instead.
+
+At sign-up the API claims every touch that shares the browser's `yelo_anon_id`. See [Record an anonymous link touch](/engineering/identity/auth-v3-transactions#record-an-anonymous-link-touch) and [Anonymous link touches](/engineering/domains/referrals-and-links#anonymous-link-touches).
+
+`attributionFromSnapshot()` applies two landing rules:
+
+- On `/i/<code>`, `landing_surface` is `/i` for every invite, and the code becomes the `referral_code` fallback when no `ref`, `referral_code`, or `code` parameter is present.
+- `utm_medium` falls back to `qr` when the URL has `qr=1` and no `utm_medium`.
+
 ## Tip links
 
 QR payment configs show a Dub short link (`pay.yelo.link/<slug>` in `QRConfigCards`). The canonical tip page is `joinyelo.com/pay/tip/<slug>`, which the `experience-router` Worker proxies to this site's `/tip/<slug>`. See [Edge and routing](/engineering/web/edge-and-routing).
@@ -137,15 +165,15 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 | `yelo.auth-v3.web-pending` | `sessionStorage` | `webFlow.ts` | PKCE `state`, `codeVerifier`, redirect URI, and return search |
 | `yelo_signup_jwt` | `sessionStorage` | `signupTokenStore.ts` | Presignup or full JWT for `/authv2/`, `/user/`, `/world-cup/`, and `/tips/` requests |
 | `yelo.auth-v3.analytics-context` | `sessionStorage` | `analytics.ts` | Correlation IDs for PostHog, without email |
-| `yelo_anon_id` | Cookie, 90 days, `SameSite=Lax`, `Secure` on HTTPS | `attribution.ts` | Anonymous ID sent in legal-acceptance attribution. Scoped to `.joinyelo.com` on that domain. |
-| `dub_id` | Cookie (read only) | Dub | Fallback click ID when `?dub_id=` is absent |
+| `yelo_anon_id` | Cookie, 90 days, `SameSite=Lax`, `Secure` on HTTPS | `attribution.ts` | Anonymous ID sent in link touches and legal-acceptance attribution. Scoped to `.joinyelo.com` on that domain. |
+| `dub_id` | Cookie, 90 days, `SameSite=Lax`, `Secure` on HTTPS | `attribution.ts` (from `?dub_id=`, written synchronously), Dub | Dub click ID. Fallback when `?dub_id=` is absent. Scoped to `.joinyelo.com` on that domain. |
 | Dub analytics cookie | Cookie, `.joinyelo.com`, 90 days | `renderSite({ dubAnalytics })` | Main bundle only |
 
 `signupSession.ts` installs an axios interceptor on import. It attaches the token only to signup paths. On a `401` it calls `POST /authv3/session/refresh` with credentials and retries that request once (`_yeloAuthRetried`). Concurrent 401s in one tab share a single module-level refresh promise. Other tabs don't share it. A failed refresh clears the token. A `401` whose body marks the account deleted clears the token and sends the browser to `/`.
 
 ## Analytics
 
-`initializeAuthV3Analytics()` initializes PostHog only when `VITE_POSTHOG_KEY` is set, `VITE_APP_ENV` (or Vite mode) is `production`, and the context is not an emulator, a test account, or an `@rideyelo.com` email. Pageview, pageleave, and autocapture are off; session replay masks inputs and anything with `ph-no-capture`. Events are the `auth_v3_*` set in `analytics.ts` with `event_schema_version: 2`. On a `pagehide` before completion, the page sends `auth_v3_abandoned` with the last stage.
+`initializeAuthV3Analytics()` initializes PostHog only when `VITE_POSTHOG_KEY` is set, `VITE_APP_ENV` (or Vite mode) is `production`, and the context is not an emulator, a test account, or an `@rideyelo.com` email. Pageview, pageleave, and autocapture are off; session replay masks inputs and anything with `ph-no-capture`. Events are the `auth_v3_*` set in `analytics.ts` with `event_schema_version: 2`. The analytics context (`AuthV3AnalyticsContext`) adds attribution dimensions so you can cut the funnel by how the visitor arrived: `has_referral`, `has_link_click`, `utm_source`, `utm_medium`, and `utm_campaign`. The invite code and Dub click ID are never sent, only their presence flags. On a `pagehide` before completion, the page sends `auth_v3_abandoned` with the last stage.
 
 ## Where this lives in code
 
@@ -153,7 +181,8 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 | --- | --- |
 | Main router | `yelo-web/src/sites/signup/App.tsx` |
 | Entries | `src/sites/signup/main.tsx`, `src/sites/signup/auth/v3/main.tsx` |
-| Auth v3 page and helpers | `src/sites/signup/auth-v3/` (`AuthV3Page.tsx`, `requestSecret.ts`, `webFlow.ts`, `webIntent.ts`, `redirects.ts`, `authV3Fetch.ts`, `attribution.ts`, `analytics.ts`) |
+| Invite landing | `src/sites/signup/invite/` (`InvitePage.tsx`, `referralHandoff.ts`, `api.ts`) |
+| Auth v3 page and helpers | `src/sites/signup/auth-v3/` (`AuthV3Page.tsx`, `requestSecret.ts`, `webFlow.ts`, `webIntent.ts`, `redirects.ts`, `authV3Fetch.ts`, `attribution.ts`, `touch.ts`, `analytics.ts`) |
 | Recovery notes | `src/sites/signup/auth-v3/README.md` |
 | Shared steps | `src/shared/signup/steps/` (`TipStep`, `EduClaimStep`, `Handoff`, `OtpStep`, `PhoneStep`, `OAuthStep`) |
 | Token store and interceptor | `src/shared/signup/signupTokenStore.ts`, `signupSession.ts` |
@@ -163,10 +192,11 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 
 ## Gotchas and edge cases
 
-- **Web completion loses the intent.** On the callback load, `completeAuthV3WebFlow()` restores the saved return search with `replaceState`, so `intent`, `tip_slug`, `amount`, and `after` are briefly back in the URL. Its `.then` then calls `initializeAuthV3Analytics()` before `authV3WebCompletionPath(window.location.search)` (`AuthV3Page.tsx:595-596`). The provider round trip was a full page load, so analytics initializes again, and `sanitizedAuthV3Search()` rewrites the URL to the safe correlation keys only. The completion path then sees no intent, and the user lands on the generic **Open Yelo** screen instead of the tip or World Cup page. Computing the path from the pending record's `returnSearch` would avoid this.
+- **Web completion loses the intent.** On the callback load, `completeAuthV3WebFlow()` restores the saved return search with `replaceState`, so `intent`, `tip_slug`, `amount`, and `after` are briefly back in the URL. Its `.then` then calls `initializeAuthV3Analytics()` before `authV3WebCompletionPath(window.location.search)` (`AuthV3Page.tsx:602-603`). The provider round trip was a full page load, so analytics initializes again, and `sanitizedAuthV3Search()` rewrites the URL to the safe correlation keys only. The completion path then sees no intent, and the user lands on the generic **Open Yelo** screen instead of the tip or World Cup page. Computing the path from the pending record's `returnSearch` would avoid this.
 - **Stale comment about tip config.** The preview stub in `App.tsx` says the tip config "needs a verified session". `GET /tips/{slug}` is public (`tipping/routes.go`); only `visit` and `checkout` need a token.
 - **Authenticated tippers see a signup prompt.** Stripe returns to `?status=success&checkout=yelo` without `signed_up=true`, so `TipComplete` still shows **continue with yelo signup** after a signed-in tip.
 - **Two app schemes.** Auth v3 uses `VITE_AUTH_V3_APP_SCHEME` (default `com.rideyelo`, `com.rideyelo.e2e` for maestro). The fleet invite page on the `invite` site uses `yelo:///`.
+- **Invite pages are never cached.** Firebase sends `Cache-Control: no-cache, no-store, must-revalidate` for `/i/**` (`src/sites/signup/firebase.json`).
 - **US phone numbers only.** The phone view prefixes `+1` and strips a leading `1` from 11-digit input.
 - **World Cup `.edu` check is loose.** The browser regex accepts any address ending in `.edu`, including subdomains; the API normalizes and validates.
 - **Auth v3 disabled returns `503`.** When `AUTH_V3_ENABLED` is off, the API answers every `/authv3/*` path with `AuthV3UnavailableError`, which the page maps to `provider_unavailable`.

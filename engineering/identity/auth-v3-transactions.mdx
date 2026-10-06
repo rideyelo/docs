@@ -95,6 +95,22 @@ The HTTP handler also resolves a coarse location from the requester IP (`CoarseI
 The hosted page calls accept only when the user taps a method, never on page load (`ensureAccepted` in `AuthV3Page.tsx`). The acceptance is the legal record, so it must follow a user action.
 </Note>
 
+## Record an anonymous link touch
+
+`POST /authv3/attribution/touch` (`Handler.RecordTouch`, `Service.RecordTouch`) logs a link landing before any transaction exists. Landing pages on `joinyelo.com` (invite, QR, tip, and claim pages) call it on page load. The hosted `/auth/v3` page doesn't, because it reports attribution with acceptance.
+
+- The body is the same attribution object accept takes, with the same validation. `anonymous_id` and `landing_surface` are required.
+- The touch is stored with `auth_transaction_id = NULL` and `user_id = NULL`.
+- Rate scope `attribution_touch` allows 120 requests per 10 minutes.
+- The call isn't counted in the funnel step metric, because a landing isn't a sign-in attempt.
+- A success returns `{ "success": true }`. The web client sends it with `keepalive` and ignores errors.
+
+```bash
+curl -X POST "$API_BASE_URL/authv3/attribution/touch" \
+  -H 'Content-Type: application/json' \
+  -d '{"anonymous_id":"4f9c2a7e-1b3d-4c8e-9a6f-2d5e7b1c0a93","landing_surface":"/i","referral_code":"SL-7QK2M","utm_medium":"qr"}'
+```
+
 ## Start a provider
 
 `POST /authv3/providers/{google,apple}/start` (`Service.StartProvider`):
@@ -115,7 +131,7 @@ Google redirects with `GET /providers/google/callback`. Apple posts `form_post` 
 - Treat a provider `error` as a cancellation. `ResolveProviderFailure` moves `provider_pending` to `cancelled` and never reflects provider error text.
 - Call `authenticatedCallback`, which opens the sealed state and requires: the right kind and provider, a transaction whose stored provider matches, matching state and nonce hashes, neither the state nor the transaction expired, and status `provider_pending`.
 
-Then the provider code is exchanged and `ResolveVerifiedIdentity` runs. See [Identity resolution and linking](/engineering/identity/identity-resolution) for the algorithm. On success it sets the transaction to `verified`, copies legal acceptance into `UserLegalAcceptances`, sets `Users.is_terms_agreed`, binds attribution touches to the user, and either creates a handoff code or asks for a phone.
+Then the provider code is exchanged and `ResolveVerifiedIdentity` runs. See [Identity resolution and linking](/engineering/identity/identity-resolution) for the algorithm. On success it sets the transaction to `verified`, copies legal acceptance into `UserLegalAcceptances`, sets `Users.is_terms_agreed`, binds attribution touches to the user (including unclaimed anonymous touches that share the transaction's `anonymous_id` and are at most 90 days old), and either creates a handoff code or asks for a phone.
 
 ### What the callback redirects to
 
@@ -178,6 +194,8 @@ Known bug: `AuthHandoffCodes.transaction_id` is unique, and `CreateAuthV3Handoff
 - `use_provider_photo` only accepts a photo URL already stored on one of the user's `AuthIdentities` (`IsAuthV3ProviderPhotoTrusted`). The client can't choose an arbitrary URL.
 - Generates a referral code under a Postgres advisory lock. A collision returns `ErrorTypeDuplicate`, which the retry loop treats as retryable (up to 5 attempts).
 - A referral code captured on the transaction's attribution wins. Presenting a **different** code returns 400 `referral code is already bound to this sign-in`. Self-referral and unknown codes return 400 `referral code is invalid`. An existing `Referrals` row is never overwritten.
+- If neither the transaction nor the request carries a code, the most recent code on the user's claimed anonymous touches is applied (`applyAuthV3AmbientReferral`). The user never presented that code, so an invalid, self-referring, or conflicting one is silently dropped. Only a server error fails the profile.
+- After completion, if any claimed touch carries a `dub_click_id`, a Dub `Sign Up` lead is sent asynchronously with the latest click ID and the user ID.
 - Sets `profile_completed = true` and clears `auth_v3_provisional`.
 - Always issues a **native** user token (6,360 hours), even for web transactions.
 
