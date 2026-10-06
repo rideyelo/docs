@@ -1,9 +1,9 @@
 ---
 title: "Driver earnings and activity"
-description: "How every driver-facing earnings number is computed: the driver_payout lifecycle, the activity feed and its ride enrichment, weekly and rolling windows, pagination, payout pushes, and the other driver endpoints that report stats and auto-queue state."
+description: "How every driver-facing earnings number is computed: the driver_payout lifecycle, net earnings after Stripe fees, pending (uncaptured) rides, the activity feed and its ride enrichment, weekly and rolling windows, pagination, payout pushes, and the other driver endpoints that report stats and auto-queue state."
 ---
 
-A driver sees earnings in four places, and each one is computed differently. The earnings hub reads Stripe. The weekly headline, the status poll, and drive history read `Rides.driver_payout` from Postgres. This page explains where each number comes from and why they disagree.
+A driver sees earnings in four places, and each one is computed differently. The earnings hub reads Stripe, plus completed rides whose fare isn't captured yet. The weekly headline, the status poll, and drive history read `Rides` from Postgres and report net earnings: `driver_payout` less Stripe's processing fee. This page explains where each number comes from and why they disagree.
 
 For payout mechanics (instant fee, idempotency key, payout schedule, Stripe fee backfill), see [Payouts and earnings internals](/engineering/payments/payouts-and-earnings). For how tips are charged, see [Ride tip charging](/engineering/payments/ride-tips). For the product summary, see [Tips and earnings](/concepts/tips-and-earnings).
 
@@ -11,7 +11,7 @@ For payout mechanics (instant fee, idempotency key, payout schedule, Stripe fee 
 
 | Store | Keys or columns | Read by | Written by |
 | --- | --- | --- | --- |
-| Postgres `Rides` | `driver_payout`, `tip_amount`, `payment_intent_id`, `complete_time`, `request_time`, `status`, `stripe_fee_cents` | Weekly headline, activity enrichment, status poll, drive history | Ride completion, tip capture, `payment_intent.succeeded` webhook, fee backfill |
+| Postgres `Rides` | `driver_payout`, `tip_amount`, `tips_enabled`, `payment_intent_id`, `complete_time`, `request_time`, `status`, `stripe_fee_cents`, `estimated_stripe_fee_cents`, `tip_stripe_fee_cents`, `estimated_tip_stripe_fee_cents` | Weekly headline, activity enrichment, pending rides, status poll, drive history | Ride completion, tip capture, `payment_intent.succeeded` webhook, fee backfill |
 | Postgres `Users` | `stripe_merchant_id`, `auto_queue`, `auto_queue_max_minutes`, `auto_queue_paused_until`, `is_online_driver` | Account resolution, auto-queue settings | Connect onboarding, `/driver/auto-queue*` |
 | Postgres `Communities` | `auto_queue_max_minutes`, `auto_queue_default_minutes` | Auto-queue settings | Dashboard |
 | Postgres `DriverAutoQueueLog` | `driver_id`, `community_id`, `enabled_at`, `disabled_at` | Uptime reporting (no live caller) | `reconcileDriverAutoQueueAccounting` |
@@ -27,7 +27,7 @@ All app routes use the shared `authenticatedGroup` or `userAuthGroup` in `intern
 
 | Method | Path | Auth | Handler and purpose |
 | --- | --- | --- | --- |
-| GET | `/earnings/balance` | JWT, role `user` | `GetBalance`. Stripe balance buckets |
+| GET | `/earnings/balance` | JWT, role `user` | `GetBalance`. Stripe balance buckets, plus `uncaptured` and `uncaptured_rides` |
 | GET | `/earnings/external-account` | JWT, role `user` | `GetExternalAccount`. Default bank or card, 404 when none |
 | GET | `/earnings/payout-schedule` | JWT, role `user` | `GetPayoutSchedule`. Cadence and estimated `next_payout_at` |
 | PUT | `/earnings/payout-schedule` | JWT, role `user` | `UpdatePayoutSchedule`. Writes Stripe account settings |
@@ -36,7 +36,7 @@ All app routes use the shared `authenticatedGroup` or `userAuthGroup` in `intern
 | POST | `/earnings/payouts/instant` | JWT, role `user` | `CreateInstantPayout` |
 | GET | `/earnings/activity` | JWT, role `user` | `GetActivity`. `from`, `to`, `limit`, `cursor` |
 | GET | `/user/status` | JWT, role `user` | `GetUserStatus`. Includes `driver_earnings` daily, weekly, all-time |
-| GET | `/user/drive-history` | JWT, role `user` | `GetDriveHistory`. Last 200 driven rides with fare, tip, fee |
+| GET | `/user/drive-history` | JWT, role `user` | `GetDriveHistory`. Last 200 driven rides with fare, tip, fee, net earnings, and `pending` |
 | GET | `/driver/demand-dashboard` | JWT, role `user` | `GetDemandDashboard`. Requests in last 20 min, drivers online, demand curve |
 | GET | `/driver/auto-queue` | JWT, role `user` | `GetAutoQueueSettings` |
 | PUT | `/driver/auto-queue` | JWT, role `user` | `SetAutoQueue`. `enabled`, optional `max_minutes` |
@@ -55,16 +55,16 @@ Other `/driver/*` routes are documented by their owners:
 
 ## How `driver_payout` is built
 
-`Rides.driver_payout` is the gross amount (fare plus tip, in dollars, `real`) that every database-backed earnings number sums. It's never net of Stripe fees. Several writers touch it over a ride's life:
+`Rides.driver_payout` is the gross amount (fare plus tip, in dollars, `real`) that the rider was charged. It's never net of Stripe fees. Driver-facing reads don't show it directly. They pass it to `ride_driver_earnings_cents`, which subtracts the fees (see [Net earnings after Stripe fees](#net-earnings-after-stripe-fees)). Several writers touch it over a ride's life, and most of them also snapshot a fee estimate:
 
-| Moment | Writer | Value |
-| --- | --- | --- |
-| Driver completes ride | `CompleteRideForRating` via `RideService.Complete` | `GetEffectivePrice()`: `discounted_price` if set, else `price` |
-| Rider tips within the $5.00 buffer | `CompleteRideTip` via `captureTipWithinBuffer` | `fare + tip`, status `complete` |
-| Rider rates with no tip, or tip window expires | `CompleteRideTip` with tip 0 | `fare`, status `complete` |
-| Tip over the buffer, after the fare settled | `RecordCompletedRideTip` | `COALESCE(driver_payout, 0) + tip`, only when `tip_amount = 0` |
-| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists |
-| Cancellation with a fee | Same webhook | Captured fee amount |
+| Moment | Writer | Value | Fee estimate written |
+| --- | --- | --- | --- |
+| Driver completes ride | `CompleteRideForRating` via `RideService.Complete` | `GetEffectivePrice()`: `discounted_price` if set, else `price` | `estimated_stripe_fee_cents` |
+| Rider tips within the $5.00 buffer | `CompleteRideTip` via `captureTipWithinBuffer` | `fare + tip`, status `complete` | `estimated_stripe_fee_cents` (unchanged by the tip) |
+| Rider rates with no tip, or tip window expires | `CompleteRideTip` with tip 0 | `fare`, status `complete` | `estimated_stripe_fee_cents` |
+| Tip over the buffer, after the fare settled | `RecordCompletedRideTip` | `COALESCE(driver_payout, 0) + tip`, only when `tip_amount = 0` | `estimated_tip_stripe_fee_cents` on the tip alone |
+| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists | `estimated_stripe_fee_cents`, re-estimated on the fare (plus the $5.00 buffer when tips are enabled) |
+| Cancellation with a fee | Same webhook, or the cancellation operation | Captured fee amount | `estimated_stripe_fee_cents` on the fee (operation path, `stripe_fee_estimate_cents(fee_cents)`), or on the fare (webhook path) |
 
 ### Worked example
 
@@ -84,20 +84,58 @@ A $12.00 ride with tips enabled:
 
 With an $8.00 tip instead, the fare is captured alone (1200 cents), then a separate tip PaymentIntent charges 800 cents. `RecordCompletedRideTip` sets `driver_payout = 20.00`. If the fare's `payment_intent.succeeded` lands afterward, it writes `12.00` back. The tip survives in `tip_amount`, but every sum below loses $8.00. [Stripe webhooks](/engineering/payments/webhooks) documents this race.
 
+## Net earnings after Stripe fees
+
+Stripe takes its processing fee out of the driver's connected account, so what the driver keeps is less than what the rider paid. Every driver-facing read returns this net figure as `driver_earnings` (dollars) or `earnings` (cents). Rider-facing reads keep returning the price the rider paid and never see the fee.
+
+Two Postgres functions, added in `000348` and revised in `000352`, hold the whole definition:
+
+| Function | Returns |
+| --- | --- |
+| `stripe_fee_estimate_cents(amount_cents)` | `ROUND(amount_cents * 0.029) + 30` for a positive amount, else 0. This is Stripe's standard 2.9% + 30¢ card rate, and the only place the rate lives. Change it with `CREATE OR REPLACE` in a new migration. Stored estimates and actual fees on existing rides aren't affected. |
+| `ride_fare_fee_estimate_cents(fare_cents, tips_enabled)` | The fee on the fare charge. Stripe assesses its fee on the amount authorized, not the amount captured, and keeps it when the unused hold is released. A tips-enabled ride authorizes fare + $5.00 (`models.TipBuffer`), so the estimate is `stripe_fee_estimate_cents(fare_cents + 500)`. Otherwise it's the fee on the fare. |
+| `ride_driver_earnings_cents(driver_payout, price, discounted_price, tip_amount, stripe_fee_cents, estimated_stripe_fee_cents, tip_stripe_fee_cents, estimated_tip_stripe_fee_cents, tips_enabled)` | Gross less fees, floored at 0. Gross is `driver_payout`, or `COALESCE(discounted_price, price) + tip_amount` before a payout is written. |
+
+`ride_driver_earnings_cents` subtracts one fee per charge, and the actual fee always wins:
+
+1. **Fare charge**: `stripe_fee_cents` (actual, from the fee backfill), else `estimated_stripe_fee_cents` (snapshotted by the payout writers), else a live `ride_fare_fee_estimate_cents`. The live estimate covers rides with no payout yet, such as a request card on the board.
+2. **Dedicated tip charge**: `tip_stripe_fee_cents` (actual), else `estimated_tip_stripe_fee_cents`, else 0. Only over-buffer tips charged on their own PaymentIntent have this fee.
+
+<Note>
+`000348` also created an 8-argument form of `ride_driver_earnings_cents` that estimates on the captured amount. `000352` adds the 9-argument form with `tips_enabled` and keeps the old one for API instances still running the previous release. Every current query calls the 9-argument form.
+</Note>
+
+### Worked example
+
+A $12.00 ride with tips enabled. The fare authorization is 1700 cents (fare plus the $5.00 buffer), so the fare charge's estimated fee is `ROUND(1700 * 0.029) + 30 = 79` cents.
+
+| Scenario | Gross | Fees subtracted | `driver_earnings` |
+| --- | --- | --- | --- |
+| Before the rider tips (`pending_rider_rating`) | 1200 | 79 (fare estimate) | $11.21 |
+| Rider tips $3.00 inside the buffer | 1500 | 79 (same charge, same authorization) | $14.21 |
+| Rider tips $8.00 as a dedicated charge | 2000 | 79 (fare) + 53 (`ROUND(800 * 0.029) + 30`) | $18.68 |
+
+When the fee backfill later stores Stripe's actual fee, the actual replaces the estimate for that charge and the driver's number updates on the next read.
+
+### Rider name on driver-facing reads
+
+Driver-facing reads show the rider's first name and last initial only, for example `Elle A.`. `models.RiderNameForDriver` shortens the `rider_name` string on drive history, activity rows, and pending rides. `models.RiderLastInitial` shortens `rider.last_name` on `GET /ride/i/{id}` for any viewer except the rider, and `rider_last_name` on the driver's message threads. The rider still sees their full name.
+
 ## Earnings surfaces
 
 | Surface | Source | Window | Time column | Includes fleet-paid rides |
 | --- | --- | --- | --- | --- |
 | Hub balance | Stripe `Balance.Get` on `Users.stripe_merchant_id` | Live | n/a | No |
-| Activity rows | Stripe balance transactions | Caller's `from` and `to` | Stripe `created` | No |
-| Activity `gross` per row | `Rides.driver_payout` | Per ride | n/a | No, only rows on the driver's account |
+| Hub `uncaptured` | `ListDriverUncapturedRides`, net | Live | n/a | No, only rides on the driver's account |
+| Activity rows | Stripe balance transactions, plus pending rows on the first page | Caller's `from` and `to` | Stripe `created`, or `complete_time` for pending rows | No |
+| Activity `gross` and `earnings` per row | `Rides.driver_payout` and `ride_driver_earnings_cents` | Per ride | n/a | No, only rows on the driver's account |
 | Weekly headline (`week_total`, `ride_count`) | `GetDriverWeekEarnings` | Monday 00:00 UTC to now | `complete_time` | Yes |
 | Status `daily_earnings` | `GetUserDriverStatus` | Rolling 24 hours | `request_time` | Yes |
 | Status `weekly_earnings` | `GetUserDriverStatus` | Rolling 7 days | `request_time` | Yes |
 | Status `all_time_earnings` | `GetDriverAllTimeEarnings`, Redis 60 s | All time | n/a | Yes |
 | Drive history | `GetRideHistoryByDriverID` | Last 200 rides | `request_time` order | Yes |
 
-All database-backed sums filter `status IN ('complete', 'pending_rider_rating')` and `driver_payout IS NOT NULL`. A sum with no rows is returned as `null` (status poll) or `0` (weekly headline).
+All database-backed sums add up `ride_driver_earnings_cents` per ride, so they're net of Stripe fees. They filter `status IN ('complete', 'pending_rider_rating')` and `driver_payout IS NOT NULL`. A sum with no rows is returned as `null` (status poll) or `0` (weekly headline).
 
 ### Period bucketing and timezones
 
@@ -133,7 +171,10 @@ The mobile client picks its `from` in UTC too. `useEarningsHubData` sends `from 
     `buildActivityPage` maps each transaction, classifies its type, appends it to its UTC day group, and adds `net` to that group's `total`. It also sums a page-local week total from rows with `created` on or after the week start and `net` greater than 0. Every `charge` or `payment` row among those counts as a ride.
   </Step>
   <Step title="Enrich with rides">
-    `enrichActivityWithRides` reads `source.charge.payment_intent.id` from each transaction and runs one `GetRideEarningsByPaymentIntents` query (`WHERE payment_intent_id = ANY($1)`). Matched rows get `ride_id`, `rider_name`, `tip_amount` (cents, `math.Round(tip * 100)`), and `gross` (cents from `driver_payout`). A query failure logs a warning and returns bare rows.
+    `enrichActivityWithRides` reads `source.charge.payment_intent.id` from each transaction and runs one `GetRideEarningsByPaymentIntents` query (`WHERE payment_intent_id = ANY($1)`). Matched rows get `ride_id`, `rider_name` (first name and last initial), `tip_amount` (cents, `math.Round(tip * 100)`), `gross` (cents from `driver_payout`), and `earnings` (cents from `ride_driver_earnings_cents`). A query failure logs a warning and returns bare rows.
+  </Step>
+  <Step title="Add pending rides">
+    When `cursor` is empty, `addPendingRides` merges the driver's uncaptured rides into the page as pending rows. See [Pending rides](#pending-uncaptured-rides). A failed lookup logs a warning and adds nothing.
   </Step>
   <Step title="Replace the headline">
     When `cursor` is empty, `weeklySummary` overwrites `week_total` and `ride_count` with `GetDriverWeekEarnings`. A failure logs a warning and keeps the page-local values.
@@ -144,18 +185,20 @@ The mobile client picks its `from` in UTC too. `useEarningsHubData` sends `from 
 
 | Field | Source | Notes |
 | --- | --- | --- |
-| `id` | Balance transaction ID | Used as the cursor |
+| `id` | Balance transaction ID, or `pending_{rideID}` for a pending row | Used as the cursor |
 | `type` | `classifyTransactionType` | `charge`, `payment`, `payout`, `refund`, `adjustment`, `fee`, `other` |
 | `amount`, `net`, `fee` | Stripe, cents | Stripe books the charge at the authorized amount, per the `weeklySummary` comment |
-| `gross` | `Rides.driver_payout` | Omitted when 0 or unmatched. The client shows `gross` when present, else `net` (`mappers.ts`) |
+| `gross` | `Rides.driver_payout` | Omitted when 0 or unmatched |
+| `earnings` | `ride_driver_earnings_cents` | What the driver keeps, in cents. Omitted when 0 or unmatched. The client shows `earnings` when present, then `gross`, then `net` (`mappers.ts`) |
+| `pending` | `addPendingRides` | `true` on rows for rides whose fare isn't captured yet. Omitted otherwise. `net` and `fee` on these rows are estimates |
 | `tip_amount` | `Rides.tip_amount` | Cents |
 | `created_at`, `available_on` | Stripe | Unix seconds |
 
 ### Headline math
 
-`GetDriverWeekEarnings` sums dollars in Postgres, and the repository converts with `int64(math.Round(total * 100))`.
+`GetDriverWeekEarnings` sums `ride_driver_earnings_cents` in Postgres and returns dollars. The repository converts back with `int64(math.Round(total * 100))`.
 
-Example week: rides with `driver_payout` of 12.00, 15.00, and 7.50, plus a canceled ride with a $3.00 fee. The query returns `total_dollars = 37.50` and `ride_count = 4`. The response carries `week_total = 3750` and `ride_count = 4`. The canceled ride counts as a ride because the query doesn't filter `cancel_phase`.
+Example week, with no tips enabled and estimated fees only: rides with `driver_payout` of 12.00 (fee 65¢), 15.00 (fee 74¢), and 7.50 (fee 52¢), plus a canceled ride with a $3.00 fee (fee 39¢). The query returns `total_dollars = 35.20` and `ride_count = 4`. The response carries `week_total = 3520` and `ride_count = 4`. The canceled ride counts as a ride because the query doesn't filter `cancel_phase`.
 
 ### Pagination
 
@@ -172,7 +215,7 @@ The mobile app never sends `cursor`. The hub and the **All activity** screen eac
 
 ## Status poll earnings
 
-`UserRepository.GetStatus` runs `GetUserDriverStatus` on every `GET /user/status` poll. The query's `recent_drives` CTE is bounded to one week of `request_time`, so daily and weekly sums stay cheap.
+`UserRepository.GetStatus` runs `GetUserDriverStatus` on every `GET /user/status` poll. The query's `recent_drives` CTE is bounded to one week of `request_time`, so daily and weekly sums stay cheap. Daily, weekly, and all-time sums are net of Stripe fees: each ride contributes `ride_driver_earnings_cents / 100`, not `driver_payout`.
 
 All-time earnings used to run inside the same query. They're now served by `DriverEarningsCache` (`internal/data/redis/driver_status_cache.go`):
 
@@ -190,11 +233,53 @@ All-time earnings used to run inside the same query. They're now served by `Driv
 | --- | --- |
 | `price` | `COALESCE(discounted_price, price)`, the fare. Not `driver_payout` |
 | `tip_amount` | `COALESCE(tip_amount, 0)` |
-| `fee_cents` | `Rides.stripe_fee_cents`, null until the fee backfill fills it |
-| `rider_name` | Rider first and last name |
+| `fee_cents` | Gross less `driver_earnings`, in cents. This is the fee applied to the driver's earnings across the fare charge and any dedicated tip charge: actual where Stripe has reported it, else the estimate. Never null on drive history |
+| `driver_earnings` | `ride_driver_earnings_cents / 100`, what the driver keeps, in dollars |
+| `pending` | `true` while the fare is authorized but not captured. `driver_earnings` isn't in the Stripe balance yet, `fee_cents` is an estimate, and a tip may still be added |
+| `rider_name` | Rider first name and last initial |
 | `duration` | Seconds from `request_time` to `complete_time` |
 
-The model comment in `internal/models/ride.go` defines driver take-home as `price + tip - fee_cents`. The history query doesn't filter `cancel_phase`, so canceled rides appear with their full quoted fare in `price`.
+Gross less `fee_cents` always equals `driver_earnings`. The history query doesn't filter `cancel_phase`, so canceled rides appear with their full quoted fare in `price`.
+
+`GET /user/ride-history` (the rider's own history) no longer returns a fee. Its `fee_cents` is always null and it has no `driver_earnings`.
+
+## Pending (uncaptured) rides
+
+On a tips-enabled ride, the fare stays authorized but uncaptured during the rider's 24-hour tip window. Stripe has no balance transaction for it yet, so the Stripe balance and activity list leave out a ride the driver just finished. The API reports these rides from Postgres instead.
+
+`ListDriverUncapturedRides` selects up to 100 of the driver's rides on the given connected account where:
+
+- `status = 'pending_rider_rating'` and `cancel_phase IS NULL`,
+- `tips_enabled = TRUE`, `payment_intent_id IS NOT NULL`, and `driver_payout > 0`,
+- `complete_time` is set, and
+- `tip_window_expires_at > NOW() - INTERVAL '1 hour'`.
+
+Rides more than an hour past their window are stuck captures awaiting manual review. They're left out instead of being promised to the driver. Drive history's `pending` flag uses the same rule.
+
+Pending rides show up in three places:
+
+| Surface | Field | Value |
+| --- | --- | --- |
+| `GET /earnings/balance` | `uncaptured`, `uncaptured_rides` | Sum of the pending rides' net earnings in cents, and their count. Not part of `available`, `pending`, or `instant_available`, and can't be paid out |
+| `GET /earnings/activity`, first page | Rows with `pending: true` | One `charge` row per ride: `amount` and `gross` are the gross, `earnings` and `net` are the net, `fee` is the difference, `created_at` is `complete_time`. Added to its UTC day group's `total` |
+| `GET /user/drive-history` | `pending` | `true` on the ride's record |
+
+Example `data` payload from `GET /earnings/balance` for a driver with two rides in their tip windows:
+
+```json
+{
+  "available": 4210,
+  "pending": 1530,
+  "instant_available": 4210,
+  "currency": "usd",
+  "uncaptured": 2363,
+  "uncaptured_rides": 2
+}
+```
+
+The lookup is best-effort. A failure logs `[earnings] uncaptured rides lookup failed; serving Stripe balance only` and returns `uncaptured: 0`.
+
+When the rider rates the ride (with or without a tip), `RideService.Rate` sends the driver a ride-status ping with status `complete`, so the driver's app refreshes its balance and history right away.
 
 ## Payout pushes
 
@@ -275,7 +360,10 @@ Example: a driver enables auto-queue at 18:30 local and goes offline at 20:15, w
 | Query parsing | `internal/server/http/earnings/earnings_handler.go` | `parseInt64Query`, `GetActivity` |
 | Response models | `internal/models/earnings.go` | `EarningsActivityPage`, `ActivityItem`, `RideEarningEnrichment` |
 | Stripe list calls | `internal/data/stripe/payout.go` | `ListBalanceTransactions`, `ListPayouts`, `buildCreatedRange` |
-| Week headline and enrichment SQL | `internal/data/repository/queries/ride_history.sql` | `GetDriverWeekEarnings`, `GetRideEarningsByPaymentIntents`, `GetRideHistoryByDriverID` |
+| Week headline, enrichment, and pending rides SQL | `internal/data/repository/queries/ride_history.sql` | `GetDriverWeekEarnings`, `GetRideEarningsByPaymentIntents`, `GetRideHistoryByDriverID`, `ListDriverUncapturedRides` |
+| Pending rows | `internal/service/earnings/mappers.go`, `earnings.go` | `addPendingRides`, `uncapturedRides` |
+| Net earnings and fee estimate functions | `migrations/000348_ride_driver_earnings.up.sql`, `migrations/000352_ride_fee_estimate_authorized_amount.up.sql` | `stripe_fee_estimate_cents`, `ride_fare_fee_estimate_cents`, `ride_driver_earnings_cents` |
+| Rider name for drivers | `internal/models/driver_view.go` | `RiderNameForDriver`, `RiderLastInitial` |
 | Status poll earnings | `internal/data/repository/queries/user_driver.sql` | `GetUserDriverStatus`, `GetDriverAllTimeEarnings` |
 | All-time cache | `internal/data/redis/driver_status_cache.go` | `DriverEarningsCache` |
 | `driver_payout` writers | `internal/data/repository/queries/ride_lifecycle.sql` | `CompleteRideForRating`, `CompleteRideTip`, `RecordCompletedRideTip`, `MarkRidePaymentSucceeded` |
@@ -290,7 +378,9 @@ Example: a driver enables auto-queue at 18:30 local and goes offline at 20:15, w
 - **`tip_count` is always 0.** `buildActivityPage` declares `tipCount` and never increments it. The response field exists, but carries no data.
 - **Page-local totals on later pages.** Only the first page (empty `cursor`) gets the database headline. A request with a cursor returns `week_total` and `ride_count` computed from that page's rows alone.
 - **Headline counts canceled rides.** `GetDriverWeekEarnings` and the status poll don't filter `cancel_phase`, so a cancellation fee counts as a ride. `drive_count` on the user profile does filter it.
-- **Over-buffer tips can show twice.** Enrichment matches only `Rides.payment_intent_id`. The fare row gets `gross = fare + tip`, and the dedicated tip PaymentIntent's row stays unenriched with its own `net`. The client shows both.
+- **Over-buffer tips can show twice.** Enrichment matches only `Rides.payment_intent_id`. The fare row gets `gross` and `earnings` that include the tip, and the dedicated tip PaymentIntent's row stays unenriched with its own `net`. The client shows both.
+- **Estimates can drift until the backfill runs.** A ride shows the estimated fee until `stripe_drive_fee_repair` stores Stripe's actual fee, which can shift `driver_earnings` by a few cents. Rides from before `000348` have no stored estimate and use the live estimate.
+- **Hub total versus cash-out.** The app's hub total and pending amount include `uncaptured`. The next payout and the cash-out amount use only Stripe's buckets.
 - **Headline versus status weekly.** The headline is a calendar week from Monday 00:00 UTC on `complete_time`. `weekly_earnings` is a rolling 7 days on `request_time`. They rarely match.
 - **Fleet-paid rides.** Database sums include rides charged on a fleet account. Stripe-backed balance, activity, and payouts don't. See [payout routing](/engineering/fleets/membership-and-payout-routing).
 - **Dev override.** Outside `dev`, `development`, `local`, and `test`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID` is ignored. Inside them, every user's Stripe calls hit that account, but the weekly headline still reads the caller's own rides.

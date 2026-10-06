@@ -13,7 +13,24 @@ Markers on each line:
 
 Dependency bumps, CI changes, and E2E tooling are summarized in one line per week.
 
-<Update label="Week of October 5, 2026" description="Anonymous link touches, ambient referral credit, self-healing Dub share links, and dependency updates">
+<Update label="Week of October 5, 2026" description="Driver net and pending earnings, anonymous link touches, ambient referral credit, self-healing Dub share links, friend_joined push, idempotent ride accept, legacy update gate, and dependency updates">
+  **Notifications**
+
+  - New `friend_joined` push ("[Name] is on Yelo 👋", opens `/map`). It goes to the other side of each newly created friendship from a contact match, signup referral, or invite link, and is deduplicated per joiner and recipient set. It is a `marketing` template, so it defers to quiet hours. [#299](https://github.com/rideyelo/yelo-api/pull/299). See [Notification catalog](/engineering/notifications/catalog#operator-and-friends).
+
+  **Rides**
+
+  - Manual accepts are serialized per ride under the ride's advisory lock, so a duplicate request can't place a second authorization on the rider's card. A repeat accept from the driver who already holds the ride returns success instead of an error. A lifecycle conflict while saving the payment intent returns the conflict instead of a 500. [#295](https://github.com/rideyelo/yelo-api/pull/295). See [Concurrency and races](/engineering/matching/concurrency#race-scenarios).
+
+  **Social**
+
+  - `POST /user/friends/contacts` accepts up to 10,000 `phone_numbers`, up from 5,000. The mobile app raised its snapshot cap to match in [yelo-frontend#657](https://github.com/rideyelo/yelo-frontend/pull/657). [#295](https://github.com/rideyelo/yelo-api/pull/295). See [User social graph](/engineering/domains/user-social-graph#request-validation).
+
+  **Payments**
+
+  - Driver-facing earnings are net of Stripe's processing fee. Ride board, queue, ride details for drivers, message threads, drive history, and activity rows return `driver_earnings` (dollars) or `earnings` (cents). Status poll earnings and the weekly headline sum net earnings instead of `driver_payout`. Fees use the actual Stripe fee per charge when known, else a stored 2.9% + 30¢ estimate. Driver-facing reads show the rider's first name and last initial only. The fee repair job also stores dedicated tip charge fees and logs `stripe_fee_estimate_mismatch` when Stripe's fee differs from the estimate. **Migration** `000348` adds three fee columns to `Rides` and the `stripe_fee_estimate_cents` and `ride_driver_earnings_cents` functions. `000349` and `000350` add concurrent tip-fee repair indexes. **Breaking:** drive history `fee_cents` is now gross less `driver_earnings`, and rider history no longer returns a fee. [#298](https://github.com/rideyelo/yelo-api/pull/298). See [Driver earnings and activity](/engineering/domains/driver-earnings-and-activity#net-earnings-after-stripe-fees).
+  - `GET /earnings/balance` adds `uncaptured` and `uncaptured_rides` for completed rides whose fare is authorized but not captured. The first activity page lists them as `pending: true` rows, and drive history flags them with `pending`. Rating a ride pings the driver so the app refreshes. Fee estimates now use the authorized amount (fare + $5.00 when tips are on). **Migration** `000352` adds `ride_fare_fee_estimate_cents` and a 9-argument `ride_driver_earnings_cents`, and re-estimates stored fees with no actual fee yet. [#301](https://github.com/rideyelo/yelo-api/pull/301). See [Pending rides](/engineering/domains/driver-earnings-and-activity#pending-uncaptured-rides).
+
   **Referrals and attribution**
 
   - New public `POST /authv3/attribution/touch` records an anonymous link landing before any auth transaction exists. It takes the same attribution object as accept, with `anonymous_id` and `landing_surface` required, and stores the touch with no `auth_transaction_id`. The new `attribution_touch` rate scope allows 120 requests per 10 minutes per requester prefix. When a transaction resolves, it claims unclaimed touches with the same `anonymous_id` from the 90 days before authentication. At profile completion, if the user presented no code, the most recent referral code on those touches is applied, and invalid, self, or conflicting codes are dropped silently. Auth v3 signups with a claimed Dub click ID send a Dub `Sign Up` lead. **Config:** `REFERRAL_LANDING_BASE_URL` sets the destination base for personal invite links on `join.yelo.link`, intended as `https://joinyelo.com/i`. It falls back to `INVITE_LANDING_BASE_URL`, then `https://invite.yelo.link`. [#294](https://github.com/rideyelo/yelo-api/pull/294). See [Anonymous link touches](/engineering/domains/referrals-and-links#anonymous-link-touches) and [Record an anonymous link touch](/engineering/identity/auth-v3-transactions#record-an-anonymous-link-touch).
@@ -22,6 +39,7 @@ Dependency bumps, CI changes, and E2E tooling are summarized in one line per wee
 
   **Platform**
 
+  - New standalone App Engine service for the retired host `prod-yelo.uc.r.appspot.com`. App builds 4.x and older get `426 Upgrade Required` with the store link. `/update-required` is proxied to the live API. **Config:** deployed manually with `gcloud app deploy`, outside the release pipeline. [#295](https://github.com/rideyelo/yelo-api/pull/295). See [Legacy update gate](/engineering/deployment#legacy-update-gate).
   - Dependencies: maps, Dub, OTLP trace exporter, `x/net`, and Google API modules. [#291](https://github.com/rideyelo/yelo-api/pull/291)
 </Update>
 
