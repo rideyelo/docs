@@ -1,6 +1,6 @@
 ---
 title: "Map tab internals"
-description: "The providers, camera bridge, sheet geometry, and marker helpers behind the rider map tab: first-camera resolution, per-frame pub/sub, proximity and centered-POI emphasis, pan-to-dismiss, top bar ownership, and entity follow."
+description: "The providers, camera bridge, sheet geometry, and marker helpers behind the rider map tab: first-camera resolution, per-frame pub/sub, request sheet snaps and morph, proximity and centered-POI emphasis, label placement, pan-to-dismiss, top bar ownership, and entity follow."
 ---
 
 The rider map tab (`app/(app)/(tabs)/map/`) is one Mapbox view with a glass bottom sheet on top. A stack of small providers lets detail screens, markers, and the camera talk to each other without re-rendering the map on every frame. This page covers that plumbing.
@@ -141,6 +141,103 @@ A detail sheet (POI, place, friend, or vehicle) closes back to the feed when the
 
 The baseline is set only by a real touch, so the open-time fly and programmatic recenters never dismiss. The check runs mid-drag, and the ride request screen is exempt.
 
+## Request sheet geometry
+
+The ride request screen (`app/(app)/(tabs)/map/request.tsx`) replaces the feed's snap points through `setSnapOverride`. The maths lives in `components/map/request/sheetGeometry.ts` as pure functions, and the route memoizes the results. For what the sheet shows, see [Rider experience](/engineering/mobile/rider-experience#request-sheet).
+
+The screen has three content modes, and each one sizes the sheet differently:
+
+| Mode | Flag | When |
+| --- | --- | --- |
+| Yelo options | Neither flag | The default, including while the options load |
+| Aggregator | `showAggregator` | A pickup is set and the community is inactive or the draft returned no vehicle options, with the `rideshare-price-aggregator` experiment on |
+| Deep-link fallback | `showDeepLinkFallback` | Same condition, with the experiment off |
+
+### Request snap points
+
+All values are sheet heights in pixels.
+
+| Snap | Function | Value |
+| --- | --- | --- |
+| Top | `computeTopSheetHeight` | A fixed anchor: window height minus top inset minus `MAP_TOP_UI_HEIGHT` (`rem(8.375)`) minus `rem(3)` (`ACTION_BAR_TOP_SNAP_RESERVE`). The deep-link fallback instead fits its measured content plus `rem(2)`, or `rem(29.5)` before measurement, capped at the anchor |
+| Collapsed | `computeCollapsedSheetHeight` | Measured summary height plus `rem(0.5)`, plus the measured bottom stack (CTA and payment row), plus `rem(2)` of sheet padding. Never above the top snap |
+| Middle peek | `computeMiddleSheetHeight` | 48% of the window, clamped between the collapsed and top snaps, then aligned to a whole option card |
+
+Until the first layout lands, the collapsed snap uses estimates: `rem(4)` for the summary and `rem(9)` for the bottom stack. The aggregator uses its own measured summary and CTA with the same estimates. The deep-link fallback collapses to its measured header and first card plus `rem(2)`, or `rem(10.5)` before measurement.
+
+`resolveSheetBaseHeight` returns the chrome around the options list: `rem(14.5)` when payment is required, and `rem(3.25)` less for a free ride, which hides the payment row. The route subtracts it from the top snap to get the expanded list height.
+
+### Card-aligned peek
+
+A plain 48% line can cut an option card in half. `RideOptions` reports the bottom offset of each parent option group once every group has measured, and `RideAggregatorSection` does the same in aggregator mode. `snapPeekToParent` uses those boundaries:
+
+1. Work out how much of the list the 48% peek would show, using the same linear mapping as the morph.
+2. Find the last boundary inside that viewport and the next one past it.
+3. Round up to the next boundary when at least 40% of that card is already showing (`PARENT_ROUND_UP_THRESHOLD`). Otherwise round down.
+4. Add `rem(0.75)` (`PARENT_REVEAL_MARGIN`) below the card, then invert the mapping to get a sheet height.
+
+It returns `null`, and the peek stays at 48%, until the morph heights and at least one boundary exist.
+
+### Snap override list
+
+`computeSnapOverridePoints` returns `[collapsed, middle, top]`. Two rules keep the list valid for Gorhom:
+
+- The top is at least 1 px above the collapsed snap, so the list always has two strictly increasing entries and the sheet's `index={1}` stays in range.
+- The middle peek is included only when it sits more than 1 px from both neighbours.
+
+The deep-link fallback returns `[collapsed, top, top + 1]`. The extra 1 px entry is an unreachable top, so the sheet rests at the second-highest snap and the glass stays clear. Only the highest snap turns the sheet opaque.
+
+### Installing and syncing snaps
+
+`useRequestSheetSnaps` owns the override while the screen is focused. It has three effects:
+
+| Effect | Trigger | Action |
+| --- | --- | --- |
+| Focus setup | Screen focus | Dismiss the keyboard, install the override, set the map's bottom padding to the middle height, and snap to index 1 on the next frame. On blur, clear the override and the bottom bar |
+| Sync | Any snap height change while focused, when Yelo options or the third-party fallback are showing | Re-install the override and the map padding. Never moves the sheet |
+| One-shot open | Options or the aggregator list first arrive | Snap to index 1 once per screen |
+
+The focus effect reads the snap heights from a ref, not from its dependencies. Re-running it on every re-measure would re-open the sheet while you drag it down.
+
+The one-shot open waits for the card boundaries so its single snap already lands card-aligned. If they haven't arrived after 200 ms (`PEEK_ALIGN_FALLBACK_MS`), it opens at the estimate.
+
+### Keyboard-deferred snaps
+
+Every snap change above goes through `afterKeyboardHidden` (`components/map/request/afterKeyboardHidden.ts`). It runs the callback immediately when the keyboard is hidden. Otherwise it waits for `keyboardDidHide`, not `keyboardWillHide`, so the sheet doesn't resize during the keyboard animation. It returns a cancel function. A blur, an unmount, or a newer measurement cancels the pending call, so only the latest geometry is applied.
+
+### Collapsed-to-full morph
+
+`sheetExpandProgress` from `useMapSheetSnaps` runs from 0 at the first override entry to 1 at the last. It is derived from the sheet's real top-edge position. `useSheetMorphAnimations` turns it into four animated styles and two JS-side latches:
+
+| Output | Driven by | Used for |
+| --- | --- | --- |
+| `morphAreaStyle` | Height from the summary height to the expanded list height | Yelo options wrapper |
+| `fallbackMorphStyle` | Height between the fallback's collapsed and expanded scroll heights | Third-party fallback scroll area |
+| `optionsFadeStyle` | Opacity 0 to 1 across `summaryFadeStart` to `summaryFadeEnd` | Options list |
+| `summaryFadeStyle` | Opacity 1 to 0 across the same range | Compact summary |
+| `sheetCollapsed` | Progress below `summaryFadeEnd` | Sets the options layer to `pointerEvents="none"` so the summary takes taps |
+| `sheetFullyExpanded` | Progress at or above 0.99 | Enables the list's inner scroll. Below it, an upward drag raises the sheet instead |
+
+The route sets `summaryFadeEnd` to `max(0.12, middleProgress × 0.6)` and `summaryFadeStart` to 30% of that. `middleProgress` is the middle peek's fraction of the collapsed-to-top distance. The cross-fade therefore finishes before the peek, so the peek and top snaps show only the list.
+
+`RideSheetMorph` renders the two layers inside one `overflow: hidden` wrapper. The summary is absolutely positioned at the top and wrapped in a touchable with the accessibility label `Show ride options` that snaps to the peek. The options layer stays in normal flow with `flex: 1`, which keeps Gorhom's scroll and tap gesture coordination working.
+
+### Route drawing
+
+`useRequestMapDrawing` draws the trip on the shared map. On focus it:
+
+1. Shows the community bounding box and zones.
+2. Turns on smart label placement and registers two keep-outs: a full-width strip `rem(4)` tall at the top-left, and a `rem(7.5)` by `rem(7)` box at the bottom-right for the action cluster. See [Label placement](#label-placement).
+3. Runs `setMapElements`: `clearMap`, then `setPickup`, `setDropoff`, and `setRoute` when a pre-ride route exists, then `focusMap(['pickup', 'dropoff', 'route'], padding)`.
+
+The framing padding is the middle sheet height plus `rem(3)`. The pickup pin uses `resolvePickupDisplayName`, so it matches the sheet header.
+
+Each `setMapElements` run increments an epoch counter and bails after every awaited step if a newer run has started. The callback depends on the stops' primitive coordinates, names, and addresses, not on object identity or sheet height. Either would clear and redraw the pins on unrelated re-renders.
+
+A UI-thread reaction buckets `sheetExpandProgress` into snap index 0, 1, or 2 at the midpoints between snaps. When the bucket changes while the screen is focused, the hook reframes the route against the collapsed or middle height. It skips index 2 because the strip above the top snap is too small to frame a route.
+
+On blur, the hook bumps the epoch, stops the camera, turns smart placement off, clears the keep-outs, and clears the map.
+
 ## Marker emphasis
 
 ### Proximity pop
@@ -154,6 +251,62 @@ Community POIs and saved places are drawn by separate `PinnedSymbolsLayer` insta
 - Each layer runs `pickCenteredPoi` (`components/map/pinned/findCenteredPoi.ts`) on every frame. Distance is measured as a fraction of the visible span. A pin gains emphasis within 0.18, keeps it until 0.22, and loses it to a challenger only if the challenger is closer than 0.85× the holder's distance.
 - Each layer reports its candidate to `CenteredPoiProvider`, which keeps the global nearest and applies the same 0.85 switch margin across layers.
 - Candidate lookup uses `createPointIndex` (`lib/map/pointIndex.ts`): coordinates sorted by latitude and longitude, binary-searched on whichever axis gives fewer candidates, with antimeridian wrap. Results keep the input order.
+
+### Label placement
+
+Pickup, dropoff, and driver callout pills can sit at any of four corners of their pin: `TR`, `TL`, `BR`, or `BL`. `components/map/labelPlacement/` picks the corner that keeps each pill on screen and clear of other pills and floating UI. The resting corner is `TR` (`PREFERRED_CORNER`).
+
+`computeLabelPlacements` (`placement.ts`) scores every corner for every marker and picks the lowest total. Penalties come from `DEFAULT_PLACEMENT_CONFIG` in `constants.ts`:
+
+| Term | Weight | Applies when |
+| --- | --- | --- |
+| Clip | 100,000 per unit | Part of the pill falls outside the usable band. Horizontal and vertical fractions add |
+| Overlap | 10,000 per unit | Two pills intersect, normalized by the smaller pill's area |
+| Exclusion | 4,000 per unit | The pill covers a keep-out rect, as a fraction of the pill's area |
+| Preempt | 1,000 | The pin is within 2× the label height of the band edge the corner leans toward |
+| Switch | 200 | The corner differs from the marker's current corner |
+| Preference | 50 | The corner isn't `TR` |
+| Spread | 10 | The corner leans toward the band's vertical center |
+
+With up to four markers (`MAX_EXHAUSTIVE_MARKERS`), it scores all 4^N combinations, including pairwise overlap. Above that, each marker takes its own lowest-penalty corner and overlap is ignored. `CORNERS` order breaks ties.
+
+`useMarkerLabelPlacement` runs the loop. On camera frames it projects each marker with `getPointInView`, at most once per 100 ms (`PROJECT_INTERVAL_MS`). It writes the result to per-marker shared values: `cornerById` and `readyById`. `AnnotatedMarker` animates the pill to the new corner over 180 ms and fades it in over 150 ms once `ready` is true. If the first projection fails, the hook retries on the next frame, up to 60 times.
+
+Keep-outs come in two kinds:
+
+| Kind | Type | Anchored to | Source |
+| --- | --- | --- | --- |
+| Screen chrome | `LabelKeepOut` | A corner of the band, with a width and height | The host screen, through `display.setLabelExclusions` |
+| Map obstacle | `LabelObstacle` | A map coordinate, projected on every pass | Zone name pills. `ZoneLabel` reports its measured size through `CommunityZonesLayer` |
+
+At most 8 obstacles are projected per pass (`MAX_PROJECTED_OBSTACLES`). A failed obstacle projection is dropped without aborting the pass. Zone obstacles count only while the zones are visible.
+
+`useMapLabelPlacement` (`components/map/customMapView/useMapLabelPlacement.ts`) wires this into `CustomMapView` for the `pickup` and `dropoff` markers. The band is the window inset by 8 px on each side, below the top safe area and above the map's bottom padding. Pill sizes start at 150 by 44 and update from measurement.
+
+Placement is off by default. A screen turns it on with `display.setSmartLabelPlacement(true)`:
+
+| Caller | Keep-outs |
+| --- | --- |
+| Ride request (`useRequestMapDrawing`) | Top strip and bottom-right action cluster. See [Route drawing](#route-drawing) |
+| Driver home (`app/(app)/drive/index.tsx`), while a ride is active | Top-left `remFixed(8)` by `remFixed(3.5)`, top-right `remFixed(7.5)` by `remFixed(3.5)` |
+
+`RouteMap` calls `useMarkerLabelPlacement` directly for its static preview, with `pickup`, `dropoff`, and `driver` markers, a band inset 8 px from the map's own bounds, and no keep-outs.
+
+### Edge pointers
+
+`components/map/edgePointers/` draws bubbles at the edge of the map that point toward off-screen community POIs. The feature is disabled. `EDGE_POINTERS_ENABLED` in `components/map/edgePointers/constants.ts` is `false`, and `_layout.tsx` mounts `EdgePoiPointersLayer` only when it is `true`. The constant is a compile-time value, not a remote flag.
+
+When enabled, the layer works like this:
+
+- `buildPointerFeatures` (`features.ts`) keeps POIs that are off-screen and within 8 km of the map center (`MAX_POINTER_DISTANCE_KM`), then takes the 5 nearest (`MAX_POINTERS`). It returns nothing below zoom 11 (`POINTER_MIN_ZOOM`, an alias of `PINNED_MIN_ZOOM`).
+- Each pointer sits where the ray from the center to the POI exits an inset rectangle. The top inset clears the safe area plus `MAP_TOP_UI_HEIGHT`, and the bottom inset follows the sheet's top edge. Each adds 5% of the center-to-edge distance. The sides use 30%. No inset exceeds 85% (`MAX_INSET_FRACTION`).
+- Pointers on the same edge slide apart to at least 22% of the inset edge's length, and stay 12% clear of each corner.
+- The chevron rotates to the POI's bearing minus the map heading.
+- `stepPointers` (`pointerAnimation.ts`) fades each pointer by 0.12 opacity per frame (`FADE_STEP`). A leaving pointer holds its last position until it has faded out.
+- The layout passes `enabled` as false while a POI, friend, or vehicle is selected, which fades the pointers out.
+- Tapping a bubble flies the camera to that POI.
+
+The bubble is three native layers on one `ShapeSource`: a chevron glyph, a circle with a 20 px radius, and the category icon. Icons are registered under the `yelo-edge-` prefix, separate from the pins' images.
 
 ### Visible marker caps
 
@@ -199,6 +352,9 @@ When the current community ID changes to a different non-empty value, the layout
 | Pinned layers | `yelo-frontend/components/map/pinned/` (`findCenteredPoi.ts`, `useMarkerProximityScale.ts`, `constants.ts`) |
 | Pure helpers | `yelo-frontend/lib/map/` (`cameraMovement`, `mapPanDismiss`, `mapSheetSnap`, `pointIndex`, `visibleMarkers`, `mapEntityPositions`, `mapFrameRate`, `savedLocationsMatch`, `ridePreparation`) |
 | Proximity detection | `yelo-frontend/hooks/useMarkerCenterProximity.ts` |
+| Request sheet geometry | `yelo-frontend/components/map/request/` (`sheetGeometry.ts`, `useRequestSheetSnaps.ts`, `useSheetMorphAnimations.ts`, `useRequestMapDrawing.ts`, `RideSheetMorph.tsx`, `afterKeyboardHidden.ts`) |
+| Label placement | `yelo-frontend/components/map/labelPlacement/` (`constants.ts`, `geometry.ts`, `placement.ts`, `useMarkerLabelPlacement.ts`), `components/map/customMapView/useMapLabelPlacement.ts`, `components/map/AnnotatedMarker.tsx` |
+| Edge pointers (disabled) | `yelo-frontend/components/map/edgePointers/` (`EdgePoiPointersLayer.tsx`, `features.ts`, `geometry.ts`, `pointerAnimation.ts`, `constants.ts`) |
 
 ## Gotchas and edge cases
 
@@ -217,6 +373,18 @@ When the current community ID changes to a different non-empty value, the layout
   </Accordion>
   <Accordion title="Two meters-per-pixel constants">
     `lib/map/mapPanDismiss.ts` uses 78,271.5 m per pixel at zoom 0, which matches Mapbox's 512 px tiles. `hooks/useMarkerCenterProximity.ts` uses 156,543 m per pixel, the 256 px tile value. At the same zoom, the proximity radius converts to about twice the intended meters, so the pop triggers from roughly twice as far as `PROXIMITY_RADIUS_PX` suggests.
+  </Accordion>
+  <Accordion title="Edge pointers are built but switched off">
+    `EDGE_POINTERS_ENABLED` is `false`, so `EdgePoiPointersLayer` never mounts. Flip the constant in `components/map/edgePointers/constants.ts` to enable it. Nothing else gates the layer.
+  </Accordion>
+  <Accordion title="Three copies of MAP_TOP_UI_HEIGHT">
+    `components/map/layout/constants.ts` exports `MAP_TOP_UI_HEIGHT = rem(8.375)`. `components/map/request/sheetGeometry.ts` and `components/map/tutorial/BumpAutoOpen.tsx` each declare a private copy with the same value. Change all three together, or the request sheet's top snap drifts from the top bar.
+  </Accordion>
+  <Accordion title="Snap sync must never expand the sheet">
+    The sync effect in `useRequestSheetSnaps` only swaps the snap array. Async re-measures, such as the payment row settling, land while you may be mid-drag. Expanding there snaps a collapsed sheet back open.
+  </Accordion>
+  <Accordion title="Greedy label placement ignores overlap">
+    With more than four markers, `computeLabelPlacements` picks each corner independently. Pills can overlap in that mode. Current callers pass at most three markers.
   </Accordion>
   <Accordion title="Returning from profile doesn't recenter">
     The map is deliberately not recentered on re-focus, because the profile screen slides over it. Only the first mount resolves a camera.

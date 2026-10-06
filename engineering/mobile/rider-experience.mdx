@@ -35,7 +35,7 @@ The search bar carries a status chip from the current community:
 | Community state | Chip | Tap behavior |
 | --- | --- | --- |
 | `rides_disabled` | **COMING** | Opens search |
-| `market_status: OFF_PEAK` | `next_operating_window` or **OFF-PEAK** | Collapses the sheet and opens the off-peak popup |
+| `market_status: OFF_PEAK` | `next_operating_window` or **OFF-PEAK** | Collapses the sheet and opens the [off-peak overlay](#off-peak-overlay) |
 | Otherwise | **LIVE** | Opens search |
 
 `LocationGate` covers the whole map when foreground location is missing. See [Permissions](/engineering/mobile/permissions-and-device#location).
@@ -60,8 +60,130 @@ A failed retrieve keeps search open and shows **Couldn't load this location** / 
 | Saved places (likes) | Server, `GET /user/likes`, `POST /user/likes`, `DELETE /user/likes/{id}` | none in client |
 | Community POIs | `GET /location/pois`, merged into saved places unless hidden per user | n/a |
 | Pinned spots | AsyncStorage `spots:pinnedIds:<userId>` and `spots:unpinnedOrder:<userId>` | 2 pinned (`MAX_PINNED` in `hooks/usePinnedSpots.ts`) |
+| Hidden community POIs | AsyncStorage `community-pois:hidden:<userId>` | none in client |
 
-`SavedSpotsBar` docks above the sheet and opens `/(app)/save-location` for management. The save-location screen can start a ride directly by pushing `map/request` with the spot as `dropoff`.
+`useSavedLocations` (`hooks/useSavedLocations.ts`) is the single source for "saved spots". It returns the user's likes followed by community POIs. It skips a community POI that is hidden, that lacks a name or coordinates, or that `findSavedMatch` matches to an existing like. Pinned state stores IDs only, so both `SavedSpotsBar` and the save-location screen resolve those IDs against this combined list.
+
+`SavedSpotsBar` docks above the sheet. It shows the pinned spots and opens `/(app)/save-location` for management. A pinned spot pushes `map/request` with the spot as `dropoff`. An empty pin slot opens the screen with `focusSearch=1`, which focuses the search input on mount. `MapFeedLikesRail` and the first-like featured card use the same param.
+
+#### Save-location screen
+
+`app/(app)/save-location/index.tsx` is titled **Liked Spots**. It has a search input (**Search a place to like**) above two lists rendered by `components/save-location/SpotsList.tsx`:
+
+- **PINNED n/2.** The pinned spots, in pin order. Each empty slot renders a dashed placeholder, "Tap a pin icon to fill this slot".
+- **LIKED n.** Every other saved spot. Spots with no stored position come first, so a newly liked place lands at the top. The rest follow the stored `unpinnedOrder`.
+
+Each row supports these actions:
+
+| Action | Control | Behavior |
+| --- | --- | --- |
+| Start a ride | Tap the row | Pushes `map/request` with the spot as `dropoff`. Ignored when the spot has no name or coordinates |
+| Reorder | Long-press the six-dot handle for 200 ms, then drag | Reorders within the section only. Dragging never moves a spot between **PINNED** and **LIKED**. The pinned handle appears only when two spots are pinned |
+| Pin | Tap the outline pin | Appends the spot to the pinned list. With both slots full, the spot in the first slot moves to the top of **LIKED** |
+| Unpin | Tap the filled pin | Moves the spot to the top of **LIKED** |
+| Remove | Tap the heart | See below |
+
+Removing a spot depends on where it came from:
+
+- **A like.** The screen drops the ID from the pin state and from the `GET /user/likes` query cache at once, then calls `DELETE /user/likes/{id}`. On failure it restores both and shows "Couldn't remove — try again".
+- **A community POI.** The screen adds the ID to the hidden set. It makes no API call and shows no snackbar.
+
+Every pin, unpin, and reorder goes through `setPinnedAndUnpinned`. Once the pin state is hydrated, the screen also strips IDs that no longer resolve to a saved spot.
+
+#### Search overlay
+
+Typing in the input shows `components/save-location/SearchOverlay.tsx` over the top half of the list. It is separate from the home search pipeline.
+
+- Suggestions come from `POST /mapping/search-suggestions` with `limit: 10`, the community ID, and the device position when available. The screen asks for foreground location on focus and reads one balanced-accuracy fix for this.
+- Calls are throttled to one per 200 ms, firing on the first keystroke and once more at the end of the window with the latest text.
+- An empty result shows "No places found."
+- A place that is already saved shows a filled heart and ignores taps.
+
+Tapping a suggestion saves it:
+
+1. A suggestion without coordinates is resolved through `POST /mapping/search-result`. A failure shows "Couldn't save — try again".
+2. The resolved place is checked against saved spots again. A match shows "Already liked".
+3. A stub with a `temp-<timestamp>` ID is prepended to the likes cache. The search clears and the keyboard closes.
+4. `POST /user/likes` runs. Success refetches likes. Failure restores the cache and shows "Couldn't save — try again".
+
+A first-ever like requests the feedback prompt (`first-like`). Tapping the overlay background clears the search. The clear button empties the input and keeps the keyboard up.
+
+#### Per-user sets
+
+Four hooks keep per-user ID sets in AsyncStorage. Nothing in them reaches the API, so the state stays on the device and does not follow the user to another one.
+
+| Hook | Key | Holds | Written by |
+| --- | --- | --- | --- |
+| `usePinnedSpots` | `spots:pinnedIds:<userId>`, `spots:unpinnedOrder:<userId>` | Pinned IDs (truncated to 2 on read and write) and the **LIKED** order | Save-location screen |
+| `useHiddenCommunityPois` | `community-pois:hidden:<userId>` | Community POIs the user un-hearted | Save-location remove, and the heart in `components/map/poi/PoiHeader.tsx`, which toggles `hide` and `unhide` |
+| `useDismissedSpots` | `featured-spot:dismissed:<userId>` | Featured spots hidden from the dock. The hook has no remove | Nothing today: `useFeaturedSpot` returns `dismiss`, but no component calls it |
+| `useCollapsedSpots` | `featured-spot:collapsed:<userId>` | Featured spots the user expanded into the card | `expand` and `collapse` from `useFeaturedSpot`, called by `FeaturedSpotOverlay` and `MapTutorialOverlay` |
+
+- **One store per user.** Each hook keeps a module-level store keyed by user, so every mounted instance sees the same state. `useDismissedSpots` and `useCollapsedSpots` share the implementation in `hooks/usePersistedSpotIdSet.ts`.
+- **Debounced writes.** State updates at once. The AsyncStorage write follows 150 ms later.
+- **No user, no state.** Without a `userId` the hooks return an empty set with `ready: false`, and writes do nothing.
+- **Hidden means un-hearted, not removed.** A hidden community POI leaves saved spots, but `CommunityPoisLayer` still draws it on the map without the heart. `PoiHeader` uses the same hidden set for community POIs and for spots flagged `liked`, so their heart never calls the likes API.
+- **`useCollapsedSpots` is named backwards.** `components/map/feed/useFeaturedSpot.ts` treats the set as the spots the user expanded. A spot that is absent renders as the compact pill.
+
+### Off-peak overlay
+
+`components/map/OffPeakHoursOverlay.tsx` is the **Operating hours** card that the **OFF-PEAK** chip opens. `MapAboveSheetOverlays` mounts it in the dock above the sheet, and `offPeakVisible` in `MapFeedProvider` controls it.
+
+- Swiping the card down or tapping anywhere outside it dismisses it.
+- Focusing search or switching community also closes it.
+- The featured-spot banner hides while it is open.
+
+The card has two modes, chosen by whether the community carries a `calendar_schedule`.
+
+#### Calendar mode
+
+With a schedule, `buildUpcomingCalendarWindows` (`lib/map/calendarHours.ts`) compacts the imported hours into days, then zones. To set up the calendar that feeds it, see [Operating hours](/admin/operating-hours).
+
+<Steps>
+  <Step title="Filter">
+    It keeps hours that end after now and start within the next 7 days. It drops hours with an unparseable date or an end at or before the start.
+  </Step>
+  <Step title="Group by day">
+    It sorts by start, then end, and groups by the start date in the schedule's `time_zone`. A window that runs past midnight appears only under the day it starts.
+  </Step>
+  <Step title="Group by zone">
+    Within a day, each hour is added to every active zone listed in its `zone_ids`. Inactive zones are skipped. A day with no active zone is left out.
+  </Step>
+  <Step title="Format">
+    Times render in the schedule's time zone as compact ranges such as `10PM–2AM` or `2:30PM–6PM`. Identical ranges in a zone collapse into one.
+  </Step>
+</Steps>
+
+Each row shows a short weekday (`Wed`), then one line per zone with its ranges joined by commas. A zone shows its `name`. When two active zones share a name, each shows its `key` instead, title-cased with underscores and hyphens turned into spaces.
+
+| Condition | Text |
+| --- | --- |
+| No upcoming windows | "No upcoming operating hours." |
+| Schedule `state` is not `ready`, with hours | "Showing the last imported schedule." |
+| Schedule `state` is not `ready`, without hours | "The schedule is being updated." |
+
+The list scrolls inside the card once it is taller than `rem(18)`.
+
+#### Weekly mode
+
+Without a schedule, `buildOperatingWeek` (`lib/map/operatingHours.ts`) expands the community's `operating_windows` into seven rows, Sunday first (`day_of_week` 0 is Sunday).
+
+- Each window renders as `9:00 PM – 2:00 AM`, from `open_time` and `close_time` in `HH:MM`. Windows sort by open time and join with commas.
+- A day with no window reads **Off-peak**.
+- Today's row is semibold. "Today" is the device's local day, not the community's.
+
+#### Place hours are separate
+
+The open or closed chip on a place sheet does not use community hours. `computeOpenStatus` (`lib/map/poi/poiHours.ts`) derives it at render time from the place's opening periods and UTC offset, because cached place details go stale.
+
+| Case | Chip |
+| --- | --- |
+| Any period never closes | Open, "24 hours" |
+| Inside a period | Open, "until [closing time]" |
+| Outside every period | Closed, "until [next opening time]" |
+| No periods, cached `open_now` present | Open or closed, "now" |
+
+A boundary more than 24 hours away gains a weekday prefix, as in "until Mon 9 AM".
 
 ## Request sheet
 
@@ -75,7 +197,86 @@ A pickup with no name shows as **Pickup pin** (`resolvePickupDisplayName` in `li
 
 - No dropoff and no `bump=true`: it replaces back to the map.
 - `bump=true` without a dropoff: it opens the change-stop sheet in destination mode first. Dismissing that sheet without choosing goes back.
-- The pickup seeds from the `pickup` param, else the last GPS fix. If neither exists, `useSeedRideStops` shows **Choose pickup**.
+- The pickup seeds from the `pickup` param, else the last GPS fix. If neither exists, `useSeedRideStops` shows **Choose pickup**. See [How stops are seeded](#how-stops-are-seeded).
+
+### Editing stops
+
+`RequestTopBar` replaces the map top bar with a back button and `RequestRouteHeader` (`components/map/RequestRouteHeader.tsx`). The header is two cards, **FROM** and **TO**. Tapping one opens `ChangeStopBottomSheet` in `pickup` or `destination` mode.
+
+The header reads its labels from `stores/requestRouteStore.ts`, because it renders in the shared top bar slot and can't see the screen's state. The request screen mirrors the labels into the store, and the header truncates them to 20 characters.
+
+| Stop | Label |
+| --- | --- |
+| Pickup from the device position | **Current Location** |
+| Pickup with a name | The name |
+| Pickup without a name | **Pickup pin** |
+| No pickup | **Choose pickup** |
+| Dropoff with a name | The name |
+| Dropoff without a name | **Destination pin** |
+| No dropoff | **Choose destination** |
+
+#### Change-stop sheet
+
+`components/bottom-sheets/ChangeStopBottomSheet.tsx` opens at 85% height with the input focused. It runs its own `useSearchSuggestions` instance, so it uses the same [search pipeline](#search-pipeline) as the home sheet.
+
+| Mode | Placeholder | List |
+| --- | --- | --- |
+| `destination` | **Where to?** | `LocationSearchResults`: the browse rails while the query is empty, then suggestions |
+| `pickup` | **Pickup from?** | `LocationItemsList`, with a **Current location** row first while the query is empty |
+
+The **Current location** row is not a search result. It carries the sentinel `mapbox_id` `current` (`CURRENT_LOCATION_ID`), and it disappears once you type. Its subtitle is the reverse-geocoded address of the last GPS fix, looked up when the sheet opens in pickup mode. The subtitle stays blank if that lookup fails.
+
+`resolveStopLocation` (`components/map/request/stopLocations.ts`) turns the tapped row into a stop:
+
+| Row | Resolution |
+| --- | --- |
+| Sentinel `current` | Reads the device position and builds a pickup with coordinates, an empty name and address, and `isCurrentLocation: true` |
+| Has coordinates | Normalized as is, with no network call |
+| No coordinates | `POST /mapping/search-result` with the suggestion's ID, `session_token`, and `provider` |
+
+A row that fails to resolve leaves the sheet open, with no error dialog, so you can pick another. On success the screen records the stop as a recent location (except the device position), applies it, and dismisses the sheet. A selection counter drops a result that resolves after a newer tap or after the sheet closes.
+
+The bump sheet reuses this component for its own location picker and passes `selectionLoading` ("Loading spot…") and `selectionError`. The request screen passes neither.
+
+#### Forced stop confirmation
+
+The request screen computes a `recoveryStop` when a stop is unusable:
+
+- A `pickup` or `dropoff` param is present but `parseRideStop` can't read it, and the session holds no stop for that side.
+- The draft failed for the stops on screen and named a stop to fix. See [Draft creation](#draft-creation).
+
+While `recoveryStop` is set, the screen opens the sheet in that mode by itself. It does this once per draft state, and only while the screen is focused and the app is in the foreground. The sheet shows a line above the input:
+
+| Mode | Text |
+| --- | --- |
+| `pickup` | "Confirm your pickup: choose where your driver should meet you." |
+| `destination` | "Confirm your destination: choose where you want to arrive." |
+
+The line shows only when the sheet's mode matches the stop being recovered. If you dismiss the sheet, the request sheet keeps a **Confirm pickup** or **Confirm destination** button that reopens it.
+
+#### How stops are seeded
+
+`useSeedRideStops` (`components/map/request/useSeedRideStops.ts`) fills the stops when the screen mounts.
+
+```mermaid
+flowchart TD
+  P{"pickup param?"} -->|yes| USE["Use it"]
+  P -->|no| C{"Cached GPS fix?"}
+  C -->|yes| GPS["Pickup from coordinates"]
+  C -->|no| E["ensureCurrentPosition('ride_pickup')"]
+  E -->|ok| GPS
+  E -->|fails| NEED["needsPickup: Choose pickup button"]
+  GPS --> RG["Reverse geocode"]
+  RG -->|street address found| ADDR["Add name and address"]
+  RG -->|otherwise| KEEP["Keep coordinates only"]
+```
+
+- **Dropoff.** The hook seeds it only from the `dropoff` param. A bump entry without one picks it in the change-stop sheet, as in [Entry guards](#entry-guards).
+- **Pickup param.** It wins and counts as an explicit selection.
+- **Automatic pickup.** It runs only while the screen is focused, the app is in the foreground, and the `pickup` param is not unreadable. A cached fix is used synchronously, so the common path makes no permission or location call.
+- **Coordinates first.** A GPS pickup is complete as soon as it has coordinates, so the draft can start. The address arrives later and is kept only when the reverse geocode returns an `address` result with address text. The pickup still displays as **Current Location**.
+- **Explicit beats automatic.** Any explicit pickup invalidates automatic results still in flight. A reverse geocode is discarded if the pickup changed while it ran.
+- **Paused while choosing.** Opening the sheet in pickup mode pauses automatic seeding. Dismissing it resumes, and retries if there is still no pickup.
 
 ### Draft creation
 
@@ -273,7 +474,11 @@ It shows **YOU PAID** (price plus tip), pickup and drop-off, a route map, **Base
 | Area | Path |
 | --- | --- |
 | Home feed and search | `app/(app)/(tabs)/map/index.tsx`, `components/search/`, `hooks/useSearchSuggestions.ts`, `hooks/useRecentLocations.ts` |
-| Saved places | `app/(app)/save-location/index.tsx`, `components/home/SavedSpotsBar.tsx`, `hooks/useSavedLocations.ts`, `hooks/usePinnedSpots.ts` |
+| Saved places | `app/(app)/save-location/index.tsx`, `components/save-location/`, `components/home/SavedSpotsBar.tsx`, `hooks/useSavedLocations.ts`, `hooks/usePinnedSpots.ts`, `hooks/useHiddenCommunityPois.ts` |
+| Featured-spot sets | `hooks/usePersistedSpotIdSet.ts`, `hooks/useDismissedSpots.ts`, `hooks/useCollapsedSpots.ts`, `components/map/feed/useFeaturedSpot.ts` |
+| Off-peak overlay | `components/map/OffPeakHoursOverlay.tsx`, `lib/map/calendarHours.ts`, `lib/map/operatingHours.ts`, `components/map/layout/MapAboveSheetOverlays.tsx` |
+| Place hours | `lib/map/poi/poiHours.ts`, `components/map/poi/usePlacePoiDetails.ts` |
+| Editing stops | `components/map/RequestTopBar.tsx`, `components/map/RequestRouteHeader.tsx`, `components/bottom-sheets/ChangeStopBottomSheet.tsx`, `components/map/request/useSeedRideStops.ts`, `components/map/request/stopLocations.ts`, `stores/requestRouteStore.ts` |
 | Request sheet | `app/(app)/(tabs)/map/request.tsx`, `components/map/request/`, `hooks/usePreRideRequest.ts` |
 | Vehicle options | `components/ride/RideOptionCard.tsx`, `RideOptionGroup.tsx`, `RideOptionBadges.tsx`, `lib/ride/rideOptionGrouping.ts` |
 | Payment | `components/ride/StripePaymentScreen.tsx`, `lib/payments/` |
@@ -300,4 +505,6 @@ It shows **YOU PAID** (price plus tip), pickup and drop-off, a route map, **Base
 - **Unreachable branches in `4-ride`.** `chatDisabled` and `callDisabled` check `queued`, and `mapFocusButton` handles `complete`, but the screen only renders for the three assigned statuses.
 - **Support SMS goes to `QUO_PHONE_NUMBER`** in `lib/constants.ts`, `(203) 555-9356`. Only `555-0100` to `555-0199` is reserved for fiction, so this may be a real line, but confirm it routes before relying on **Report safety issue**. Driver signup's hub and submitted screens text the same number.
 - **Queued driver card passes the phone number as `driverId`** (`2-queued.tsx:185`).
+- **`buildCalendarWeek` is not wired.** `lib/map/calendarHours.ts` exports it, but only its test calls it. The overlay uses `buildUpcomingCalendarWindows`.
+- **Pins, order, and hidden POIs are per device.** They live in AsyncStorage keyed by user ID and are never synced. See [Per-user sets](#per-user-sets).
 - **Legacy screens still mount.** `ride/pickup`, `ride/dropoff`, and `ride/3-ride-matching` are registered in the ride stack, and `ride/index` redirects to the map. The lifecycle router never targets them.
