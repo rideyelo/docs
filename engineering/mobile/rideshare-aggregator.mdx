@@ -1,0 +1,428 @@
+---
+title: "Rideshare aggregator"
+description: "How the mobile app signs in to Uber, Lyft, and Empower on the device, fetches live quotes from their APIs, caches and ranks them, hands off by deep link, and reports redacted provider diagnostics."
+---
+
+The rideshare aggregator is a client-only subsystem in `yelo-frontend`. The app holds the rider's own Uber, Lyft, and Empower sessions on the device, calls each provider's API directly for quotes, and opens the provider's app to book. `yelo-api` is not involved: it never sees provider tokens, quote requests, or quote responses.
+
+For where the aggregator appears in the rider journey, see [Rider experience](/engineering/mobile/rider-experience#no-yelo-options). For the experiment and its disclosure, see [Widgets and experiments](/engineering/mobile/widgets-and-experiments#price-aggregator-disclosure). For the privacy summary, see [PII and retention](/engineering/security/pii-and-retention#third-party-provider-diagnostics).
+
+## When it runs
+
+Two conditions gate the aggregator on the request sheet (`app/(app)/(tabs)/map/request.tsx`):
+
+1. The sheet is in its third-party fallback: a pickup is set, and the community is inactive or the draft returned zero `vehicle_options`.
+2. `useExperimentEnabled(EXPERIMENTS.ridesharePriceAggregator)` is true. That requires the community list, the user list, and the on-device disclosure.
+
+With the experiment off, the same fallback renders the static `ThirdPartyDeepLinkFallback` cards and the app makes no provider quote call. The connect screens and the **Rideshare accounts** screen redirect to **Experiments** when the experiment is off.
+
+## Quote pipeline
+
+`useAggregatorPlatforms(pickup, dropoff)` in `lib/ride/useAggregatorPlatforms.ts` owns the pipeline. It returns `platforms`, `refresh`, `routeKey`, and `settled`.
+
+```mermaid
+flowchart TD
+  FX["Fetch effect: focus, experiment, pickup, dropoff, or refresh changed"] --> CONN{"isConnected(provider)?"}
+  CONN -->|no| LOGIN["needsConnect: log in card"]
+  CONN -->|yes, but a stop has no coordinates| WAIT["loading: spinner, no request"]
+  CONN -->|yes| CACHE{"getFreshQuotes: same route under 20 s old?"}
+  CACHE -->|yes| LIVE["live: cached options"]
+  CACHE -->|no| LOAD["loading: spinner"]
+  LOAD --> FETCH["getUberQuotes / getLyftQuotes / getEmpowerQuotes"]
+  FETCH -->|throws 401 or 403| AUTH["errorKind auth: reconnect"]
+  FETCH -->|throws anything else| UNAV["errorKind unavailable"]
+  FETCH -->|options with a usable price| PUT["putQuotes, then live"]
+  FETCH -->|no usable options| RECHECK{"still connected?"}
+  RECHECK -->|yes| UNAV
+  RECHECK -->|no| LOGIN
+  PUT --> ASSEMBLE["toLivePlatform, splitBikeShare, sortAggregatorPlatforms"]
+  LIVE --> ASSEMBLE
+```
+
+The effect runs only while the request screen is focused and the experiment is enabled. It re-runs when focus returns, when a stop's coordinates change, and when `refresh()` bumps a nonce. Returning from a connect screen therefore re-checks the connection.
+
+For each of `uber`, `lyft`, and `empower`, in parallel:
+
+1. **Connection check.** `isConnected` reads SecureStore. A provider with no stored session stops here and shows the log-in card. A connected provider whose route is missing a coordinate also stops here, with no request, and its card shows the spinner.
+2. **Cache check.** `getFreshQuotes` serves the cached options for the same route. See [Quote cache and cooldown](#quote-cache-and-cooldown).
+3. **Fetch.** The provider module gets a valid access token, calls the provider, and parses the response into `RideQuoteOption[]` (`lib/ride/types.ts`).
+4. **Filter.** `toAggregatorOptions` maps quotes to `AggregatorRideOption`. `hasUsablePrice` drops any option with no numeric fare and a blank label.
+5. **Empty result.** An empty list can mean a dead refresh cleared the tokens, so the hook calls `isConnected` again. Disconnected becomes the log-in card. Still connected becomes `unavailable`.
+6. **Error.** `classifyQuoteError` maps a thrown HTTP 401 or 403 to `auth`. Every other failure (5xx, timeout, network) is `unavailable`. The hook logs `ride.quotes.error`.
+
+When the route changes, the hook clears every provider's options before any request starts, so one trip's prices never show on another. `settled` turns true only after every provider reaches a terminal state. The request screen uses that edge to fire `ride_aggregator_prices_loaded` once per route and once per manual refresh.
+
+### Platform states
+
+`toLivePlatform` turns the static registry entry (`RIDE_AGGREGATOR_PLATFORMS` in `lib/ride/aggregatorPlatforms.ts`) plus the provider's live state into one `AggregatorPlatform`. `RideAggregatorCard` renders the right-hand slot from it.
+
+| State | Fields set | Card |
+| --- | --- | --- |
+| Not connected | `needsConnect`, `connectRoute` | Provider name and a blurred teaser price. Tapping opens the connect screen. |
+| Loading | `loading` | Provider name and a spinner |
+| Live | `live`, `options` | Ride type, seats, pickup ETA, and price. The top card reads "from" before the price when ride types nest below it. |
+| Session rejected | `errorKind: 'auth'`, `connectRoute` | Same teaser as not connected. Tapping opens the connect screen to reconnect. |
+| No rides | `errorKind: 'unavailable'` | Provider name and **Unavailable** |
+
+The teaser price is not a quote. `teaserPriceLabel` derives a fixed fake amount between $14 and $39 from the provider name and renders it blurred.
+
+`visibleAggregatorPlatforms` (`components/map/request/selectionHelpers.ts`) hides Empower until it is connected. Uber and Lyft always show.
+
+## Provider sign-in
+
+Each provider has its own route under `app/(app)/`. All three render `ProviderAccountView` for the signed-out, error, and signed-in states, and read their state from `useProviderAccount`.
+
+| Provider | Screen | Method | Callback |
+| --- | --- | --- | --- |
+| Uber | `connect-uber.tsx` | `WebBrowser.openAuthSessionAsync` to Uber's hosted login with PKCE | `uberauth://` |
+| Lyft | `connect-lyft.tsx` | Native phone, SMS code, and optional email challenge against Lyft's API | none |
+| Empower | `connect-empower.tsx` | `WebBrowser.openAuthSessionAsync` to Empower's Azure AD B2C page with PKCE | `rideyazam://login.token` |
+
+`lib/ride/providerConfig.ts` holds every endpoint, client identifier, and header set. The requests present as each provider's own first-party mobile app. Uber's login, refresh, and fare calls all read one `UBER_CLIENT_VERSION` constant so a session is minted and used at the same app version.
+
+### Uber
+
+<Steps>
+  <Step title="Authorize">
+    `uberBuildAuthorize` generates a 32-byte PKCE verifier and its SHA-256 challenge, then builds the authorize URL. The screen opens it in an auth session.
+  </Step>
+  <Step title="Parse the callback">
+    `parseUberCallback` reads the session value from the `uberauth://` URL and splits it at the last dot into an in-auth session ID and a verification code. The screen never logs the URL.
+  </Step>
+  <Step title="Exchange">
+    `uberExchangeSession` posts the verification code and the PKCE verifier. The response carries the access token, refresh token, and the account email, which `saveTokens('uber', …)` persists.
+  </Step>
+</Steps>
+
+On iOS, after a cancelled or failed attempt, the screen offers **Try a fresh sign-in**, which repeats the flow with `preferEphemeralSession`. A failure shows the alert **Could not connect to Uber**. `app/+native-intent.tsx` rewrites any `uberauth://` URL to `/connect-uber`, and `app.config.ts` registers the `uberauth` intent filter on Android.
+
+**Quotes.** `getUberQuotes` posts the pickup and destination coordinates to Uber's fare-estimate endpoint with a bearer token and device headers, with a 20-second timeout. In parallel, `getUberVehicleViews` posts the pickup to Uber's rider status endpoint (10-second timeout) to get the city's product catalog and nearby-vehicle ETAs. The catalog is cached in memory, keyed by the pickup rounded to two decimal places. A catalog failure is swallowed.
+
+`parseUberFareEstimate` (`lib/ride/parsers.ts`) walks `packageVariants`:
+
+- **Name and seats** come from the live catalog, then the bundled `UBER_VEHICLE_VIEWS` table, then text extracted from the variant's copy. A product in neither catalog is logged as `ride.uber.unmappedVehicleView`. If the copy yields no name either, it is named `Uber #<id>` and hidden by the ranking code.
+- **Zero-seat products** (delivery and package tiers) are dropped.
+- **Price** is the numeric upfront fare. The label falls back through the formatted fare, the formatted numeric fare, the styled fare text, and the estimate string.
+- **Pickup ETA** comes only from the live catalog. If the catalog call fails, Uber options have no ETA.
+- **`deepLinkId`** is the product UUID.
+
+### Lyft
+
+The Lyft flow has no web view. `connect-lyft.tsx` moves through three phases:
+
+| Phase | CTA | Call | Result |
+| --- | --- | --- | --- |
+| `phone` | **Send code** | `lyftSendCode`: gets an anonymous client token, then requests an SMS | Moves to `otp` |
+| `otp` | **Verify** (auto-submits at 6 digits) | `lyftSubmitOtp`: phone grant with the code | `ok` connects. A 401 with `challenge_required` moves to `email` with Lyft's hint. |
+| `email` | **Continue** | `lyftSubmitEmail`: the same grant plus the typed email | Connects |
+
+`normalizeLyftPhone` keeps a number that starts with `+`, prefixes `+1` to a 10-digit number, and prefixes `+` otherwise. Any failure shows "Something went wrong. Please try again." and stays on the current phase. A failed code also clears the code field.
+
+After a successful login, `syncLyftAccountEmail` reads the canonical account email in the background and merges it into the stored session. `updateStoredEmail` applies it only if the stored refresh token still matches the session the lookup started with.
+
+**Quotes.** `getLyftQuotes` posts the origin and destination as microdegrees (`latitude_e6`, `longitude_e6`) to Lyft's offerings endpoint with a 20-second timeout. `parseLyftOfferings` walks `offers`:
+
+- **Name** is the ride type's display name, defaulting to "Lyft".
+- **Price** is `upfront_cost_cents`, or `estimated_cost_cents_min`, divided by 100. The label prefers Lyft's final price text.
+- **Pickup ETA** is the pickup estimate's duration in minutes, with a minimum of 1.
+- **`deepLinkId`** is the offer's `ride_type`.
+
+Lyft returns bike-share tiers in the same list. See [Bike-share split](#bike-share-split).
+
+### Empower
+
+`empowerBuildAuthorize` builds a standard OIDC authorization-code URL with PKCE and `prompt=login`. The rider signs in on Empower's hosted page. `parseEmpowerCallback` reads `code` from the redirect, and `empowerExchangeCode` exchanges it. `toTokens` decodes two JWTs locally: the account email from the ID token, and the passenger ID (`sub`, falling back to `oid`) from the access token.
+
+**Quotes.** `getEmpowerQuotes` is a two-step call:
+
+1. `resolveEstimateUrl` fetches the passenger record and finds the operation named `put-rideEstimate`. The URL is cached in memory per passenger ID.
+2. A `PUT` to that URL sends the passenger ID and two stops as plain decimal `lat` and `lon`.
+
+`parseEmpowerEstimates` returns nothing when `serviceAvailable` is false. Otherwise it reads the `estimates` map, one entry per vehicle type, and sorts `STANDARD`, `STANDARD_XL`, `PREMIUM`, `PREMIUM_XL`. Those display as "Everyday", "Everyday XL", "Premium", and "Premium XL".
+
+Empower's two quote calls use `validateStatus: () => true`, so a non-200 response never throws. The module logs `ride.empower.bootstrap.status`, `ride.empower.bootstrap.noEstimateOp`, `ride.empower.noPassengerId`, or `ride.empower.estimate.status` and returns an empty list.
+
+## Token storage and refresh
+
+`lib/ride/tokenStore.ts` stores one `StoredTokens` JSON record per provider in `expo-secure-store` under `ride_tokens_<provider>`.
+
+| Field | Notes |
+| --- | --- |
+| `accessToken` | Bearer for quote calls |
+| `refreshToken` | Optional. Uber and Lyft rotate it on every refresh. |
+| `expiresAt` | Epoch milliseconds. `buildStoredTokens` defaults the lifetime to 3,600 seconds when the provider gives none. |
+| `email` | Captured at connect. Refresh responses carry none, so the stored value is kept. |
+| `passengerId` | Empower only |
+
+Uber and Lyft also persist a per-install device UUID in SecureStore (`ride_uber_device_id`, `ride_lyft_device_id`, from `lib/ride/deviceId.ts`), so every call presents the same device.
+
+Two mechanisms keep concurrent work safe:
+
+- **Single flight.** `getValidAccessToken` runs once per provider at a time. Parallel quote and catalog calls share one refresh, so two refreshes can't invalidate each other's rotated token.
+- **Write lock.** `saveTokens`, `clearTokens`, `updateStoredEmail`, and the refresh write are serialized per provider. The lock wraps only keychain reads and writes, never the network call.
+
+`getValidAccessToken` returns a token or `null`:
+
+| Condition | Result | Stored session |
+| --- | --- | --- |
+| Nothing stored | `null` | none |
+| Token expires more than 60 seconds from now (`EXPIRY_SKEW_MS`) | Stored access token | Unchanged |
+| Expired, no refresh token | `null` | Cleared, reason `missing_refresh_token` |
+| Refresh returns no access token | `null` | Cleared, reason `missing_access_token` |
+| Refresh throws with HTTP 400, 401, or 403 | `null` | Cleared, reason `refresh_rejected` |
+| Refresh throws anything else (network, 5xx) | `null` | Kept for a later retry |
+| Stored session was cleared or replaced during the refresh | `null` | Left as is. The refreshed tokens are discarded. |
+| Refresh succeeds | New access token | Rewritten, keeping the stored `email` and `passengerId` |
+
+Every `null` makes the provider module return an empty quote list. The pipeline's connection re-check then decides between the log-in card and **Unavailable**.
+
+Signing out from a provider screen calls `clearTokens(provider)` with reason `sign_out` and resets that provider's entry in the [account status store](#account-status-store).
+
+## Quote cache and cooldown
+
+`lib/ride/quoteRateLimiter.ts` keeps one cache entry per provider at module level: the route key, a timestamp, and the options. `MIN_FETCH_INTERVAL_MS` is 20,000.
+
+- **Route key.** `routeKeyOf` joins the exact pickup and dropoff coordinates. Any coordinate change is a different route.
+- **Hit.** A request for the same route within 20 seconds serves the cached options with no provider call. Because the cache is module-level, this covers cancelling and reopening the request sheet.
+- **Write.** `putQuotes` runs only after a fetch returns at least one usable option. Errors and empty results don't start a cooldown.
+- **Scope.** The cache holds only the latest route per provider and lives in memory, so it doesn't survive an app restart.
+
+`useRefreshCooldown` (`components/map/request/useAggregatorSheet.ts`) drives the action bar's **Refresh** pill. It takes the longest `cooldownRemainingMs` across the three providers and ticks once a second while it is above zero. During that time the pill is disabled and shows the remaining seconds, for example "12s". Tapping an enabled pill fires `ride_aggregator_prices_refreshed` and calls `refresh()`.
+
+## Grouping and ranking
+
+`lib/ride/rideAggregatorSelect.ts` holds the pure ranking helpers.
+
+### Platform order
+
+`sortAggregatorPlatforms` orders the cards:
+
+1. The Citi Bike card last.
+2. Connected providers before log-in cards.
+3. Lowest top-card price first. A platform with no numeric top price sorts after the priced ones.
+
+### Ride order within a platform
+
+`orderPlatformRides` builds each platform's list. The first entry is the top card and the rest nest beneath it.
+
+1. The X-equivalent tier: `UberX`, or Lyft's `Standard`, `Lyft`, or `Core`.
+2. The XL-equivalent tier: `UberXL`, or Lyft's `XL`.
+3. The platform's fastest mainstream option.
+4. The platform's cheapest mainstream option.
+5. Remaining mainstream options by price, then name.
+6. Specialty options by price, then name.
+
+Specialty options are names that match wheelchair, WAV, pet, car seat, assist, bike, e-bike, or scooter. Empower has no tier aliases, so its order starts at step 3. The Citi Bike card reuses the two tier slots: an electric bike leads and a classic bike nests below it.
+
+`RideAggregatorGroup` shows the top card and one nested row. **Show [N] more** reveals three more rows at a time. A platform that needs sign-in, is loading, or has an error shows only its top card.
+
+### Cheapest and fastest
+
+`pickGlobalCheapest` and `pickGlobalFastest` each pick one option across all providers. Specialty options are excluded from both.
+
+| Pick | Primary | Tie-break |
+| --- | --- | --- |
+| Cheapest | Lowest `priceValue` | Lower effective ETA |
+| Fastest | Lowest effective ETA | Lower `priceValue` |
+
+The effective ETA is `etaMaxMinutes` when the provider gives a range, otherwise `etaMinutes`. A "2–11 min" option competes on 11. Options with no numeric value for the primary measure are skipped.
+
+The picks have two uses:
+
+- **Badges.** `RideAggregatorSection` passes them down so at most one option carries the **Cheapest** badge and at most one the **Fastest** badge.
+- **Quick picks.** `useAggregatorQuickPicks` wires the action bar's **Fastest** and **Cheapest** segments to select the pick. They fire `ride_aggregator_fastest_selected` or `ride_aggregator_cheapest_selected`.
+
+### Default selection
+
+Until the rider taps an option, the request screen keeps the selection on the top card of the first platform that is connected, is not Citi Bike, and has a top option. A manual pick stops the tracking. If the selected option disappears from the live list, the selection clears and tracking resumes.
+
+### Bike-share split
+
+`splitBikeShare` (`lib/ride/splitBikeShare.ts`) runs on the Lyft platform after `toLivePlatform`. Lyft exposes no vehicle mode, so the only signal is a display name that contains "bike", "ebike", or "e-bike" (singular or plural) as a whole word. Matching options move to a synthesized platform with `provider: 'citibike'`, Citi Bike branding, and `live: true`. The Lyft card keeps the cars.
+
+The Citi Bike card is display-only. `resolveHandoffProvider` maps it to Lyft for the install probe and the handoff, and the CTA reads **Open Lyft**. Analytics fold it back into `lyft` for provider counts.
+
+## Account status store
+
+`stores/rideAccountStatusStore.ts` is a Zustand store with one `ProviderStatus` per provider: `errorKind` (`auth` or `unavailable`) and `loading`. It is not persisted.
+
+| Writer | Writes |
+| --- | --- |
+| `useAggregatorPlatforms` | `{ loading: true }` when a fetch starts, `{ errorKind }` on a thrown error or an empty result from a connected provider, `{}` on success, cache hit, not connected, or no route |
+| `useProviderAccount.signOut` | `{}` for that provider |
+
+| Reader | Use |
+| --- | --- |
+| `useProviderAccount` | The connect screen's state: `signed-out`, `error` (connected and `errorKind` is `auth`), or `signed-in` |
+| `useConnectedAccounts` | The **Rideshare providers** list on `profile/accounts`, which also re-reads stored tokens on focus |
+
+Only `auth` counts as an account error. `unavailable` means no rides for that route and never flags the account. Because the store is session-scoped, opening **Accounts** after a cold start shows no error until a quote fetch has run.
+
+The action bar's **Accounts** badge does not read the store. It reads the live platforms directly: the count of unconnected providers, or "!" when any platform has `errorKind: 'auth'`. `AccountsCoachMark` shows a one-time **Sign in** tooltip above the pill while nothing is connected. Opening **Accounts** dismisses it through the `accounts-tooltip:dismissed:` user flag.
+
+## Deep-link handoff
+
+`RideAggregatorOpenButton` is the pinned CTA. Its label follows this order:
+
+| Condition | Label | Action |
+| --- | --- | --- |
+| No provider connected | **Sign in to see prices** | Opens `profile/accounts?mode=rideshare` |
+| No option selected | **Select an option** | Disabled |
+| Provider app not confirmed installed | **[Provider] not installed** | Disabled |
+| Otherwise | **Open [Provider]** | Hands off |
+
+`useThirdPartyInstalled` probes the provider's bare scheme with `Linking.canOpenURL`. The CTA stays disabled until the probe returns true. The schemes are declared in `LSApplicationQueriesSchemes` in `app.json` and in `RIDE_PROVIDER_SCHEMES` in `app.config.ts`.
+
+`openAggregatorRide` (`components/map/request/aggregatorHandoff.ts`) fires `ride_aggregator_provider_opened`, adds a `ride_aggregator` Sentry breadcrumb, and calls `openThirdPartyRide` with the dropoff and the option's `deepLinkId`.
+
+| Provider | App link | Tier | Web fallback |
+| --- | --- | --- | --- |
+| Uber | `uber://riderequest` with `pickup=my_location` and the dropoff coordinates, name, and address | `product_id` | none |
+| Lyft | `lyft://ridetype` with the destination coordinates | `id`, defaulting to `lyft` | `https://ride.lyft.com/ridetype` with the same parameters |
+| Empower | `rideyazam://` with no parameters | none | `https://empower.co/` |
+| Citi Bike | Lyft's link | The bike tier's `ride_type` | Lyft's fallback |
+
+The handoff passes only the dropoff. No link carries the Yelo pickup. The web fallback opens only when `Linking.openURL` throws for the app link. `openThirdPartyRide` does nothing when the dropoff has no coordinates.
+
+`THIRD_PARTY_PROVIDERS` also defines Waymo. Waymo is not in `RIDE_AGGREGATOR_PLATFORMS`, so it has no quotes and no card in the aggregator. Only the static fallback uses it.
+
+## Provider diagnostics
+
+Provider APIs are unofficial and change without notice, so each Uber and Lyft request reports a structured summary of what came back. The design rule is projection, not redaction: the code copies named fields out of a response and never serializes a whole body.
+
+### Consent
+
+`stores/providerDiagnosticConsentStore.ts` holds `enabled` and a `generation` counter that increments on every change. `providers/ProviderDiagnosticsObserver.tsx`, mounted once in `app/_layout.tsx`, is the only long-lived writer. It sets `enabled` to true only when all of these hold:
+
+- A JWT is present and not being updated.
+- The current user ID is known.
+- The `rideshare-price-aggregator` experiment is enabled, resolved, and not in an error state. That includes the accepted disclosure.
+
+It sets `enabled` to false when the user ID changes, before applying the new value, and on unmount. The **Experiments** screen also sets it to false as soon as the rider switches the experiment off. Each change fires `ride_provider_diagnostics_consent_changed` with `enabled`, `scope: 'experiment'`, and `disclosure_version: 1`.
+
+`diagnoseProviderRequest` reads the generation when a request starts and checks it again when the request finishes. A request that spans a disable, sign-out, or re-enable is treated as unconsented.
+
+<Note>
+Consent gates route coordinates, not the event. Every wrapped request emits `ride_provider_request_completed` with its response summary. Consent adds `route` (pickup and dropoff latitude and longitude) and sets `detailed_diagnostics` to true. Coordinates are also dropped when any value is non-finite or out of range.
+</Note>
+
+The same consent gates the route fields on `ride_aggregator_prices_loaded` and `ride_aggregator_provider_opened` through `withConsentedAggregatorRoute`. See [Analytics events](/reference/analytics-events#redaction-and-exclusion).
+
+### What is wrapped
+
+`diagnoseProviderRequest(provider, operation, send, consume, route?)` in `lib/ride/providerDiagnostics.ts` wraps one HTTP request and its parsing. It never receives the request URL, headers, or body. It rethrows the original error, so token-refresh and quote error handling are unchanged. A failure inside the reporter is swallowed.
+
+| Provider | Operations |
+| --- | --- |
+| Uber | `exchange`, `refresh`, `catalog`, `quotes` |
+| Lyft | `anonymous_token`, `send_code`, `otp`, `email_challenge`, `refresh`, `quotes`, `profile` |
+| Empower | none. `DiagnosticProvider` is `'uber' \| 'lyft'`. |
+
+Only `quotes` calls pass a route.
+
+### Summarization and redaction
+
+`lib/ride/providerResponseSummary.ts` builds the summary.
+
+| Operations | Fields projected |
+| --- | --- |
+| All | `body_kind`, `has_error`, and `error_code` only when it is one of seven allowlisted codes |
+| `exchange`, `refresh`, `anonymous_token`, `otp`, `email_challenge` | `has_access_token`, `has_refresh_token`, `expires_in_seconds`, `challenge_count`. Token values are never copied. |
+| `quotes` | `has_offers_array`, `offer_count`, and one `fares` row per offer |
+| `catalog`, `profile` | Shape only. These bodies can contain nearby drivers and full account details. |
+
+A `fares` row carries an array `index`. Uber product UUIDs and Lyft offer IDs are not copied:
+
+- **Uber:** `title`, `formatted_fare`, `fare_estimate`, `vehicle_view_id`, `upfront_fare`, `currency_code`, `has_formatted_fare`, `has_styled_fare`.
+- **Lyft:** `title`, `final_price_text`, `upfront_cost_cents`, `estimated_cost_cents_min`, `pickup_duration_ms`, `seats`, `has_final_price_text`.
+
+Values are bounded. Display text is cut to 160 characters. Numbers must be finite and no larger than 1,000,000,000 in magnitude. Currency codes pass only if they are in a 10-code allowlist.
+
+`summarizeParsedQuotes` adds the parser's output for `quotes` calls: `parsed_option_count` and one row per option with `title`, `price_label`, `price_value`, `has_price_label`, `eta_minutes`, `eta_max_minutes`, and `seats`. Sending both the raw projection and the parsed rows shows whether a bad price came from the provider or from the parser.
+
+`summarizeProviderError` reduces an error to `error_kind` (`http`, `timeout`, `network`, `cancelled`, or `unexpected`) and the HTTP status. It never reads the error message, because Axios errors hold request headers and bodies. The Uber and Lyft connect screens use it too, and report a fixed message instead of the original exception.
+
+### Outcomes
+
+Each event carries one `outcome`, decided in this order:
+
+| Outcome | When |
+| --- | --- |
+| `challenge` | Lyft `otp` returned 401 with `challenge_required` |
+| `http_error` | Any other non-2xx status |
+| `processing_error` | A response arrived but parsing threw |
+| `timeout`, `network`, `cancelled`, `unexpected` | No response arrived |
+| `missing_token` | A token operation returned 2xx with no access token |
+| `unexpected_response` | A quotes response had no offers array |
+| `empty` | The parser returned zero options |
+| `success` | Everything else |
+
+The event also carries `schema_version: 1`, a random `request_id`, `started_at_ms`, `duration_ms` (network time), `processing_ms` (parse time), and `status`.
+
+### Volume bounding
+
+| Sink | What is sent | Bound |
+| --- | --- | --- |
+| PostHog | `ride_provider_request_completed` for every wrapped request | First 30 `fares` rows and 30 parsed options, with `offers_truncated` and `parsed_options_truncated` flags |
+| PostHog | `ride_provider_request_options` | One event per further chunk of 30 rows, keyed by `request_id`, `chunk_index`, and `chunk_count` |
+| Sentry breadcrumb | Category `ride.provider`, message `<provider>.<operation>`, level `warning` on failure | Same 30-row bound, with `route` removed |
+| Sentry issue | `captureMessage('Ride provider request failed')` at `warning` | At most one per provider, operation, and outcome every 60 seconds |
+
+Sentry never receives coordinates from this path. An issue is raised for every outcome except `success`, `empty`, `challenge`, and `cancelled`. It uses a fixed message, the fingerprint `['ride-provider', provider, operation, outcome]`, and the sanitized summary as context, not the Axios exception. The 60-second throttle is an in-memory map, so it resets when the app restarts.
+
+PostHog events go through the active analytics recorder (`getActiveRecorder`), which is a no-op recorder until one is registered.
+
+### Session events
+
+`tokenStore.ts` calls `reportProviderSession` on keychain changes for all three providers, including Empower. It fires `ride_provider_session_changed` and adds a `ride.provider.session` Sentry breadcrumb. These events are not gated by diagnostics consent and contain no token or email.
+
+| `action` | When |
+| --- | --- |
+| `saved`, `save_failed` | A login writes a session |
+| `load_failed` | SecureStore read or JSON parse threw |
+| `cleared` | Session removed, with `reason`: `sign_out`, `missing_refresh_token`, `missing_access_token`, or `refresh_rejected` |
+| `refreshed` | Rotated tokens persisted |
+| `refresh_discarded` | The stored session changed during the refresh |
+| `refresh_failed` | The refresh call threw |
+
+Event properties are listed in [Analytics events](/reference/analytics-events#mobile).
+
+## Where this lives in code
+
+All paths are in `yelo-frontend`.
+
+| Area | Path |
+| --- | --- |
+| Pipeline hook | `lib/ride/useAggregatorPlatforms.ts` |
+| Provider transports | `lib/ride/uberProvider.ts`, `lyftProvider.ts`, `empowerProvider.ts` |
+| Endpoints and client headers | `lib/ride/providerConfig.ts` |
+| Response parsers | `lib/ride/parsers.ts` |
+| Token and device ID storage | `lib/ride/tokenStore.ts`, `lib/ride/deviceId.ts` |
+| Quote cache | `lib/ride/quoteRateLimiter.ts` |
+| Registry and types | `lib/ride/aggregatorPlatforms.ts`, `lib/ride/types.ts` |
+| Ranking and bike split | `lib/ride/rideAggregatorSelect.ts`, `lib/ride/splitBikeShare.ts` |
+| Deep links | `lib/ride/thirdPartyDeepLink.ts`, `components/map/request/aggregatorHandoff.ts`, `hooks/useThirdPartyInstalled.ts` |
+| Sheet state | `components/map/request/useAggregatorSheet.ts`, `components/map/request/selectionHelpers.ts` |
+| List UI | `components/ride/RideAggregatorSection.tsx`, `RideAggregatorGroup.tsx`, `RideAggregatorCard.tsx`, `RideAggregatorChildCard.tsx`, `RideAggregatorCollapsedSummary.tsx`, `RideAggregatorOpenButton.tsx` |
+| Action bar | `components/ride/RideActionBar.tsx`, `components/ride/AccountsCoachMark.tsx` |
+| Account screens | `app/(app)/connect-uber.tsx`, `connect-lyft.tsx`, `connect-empower.tsx`, `app/(app)/profile/accounts.tsx`, `components/ride/ProviderAccountView.tsx` |
+| Account state | `stores/rideAccountStatusStore.ts`, `hooks/useProviderAccount.ts`, `hooks/useConnectedAccounts.ts` |
+| Diagnostics | `lib/ride/providerDiagnostics.ts`, `lib/ride/providerResponseSummary.ts`, `lib/analytics/events/providerDiagnostics.ts` |
+| Consent | `stores/providerDiagnosticConsentStore.ts`, `providers/ProviderDiagnosticsObserver.tsx`, `lib/ride/aggregatorDisclosure.ts` |
+| Analytics | `lib/analytics/events/rideAggregator.ts`, `lib/analytics/events/rideProviders.ts` |
+
+## Gotchas and edge cases
+
+- **Empower has no request diagnostics.** `empowerProvider.ts` calls Axios directly and never goes through `diagnoseProviderRequest`. Its only signals are the `ride.empower.*` log lines and session events.
+- **Empower never reports a rejected session from a quote call.** Its quote requests accept every status, so a 401 or 403 becomes an empty list and the card reads **Unavailable**, not a reconnect prompt.
+- **Empower connect reports the original error.** `connect-empower.tsx` passes the caught error straight to `analytics.captureException`. Uber and Lyft send a fixed message with `summarizeProviderError`. It also shows no alert on failure.
+- **Two log lines bypass the error summary.** `ride.quotes.error` and `ride.tokens.refresh.error` pass the caught error object to the logger. In production builds the logger writes to the console and to a rotating file in the app cache directory (`lib/observability/logger.ts`).
+- **Empower's handoff ignores the selected tier.** `buildUrl` returns `rideyazam://` with no destination and no vehicle type.
+- **Placeholder options stay on platforms without quotes.** A platform that is unconnected, loading, or in an error state keeps the static options from `RIDE_AGGREGATOR_PLATFORMS`, such as "UberX" at "$9.75". The card hides them, and they have no `priceValue` or ETA, so they never win cheapest or fastest. They still appear as rows in the `options` array of `ride_aggregator_prices_loaded`, flagged by `needs_connect` or `error_kind`.
+- **The default selection can land on a placeholder.** The default-selection rule skips unconnected platforms only. If the first connected platform is loading or has an error, its placeholder top option is selected, and a handoff from it carries no tier ID.
+- **`highlighted` is unused.** `toAggregatorOptions` marks each provider's cheapest option as `highlighted`, but no component reads the field. The badges come from the global picks.
+- **Bike detection is by name.** Any Lyft option whose name contains the word "bike", "ebike", or "e-bike" moves to the Citi Bike card, whatever the market's bike-share brand is.
+- **Uber ETAs depend on the catalog call.** When the status request fails or times out, Uber options have prices but no ETA and can't win **Fastest**.
+- **The route key is exact.** A pickup that drifts by any amount is a new route, which bypasses the 20-second cache.
+- **Third-party tokens survive Yelo sign-out.** Nothing clears `ride_tokens_<provider>` when the Yelo session ends. See [Social and contacts](/engineering/mobile/social-and-contacts#gotchas-and-edge-cases).
+- **`rideAccountStatusStore.reset` has no production caller.** Only its test calls it.

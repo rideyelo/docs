@@ -1,24 +1,24 @@
 ---
 title: "Widgets, experiments, and client toggles"
-description: "iOS Live Activity scaffolding, the server-driven experiments system, the feedback and store-review prompts, and every build-time EXPO_PUBLIC flag in yelo-frontend, with where each one is read."
+description: "iOS Live Activity registration and native target, the server-driven experiments system, the feedback and store-review prompts, and every build-time EXPO_PUBLIC flag in yelo-frontend, with where each one is read."
 ---
 
-This page covers the switches that change what the mobile app does without a server deploy: the iOS Live Activity scaffold, opt-in experiments, the feedback and review prompts, and build-time `EXPO_PUBLIC_*` flags. For the native config that ships the widget extension, see [Native configuration](/engineering/mobile/native-config).
+This page covers the switches that change what the mobile app does without a server deploy: the iOS Live Activity extension, opt-in experiments, the feedback and review prompts, and build-time `EXPO_PUBLIC_*` flags. For the native config that ships the widget extension, see [Native configuration](/engineering/mobile/native-config).
 
 ## iOS Live Activities
 
 ### Current status
 
-The widget extension ships in every iOS build, but no Live Activity ever starts. Two activity layouts are registered and nothing calls them.
+Two Live Activities are live. The app starts, updates, and ends them from JavaScript. See [Live Activities](/engineering/mobile/live-activities) for the lifecycle, props, layouts, and the dev preview route.
 
-| Activity | File | Props | Layout |
+| Activity | File | Driven by | Shows |
 | --- | --- | --- | --- |
-| `RiderRideActivity` | `widgets/RiderRideActivity.tsx` | `status`, `driverName`, `etaMinutes` | Stub. Banner with status, driver name, and ETA. Compact and minimal views use the `car.fill` SF Symbol. |
-| `DriverOnlineActivity` | `widgets/DriverOnlineActivity.tsx` | `status`, `riderName?`, `queueCount` | Stub. Banner with status, rider, and queue count. Compact and minimal views use `steeringwheel`. |
+| `RiderRideActivity` | `widgets/RiderRideActivity.tsx` | `useRiderLiveActivity` in `app/(app)/_layout.tsx` | A confirmed ride from matching through rating |
+| `DriverOnlineActivity` | `widgets/DriverOnlineActivity.tsx` | `useDriverLiveActivity` in `app/(app)/drive/_layout.tsx` | A driver's shift: board, queue, earnings, and the current ride |
 
-Both files say the stub layout exists "so the widget extension ships in the review build" and that the real UI comes later. There are no `.start()` calls, no push-to-start token listeners, and no API endpoints that store Live Activity push tokens.
+There are no push-to-start token listeners and no API endpoints that store Live Activity push tokens.
 
-### How the scaffold loads
+### How the layouts load
 
 ```mermaid
 flowchart TD
@@ -29,8 +29,8 @@ flowchart TD
 ```
 
 - `widgets/index.ts` checks for the `ExpoWidgets` native module before importing the activity files. Binaries built before `expo-widgets` was added (before 5.6.1) and some dev clients lack the module. Both `expo-widgets` and `@expo/ui` touch native code at import time, so an unguarded import crashes those binaries at startup.
-- The exports are typed `LiveActivityFactory<Props> | undefined`. Any future caller must handle `undefined`.
-- Layout functions use the `'widget'` directive and `@expo/ui/swift-ui` primitives (`VStack`, `HStack`, `Text`, `Image`, `Spacer`). They're compiled for the widget extension, so they can't use app hooks or state.
+- The exports are typed `LiveActivityFactory<Props> | undefined`. `useLiveActivity` skips its sync when the factory is `undefined`.
+- Layout functions use the `'widget'` directive and `@expo/ui/swift-ui` primitives (`VStack`, `HStack`, `Text`, `Image`, `Spacer`). Each function is serialized and evaluated inside the widget extension, so it can't use app hooks or state, or close over anything in its module.
 
 ### Native target
 
@@ -41,10 +41,6 @@ flowchart TD
 | Push updates | `enablePushNotifications: true` | Same |
 
 Android has no widget equivalent.
-
-<Warning>
-  Changing activity names, props, or layouts changes the widget extension, which is a native change. `createLiveActivity('RiderRideActivity', ...)` names are the contract with any future server push payload. Don't rename them after a real layout ships.
-</Warning>
 
 ## Experiments
 
@@ -200,6 +196,7 @@ The app doesn't read PostHog feature flags.
 | Concern | Path |
 | --- | --- |
 | Live Activity layouts and guard | `widgets/index.ts`, `widgets/RiderRideActivity.tsx`, `widgets/DriverOnlineActivity.tsx` |
+| Live Activity lifecycle | `hooks/useLiveActivity.ts`. See [Live Activities](/engineering/mobile/live-activities#where-this-lives-in-code). |
 | Widget registration | `app/_layout.tsx` (`import '@/widgets'`) |
 | Experiment keys and hooks | `lib/experiments/index.ts` |
 | Experiments screen | `app/(app)/profile/experiments.tsx` |
@@ -216,4 +213,4 @@ The app doesn't read PostHog feature flags.
 - **Prompt state is per device.** Both state machines live in AsyncStorage. A reinstall or new device resets cadence, cooldowns, and one-shot flags. The iOS system also rate-limits `requestReview()` on its own.
 - **Unknown experiment keys still show up.** The Experiments screen lists every community key, including ones no build gates. Users can toggle them with no visible effect.
 - **Experiment keys are a cross-repo contract.** The dashboard stores free-text keys. A typo in the community editor silently makes the experiment unavailable.
-- **The widget module guard hides import errors.** If `ExpoWidgets` is missing, both factories are `undefined` with no log line.
+- **The widget module guard hides import errors.** If `ExpoWidgets` is missing, both factories are `undefined` with no log line, and no Live Activity starts. The dev route `/live-activity-preview` reports it.
