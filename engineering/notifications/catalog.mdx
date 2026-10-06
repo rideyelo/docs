@@ -111,6 +111,11 @@ These templates have `silent = true`. The send worker strips title, body, and so
 | `dashboard_send` | `NotificationService.SendNotification`, `SendNotificationToUsers`. Nothing calls either in production. | `{{title}}` / `{{body}}` | none | Caller data |
 | `friend_bump` | `NotificationService.emitFriendBumpPushFallback` and `bumpSMSWorker.enqueuePushFallback` | `{{sender_first_name}} bumped you 👋` / `Heading to {{destination_name}}{{arrival_phrase}}.` | `/map` | `sender_user_id`, `destination_name`, `destination_poi_id`, `destination_latitude`, `destination_longitude` |
 | `friend_bump_sms` | Never emitted. Read directly by the bump SMS worker. | Same copy, joined into one line | none | n/a |
+| `friend_joined` | `mapchanges.Service.friendJoined`, called by the friendship wrapper after a write creates at least one new edge (contact match, signup referral, or invite link) | `{{friend_first_name}} is on Yelo 👋` / `You're now friends. See where they're headed.` | `/map` | none |
+
+`friend_joined` goes to the other side of each newly created friendship. The user who acted (signed up with a referral code, accepted an invite link, or uploaded contacts) is the joiner, and `friend_first_name` is the joiner's first name. Edges that already existed are skipped. The event key is `friend_joined:{joiner}:{hash}`, where the hash covers the sorted recipient set, so two racing writes of the same edges push once. The push is best-effort: a failed name lookup or enqueue is logged and never fails the friendship write. No push is sent when the joiner has no first name.
+
+Example: Alice signs up with Bob's referral code. Bob receives "Alice is on Yelo 👋". If Alice's first contact upload then creates edges to Carol and Dan, Carol and Dan each receive the same push in one event.
 
 See [Operator broadcasts](/engineering/notifications/broadcasts-and-scheduling) and [SMS, iMessage, and friend bumps](/engineering/notifications/sms-and-friend-bumps).
 
@@ -147,6 +152,7 @@ See [Operator broadcasts](/engineering/notifications/broadcasts-and-scheduling) 
 | `driver_renew_online` | default | default | default | transactional | none | none | yes | None |
 | `community_broadcast` | default | default | default | marketing | none | none | no | None |
 | `friend_bump` | default | default | default | transactional | 10 | 300 s | yes | None |
+| `friend_joined` | default | default | default | marketing | none | none | no | None |
 | `dashboard_ping_driver` | high | default | default | transactional | 1 | none | yes | None |
 | `dashboard_ping_rider` | high | default | default | transactional | 1 | none | yes | None |
 | `driver_application_approved` | high | default | success | transactional | 1 | none | no | None |
@@ -154,7 +160,7 @@ See [Operator broadcasts](/engineering/notifications/broadcasts-and-scheduling) 
 | `payout_failed` | high | default | warning | transactional | 1 | none | no | None |
 | `payout_canceled` | default | default | warning | transactional | 1 | none | no | None |
 
-All seeded Android channels are `default`. No seeded template uses `kaching.wav` or `kaching-channel`. The seeder sets `quiet_hours_behavior = defer` only for `community_broadcast` and `bypass` for everything else. Haptic is stored but never sent to Expo.
+All seeded Android channels are `default`. No seeded template uses `kaching.wav` or `kaching-channel`. The seeder sets `quiet_hours_behavior = defer` for `marketing` templates (`community_broadcast` and `friend_joined`) and `bypass` for everything else. Haptic is stored but never sent to Expo.
 
 ## Adding a code
 

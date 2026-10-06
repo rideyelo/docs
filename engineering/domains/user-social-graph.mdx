@@ -19,6 +19,7 @@ For the mobile side of contact sync and invites, see [Social and contacts](/engi
 | Redis | `user:profile:{userID}` | Caller's own phone number during matching |
 | Env | `CONTACT_HASH_PEPPER` | HMAC key for phone hashes. Read with `os.Getenv` on every call |
 | Notify | `friends` map-change scope | Emitted by `mapchanges.Service.SocialChanged` |
+| Notify | `friend_joined` push | Emitted by the friendship wrapper for each newly created edge |
 
 ## Endpoints
 
@@ -121,6 +122,17 @@ Example: a user submits three strings with no region. Two are different formats 
 - Rows are stored as `LEAST(a, b)`, `GREATEST(a, b)`. A to B and B to A collapse into one row.
 - `ON CONFLICT (user_low, user_high) DO NOTHING`. The first source wins and later matches never change it.
 - There is no endpoint to remove a friend.
+
+### New friend push
+
+`UserService` writes friendships through `mapchanges.Service.WrapFriendships`, which covers contact matching, signup referrals (`applyReferralCode`), and invite links (`ConnectFriend`). The first user passed to `AddMutual` or `AddMutualBatch` is the joiner: the user who uploaded contacts, signed up, or tapped the invite. Referral and invite call sites pass the new user first, so the referrer or inviter receives the push.
+
+After the write, the wrapper compares against `FriendsAmong` and keeps only edges that did not exist before. When there is at least one, it:
+
+- Emits `friend_joined` to those other users with `friend_first_name` set to the joiner's first name, `triggered_by` set to the joiner, and event key `friend_joined:{joiner}:{first 8 bytes of SHA-256 over the sorted recipient IDs}`.
+- Emits the `friends` map-change refresh to the joiner and the new friends.
+
+The push runs on a detached context with a 5-second timeout and only logs failures (`friend.joined.name_lookup_failed`, `friend.joined.enqueue_failed`). It is skipped when the joiner has no first name. See [Notification catalog](/engineering/notifications/catalog#operator-and-friends) for the template.
 
 ### Friend list
 
