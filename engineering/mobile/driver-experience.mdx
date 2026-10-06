@@ -71,14 +71,55 @@ On first load, if no navigation app is stored in SecureStore (`defaultNavApp`), 
 
 `DriverShiftSheet` shows `OfflineSheetContent`: a **YOU'RE OFFLINE** status and a **Go online** button. The button is enabled only when `driver_application_status` and `stripe_signup_status` are both `complete`. A `FirstDrivePromoTile` ("Ready for your first drive?") appears while `drive_count` is 0.
 
-**Go online** checks background location first. See [Permissions](/engineering/mobile/permissions-and-device#location). Then `GoOnlineConfirmationSheet` shows:
+**Go online** checks background location first. See [Permissions](/engineering/mobile/permissions-and-device#location). Then `GoOnlineConfirmationSheet` opens under **BEFORE YOU GO ONLINE** / **Ready to drive?** with:
 
-- A **vehicle tile** (make and model of the vehicle chosen by `goOnlineVehicle` for the active fleet, or "No vehicle"). Tapping opens `VehiclePickerSheet`, which is locked while online ("You're online — go offline to change vehicles.") or on a ride.
-- An **auto-queue tile** ("[N] min"), only when auto-queue is on. Tapping opens `AutoQueueDurationSheet`.
-- A **What is auto-queue?** link to `AutoQueueExplainerSheet`, only when auto-queue is on.
-- A warning if the vehicle has `in_use_by_other_driver`.
+- A **Vehicle** tile showing the make and model of the vehicle chosen by [`goOnlineVehicle`](#vehicle-choice), or "No vehicle". Tapping opens the [vehicle picker](#vehicle-picker). The tile is disabled and loses its caret when the active fleet has `has_owner_operators` set.
+- An **Auto-queue** tile ("[N] min"), only when auto-queue is on. Tapping opens `AutoQueueDurationSheet`.
+- A yellow warning when the chosen vehicle has `in_use_by_other_driver`: "Another driver has an open session with this vehicle. You can still go online."
+- A caption under the button with the active fleet's name and, when auto-queue is on, a **What is auto-queue?** link to `AutoQueueExplainerSheet`.
 
-**Go Online** refreshes vehicles ("Checking vehicle…"). If another driver has an open session, it asks **Vehicle already in use** with **Go online anyway**. Then `driveActions.setOnline(true, vehicleId)` runs. See [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#going-online) for the API sequence.
+Two other paths open the same sheet without the background location check in `handlePressGoOnline`: the `FirstDrivePromoTile` on the shift sheet, and the `openReadyToDrive=1` route param that the promo tiles on the driver hub and the vehicle add and edit screens set.
+
+**Go Online** runs these steps:
+
+1. The button reads "Checking vehicle…" while `refreshGoOnlineVehicle` refetches the vehicle list and picks again from the fresh response, not from the provider's cached list.
+2. If no approved vehicle comes back, or the refetch fails, an alert shows **Could not check vehicle** / "Check your connection and approved vehicle selection, then try again."
+3. If the fresh vehicle has `in_use_by_other_driver`, an alert asks **Vehicle already in use** with **Cancel** and **Go online anyway**.
+4. `driveActions.setOnline(true, vehicleId)` runs and the sheet dismisses. See [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#going-online) for the API sequence.
+
+The sheet drops a stale check. Dismissing it, or a change to `driver_active_fleet` while the check is in flight, cancels the attempt without an alert.
+
+#### Vehicle choice
+
+`goOnlineVehicle(vehicles, fleetId)` in `lib/vehicles/goOnlineVehicle.ts` decides which vehicle goes online. The go-online tile and the **Go Online** button both use it.
+
+```mermaid
+flowchart TD
+  A["Vehicles with fleet_id equal to the active fleet"] --> B{"Any?"}
+  B -->|yes| C["Candidates: those shared fleet vehicles"]
+  B -->|no| D["Candidates: vehicles with no fleet_id"]
+  C --> E["Drop vehicles whose application_status is set and not complete"]
+  D --> E
+  E --> F{"Pick"}
+  F -->|"1st"| G["is_active"]
+  F -->|"2nd"| H["is_fleet_default"]
+  F -->|"3rd"| I["First remaining vehicle"]
+```
+
+- Shared fleet vehicles win over personal ones. A driver's personal vehicles are only candidates when the active fleet has no shared vehicle for them.
+- The fallback happens before the approval filter. If the fleet's shared vehicles all fail the filter, the function returns nothing, even when an approved personal vehicle exists.
+- With no active fleet, only vehicles without a `fleet_id` are candidates.
+
+#### Vehicle picker
+
+`VehiclePickerSheet` (**Select vehicle**) lists every vehicle in the drive session, sorted by id. Each row is a `VehicleListRow`: a type illustration, the color, make, and model, a plate pill, the year, and "Shared fleet vehicle · managed by your fleet" for vehicles with a `fleet_id`. A yellow bar marks the vehicle with `is_active`.
+
+- Tapping a row sends `PUT /vehicle/{id}` with the vehicle's existing fields and `is_active: true`, refreshes the vehicle list, and dismisses the sheet. A failure alerts "Failed to set vehicle."
+- The row for the already-active vehicle is disabled.
+- The pencil button, shown on personal vehicles only, selects the vehicle here. It does not open an editor.
+- The sheet is locked while the driver is online or on a ride (`isDriverEngaged` in `lib/ride/tripGuards.ts`). The header shows "You're online — go offline to change vehicles." or "You're on a ride — finish it, then go offline to change vehicles." A tap alerts the same text.
+
+The lock exists because the vehicle is bound to the online session at go-online and isn't re-registered when it changes.
 
 Client-side errors from `setOnline`:
 
@@ -108,6 +149,28 @@ Auto-queue is opt-in. Drivers turn it on from the **Auto-queue** row under DRIVE
 Settings come from `GET /driver/auto-queue` (`enabled`, `paused_until`, `effective_max_minutes`, `community_max_minutes`). The hub row, the go-online sheet, and the drive screen share one save path (`useAutoQueueSettings`). It updates the cache optimistically, runs the version gate when turning on, and refetches either way.
 
 ## Ride requests
+
+### The request overlay
+
+`DriverMapOverlay` (`components/drive/DriverMapOverlay.tsx`) is the layer between the map and the shift sheet. `drive/index.tsx` creates the sheet refs and passes them in, and the overlay mounts `GoOnlineConfirmationSheet`, `VehiclePickerSheet`, the three auto-queue sheets, `GoOfflineConfirmationSheet`, `TooSlowPopup`, and the ride request `Modal`.
+
+A potential ride exists when `driver_is_online` is true and `DriveProvider` has an `activeCardRide`. While one exists:
+
+- The [top chrome](#top-chrome) is hidden. The **Reconnecting to ride requests…** card can still show.
+- Map gestures are disabled through `setMapInteractionsEnabled(false)`.
+- `ride_sound.mp3` plays once per new card ride id. It also plays when the queue grows while auto-queue is on. Playback is skipped when the app isn't in the `active` state, and a refused audio session is swallowed.
+
+The `Modal` stays visible while any of three things is true: a potential ride exists, the decline sheet is open, or an accept is waiting for confirmation. Three pieces of local state keep the card stable:
+
+| State | Purpose |
+| --- | --- |
+| `renderedRide` | The last ride drawn. It keeps the card mounted during the slide-out animation. It doesn't swap to the next ride while the decline sheet is open or an accept is pending. |
+| `pendingAcceptedRideId` | Set on accept. Cleared when status lists the ride as current or queued, when the accept fails, or after 8 seconds. |
+| `declineSheetOpen` | Pauses the card's countdown and keeps the modal up behind `DeclineReasonSheet`. |
+
+`DeclineReasonSheet` renders inside the modal in its own `BottomSheetModalProvider`, so it presents above the card.
+
+The overlay also invalidates the `/user/status` query when `current_ride_status` goes from set to empty.
 
 ### The ride card
 
@@ -193,20 +256,64 @@ Ratings of 4 or 5 count as positive for the shift. Going offline after 3 or more
 
 ## Driver hub
 
-`drive/driver-hub/1-hub` (**Driver Profile**) has a rider-mode switch (blocked mid-ride with **Finish your ride first**) and these rows:
+`drive/driver-hub/1-hub` (**Driver Profile**) is the driver's settings screen. `driver-hub/_layout.tsx` wraps the stack in `DriverHubVehicleProvider`, which holds the vehicle draft for the add and edit screens.
 
-| Section | Row | Target |
-| --- | --- | --- |
-| Header | Photo with camera button | `2-profile-photo` (same picker, `POST /driver/profile-photo`) |
-| ACCOUNT | Education status (**Verified** or **Not verified**) | `driver-signup/verify/1-oauth` with `returnTo` set back to the hub |
-| EARN | **Earnings & stats** ("$X this week") | `driver-earnings/1-hub` |
-| EARN | **Payouts** ("Managed by [fleet]" or "Managed through your Stripe account") | `driver-signup/6-stripe` |
-| EARN | **Drive history** ("[N] trips") | `3-drive-history`, then `4-ride-details` (`GET /user/drive-history`) |
-| DRIVE | **My vehicles** | `DriverHubVehiclesSheet`: set default (`PUT /vehicle/{id}`), add or edit via `5-vehicle-basic` and `6-vehicle-details` |
-| DRIVE | **Navigation** | `DriverHubNavigationSheet` |
-| DRIVE | **Switch fleet** | `DriverHubFleetSwitcherSheet`: "Choose the network you're driving for right now." `POST /driver/active-fleet`. Blocked while online or on a ride. |
-| DRIVE | **Auto-queue** ("On · up to [N] min ahead" or "Off") | `AutoQueueDurationSheet`: `PUT /driver/auto-queue` |
-| Support | **Contact Yelo** | `ContactYeloSheet` |
+The header has a **Rider mode** button. Mid-ride it alerts **Finish your ride first**. Otherwise it calls `setOnline(false)` and navigates to the map tab. A `FirstDrivePromoTile` shows under the profile summary while the first-drive promo applies, and opens `/drive?openReadyToDrive=1`.
+
+| Section | Row | Subtitle | Target |
+| --- | --- | --- | --- |
+| Header | Photo with camera button | none | `2-profile-photo` (same picker, `POST /driver/profile-photo`) |
+| ACCOUNT | **Student verification** | "Not verified", or the school and "Class of [year]" with a **Verified** badge | `driver-signup/verify/1-oauth` with `returnTo` set back to the hub. Not tappable once verified. |
+| EARN | **Earnings & stats** | "$X this week" | `driver-earnings/1-hub` |
+| EARN | **Payouts** | "Managed by [fleet]" or "Managed through your Stripe account" | `driver-signup/6-stripe`. No target when `payout_source` is `fleet`. |
+| EARN | **Drive history** | "[N] trips" | `3-drive-history`, then `4-ride-details` (`GET /user/drive-history`) |
+| DRIVE | **My vehicles** | The default vehicle's color, make, and model plus "· +N", "No vehicle set", or "Locked during ride" | [Vehicles sheet](#vehicles) |
+| DRIVE | **Navigation** | Apple Maps, Google Maps, or Waze | [Navigation sheet](#navigation-app) |
+| DRIVE | **Switch fleet** | The active fleet's name, "No fleets available", or "Locked during ride" | [Fleet switcher](#fleet-switcher) |
+| DRIVE | **Auto-queue** | "On · up to [N] min ahead" or "Off" | `AutoQueueDurationSheet`: `PUT /driver/auto-queue` |
+| HELP | **Contact Yelo** | "Support · Safety" | `ContactYeloSheet` |
+| HELP | **Driver handbook** | "Policies · best practices" | Opens `DRIVER_HANDBOOK_URL` (`lib/constants.ts`) with `Linking.openURL` |
+| HELP | **Call 911** | "Emergency" | `tel:911` |
+
+Most rows end in a `DriverHubCta` pill (**View**, **Manage**, **Change**, **Switch**, **Verify**, **Contact**, **Open**, **Call**) that does the same thing as tapping the row.
+
+The three DRIVE sheets live in `components/driver-hub/` and share one layout on `DriverDarkBottomSheet`: a title, a close button, a list of options, and a bottom button.
+
+### Fleet switcher
+
+`DriverHubFleetSwitcherSheet` (**Switch fleet**, "Choose the network you're driving for right now.") lists the fleets from `GET /driver/fleet`. Each option shows the fleet's `logo_url` or a fallback icon, its name, and a radio mark. The current `driver_active_fleet` starts selected.
+
+- **Switch fleet** calls `driveActions.setActiveFleet`, which sends `POST /driver/active-fleet` with `fleet_id`. It then refreshes user status and invalidates the fleets, signup status, current user, and current community queries.
+- Picking the fleet that is already active just dismisses the sheet.
+- A failed switch is swallowed. The sheet stays open with no message.
+- The sheet is locked while the driver is online or on a ride. The subtitle changes to "You're online — go offline to switch fleets." or "You're on a ride — finish it, then go offline to switch fleets.", and the button is disabled.
+- The hub row is disabled mid-ride or when the driver has no fleets. The hub mounts the sheet only when at least one fleet exists.
+
+Switching fleets changes which vehicle goes online. See [Vehicle choice](#vehicle-choice).
+
+### Vehicles
+
+`DriverHubVehiclesSheet` (**My vehicles**) lists every vehicle, sorted by id, with the hint "Tap a vehicle to make it your default." It uses the same `VehicleListRow` as the [vehicle picker](#vehicle-picker).
+
+| Action | Behavior |
+| --- | --- |
+| Tap a row | `PUT /vehicle/{id}` with the vehicle's existing fields and `is_active: true`, then a vehicle refresh. The yellow default bar moves immediately and the other rows are disabled until the request settles. A failure alerts "Failed to set default vehicle." |
+| Pencil button | Copies the vehicle into the draft and opens `5-vehicle-basic` (**Edit vehicle**). Hidden on shared fleet vehicles. |
+| **Add vehicle** | Clears the draft and opens `5-vehicle-basic` (**Add vehicle**), then `6-vehicle-details`. Saving returns to the hub. |
+
+The hub row is disabled mid-ride. Unlike the vehicle picker, this sheet doesn't check `isDriverEngaged`, so an online driver between rides can still change the default here.
+
+### Navigation app
+
+`DriverHubNavigationSheet` (**Navigation app**, "Open turn-by-turn directions in your preferred app.") offers **Apple Maps**, **Google Maps**, and **Waze**. **Set as default** saves the choice and dismisses.
+
+`useNavigationApp` (`hooks/drive/useNavigationApp.ts`) backs it with a module-level store, so the hub row and the in-ride navigation button update together. It persists the choice to SecureStore under `defaultNavApp`. Until a valid value is stored, the app is `google` and `needsSelection` is true.
+
+The drive screen mounts the same sheet and presents it when `needsSelection` is true. Dismissing it without **Set as default** stores nothing, so `needsSelection` stays true.
+
+### Fleet selection hook
+
+`useFleetSelection` (`hooks/drive/useFleetSelection.ts`) resolves the active `Fleet` object from a fleet list and drives a dropdown animation. It is not wired in. Only the `hooks/drive/index.ts` barrel exports it, and no screen or component calls it. The fleet switcher reads `driver_active_fleet` directly instead.
 
 ## Earnings and payouts
 
@@ -255,7 +362,9 @@ The app refreshes `/earnings/balance`, `/earnings/activity`, and `/user/drive-hi
 | Current ride | `components/drive/CurrentRideBottomSheet.tsx`, `SecurityPinBottomSheet.tsx`, `RideCompleteScreen.tsx`, `components/driver-flow/DriverCancelPopup.tsx` |
 | Navigation app | `hooks/drive/useNavigationApp.ts`, `components/driver-hub/DriverHubNavigationSheet.tsx` |
 | Chat | `app/(app)/drive/queue/`, `components/drive/queue/`, `hooks/drive/useRideMessages.ts`, `providers/MessagingProvider.tsx` |
-| Hub | `app/(app)/drive/driver-hub/`, `components/driver-hub/` |
+| Go-online vehicle | `lib/vehicles/goOnlineVehicle.ts`, `components/drive/GoOnlineConfirmationSheet.tsx`, `VehiclePickerSheet.tsx`, `components/driver/VehicleListRow.tsx` |
+| Hub | `app/(app)/drive/driver-hub/`, `components/driver-hub/`, `providers/DriverHubVehicleProvider.tsx` |
+| Engagement guards | `lib/ride/tripGuards.ts` |
 | Earnings | `app/(app)/driver-earnings/`, `components/driver-earnings/`, `hooks/driver-earnings/` |
 | Live Activities | `widgets/` |
 

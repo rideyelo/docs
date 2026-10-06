@@ -1,0 +1,365 @@
+---
+title: "Friends and map FAQ"
+description: "Code-grounded answers to questions about friends, invites, bumps, contacts sync, location sharing with friends, liked and pinned spots, and price comparison with Uber, Lyft, and Empower"
+---
+
+Each answer describes what the app and API do today. Links go to the engineering pages with the full rules. If an answer points to a problem Yelo's code can't fix on its own, the last line says where to escalate.
+
+## Friends
+
+### How do two people become friends?
+
+Yelo has no friend request to accept. A friendship is created in one of three ways, and it's always mutual:
+
+| How | What happens |
+| --- | --- |
+| Mutual contacts | Both people share contacts with Yelo, and each has the other's number saved. The friendship is created during contact sync. |
+| Signing up with an invite | A new user signs up with a friend's referral code. They become friends with the referrer at sign-up. |
+| Opening an invite link | An existing user opens a friend's invite link and taps **Add friend**. The app shows "You and [name] are now friends". |
+
+When a friendship is created, the other person gets a push. By default it reads **[Name] is on Yelo 👋** / "You're now friends. See where they're headed." The person who acted doesn't get it.
+
+A one-sided contact isn't enough. If Alice has Bob's number but Bob doesn't have Alice's, they aren't friends. The settings sheet says it this way: "Find friends who have saved your number too."
+
+See [Friends](/engineering/mobile/social-and-contacts#friends).
+
+### Where do I find and add friends?
+
+Open **Profile** → **Settings** → **Refer a friend**. The same sheet opens from an empty slot in the map's **Friends** list. It shows a search field labelled **Add a new friend** and up to three sections:
+
+| Section | Who is in it | Row action |
+| --- | --- | --- |
+| **Friends** | Confirmed Yelo friends. Each row says "Your friend". | **Added** (not tappable) |
+| **Sent requests** | Contacts the user already texted an invite to. | A resend button |
+| **Contacts** | Everyone else in the shared address book. | **Invite** |
+
+Above the list, **Find friends from other apps** offers **Snapchat**, **Messages**, **QR**, **Other**, and **Drive**. **Bring your group** opens the referral share screen.
+
+With no contacts to show, the sheet says "Your friends will appear here when you connect." A search with no match says "Try another name or invite your friend with a link."
+
+### Why does the sheet keep asking for three favorites?
+
+Until the user has three people between friends and sent invites, the sheet opens with **Yelo is better with friends** / "Invite your three favorite people" and three slots. Empty slots read "Not invited yet!". Once all three are filled the header reads **You've got your 3 favorites** / "You're all set", and the prompt stops appearing after the user closes the sheet. After that the header reads **Pick your best friends** / "Invite a friend".
+
+This is saved on the device per account, so the prompt can come back on a new phone.
+
+### I invited someone. Why aren't we friends yet?
+
+**Invite** opens the phone's own Messages app with a prefilled text: "Check this out" plus the user's referral link. Yelo doesn't send that text. The user has to send it.
+
+- The contact moves to **Sent requests** when the phone reports the text as sent.
+- **Sent requests** is a list kept on the user's device. It isn't a pending request on Yelo's servers, and the friend has nothing to accept.
+- The friendship is created only when the friend signs up with the link, opens the link and taps **Add friend**, or the two become mutual contacts.
+- If the referral link hasn't loaded yet, the text carries a plain App Store link instead. That link has no referral code, so it can't connect the friend to the inviter.
+
+If the phone can't send texts, the app shows **Messaging not available** / "Unable to open Messages on this device."
+
+### What does someone see when they open my invite link?
+
+| Who opens it | Screen | Button |
+| --- | --- | --- |
+| Someone signed out | **[Name] invited you to Yelo** / "Add them as a friend to ride together." | **Get started** |
+| A signed-in user | The same title and subtitle | **Add friend**, or **Not now** |
+| The inviter | **This is your invite link** / "Share it with friends so they can ride with you." | **Go home** |
+| Someone already a friend | **You're already friends with [Name]** / "Plan a ride together from the map." | **Go home** |
+
+If the inviter's details can't load, the screen reads **You're invited to Yelo** with **Continue to Yelo** and **Try again**.
+
+If **Add friend** fails for any reason, the app shows **Something went wrong** / "We could not add your friend. Please try again." The API rejects an unknown code and the user's own code, but the app shows the same message for both.
+
+See [Invites and referral attribution](/engineering/mobile/social-and-contacts#invites-and-referral-attribution) and [Referrals](/concepts/growth-features#referrals).
+
+### Can I remove or block a friend?
+
+No. The app has no unfriend or block action, and the API has no way to remove a friendship. Changing or turning off contacts access doesn't remove existing friends. If a user needs a friendship removed, escalate to engineering.
+
+### How do I check a user's friends?
+
+Open the user's detail sheet in the dashboard and expand **Contacts & friends**. It lists their friends, how each match was made (**Mutual contacts** or **Referral / invite**), and their contacts permission and last sync. See [Registered contacts](/dashboard/user-directory#registered-contacts) and [Contact sync](/administration/contact-sync).
+
+## Bumps
+
+### What is a bump?
+
+A bump tells friends where the user is heading and roughly when they'll arrive. The **Bump Friends** sheet says "Tap friends to select them, or contacts to invite them." It opens from the ride request screen, a place's sheet on the map, an event page, the ride-matching screens, and the active ride. The **Bump** button in the map's **Friends** list and on a friend's page opens the request screen, which asks for a destination first and then shows the sheet.
+
+The sheet shows the message under **YELO SENDS AUTOMATICALLY**. The user taps the place or the time in the preview to change it. The **Arrival time** sheet offers **Drive**, **Walk**, and **Custom**. **Custom** lets the user pick 5, 10, 15, 20, 25, or 30 minutes from now. The note under them says "Travel times are estimates. Use Custom if you're leaving later."
+
+Two kinds of people appear in the row:
+
+| Legend | Who | What a tap does |
+| --- | --- | --- |
+| **friends** (yellow dot) | Yelo friends | Selects them for the bump. Yelo delivers it. |
+| **in contacts** (grey dot) | Contacts who aren't friends | Opens the phone's Messages app with an invite text. The user sends it. |
+
+Friends the user has bumped before on this device start selected.
+
+### What does my friend receive?
+
+Yelo sends a text first. The default wording is "[First name] bumped you 👋 Heading to [place], arriving around [time]." The arrival part is left out when no time is set. Admins can change the wording in the dashboard. See [Notification templates](/dashboard/notification-templates).
+
+- A friend with a verified phone number who hasn't texted STOP gets the text.
+- A friend who can't get texts gets a push with the same message instead.
+- If the text fails for good, Yelo falls back to a push for that friend.
+
+The invite text for a contact who isn't on Yelo is different, and it comes from the user's own phone: "heading to [place], ETA [time]. grab yelo so i can automatically bump you next time [link]".
+
+See [Friend bump flow](/engineering/notifications/sms-and-friend-bumps#friend-bump-flow).
+
+### My friend didn't get my bump. Why?
+
+Check these in order:
+
+| Cause | What happens |
+| --- | --- |
+| The friend got a bump text in the last 5 minutes | Yelo sends one bump text per recipient every 5 minutes, counting bumps from every sender. A second bump inside that window sends no text and no push. |
+| The friend texted STOP | No text. They get a push, if their notifications are on. |
+| The friend has no verified phone number | No text. They get a push, if their notifications are on. |
+| Push notifications are off for the friend | A push fallback doesn't arrive. See [Push notifications](/runbooks/push-notifications). |
+| The text sat in the queue more than 15 minutes | Yelo drops it instead of sending it late. |
+
+The send animation starts when the sender taps the button, and the sheet closes once the server accepts the bump. That confirms Yelo accepted it, not that the friend's phone received it.
+
+If none of these fit, collect both users' phone numbers and the time, and follow [SMS and sign-in](/runbooks/sms-and-sign-in).
+
+### Why can't I send a bump?
+
+The red line above the buttons explains the failure:
+
+| Message | Cause |
+| --- | --- |
+| "You can bump up to 10 friends at once." | The user tried to select an eleventh friend. |
+| "You've sent a lot of bumps recently. Try again in a little while." | The user sent more than 20 bumps in the last hour. The limit counts sends, not recipients. |
+| "That took too long. Check your connection and try again." | No answer from the server in 15 seconds. |
+| "You appear to be offline. Check your connection and try again." | The phone has no connection. |
+| "Your session expired. Sign in and try again." | The user's sign-in is no longer valid. |
+| "That bump couldn't be sent. Your friend list may have changed." | The server rejected the bump. The usual cause is that a selected person isn't a confirmed friend. Bumps only go to friends. |
+| "Something went wrong on our end. Try again in a moment." | A server error. |
+| "Couldn't send that bump. Please try again." | Anything else. |
+
+The send button stays disabled until at least one friend is selected. Retrying the same bump doesn't use up another slot in the hourly limit.
+
+Other messages in the sheet:
+
+- "Message preview unavailable. You can still bump your friends." The preview failed to load. Sending still works.
+- "Couldn't load that spot. Try another result." The place the user picked has no usable location.
+- "This device can't send text messages." or "Couldn't load your invite link. Please try again." These apply to inviting a contact, not to bumping a friend.
+- "Nobody matches that search." The search matched no friend or contact.
+
+### How long does a bump last?
+
+The text or push is sent once. Separately, the bump can show in the recipient's friend activity on the map for 3 hours.
+
+It only shows on the map when the destination is a place Yelo knows as public. A bump to any other address still sends the text with the place name, but it never appears on the map.
+
+A bump also stops showing if the sender has location sharing off.
+
+## Contacts
+
+### What does Yelo do with my contacts?
+
+The app uploads the phone numbers from the address book, not names or photos. The server turns each number into a one-way hash and stores only the hash. It never stores the raw numbers. Yelo uses them for one thing: creating a friendship when two users have each other's number.
+
+The upload is capped at 10,000 numbers. A larger address book isn't synced, and the app shows a **Share invite link** action instead. The earlier matches stay in place.
+
+Sharing contacts is optional. The settings sheet says "You can still invite people with a link without sharing contacts."
+
+See [Contacts sync](/engineering/mobile/social-and-contacts#contacts-sync).
+
+### How do I change or refresh contacts access?
+
+Open **Profile** → **Settings** → **Contacts**. The row shows the current access:
+
+| Label | Meaning |
+| --- | --- |
+| **Full access** | Yelo can read the whole address book. |
+| **Selected contacts** | The user picked specific contacts. Yelo only sees those. |
+| **Access off** | The user denied contacts access. |
+| **Not shared** | The user hasn't been asked yet. |
+
+In the sheet:
+
+- **Contact access** changes the permission. It shows the phone's permission prompt, the contact picker when the user shared selected contacts, or Yelo's page in the phone's settings.
+- **Refresh contacts** runs a sync now. Under it the sheet shows "Last synced [time]" or "Not synced yet". While it runs, the row reads **Checking contacts…**.
+
+When access was denied and the phone won't ask again, the sheet gives the steps. On iPhone: "In Yelo's app settings, tap Contacts and choose Limited Access or Full Access. Return here to find your friends." On Android: "In Yelo's app settings, tap Permissions, then Contacts, and allow access. Return here to find your friends."
+
+The app also syncs on its own: when contacts access changes, when the address book changes, and when the app comes to the foreground and the last sync is more than 15 minutes old.
+
+### My friend is on Yelo. Why don't they show as a friend?
+
+Matching needs both sides. Check each of these for both users:
+
+- **Both shared contacts.** A user with **Access off** or **Not shared** has no contacts on Yelo.
+- **Each saved the other's number.** One-sided contacts don't match.
+- **Selected contacts includes the friend.** With **Selected contacts**, the app prompts "Yelo can only see the contacts you selected. Add more people to find your friends." The action is **Choose more contacts**.
+- **Both accounts have a phone number.** A user with no phone number on their account can't be matched.
+- **A sync ran after both saved the number.** Ask each user to tap **Refresh contacts**.
+
+In the dashboard, **Contacts & friends** on each user's detail sheet shows **Contacts permission**, **Contact access**, **Last contact sync**, **Synced phone numbers**, and the latest matching attempt. Check both profiles. See [Contact sync](/administration/contact-sync).
+
+If matching still fails, an invite link makes them friends without contacts.
+
+### What happens when I turn contacts access off?
+
+The app uploads an empty list, which clears the user's stored contacts on Yelo. Existing friends stay friends.
+
+### What do the contacts prompts mean?
+
+| Action shown | Message | Cause |
+| --- | --- | --- |
+| **Share contacts** or **Find friends in contacts** | "Share contacts to find people you know. You can always invite friends with a link." | Contacts aren't shared yet. |
+| **Open app settings** | "Open Yelo's app settings and allow Contacts access, then return to find your friends." | Access was denied and the phone won't ask again. |
+| **Choose more contacts** | "Yelo can only see the contacts you selected. Add more people to find your friends." | The user shared selected contacts only. |
+| **Try again** or **Try finding friends again** | "We couldn't finish checking your contacts. Your existing friends are still here." | The last sync failed. |
+| **Share invite link** or **Invite a friend** | "Your address book is larger than we can sync at once. Your saved matches are safe. Invite someone with a link." | The address book is over the upload cap. |
+| **Share invite link** or **Invite a friend** | "Your shared contacts list is empty. Send an invite link to connect with a friend." | The shared list has no contacts. |
+
+A user who syncs more than 30 times in an hour is refused until the next hour. The API's message is **Slow down** / "Contact sync was attempted too many times; try again later." Normal use doesn't reach this.
+
+## Location sharing with friends
+
+### Can my friends see where I am?
+
+Yes, by default. Every account starts with location sharing on. A user's friends see them on the map:
+
+- A friend with a live position shows there.
+- A friend without one shows at their last known position, labelled **LAST SEEN** with how long ago. Positions older than 7 days aren't shown.
+- A friend's page shows the distance as "[X] MI AWAY · [Y] MIN WALK", or "Location unavailable".
+
+The map refreshes friends once a minute while the map is open.
+
+Friends also see places the user liked, and bumps the user sent them. See [Map tab internals](/engineering/mobile/map-tab-internals).
+
+### How do I turn location sharing off?
+
+The app can't do it today. A **Share location with friends** switch exists in the code, with the subtitle "Show where you are on the map", but it's switched off and doesn't appear in **Settings**. The API can save the setting but doesn't tell the app the current value, so the app has nothing truthful to show.
+
+<Warning>
+Don't tell a user to look for this switch. It isn't in any released screen. If a user wants to stop sharing their location with friends, escalate to engineering. The API supports the change, but the dashboard has no control for it.
+</Warning>
+
+To see a user's current setting, open their detail sheet and read **Shares location with friends** under **Contacts & friends**.
+
+Turning sharing off hides the user from their friends' maps. It also hides their liked spots and the bumps they sent from friends' activity.
+
+## Liked and pinned spots
+
+### How do I save a place?
+
+Open **Liked Spots** from the saved spots bar on the map. Type in **Search a place to like** and tap a result's heart. A place that's already saved shows a filled heart, and tapping it does nothing.
+
+- "No places found." means the search returned nothing.
+- "Already liked" means the place turned out to match a spot the user already saved.
+- "Couldn't save — try again" means the place couldn't be loaded or saved. Nothing was saved.
+- Saving the same place twice doesn't create a duplicate.
+
+Tapping a saved spot starts a ride request with that spot as the destination.
+
+Some spots in the list come from the community, not from the user. The user didn't like them, but they can pin or remove them the same way.
+
+### What are pinned spots?
+
+Pins are the spots shown on the map's saved spots bar. The list has two sections: **PINNED** (shown as a count out of 2) and **LIKED**.
+
+- The limit is 2 pins. Pinning a third unpins the first one in the list.
+- An empty pin slot reads "Tap a pin icon to fill this slot".
+- Press and hold a row's drag handle, then drag it to reorder.
+
+### Why did my pins disappear?
+
+Likes are saved to the user's account. Pins and the order of the list are saved on the device only. On a new phone or a second device, the liked spots come back but the pins and the order don't. The user has to pin them again.
+
+Removing a liked spot also removes its pin.
+
+### I removed a spot and it came back, or it's still on another phone
+
+Removing a spot the user liked deletes it from their account. If that fails, the app shows "Couldn't remove — try again" and puts the spot back.
+
+Removing a community spot only hides it on that device. It has no confirmation, and the spot still shows on the user's other devices.
+
+## Price comparison with Uber, Lyft, and Empower
+
+### Why don't I see other apps' prices?
+
+Price comparison is an experiment called **Rideshare Price Aggregator**. A user sees live prices only when all of these are true:
+
+- An admin added the `rideshare-price-aggregator` key to the user's community. See [Experimental features](/dashboard/communities#experimental-features).
+- The user turned it on in **Profile** → **Settings** → **Experiments** and tapped **Enable experiment** on the disclaimer.
+- Yelo has no ride options for the trip. That means the community is inactive or has rides disabled, or no Yelo vehicle serves the trip.
+- The user signed in to at least one provider.
+
+<Note>
+Other apps' prices never appear next to Yelo's own ride options. When Yelo has options for a trip, the request screen shows only those.
+</Note>
+
+The **Experiments** row only appears in **Settings** when the community has at least one experiment. An empty screen reads "No experiments available".
+
+The disclaimer is accepted once per user per device. On a new phone, the switch shows off until the user accepts it again.
+
+See [Experiments](/engineering/mobile/widgets-and-experiments#experiments).
+
+### What do users see without the experiment?
+
+When Yelo has no options for a trip and the experiment is off, the request screen shows **Need a ride?** with three cards: **Open in Uber**, **Open in Lyft**, and **Open in Waymo**, followed by "Yelo rides are coming soon". The cards show no prices. Each one opens that app with the destination filled in.
+
+Empower isn't in this list. It only appears with the experiment on.
+
+### How do I connect Uber, Lyft, or Empower?
+
+With the experiment on, open **Profile** → **Settings** → **Accounts** and pick a provider under **RIDESHARE PROVIDERS**. The **Accounts** button on the request screen opens the same list, titled **Rideshare accounts**.
+
+| Row status | Meaning |
+| --- | --- |
+| "Not connected" | The user hasn't signed in. |
+| The account's email, or "Connected" | Signed in and working. |
+| A red warning icon | Signed in, but the provider rejected the saved sign-in on the last price request. |
+
+Each provider screen starts with **Sign in to [provider]** and **Continue to [provider]**. Lyft asks for a phone number and a texted code, and sometimes the account's email.
+
+The sign-in is kept on the phone. The screen says "Login is stored only on this device". Yelo's servers don't hold it, so support can't see, reset, or disconnect a provider account. The user signs out with **Sign out** on the provider's screen. A new phone needs a fresh sign-in.
+
+See [Connect Uber, Lyft, and Empower](/engineering/mobile/social-and-contacts#connect-uber-lyft-and-empower).
+
+### What do the price cards mean?
+
+Each provider gets one card. Its other ride types nest underneath, with **Show [n] more** for the rest.
+
+| Card shows | Meaning | What the user does |
+| --- | --- | --- |
+| A blurred price | Not signed in to that provider. | Tap the card to sign in. |
+| A blurred price on a connected provider | The provider rejected the saved sign-in. The **Accounts** button flags it. | Tap the card to sign in again. |
+| A spinner | Prices are loading. | Wait. |
+| **Unavailable** | The provider returned no priced rides for this trip, or the request failed. | Tap the refresh button, or try another provider. |
+| A price, with "from" when tiers nest below | A live quote from the user's own account. | Tap to select it. |
+
+A cheapest badge and a fastest badge mark the best option across all providers.
+
+The button at the bottom changes with the state:
+
+| Button | When |
+| --- | --- |
+| **Sign in to see prices** | No provider is connected. It opens **Rideshare accounts**. |
+| **Select an option** | Nothing is selected yet. |
+| **Open [provider]** | A ride is selected. It opens that provider's app. |
+| **[Provider] not installed** | The selected provider's app isn't on the phone. |
+
+A Citi Bike card can appear when Lyft returns bike options. Its button opens Lyft.
+
+### Can I book an Uber or Lyft in Yelo?
+
+No. Yelo shows the price and hands off. **Open [provider]** opens that app with the destination, and the user books and pays there. Yelo doesn't charge anything, doesn't know whether the ride happened, and can't help with the fare, the driver, or a refund. Send the user to that provider's support.
+
+### Why is the price in the other app different?
+
+The prices are estimates from the provider at the moment Yelo asked. The disclaimer says "Estimates may be delayed, inaccurate, or unavailable." The provider sets the final price in its own app.
+
+Yelo reuses a provider's prices for the same trip for 20 seconds. The refresh button on the request screen is disabled during that time and shows a countdown.
+
+Yelo isn't affiliated with these companies. The disclaimer says Yelo "is not affiliated with, endorsed by, or sponsored by Uber Technologies, Inc., Lyft, Inc., or any other supported ride-hailing service" and "provides no support or warranties for third-party services."
+
+### How do I turn price comparison off?
+
+Turn the switch off in **Profile** → **Settings** → **Experiments**. Per the disclaimer, Yelo collects diagnostic information about the feature while it's on, without account credentials, cookies, or payment details. Turning the experiment off stops that.
+
+Turning it off doesn't sign the user out of the providers, and it hides the provider screens. To sign out, the user taps **Sign out** on each provider's screen before turning the experiment off.
