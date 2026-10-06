@@ -106,7 +106,9 @@ Main writers: `queries/user_profile.sql`, `authv3.sql`, `user_driver.sql`, `educ
 | `stripe_merchant_id` | `text` | No | `''` | Driver's Stripe Express account. |
 | `referral_code` | `text` | No | `''` | Current referral code. |
 | `old_referral_code` | `text` | Yes | | Previous code, kept when creating a Dub link replaced it. Lookups match either column. |
-| `has_dub_link` | `boolean` | No | `false` | A Dub short link exists for the referral code. |
+| `has_dub_link` | `boolean` | No | `false` | Superseded by `share_link_created_at` in `000351`. The API no longer reads it but still writes it for dashboard readers. |
+| `share_link_created_at` | `timestamptz` | Yes | | When the user's Dub share link first existed. `NULL` means no link yet. `000351` backfilled it to `now()` where `has_dub_link` was true. |
+| `share_link_fingerprint` | `text` | Yes | | Fingerprint of the last link request Dub accepted. `NULL` means the link must be rewritten. When it doesn't match the current fingerprint, the next sync or the [share link sweep](/engineering/domains/referrals-and-links#self-healing-sweep) rewrites the link. |
 | `quo_contact_id` | `text` | Yes | | OpenPhone (Quo) contact ID, written by contact sync. |
 | `contacts_snapshot_hash` | `text` | No | `''` | SHA-256 of the user's last uploaded contact hash set. |
 | `contacts_synced_at` | `timestamptz` | Yes | | Last contact upload. |

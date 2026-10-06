@@ -13,7 +13,13 @@ Markers on each line:
 
 Dependency bumps, CI changes, and E2E tooling are summarized in one line per week.
 
-<Update label="Week of October 5, 2026" description="Dependency updates">
+<Update label="Week of October 5, 2026" description="Anonymous link touches, ambient referral credit, self-healing Dub share links, and dependency updates">
+  **Referrals and attribution**
+
+  - New public `POST /authv3/attribution/touch` records an anonymous link landing before any auth transaction exists. It takes the same attribution object as accept, with `anonymous_id` and `landing_surface` required, and stores the touch with no `auth_transaction_id`. The new `attribution_touch` rate scope allows 120 requests per 10 minutes per requester prefix. When a transaction resolves, it claims unclaimed touches with the same `anonymous_id` from the 90 days before authentication. At profile completion, if the user presented no code, the most recent referral code on those touches is applied, and invalid, self, or conflicting codes are dropped silently. Auth v3 signups with a claimed Dub click ID send a Dub `Sign Up` lead. **Config:** `REFERRAL_LANDING_BASE_URL` sets the destination base for personal invite links on `join.yelo.link`, intended as `https://joinyelo.com/i`. It falls back to `INVITE_LANDING_BASE_URL`, then `https://invite.yelo.link`. [#294](https://github.com/rideyelo/yelo-api/pull/294). See [Anonymous link touches](/engineering/domains/referrals-and-links#anonymous-link-touches) and [Record an anonymous link touch](/engineering/identity/auth-v3-transactions#record-an-anonymous-link-touch).
+  - Changing the destination of an existing Dub link no longer fails with a duplicate-key conflict. Dub upserts match by destination URL, so on conflict the client now looks the link up by domain and key and updates it in place. [#297](https://github.com/rideyelo/yelo-api/pull/297). See [Share links](/engineering/domains/referrals-and-links#share-links).
+  - Personal invite links heal themselves. `GET /referral/link` syncs the link and is a no-op when the stored fingerprint matches. If Dub fails and a link already exists, it serves the existing link instead of returning 500. A new `share_link_sweep` River job rewrites up to 40 stale links every minute, and name or photo changes mark the link stale. **Migration** `000351` adds `Users.share_link_created_at` and `Users.share_link_fingerprint`, and backfills existing links as unsynced so each is rewritten once. `has_dub_link` is no longer read by the API. [#300](https://github.com/rideyelo/yelo-api/pull/300). See [Self-healing sweep](/engineering/domains/referrals-and-links#self-healing-sweep).
+
   **Platform**
 
   - Dependencies: maps, Dub, OTLP trace exporter, `x/net`, and Google API modules. [#291](https://github.com/rideyelo/yelo-api/pull/291)

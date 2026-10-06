@@ -13,12 +13,14 @@ This page covers the API side. For the product view, see [Growth features](/conc
 | --- | --- | --- |
 | Postgres | `Users.referral_code` (text, default `''`) | Current code |
 | Postgres | `Users.old_referral_code` (text, nullable) | Pre-hyphen code kept after migration to the new format |
-| Postgres | `Users.has_dub_link` (bool, default `false`) | Whether the Dub link has been written |
+| Postgres | `Users.share_link_created_at` (timestamptz, nullable) | When the Dub link first existed. `NULL` means no link yet. |
+| Postgres | `Users.share_link_fingerprint` (text, nullable) | Fingerprint of the last request Dub accepted. `NULL` means the link must be rewritten. |
+| Postgres | `Users.has_dub_link` (bool, default `false`) | Superseded by the two columns above (migration 000351). Still written for dashboard readers; the API no longer reads it. |
 | Postgres | `Users.acquisition_source` | Promoted to `app_referral` by the Auth v2 referral path |
 | Postgres | `Referrals` (`referrer_id`, `referee_id`, `referral_time`) | One row per referee. `referrals_referee_id_unique` on `referee_id`. |
 | Postgres | `ReferralRewards` (PK `community_id`, `start_time`) | Per-community `rider_value` and `driver_value` with a time window |
 | Postgres | `ReferralPayouts` (`payout_id`, `user_id`, `approver_id`, `amount`, `timestamp`) | Manual payouts subtracted from earnings |
-| Postgres | `AttributionTouches.referral_code` | Code captured on the hosted sign-in page, bound to the Auth v3 transaction |
+| Postgres | `AttributionTouches.referral_code`, `dub_click_id` | Code and Dub click ID captured on the hosted sign-in page or an anonymous link landing. Claimed by the user at Auth v3 resolution. |
 | Postgres | `ShortenedLinks` (`encoded_path` PK, `original_path` `VARCHAR(255)`) | Legacy in-house path shortener |
 | Postgres | `ReferralLookup` | Table exists (migration 000146). No Go code reads or writes it. |
 | Dub | Links on `join.yelo.link` | Referral share links, keyed by referral code |
@@ -31,8 +33,9 @@ For column types, see [Users and identity](/reference/database/users-and-identit
 | Method | Path | Auth | Handler and purpose |
 | --- | --- | --- | --- |
 | `GET` | `/referral/` | JWT + role `user` | `ReferralHandler.GetUserReferrals`. Lists the caller's referees with reward values. |
-| `GET` | `/referral/link` | JWT + role `user` | `ReferralHandler.GetReferralLink`. Returns `referral_code` and `link`, creating the Dub link if needed. |
+| `GET` | `/referral/link` | JWT + role `user` | `ReferralHandler.GetReferralLink`. Returns `referral_code` and `link`, creating or syncing the Dub link if needed. |
 | `GET` | `/referral/invite/{code}` | Public | `ReferralHandler.GetInvitePreview`. Returns `user_id`, `first_name`, `referral_code`, `photo_url` for the invite landing page. |
+| `POST` | `/authv3/attribution/touch` | Public, rate scope `attribution_touch` | `Handler.RecordTouch`. Logs an anonymous link landing. See [Anonymous link touches](#anonymous-link-touches). |
 | `POST` | `/user/friends/connect` | JWT + role `user` | `UserHandler.ConnectFriend`. Existing user taps an invite link; creates a mutual friendship. `referral_code` is required, at most 32 characters. |
 | `POST` | `/link/encode` | Public | `LinkHandler.Encode`. Body `path`; returns an 8-character `encoded_path`. |
 | `GET` | `/link/decode` | Public | `LinkHandler.Decode`. Query `encoded_path`; returns `path`. |
@@ -62,23 +65,31 @@ Auth v2 reuses an existing code on re-verify and only calls `CreateDubLinkAsync`
 
 ## Share links
 
+A user's Dub link is a projection of three inputs: their referral code, their profile (name and photo, baked into the signed card), and the current link configuration (`REFERRAL_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, and `shareLinkVersion`). The API records what Dub holds in `share_link_created_at` and `share_link_fingerprint`, so drift is detected and repaired automatically instead of by a manual backfill.
+
 <Steps>
   <Step title="Build the link">
     `GetOrCreateShareLink` loads the user and builds `https://join.yelo.link/<code>?v=3`. `shareLinkVersion` is `"3"`; bump it to force iMessage to re-scrape previews.
   </Step>
-  <Step title="Return early if published">
-    If `has_dub_link` is true, the handler returns the code and URL without calling Dub.
-  </Step>
   <Step title="Migrate legacy codes">
-    If the code has no hyphen, a new code is generated. The old code is passed as `oldCode` so it is kept in `old_referral_code`.
+    If the code has no hyphen, `migrateLegacyCode` generates a new code, upserts the Dub link, and runs `UpdateReferralCode` to set `referral_code` and keep the old code in `old_referral_code`. It then marks the link synced.
   </Step>
-  <Step title="Upsert on Dub">
-    `createDubLink` calls `DubProvider.UpsertLink` with the request below. Any Dub error returns 500.
+  <Step title="Sync the link">
+    Otherwise `syncShareLink` builds the Dub request and computes its fingerprint. If the stored `share_link_fingerprint` matches, nothing is sent to Dub. If not, `createDubLink` calls `DubProvider.UpsertLink` and `MarkUserShareLinkSynced` stores the new fingerprint and sets `share_link_created_at` (first time only).
   </Step>
-  <Step title="Persist">
-    `UpdateReferralCode` runs `SetUserReferralCode`, which sets `has_dub_link = true`, `referral_code`, and `old_referral_code` in one statement.
+  <Step title="Fall back when Dub fails">
+    If the sync fails and the user already has a link (`share_link_created_at` set), the handler logs a warning and still returns the existing link. If the user has no link yet, the request returns 500.
   </Step>
 </Steps>
+
+### Fingerprints
+
+The fingerprint has the form `<config version>:<request hash>`.
+
+- **Config version**: the first 4 bytes (8 hex characters) of SHA-256 over `join.yelo.link`, `REFERRAL_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, and `shareLinkVersion`.
+- **Request hash**: the first 8 bytes (16 hex characters) of SHA-256 over the request's `Domain`, `Key`, `URL`, `Title`, `Description`, and `Image`.
+
+A name or photo change alters the request hash. A configuration change alters the config version prefix, which makes every existing link stale at once.
 
 `buildDubLinkRequest` sends:
 
@@ -87,7 +98,7 @@ Auth v2 reuses an existing code on re-verify and only calls `CreateDubLinkAsync`
 | `Domain` | `join.yelo.link` (`dubBaseDomain`) |
 | `Key` | The referral code |
 | `ExternalID` | The user ID |
-| `URL` | `INVITE_LANDING_BASE_URL + "/" + code`. Default base: `https://invite.yelo.link`. |
+| `URL` | `REFERRAL_LANDING_BASE_URL + "/" + code`. Falls back to `INVITE_LANDING_BASE_URL`, then `https://invite.yelo.link`. Set to `https://joinyelo.com/i` for the first-party landing page. |
 | `FolderID` | `DUB_SYSTEM_FOLDER_ID` |
 | `Title` | `Join <first name> on Yelo` |
 | `Description` | `<first name> invited you to Yelo — tap to get the app and ride together.` |
@@ -98,16 +109,31 @@ Auth v2 reuses an existing code on re-verify and only calls `CreateDubLinkAsync`
 
 The Dub client (`internal/data/dub/dub.go`) builds a new SDK client per call from `DUB_API_KEY`. Empty fields are omitted from the upsert body.
 
+Dub's upsert matches an existing link by destination URL, not by key. Changing the destination of an existing key (for example, after `REFERRAL_LANDING_BASE_URL` changes) makes Dub return a duplicate-key conflict. On that conflict, `UpsertLink` looks the link up by domain and key with `Links.Get` and rewrites it in place with `Links.Update`, sending the URL, title, description, image, `TrackConversion`, and `Proxy`.
+
 ### Background creation and refresh
 
 | Function | Trigger | Context | Retries | On success |
 | --- | --- | --- | --- | --- |
-| `CreateDubLinkAsync` | First Auth v2 profile setup | Detached, 30 s | `retry.NewNetworkRetrier`: 5 attempts, 200 ms base delay, 10 s max, full jitter | `SetHasDubLink(true)` |
-| `RefreshShareCardAsync` | `UserService.UpdateName` and `UpdateProfilePicture` (after the thumbnail is saved) | `context.Background` with 30 s timeout | None | Nothing; failures only log |
+| `CreateDubLinkAsync` | First Auth v2 profile setup | Detached, 30 s | `retry.NewNetworkRetrier`: 5 attempts, 200 ms base delay, 10 s max, full jitter | `SyncShareLink` with create-if-missing |
+| `RefreshShareCardAsync` | `UserService.UpdateName` and `UpdateProfilePicture` (after the thumbnail is saved) | `context.Background` with 30 s timeout | None; the sweep retries | `MarkUserShareLinkStale`, then `SyncShareLink` without create |
+| `share_link_sweep` (River) | Every minute | 50 s job timeout | Next run | `SyncStaleShareLinks` |
 
-`RefreshShareCardAsync` is deliberately not gated on `has_dub_link`. The upsert is keyed by code, so a refresh before creation just creates the link. It skips users with an empty `referral_code`.
+Every writer goes through the same sync path, which is a no-op when Dub already matches. `RefreshShareCardAsync` first clears `share_link_fingerprint`, so if the rewrite fails or the process dies, the sweep still repairs the card. Users with no link yet are left alone. Their link is created from the current profile on the first `GET /referral/link`.
 
-Auth v3 profile completion doesn't call `CreateDubLinkAsync`. Those users get their Dub link lazily on the first `GET /referral/link`, or on the first name or photo change.
+Auth v3 profile completion doesn't call `CreateDubLinkAsync`. Those users get their Dub link lazily on the first `GET /referral/link`.
+
+### Self-healing sweep
+
+The `share_link_sweep` River job runs once a minute (`RunOnStart: true`, unique per 50 s period). Each run:
+
+1. Lists up to 40 users in random order whose link exists (`share_link_created_at IS NOT NULL`), who aren't deleted, have a non-blank code, and whose fingerprint is `NULL` or doesn't start with the current config version.
+2. Calls `SyncShareLink` for each. A failure logs a warning and the next user continues. Random order stops one permanently failing user from starving the batch.
+3. Counts the remaining stale links.
+
+At 40 links per minute, the sweep rewrites a few thousand links an hour. A normal run finds nothing to do. The job is skipped when the Dub client is not configured.
+
+To repoint every existing invite link, change `REFERRAL_LANDING_BASE_URL` (or `OG_IMAGE_BASE_URL`) and deploy. The config version changes, so the sweep rewrites each link once. The old `cmd/backfill-referral-links` command was removed.
 
 ### Signed OG card
 
@@ -129,16 +155,37 @@ After each upsert, `warmOGCardAsync` sends a `GET` to the image URL on a detache
 | Path | Function | Lookup | Self-referral | Failure behavior | Side effects |
 | --- | --- | --- | --- | --- | --- |
 | Auth v3 profile completion | `CompleteAuthV3Profile` calls `applyAuthV3Referral` | `GetAuthV3ReferrerIDByCode`: `upper(btrim(referral_code))`, excludes deleted and banned users | 400 "referral code is invalid" | Fails the whole profile transaction | None beyond the `Referrals` row |
+| Auth v3 ambient referral | `CompleteAuthV3Profile` calls `applyAuthV3AmbientReferral` when the user presented no code | `GetAuthV3AmbientReferralCode`: most recent code on the user's claimed anonymous touches (touches made inside an auth transaction are excluded) | Dropped | Invalid, stale, or conflicting codes are dropped. Only a server error fails the profile. | None beyond the `Referrals` row |
 | Auth v2 profile setup | `AuthV2Service.applyReferralCode` | `GetAuthUserByReferralCode`: exact match on `referral_code` **or** `old_referral_code` | "Cannot refer yourself" | Logged and ignored; setup continues | Mutual friendship (`source = referral`), `acquisition_source` promoted from `app_organic` to `app_referral` |
 | Auth v2 community signup | `applyReferralCode` from `service/authv2/community.go` | Same as above | Same | Logged and ignored | Same, plus `fireDubTrackLead` |
 
 Both inserts use `ON CONFLICT (referee_id) DO UPDATE SET referrer_id = "Referrals".referrer_id RETURNING referrer_id`. The existing referrer is kept. If the returned ID differs, the repository returns `ErrorTypeIdentityConflict`.
 
-In Auth v3, a code captured on the transaction's earliest `AttributionTouches` row wins. Presenting a different code returns 400 "referral code is already bound to this sign-in". See [Auth v3 transactions](/engineering/identity/auth-v3-transactions).
+In Auth v3, a code captured on the transaction's earliest `AttributionTouches` row wins. Presenting a different code returns 400 "referral code is already bound to this sign-in". A code from an anonymous link touch is only used when the user presented none. See [Auth v3 transactions](/engineering/identity/auth-v3-transactions).
+
+### Anonymous link touches
+
+Landing pages on `joinyelo.com` (invite, QR, tip, and claim pages) call `POST /authv3/attribution/touch` the moment they load, before any sign-in exists. The body is the same attribution object Auth v3 accepts with legal acceptance:
+
+```json
+{
+  "anonymous_id": "4f9c2a7e-1b3d-4c8e-9a6f-2d5e7b1c0a93",
+  "landing_surface": "/i",
+  "referral_code": "SL-7QK2M",
+  "dub_click_id": "abc123XYZ",
+  "utm_medium": "qr"
+}
+```
+
+The API validates the snapshot, stores it as an `AttributionTouches` row with no `auth_transaction_id`, and returns `{ "success": true }`. The endpoint uses rate scope `attribution_touch` (120 requests per 10 minutes) and is excluded from the Auth v3 funnel step metric.
+
+When an Auth v3 transaction resolves to a user, `AssociateAuthV3TransactionAttribution` claims the transaction's own touches plus any unclaimed anonymous touches that share one of the transaction's `anonymous_id` values and were recorded within 90 days of `authenticated_at`. Claimed touches join the user's first-touch and last-touch attribution. A click made before the app was installed still reaches the account, as long as the sign-up runs in the same browser cookie jar.
 
 ### Dub lead tracking
 
-`fireDubTrackLead` sends `Track.Lead` with event name `Sign Up`, the Dub click ID, and the user ID as the customer external ID. It runs on a detached 10-second context and is skipped when `dubID` is empty. Only the Auth v2 community path calls it.
+`fireDubTrackLead` sends `Track.Lead` with event name `Sign Up`, the Dub click ID, and the user ID as the customer external ID. It runs on a detached 10-second context and is skipped when `dubID` is empty. The Auth v2 community path calls it.
+
+Auth v3 reports signups the same way. After `FinishProfile` completes, the API reads the most recent `dub_click_id` from the user's claimed touches (`GetAuthV3UserDubClickID`). If one exists, `authV3DubLeadTracker` sends a `Sign Up` lead on a detached 10-second context. A failure only logs "[authv3] Dub TrackLead failed".
 
 ### Acquisition source
 
@@ -191,7 +238,23 @@ Driver leads have a separate referrer (`DriverLeads.referrer_user_id` or `referr
 
 `UserService.ConnectFriend` resolves the same way and calls `Friendship.AddMutual` with source `referral`. It rejects unknown codes ("This invite link is invalid or has expired.") and self-invites.
 
-On the client side, `ReferralCaptureObserver` in `yelo-frontend` calls Dub `trackOpen` 750 ms after the app becomes interactive. It stores the link key as the captured code in AsyncStorage (`@yelo/referral_code`). `normalizeInviteCode` uppercases only codes matching the generated format. The invite site (`yelo-web/src/sites/invite`) sends Apple devices without the app to the App Store with `ct=<code>`.
+On the client side, `ReferralCaptureObserver` in `yelo-frontend` calls Dub `trackOpen` 750 ms after the app becomes interactive. It stores the link key as the captured code in AsyncStorage (`@yelo/referral_code`) and the Dub click ID in `@yelo/referral_click`. `normalizeInviteCode` uppercases only codes matching the generated format.
+
+When a universal link opens the invite screen for a signed-out user, the app calls `trackOpen` itself, because the click never reached Dub. The returned click ID is stored in `@yelo/referral_click`. The share medium (`utm_medium`, or `qr` when the link carries `qr=1`) is passed to the invite screen and stored there too. Auth v3 forwards both as `dub_click_id` and `utm_medium` on native attribution, and as `dub_id` and `utm_medium` on the hosted sign-in URL. `clearCapturedCode` removes both keys.
+
+The QR bottom sheet appends `qr=1` to the encoded link only, so Dub counts scans separately from shared or copied links.
+
+### Invite landing page
+
+Personal invite links land on `joinyelo.com/i/<code>`, served by the signup site through the experience router. The page must stay on `joinyelo.com` so its cookies are first-party to `/auth/v3`. On load it:
+
+- Plants `yelo_anon_id` and, when the URL carries `dub_id`, a `dub_id` cookie on `.joinyelo.com` (90 days, `SameSite=Lax`).
+- Calls `POST /authv3/attribution/touch` with `keepalive`, so the request outlives an immediate App Store redirect.
+- Redirects Apple mobile devices to the App Store with `ct=<code>`.
+- Shows a **Continue → sign up** button that forwards the code and every query parameter (click ID, UTM) to `/auth/v3`.
+- On Android, links to Google Play with `referrer=deepLink=https://join.yelo.link/<code>`, which the Dub SDK reads on first open.
+
+`invite.yelo.link/<code>` redirects to `https://joinyelo.com/i/<code>` with the query string preserved. Fleet invites at `invite.yelo.link/fleet/<code>` are unchanged.
 
 ## Path shortener
 
@@ -210,14 +273,16 @@ The mobile app decodes these in `app/(app)/link.tsx`. It handles `com.rideyelo:/
 | Concern | File | Function or type |
 | --- | --- | --- |
 | Share link and Dub upsert | `internal/service/referral/referral.go` | `GetOrCreateShareLink`, `buildDubLinkRequest`, `createDubLink` |
-| Background link jobs | `internal/service/referral/referral.go` | `CreateDubLinkAsync`, `RefreshShareCardAsync`, `warmOGCardAsync` |
+| Background link jobs | `internal/service/referral/referral.go` | `CreateDubLinkAsync`, `RefreshShareCardAsync`, `SyncShareLink`, `SyncStaleShareLinks`, `warmOGCardAsync` |
+| Share link sweep | `internal/notify/queue/share_link_sync.go` | `shareLinkSweepWorker`, `shareLinkSweepPeriodic` |
+| Share link state | `internal/data/repository/queries/referral.sql` | `GetUserShareLinkState`, `MarkUserShareLinkSynced`, `MarkUserShareLinkStale`, `ListStaleShareLinkUserIDs` |
 | Card snapshot | `internal/service/referral/card.go` | `cardFromUser` |
 | OG signing | `internal/utilities/ogcard/url.go` | `CanonicalString`, `Sign`, `InviteCardURL` |
 | Referral HTTP | `internal/server/http/referral/referral_routes.go`, `referral_handler.go` | `RegisterAuthenticatedRoutes`, `RegisterUnauthenticatedRoutes` |
-| Dub client | `internal/data/dub/dub.go` | `Client.UpsertLink`, `CreateLink`, `UpdateLinkDestination`, `TrackLead` |
+| Dub client | `internal/data/dub/dub.go` | `Client.UpsertLink`, `updateLinkByKey`, `CreateLink`, `UpdateLinkDestination`, `TrackLead` |
 | Code generation | `internal/utilities/referral/generate.go` | `GenerateReferralCode` |
 | Auth v2 attribution | `internal/service/authv2/profile.go`, `community.go` | `applyReferralCode`, `generateReferralCode`, `fireDubTrackLead` |
-| Auth v3 attribution | `internal/data/repository/authv3.go` | `CompleteAuthV3Profile` path, `applyAuthV3Referral` |
+| Auth v3 attribution | `internal/data/repository/authv3.go`, `internal/server/http/authv3/touch_handler.go` | `CompleteAuthV3Profile` path, `applyAuthV3Referral`, `applyAuthV3AmbientReferral`, `RecordTouch` |
 | Referral SQL | `internal/data/repository/queries/referral.sql`, `referral.go` | `AddReferral`, `GetUserReferrals`, `GetReferrers`, `UpdateReferralReward` |
 | Code lookup | `internal/data/repository/queries/user_profile.sql` | `GetAuthUserByReferralCode`, `SetUserReferralCode`, `PromoteUserAcquisitionSource` |
 | Friend connect | `internal/service/user/friends.go` | `ConnectFriend` |
@@ -228,14 +293,14 @@ The mobile app decodes these in `app/(app)/link.tsx`. It handles `com.rideyelo:/
 
 ## Gotchas and edge cases
 
-- **Legacy codes are only migrated once.** `GetOrCreateShareLink` returns early when `has_dub_link` is true, before the hyphen check. A user with a flag set and a pre-hyphen code keeps it.
 - **Lookups disagree on legacy codes.** `GetAuthUserByReferralCode` matches `old_referral_code` and is case-sensitive. `GetAuthV3ReferrerIDByCode` ignores `old_referral_code`. An old code previews fine on the invite page but fails Auth v3 sign-up with "referral code is invalid".
 - **The preview echoes the path code.** `GetInvitePreview` returns `ReferralCode: code`. The mobile invite screen stores `preview.referral_code`, so a legacy code stays legacy.
 - **`GetAuthUserByReferralCode` has no limit or status filter.** It is a `:one` query with no `ORDER BY`. Deleted or banned users still resolve in Auth v2, preview, and connect paths.
 - **A user without a code gets one from `GET /referral/link`.** An empty code has no hyphen, so a new code is generated and `old_referral_code` is set to the empty string.
-- **Missing Dub key fails the request.** The `dubClient == nil` guard never fires because `service.go` always constructs a client. With `DUB_API_KEY` unset, `GET /referral/link` returns 500 for users without a link.
+- **Missing Dub key fails the request for new links.** The `dubClient == nil` guard never fires because `service.go` always constructs a client. With `DUB_API_KEY` unset, `GET /referral/link` returns 500 for users without a link. Users with an existing link still get it back.
 - **First-byte initials.** `GenerateReferralCode` takes `trimmed[0]`, a byte. A name starting with a multi-byte character such as "Élise" produces a Latin-1 rune (`Ã`), not `E`.
-- **Refresh races.** If `CreateDubLinkAsync` writes after a concurrent `RefreshShareCardAsync`, the card reverts to the older snapshot until the next name or photo change. The code comments accept this.
+- **The sweep only repairs existing links.** Users with `share_link_created_at IS NULL` are never swept. Their link is created on demand.
+- **Ambient referrals need a shared cookie jar.** Anonymous touches are claimed by `anonymous_id`. A landing in one browser and a sign-up in another (or in the app's native flow, which uses a per-install ID) don't link up.
 - **Reward boundaries overlap.** `BETWEEN` is inclusive at both ends, and a reward switch sets the old `end_time` equal to the new `start_time`. A referral at exactly that instant matches both rows.
 - **Shortener errors are 500s.** `GetByEncodedPath` wraps "no rows" as a server error, so an unknown code returns 500, not the documented 404. `Insert` doesn't retry on a primary-key collision; `ShortenedPathRecord.Regenerate` is never called. Paths longer than 255 characters fail the insert with 500.
 - **The shortener is unauthenticated.** Anyone can write rows to `ShortenedLinks` through `POST /link/encode`.

@@ -42,7 +42,7 @@ Use this map to jump to the migrations that shaped a domain.
 | Calendars | 317 to 320 |
 | Places and locations | 022, 046, 051, 058, 084, 095, 171, 172, 174, 181, 182, 213, 217, 218, 227, 259, 260, 270, 271, 274, 309, 326 to 328, 331, 345, 347 |
 | Notifications and messaging | 029, 047, 125, 167, 175, 176, 180, 195, 197, 237 to 241, 249, 250, 264, 268, 269, 286, 293, 300, 329, 330 |
-| Growth, social, and events | 020, 041 to 045, 079, 085, 113, 141 to 146, 149 to 153, 164, 178, 201, 220, 228, 229, 235, 252, 255, 265, 272, 273, 275 to 277, 283, 312, 313 |
+| Growth, social, and events | 020, 041 to 045, 079, 085, 113, 141 to 146, 149 to 153, 164, 178, 201, 220, 228, 229, 235, 252, 255, 265, 272, 273, 275 to 277, 283, 312, 313, 351 |
 | CRM and contact sync | 188, 190, 292, 305, 306, 308, 322, 323, 332 |
 | Platform and tooling | 104, 123, 179, 221, 242 to 248, 253, 279, 295, 296, 310, 336, 337, 341, 342 |
 
@@ -80,7 +80,7 @@ These migrations drop data. Most are early schema churn. The 2026 entries either
 
 These migrations rewrite existing rows. Rehearse a new backfill on a representative database first to measure lock time and cost.
 
-- **Identity and users**: 212 (`profile_completed`), 214 (`account_type` values), 220 (`acquisition_source` inference), 226 (stuck students), 254 (profile nulls and missing `DriverApplications`), 262 (E.164 phones, skipping collisions), 263 (provisional accounts), 278 (`location_updated_at`), 279 (test users), 280 (Google education proofs), 282 (auto-queue off for everyone), 314 (clear `is_waitlisted`).
+- **Identity and users**: 212 (`profile_completed`), 214 (`account_type` values), 220 (`acquisition_source` inference), 226 (stuck students), 254 (profile nulls and missing `DriverApplications`), 262 (E.164 phones, skipping collisions), 263 (provisional accounts), 278 (`location_updated_at`), 279 (test users), 280 (Google education proofs), 282 (auto-queue off for everyone), 314 (clear `is_waitlisted`), 351 (`share_link_created_at` for users with a Dub link).
 - **Pricing and fleets**: 166 (price parameter IDs), 177 (fleet community), 199 (end duplicate prices), 200 (vehicle types), 209 (price tiers), 231 (student-only Yelo fleet), 297 (end archived community prices), 316 (fleet community services), 325 (jitter settings), 333 and 334 (fleet-owned vehicles and the Breeze cart).
 - **Places**: 227 (empty `mapbox_id`), 260 (canonical categories), 328 and 331 (place identity backfill runs through River in resumable 500-row batches, not inside the migration), 345 (canonical top locations).
 - **Messaging and notifications**: 190 (Quo contact ID), 195 (duplicate push tokens), 249 and 250 (notification receipts and policies), 286 (push tokens from telemetry), 300 (message ordinals and streams).
@@ -490,6 +490,7 @@ Durable ride messaging, automatic school mapping, Stripe reconciliation, driver 
 | `000345_canonical_top_locations` | 2026-09-25 | [#265](https://github.com/rideyelo/yelo-api/pull/265) | Canonical top locations: `PlaceProfiles`, `CommunityTopLocations`, settings; migrates up to four legacy slots per community. | Backfill |
 | `000346_fleet_archive_reference_guards` | 2026-09-25 | [#273](https://github.com/rideyelo/yelo-api/pull/273) | Fleet archive reference guard triggers. |  |
 | `000347_restore_location_address_constraint` | 2026-09-25 | [#274](https://github.com/rideyelo/yelo-api/pull/274) | Adds the unique `Locations.address` constraint that production already had outside migration history. It is a no-op where the constraint exists. |  |
+| `000351_user_share_link_state` | 2026-10-05 | [#300](https://github.com/rideyelo/yelo-api/pull/300) | Adds `Users.share_link_created_at` and `Users.share_link_fingerprint` to track Dub share link state for the [self-healing sweep](/engineering/domains/referrals-and-links#self-healing-sweep). Sets `share_link_created_at` to `now()` where `has_dub_link` is true, so existing links start unsynced and get rewritten once. `has_dub_link` is superseded. | Backfill |
 
 ## Related pages
 

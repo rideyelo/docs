@@ -114,6 +114,8 @@ A bump tells friends where you're heading. `components/bottom-sheets/BumpFriends
 
 The preview comes from `GET /referral/invite/{code}` with a 10-second timeout.
 
+For a signed-out user who opened it from a universal link, the screen also calls Dub `trackOpen()` for `https://join.yelo.link/<code>` and stores the returned click ID. **Get started** stores the `medium` route param, if any, next to the code.
+
 ### Deferred attribution
 
 `components/ReferralCaptureObserver.tsx` runs once per cold start, 750 ms after the app is interactive. It calls Dub's `trackOpen()` and inspects the resolved link:
@@ -121,11 +123,13 @@ The preview comes from `GET /referral/invite/{code}` with a 10-second timeout.
 - A fleet code saves a pending fleet join and navigates to `/fleet-join/<code>`.
 - Otherwise the Dub link `key` (or the last URL path segment) is saved as the referral code.
 
-Codes live in AsyncStorage under `@yelo/referral_code` (`lib/storage/referralAttribution.ts`). The Auth v3 **Finish profile** step submits it. See [Auth and onboarding](/engineering/mobile/auth-and-onboarding#exchange-profile-permissions).
+When `trackOpen()` returns a click ID, the observer stores it too.
+
+Codes live in AsyncStorage under `@yelo/referral_code` (`lib/storage/referralAttribution.ts`). The Dub click ID and share medium live next to it under `@yelo/referral_click` as `{ clickId, medium }`. `clearCapturedCode` clears both keys. Native Auth v3 accept sends them as `dub_click_id` and `utm_medium`, and the hosted signup URL carries them as `dub_id` and `utm_medium`. The Auth v3 **Finish profile** step submits the code. See [Auth and onboarding](/engineering/mobile/auth-and-onboarding#exchange-profile-permissions).
 
 ### Sharing your link
 
-`useReferralLink()` returns the personalized link from `GET /referral/link`, or a static App Store link while loading. `QRBottomSheet` only encodes the personalized link. The `referral-share` screen (from **Bring your group** in the friends hub) renders a share card.
+`useReferralLink()` returns the personalized link from `GET /referral/link`, or a static App Store link while loading. `QRBottomSheet` only encodes the personalized link. It appends `qr=1` to the QR-encoded copy, not the copied or shared link, so scans are attributed to the `qr` medium. The `referral-share` screen (from **Bring your group** in the friends hub) renders a share card.
 
 ## Connect Uber, Lyft, and Empower
 

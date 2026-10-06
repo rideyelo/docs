@@ -64,6 +64,7 @@ Who referred whom.
 - There is no primary key, only the unique constraint `referrals_referee_id_unique`.
 - `AddReferral` (`queries/referral.sql`) and `AssignAuthV3Referral` (`queries/authv3.sql`) insert with `ON CONFLICT (referee_id) DO UPDATE SET referrer_id = "Referrals".referrer_id`, so the first referrer wins and the call still returns the stored referrer.
 - During auth v3 signup, the referral code comes from the transaction's earliest `"AttributionTouches".referral_code` and resolves to a referrer through `"Users".referral_code`, excluding deleted and banned users.
+- At profile completion, if no code was presented or bound, `applyAuthV3AmbientReferral` applies the most recent `referral_code` on the user's claimed anonymous touches. Invalid, self, and conflicting codes are dropped silently. Only server errors fail the signup.
 - Read by `GetUserReferrals`, `GetReferrers` (dashboard leaderboard), and `analytics.sql`.
 
 ### ReferralRewards
@@ -131,7 +132,7 @@ Marketing touchpoints captured before and during signup.
 | --- | --- | --- | --- | --- |
 | `id` | `uuid` | no | `gen_random_uuid()` | Primary key. |
 | `anonymous_id` | `text` | no | | Client-generated visitor ID. CHECK non-blank. |
-| `auth_transaction_id` | `uuid` | yes | | Signup flow. FK to `"AuthTransactions"` `ON DELETE SET NULL`. |
+| `auth_transaction_id` | `uuid` | yes | | Signup flow. FK to `"AuthTransactions"` `ON DELETE SET NULL`. `NULL` for anonymous touches from `POST /authv3/attribution/touch` until a transaction claims them. |
 | `user_id` | `uuid` | yes | | Set once the flow authenticates. FK to `"Users"` `ON DELETE SET NULL`. |
 | `touched_at` | `timestamptz` | no | `now()` | Touch time. Orders first and last touch. |
 | `landing_surface` | `text` | no | | Where the visitor landed. CHECK non-blank. |
@@ -143,7 +144,7 @@ Marketing touchpoints captured before and during signup.
 | `metadata` | `jsonb` | no | `'{}'` | Extra fields. CHECK object and at most 4096 bytes. |
 | `created_at` | `timestamptz` | no | `now()` | Insert time. |
 
-Indexes on `(anonymous_id, touched_at)`, on `auth_transaction_id` where set, and on `(user_id, touched_at)` where set. Written by `CreateAuthV3AttributionTouch` in the auth v3 flow. Read by `analytics.sql` and `internal/service/notifications/signup_alert.go`.
+Indexes on `(anonymous_id, touched_at)`, on `auth_transaction_id` where set, and on `(user_id, touched_at)` where set. Written by `CreateAuthV3AttributionTouch` in the auth v3 flow, and by the public [anonymous touch endpoint](/engineering/identity/auth-v3-transactions#record-an-anonymous-link-touch) with `auth_transaction_id` `NULL`. When a transaction resolves, `AssociateAuthV3TransactionAttribution` claims the transaction's touches plus unclaimed anonymous touches with the same `anonymous_id` touched within 90 days before `authenticated_at`. Read by `analytics.sql` and `internal/service/notifications/signup_alert.go`.
 
 ### UserAttribution
 

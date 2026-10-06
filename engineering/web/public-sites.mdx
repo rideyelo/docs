@@ -10,7 +10,7 @@ Five `yelo-web` sites need no sign-in: `event`, `invite`, `world-cup`, `home`, a
 | Site | Bootstrap | Router | Data | Link preview tags | Analytics |
 | --- | --- | --- | --- | --- | --- |
 | `event` | `renderSite({ query, router, toaster })` | React Router: `/:slug` | `GET /public/events/slug/{slug}` | None; static `<title>Yelo Event</title>`, runtime `document.title` | None |
-| `invite` | `renderSite({ query, router, dubAnalytics })` | React Router: `/fleet/:code`, `/:code` | `GET /referral/invite/{code}`, `GET /fleet-join/{code}` | Static `og:*` in `index.html` | Dub |
+| `invite` | `renderSite({ query, router, dubAnalytics })` | React Router: `/fleet/:code`. `/:code` redirects in `index.html` before the router runs | `GET /fleet-join/{code}` | Static `og:*` in `index.html` | Dub |
 | `world-cup` | `renderSite(<LandingV5 />)`, no providers | None | `GET /world-cup/standings`, `GET /world-cup/activity` through `/world-cup/api` | `<meta name="description">` only | None |
 | `home` | Plain `createRoot` | Custom pathname switch | None | Full `og:*` and `twitter:*`, plus per-route static HTML | None |
 | `maestro` | `renderSite(<App />, {})`, no providers | `?run=` query param | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
@@ -45,17 +45,9 @@ The invite site handles two kinds of shared link. Firebase redirects `/` and `/i
 
 ### Referral invites (`/:code`)
 
-<Steps>
-  <Step title="Apple devices leave immediately">
-    On mount, `referralFallbackURL()` (`referralHandoff.ts`) checks for iPhone, iPad, iPod, or a touch-capable Mac and replaces the location with the App Store URL plus `&ct=<code>` for campaign attribution. iOS normally opened the app from the original `join.yelo.link` universal link already, so this page is a store fallback. It never probes a custom scheme, because Safari shows an invalid-address alert when the app is missing.
-  </Step>
-  <Step title="Everyone else sees the inviter">
-    `useReferralGetInvitePreview` calls `GET /referral/invite/{code}` (`server/http/referral/referral_routes.go:33`), which resolves the code with `GetAuthUserByReferralCode` and returns the inviter's first name, photo thumbnail, and user ID. Without a photo, the avatar color comes from an FNV-1a hash of the user ID over a five-color palette. The app and `ogcard.DeterministicColor` in `yelo-api/internal/utilities/ogcard/color.go` implement the same function, and all three must agree.
-  </Step>
-  <Step title="Sign up on the web">
-    The primary button links to `https://joinyelo.com/auth/v3?code=<code>`. Auth v3's attribution capture reads `code` as `referral_code` (`src/sites/signup/auth-v3/attribution.ts`).
-  </Step>
-</Steps>
+Personal referral invites no longer render on this site. The landing moved to the `signup` site at `/i/<code>`, served on `joinyelo.com/i/<code>` through the `experience-router` Worker, so its attribution cookies (`yelo_anon_id`, `dub_id`) are first-party to the `joinyelo.com` sign-up page. See [Signup and Auth v3 site](/engineering/web/signup-and-auth-site#referral-invite-landing) for the page itself.
+
+An inline script in `src/sites/invite/index.html` runs before the bundle. For a single-segment path `/<code>`, it calls `location.replace()` with `https://joinyelo.com/i/<code>` and the original query string. Personal `join.yelo.link` Dub links use `REFERRAL_LANDING_BASE_URL` (intended value `https://joinyelo.com/i`) as their destination base, and the [self-healing sweep](/engineering/domains/referrals-and-links#self-healing-sweep) rewrites existing links. The redirect covers `invite.yelo.link/<code>` URLs still in circulation.
 
 ### Fleet driver invites (`/fleet/:code`)
 
@@ -140,7 +132,7 @@ The second entry, `auth/v3/index.html`, mounts the signup `AuthV3Page`. The Nx b
 | Site | Paths |
 | --- | --- |
 | event | `yelo-web/src/sites/event/` (`EventPage.tsx`, `CheckoutModal.tsx`, `lib/`); API `yelo-api/internal/server/http/event/public_handler.go` |
-| invite | `src/sites/invite/` (`InvitePage.tsx`, `FleetInvitePage.tsx`, `referralHandoff.ts`, `appLink.ts`); API `server/http/referral/`, `server/http/fleetjoin/` |
+| invite | `src/sites/invite/` (`index.html` redirect script, `FleetInvitePage.tsx`, `appLink.ts`); API `server/http/fleetjoin/`. The referral landing is in `src/sites/signup/invite/` |
 | world-cup | `src/sites/world-cup/` (`components/LandingV5.tsx`, `hooks/useWorldCupStandings.ts`, `lib/worldCup.ts`, `README.md`); API `server/http/worldcup/`, `service/worldcup/` |
 | home | `src/sites/home/` (`main.tsx`, `navigation.ts`, `contact.ts`, `README.md`), `scripts/emit-partner-html.mjs`, `tools/vite/home/gen-home-images.ts` |
 | maestro | `src/sites/maestro/` |
