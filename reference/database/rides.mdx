@@ -141,7 +141,12 @@ These columns are explained in [Payments tables](/reference/database/payments#ri
 | `stripe_merchant_id` | `text` | Yes | | Connected account that owns the PaymentIntent. |
 | `driver_payout` | `real` | Yes | | Driver earnings for the ride in dollars, including tip or cancellation fee. |
 | `tips_enabled`, `tip_amount`, `tip_window_expires_at`, `tip_payment_intent_id` | | | | Tip state. |
-| `stripe_fee_cents`, `stripe_fee_repair_after` | `bigint`, `timestamptz` | Yes | | Stripe processing fee and the repair backoff. |
+| `stripe_fee_cents`, `stripe_fee_repair_after` | `bigint`, `timestamptz` | Yes | | Actual Stripe processing fee on the fare charge, in cents, and the repair backoff. |
+| `estimated_stripe_fee_cents` | `bigint` | Yes | | Estimated fee on the fare charge, in cents. Written with `driver_payout`. Used until `stripe_fee_cents` is known. |
+| `tip_stripe_fee_cents` | `bigint` | Yes | | Actual Stripe fee on the dedicated tip charge, in cents. Filled by the fee repair job. |
+| `estimated_tip_stripe_fee_cents` | `bigint` | Yes | | Estimated fee on the dedicated tip charge, in cents. Written by `RecordCompletedRideTip`. |
+
+What the driver keeps is computed, not stored. `ride_driver_earnings_cents` returns gross less the fee per charge (actual, else stored estimate, else a live estimate). See [Net earnings after Stripe fees](/engineering/domains/driver-earnings-and-activity#net-earnings-after-stripe-fees).
 
 ### Legacy columns
 
@@ -162,7 +167,8 @@ No current query reads or writes these by name. They remain from earlier version
 - `idx_rides_rider_status (rider_id, status)`, `idx_rides_driver_status (driver_id, status)`, `idx_rides_community_status (community_id, status)`.
 - Partial indexes for hot paths: `idx_rides_queued_driver` (queued rides with a driver), `idx_rides_unmatched_confirmed` (confirmed rides with no driver or offer), `idx_rides_potential_driver`, `idx_rides_complete_time`, `idx_rides_community_confirm_time`, `idx_rides_community_request_time_with_route`.
 - `rides_rider_history_idx` and `rides_driver_history_idx` on `(user, request_time DESC)` where status is `complete` or `pending_rider_rating`.
-- `rides_missing_fee_driver_idx` and `rides_missing_fee_payment_intent_idx` support the Stripe fee repair job.
+- `rides_missing_fee_driver_idx`, `rides_missing_fee_payment_intent_idx`, `rides_missing_tip_fee_driver_idx`, and `rides_missing_tip_fee_payment_intent_idx` support the Stripe fee repair job for fare and dedicated tip charges.
+- SQL functions `stripe_fee_estimate_cents`, `ride_fare_fee_estimate_cents`, and `ride_driver_earnings_cents` (8- and 9-argument forms) define driver net earnings.
 - Trigger `attach_yelo_pickup` and `attach_yelo_destination` (`BEFORE INSERT OR UPDATE`) run `attach_yelo_place` to resolve `*_place_id`.
 - Trigger `contact_sync_rides` (`AFTER INSERT OR UPDATE OR DELETE`) queues `ContactSyncRequests` for the rider and driver when a ride enters or leaves "completed and not cancelled".
 - Trigger `guard_fleet_ride_archive` (`BEFORE INSERT OR UPDATE OF fleet_id`) rejects a ride that references an archived fleet. See [Fleet archival](/reference/database/fleets-and-vehicles#fleet-archival).
@@ -183,7 +189,7 @@ Matching code also takes a Postgres advisory lock per ride (`AcquireRideAdvisory
 ### Gotchas
 
 - `rider_id`, `driver_id`, `community_id`, `driver_vehicle_id`, `discount_id`, and `destination_event_id` have no foreign keys. Deleting a user or community leaves orphaned rides.
-- Money is stored as `real` dollars in most columns, but `tip_amount` and `pre_auth_amount` are `numeric(10,2)` and `stripe_fee_cents` is integer cents. Payment code converts with `ROUND(... * 100)`.
+- Money is stored as `real` dollars in most columns, but `tip_amount` and `pre_auth_amount` are `numeric(10,2)` and the `*stripe_fee_cents` columns are integer cents. Payment code converts with `ROUND(... * 100)`.
 - `DeleteAllRides` in `ride_lifecycle.sql` deletes every row. It exists for test and fixture tooling.
 
 ## RideEvents

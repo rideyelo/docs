@@ -54,7 +54,7 @@ flowchart LR
 | Product, Price, Payment Link | Connected (fleet) | `QrPaymentService.CreateConfig` and `UpdatePricing` | `QrPaymentConfigs.stripe_product_id`, `stripe_price_id`, `stripe_payment_link_id`, `stripe_payment_link_url` |
 | Checkout Session | Connected (fleet or driver) | `TippingService.createCheckout` | `QrTipVisits.stripe_checkout_session_id` for signed-in tippers, `QrPayments.stripe_session_id` after the webhook |
 | Payout | Connected (driver) | `Client.CreatePayout` from `POST /earnings/payouts/instant`, or Stripe's automatic schedule | Not stored |
-| Balance transaction | Connected | Stripe | Only the fee: `Rides.stripe_fee_cents`, filled by the drive fee repair job |
+| Balance transaction | Connected | Stripe | Only the fee: `Rides.stripe_fee_cents` (fare charge) and `Rides.tip_stripe_fee_cents` (dedicated tip charge), filled by the drive fee repair job |
 
 <Note>
 The `PaymentIntents` table (migration `000017`) is legacy. `PaymentIntentRepository.Create` has no callers, so the table never gets new rows. Webhook handlers still run `UpdatePaymentIntentStatus` against it, which updates zero rows.
@@ -77,7 +77,10 @@ These `Rides` columns carry the whole payment state of a ride:
 | `tip_payment_intent_id` | text | `SetRideTipPaymentIntentID` | Latest dedicated tip charge |
 | `tip_amount` | numeric(10,2) | `CompleteRideTip`, `RecordCompletedRideTip` | Tip actually recorded |
 | `driver_payout` | real | `Ride.Complete`, tip paths, and the `payment_intent.succeeded` webhook | Gross amount on the connected account for this ride |
-| `stripe_fee_cents` | bigint | Drive fee repair job | Stripe fee on the fare charge |
+| `stripe_fee_cents` | bigint | Drive fee repair job | Actual Stripe fee on the fare charge |
+| `estimated_stripe_fee_cents` | bigint | Payout writers | Estimated fee on the fare charge (2.9% + 30¢ of the authorized amount), used until `stripe_fee_cents` is known |
+| `tip_stripe_fee_cents` | bigint | Drive fee repair job | Actual Stripe fee on the dedicated tip charge |
+| `estimated_tip_stripe_fee_cents` | bigint | `RecordCompletedRideTip` | Estimated fee on the dedicated tip charge |
 
 `price` and `discounted_price` are `real` (float4). This matters for cent rounding. See [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents#amount-math).
 
