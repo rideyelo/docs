@@ -80,6 +80,28 @@ If a value is not allowed, the API returns `400 Bad Request` with a message such
   **Haptic** is saved but never sent to devices, so changing it has no effect on the notification.
 </Note>
 
+### Limits and quiet hours
+
+The same **Template settings** card holds the category, the destination link, and the delivery limits. **Save configuration** saves them together with the push settings.
+
+| Setting | Values | What it does |
+| --- | --- | --- |
+| **Category** | `transactional`, `marketing`, `safety` | Classifies the template. Only `marketing` templates, plus `community_broadcast`, can be deferred for quiet hours. |
+| **Destination link** | Text with `{{variable}}` placeholders | The link the notification opens. Insert variables with the buttons below the field, the same way as in variant copy. The field follows the [template validation](#template-validation) rules, and **Save configuration** stays disabled while it has an error. SMS templates hide it. |
+| **Quiet hours** | **Bypass (urgent)** or **Defer until quiet hours end** | **Bypass (urgent)** sends immediately. **Defer until quiet hours end** holds the notification until the community's quiet window ends. |
+| **User cooldown (seconds)** | Whole number, 1 or more | Minimum gap between two sends of this notification to the same user. Recipients inside the gap are suppressed as `user_cooldown`. |
+| **Community cooldown (seconds)** | Whole number, 1 or more | Minimum gap between two sends of this notification in the same community. Recipients inside the gap are suppressed as `community_cooldown`. |
+| **Maximum defer (seconds)** | Whole number, 1 or more | The longest a deferred notification can wait. If quiet hours end later than this, recipients are suppressed as `quiet_hours_expired`. |
+| **Maximum recipients** | Whole number, 1 or more | The most eligible recipients one dispatch can have. Yelo cancels a dispatch over the cap and does not retry it. `message_sent` ignores the cap. |
+
+Leave a number field empty for no limit. The field shows **No limit**. The API rejects zero and negative numbers with `400 Bad Request`, for example `max_recipients must be greater than zero or null`.
+
+<Note>
+  **Quiet hours** sets how the template behaves during a quiet window. It does not set the window. The start and end times come from the `NotificationPolicies` table, which no dashboard page edits. Without an active policy row for the community, **Defer until quiet hours end** never defers anything. See [Limits, cooldowns, and quiet hours](/concepts/notifications#limits-cooldowns-and-quiet-hours).
+</Note>
+
+Some codes, including `ride_available` and `message_sent`, always skip cooldowns and quiet hours, whatever the template says.
+
 ## Preview and test
 
 Under **Preview and test**, choose a **Variant**, fill in sample values, and click **Render preview**. After you review a valid preview, enter a phone number under **Admin test send** and click **Send test**. Test sends are marked **Test** in history.
@@ -107,6 +129,52 @@ The API also returns the sender in the `sender_name` field on notification log e
   "is_test": false
 }
 ```
+
+### Read a dispatch
+
+Click a row in the **History** table to open the dispatch. You can also focus a row and press <kbd>Enter</kbd> or <kbd>Space</kbd>.
+
+The header shows the notification type, the dispatch status, the title and body that were sent, and the time it was created. Test dispatches show a **Test traffic** badge.
+
+The summary lists these fields. **Sender** and **Deferred reason** are hidden when they're empty. **Scheduled** and **Expires** show a dash instead.
+
+| Field | Meaning |
+| --- | --- |
+| **Sender** | Who triggered the dispatch. It matches the **Sender** column. |
+| **Recipients**, **Delivered**, **Failed**, **Suppressed**, **Deferred** | Recipient counts for the dispatch. They match the **Outcomes** column. |
+| **Scheduled** | When a scheduled or deferred dispatch is due to send. |
+| **Expires** | Set on a deferred dispatch whose template has a **Maximum defer (seconds)**. It is the creation time plus that limit. |
+| **Deferred reason** | The reason recorded on the dispatch. When nobody was eligible, it holds the suppression reason, such as `no_reachable_recipients`. |
+| **Trace ID** | The trace identifier for the dispatch. |
+| **Ride timeline** | A link to the ride on the **Rides** page, when the dispatch belongs to a ride. |
+
+**Variant cohorts** shows one row per variant that received traffic:
+
+| Column | Meaning |
+| --- | --- |
+| **Variant** | The variant label and the first 8 characters of its ID. |
+| **Configured** | The traffic percentage set on the variant. |
+| **Allocated** | Recipients assigned to the variant. |
+| **Attempted** | Recipients Yelo tried to send to. |
+| **Accepted** | Accepted rate, with the accepted count in parentheses. |
+| **Deliverability** | Deliverability rate, with delivered and failed counts in parentheses. |
+| **Tap rate** | Tap rate, with the opened count in parentheses. |
+| **Receipts** | **Mature** once the cohort's receipts have matured. Otherwise the number still pending. |
+
+The rates use the same definitions as [Analytics](#analytics).
+
+**Per-user delivery receipts** lists every recipient:
+
+| Column | Meaning |
+| --- | --- |
+| **User** | The recipient's name, or **Unknown**, and the first 8 characters of their user ID. |
+| **Variant** | The variant the recipient received. |
+| **Status** | The delivery status for this recipient. Test recipients also show a **Test** badge. |
+| **Sent**, **Delivered**, **Opened** | Timestamps for each stage, or a dash when the stage hasn't happened. |
+| **Receipt / suppression** | The Expo receipt status. Without a receipt, it shows the suppression reason, such as `user_cooldown`. With neither, a deferred delivery shows **Deferred to** and the scheduled time. |
+| **Error** | The error code and message for a failed delivery. Hover over it to read the full message. |
+
+To work out why one recipient didn't get a notification, compare **Status** and **Receipt / suppression** with the result table in [Push notifications not arriving](/runbooks/push-notifications#diagnose).
 
 ## Analytics
 
