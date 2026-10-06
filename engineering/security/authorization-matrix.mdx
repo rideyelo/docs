@@ -266,6 +266,8 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | GET | `/dashboard/users/detail/{id}` and `/fleets`, `/messages`, `/notifications` | `admin` role gate | |
     | PUT | `/dashboard/users/detail/{id}/profile`, `/tags`, `/test-status`, `/fleet`, `/fleets`, `/fleet-transfer` | `admin` role gate | Fleet membership changes also require admin in the service |
     | POST | `/dashboard/users/detail/{id}/move-to-yelo` | `admin` role gate | |
+    | GET | `/dashboard/users/manual-payments/fund-sources` | `admin` role gate | `manualPaymentAdmin`: role `admin` and the `manual_payments` Clerk metadata claim. Otherwise 403 |
+    | POST | `/dashboard/users/detail/{id}/manual-payment` | `admin` role gate | Same `manualPaymentAdmin` check. Moves platform funds to the driver's Stripe account. See [Manual payments](/engineering/payments/payouts-and-earnings#manual-payments) |
     | GET | `/dashboard/{id}/users` | Admin, intern | Intern forced to own community |
     | GET | `/dashboard/notifications`, `/history`, `/detail/{id}`, `/analytics/types`, `/analytics/variants` | `admin` role gate | |
     | POST | `/dashboard/notifications/send` | `admin` role gate | |
@@ -368,6 +370,7 @@ These routes pass their gate as designed, but the gate is looser than the data t
 | Dashboard scope gate | `yelo-api/internal/server/http/dashboard_scope.go` |
 | Metrics and pprof mount | `yelo-api/internal/server/http/middleware_metrics_auth.go`, `middleware_pprof.go` |
 | Claim helpers | `yelo-api/internal/utilities/context/context.go` |
+| Manual payment grant | `yelo-api/internal/service/dashboard/manual_payment.go` (`manualPaymentAdmin`) |
 | Ride participant checks | `yelo-api/internal/service/ride/ride.go`, `driver.go`, `messaging.go`, `tip_charge.go` |
 | Catalog OIDC verifier | `yelo-api/internal/server/http/vehiclecatalog/oidc.go` |
 | Gate tests | `yelo-api/internal/server/http/dashboard_admin_gate_test.go`, `dashboard_scope_test.go`, `*/gate_enumeration_test.go` |
@@ -377,6 +380,7 @@ These routes pass their gate as designed, but the gate is looser than the data t
 - **Scope rejections are 401, not 403.** A payload-less 401 from `/dashboard` usually means the scope gate, not an expired Clerk token.
 - **The scope gate matches paths, not routes.** A new route under an allowed prefix, such as `/dashboard/communities/{id}/locations/...`, is reachable by interns immediately. Add a handler check when the new route is sensitive.
 - **Interns can mutate.** Interns can create, update, and delete events, locations, and top locations in their own community.
+- **Admin isn't enough to send money.** The two manual payment routes also need `manual_payments: true` in the caller's Clerk metadata claim (`ClerkCustomClaims`). The check lives in the service (`manualPaymentAdmin`), not in middleware, and no API route sets the claim.
 - **Fleet managers pass the gate for `/dashboard/calendar-owner`.** Only the handler's `requireAdmin` blocks them.
 - **Optional auth hides token errors.** `GET /ride/{id}` treats an expired or banned token as anonymous, and anonymous callers see everything except the confirm code.
 - **Clerk verification has no authorized-party check.** `clerkAuthMiddleware` passes no `AuthorizedPartiesChecker` to `clerkhttp.WithHeaderAuthorization`.

@@ -51,6 +51,8 @@ See [Ride tip charging](/engineering/payments/ride-tips).
 | Signature, timestamp, or API version mismatch | `[stripe-webhook] signature verification failed` | 500. Nothing applied. Stripe retries |
 | Secret missing | `[stripe-webhook] STRIPE_WEBHOOK_SECRET is empty` | Same |
 | Payout or account event for a fleet or unknown account | `failed to handle payout event`, `failed to handle account updated` | 500 on every retry |
+| DB error while waking ride operations on a `payment_intent.*` event | `failed to wake ride payment operation` | 500. The `payment_intent.succeeded` payout write doesn't run for that delivery. Stripe retries |
+| `payment_intent.canceled`, `processing`, `requires_action`, or `amount_capturable_updated` | `[stripe-webhook] payment intent update` | 200. Only the wake-up runs, and it matches no rows on `main`. No ride column changes |
 
 See [Stripe webhooks](/engineering/payments/webhooks).
 
@@ -125,7 +127,7 @@ These log messages and metrics indicate money is stuck or out of sync. Search fo
 | `CIRCUIT_BREAKER_TRIPPING` with component `stripe` | `circuitbreaker.NewSettings` | Wrapped Stripe calls are failing fast for 60 seconds |
 | `Stripe reconciliation coverage` at warning level | `reconciliationDispatchWorker` | Accounts are failed or overdue by more than 25 hours. Accounts Stripe rejects as invalid are counted separately and don't trigger it |
 
-There's no admin endpoint to recapture, cancel, or refund. All manual fixes happen in the Stripe Dashboard, and the Yelo row must be corrected separately, because refunds and cancellations made in Stripe don't flow back through webhooks.
+There's no admin endpoint to recapture, cancel, or refund. All manual fixes happen in the Stripe Dashboard, and the Yelo row must be corrected separately, because refunds and cancellations made in Stripe don't change the ride. `charge.refunded` isn't handled. `payment_intent.canceled` is routed to `PaymentService.PaymentIntentUpdated`, which only reschedules pending ride operation jobs and writes no ride column. See [Waking ride operations](/engineering/payments/webhooks#waking-ride-operations).
 
 ## Where this lives in code
 
@@ -142,7 +144,7 @@ There's no admin endpoint to recapture, cancel, or refund. All manual fixes happ
 ## Gotchas and edge cases
 
 - **Stripe is called before the database.** Accept, cancel, complete, and tip paths all mutate Stripe first and write Yelo second. Any DB failure after a Stripe success leaves the two out of sync, and only some paths compensate.
-- **No durable command journal.** `RideOperations` exists in the schema, but `RideOperationJournal` isn't wired into service construction. Nothing replays a half-finished money operation after a crash.
+- **No durable command journal.** `RideOperations` exists in the schema, but `RideOperationJournal` isn't wired into service construction. Nothing replays a half-finished money operation after a crash. The webhook already tries to wake its jobs on every routed `payment_intent.*` event and finds none. See [Ride operation journal](/engineering/payments/ride-operation-journal).
 - **In-process sweeper.** `TipCapture` runs in every API instance with no leader election. Correctness relies on `charge_already_captured` handling and the `status = 'pending_rider_rating'` guard.
 - **Retries on declines.** Capture and cancel use a retrier that retries every Stripe error, including permanent ones, three times with backoff. That adds seconds of latency to requests that were never going to succeed.
 - **No refunds in code.** Nothing in the API issues a refund, so a rider refund is always a manual Stripe action followed by a manual DB fix.

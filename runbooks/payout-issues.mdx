@@ -1,6 +1,6 @@
 ---
 title: "Payout issues"
-description: "Fix restricted or pending Stripe accounts for drivers and fleets, fleets that aren't payout-ready, stale Stripe status, and failed payouts"
+description: "Fix restricted or pending Stripe accounts for drivers and fleets, fleets that aren't payout-ready, stale Stripe status, failed payouts, and manual payment problems"
 ---
 
 Yelo keeps a copy of each connected account's state: `DriverApplications.stripe_status` for owner-operator drivers and `Fleets.stripe_status` for fleets. Going online, fleet joins, and ride pushes read that copy, not Stripe. Most payout incidents are either a real Stripe requirement or a stale copy.
@@ -100,6 +100,23 @@ Yelo keeps a copy of each connected account's state: `DriverApplications.stripe_
     Stripe's `payout.failed` and `payout.canceled` events send the driver a push that opens the earnings screen. The fix is on the Stripe side, usually bank details. The driver uses the Stripe Express dashboard link in the app. For a fleet, use **Open Stripe dashboard** on the **Operations** tab. Yelo can't retry a payout.
   </Accordion>
 </AccordionGroup>
+
+## Manual payment problems
+
+Admins with the manual payment grant can send a driver a one-off payment from the user detail sheet (**Send payment**). Yelo stores no row for it. See [Manual payments](/engineering/payments/payouts-and-earnings#manual-payments).
+
+**Find the transfer.** In Cloud Logging, search for `admin sent manual driver payment`. The line carries `actor_id`, `user_id`, `transfer_id`, `source_type`, and `amount`. In Stripe, the transfer on the platform account has metadata `kind = manual_payment`, `user_id`, `actor_id`, and `internal_note`. An attempt that never completed still logs `admin sending manual driver payment`.
+
+**Reverse a payment.** Nothing in the API or the dashboard reverses a transfer. The confirm step says "This moves real money and cannot be undone from the dashboard." Any reversal happens in Stripe, against the transfer on the platform account identified by `transfer_id`. Yelo has no record to correct afterward.
+
+**The title wasn't applied (`title_applied: false`).** The dashboard shows a warning toast that names the amount and the driver and ends "but the title was not applied. Do not send it again." The money moved. Only the follow-up call that titles the payment on the driver's account failed.
+
+- Don't send the payment again. A new send is a second transfer.
+- Find the warning log `manual payment sent but driver-facing title was not applied`. It has the `transfer_id` and the Stripe error.
+- Until it's fixed, the driver's activity row shows the payment without the admin's title, and the feed can count it as a ride.
+- To fix it, update the transfer's destination payment on the driver's connected account in Stripe. Set its description to the intended title and its metadata to `kind = manual_payment`. That's what the failed `Charges.Update` call writes.
+
+**The request failed with an unclear result.** On a timeout or 5xx, the dashboard keeps the idempotency key and says "Press Send again to retry safely; it will not pay twice." Retry from the same open dialog. Closing it discards the key, so check Stripe for the transfer before starting a new payment.
 
 ## Verify
 

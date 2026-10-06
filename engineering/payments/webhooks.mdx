@@ -44,13 +44,46 @@ The handler accepts one signing secret. Ride PaymentIntents, Express accounts, p
 
 | Event | Handler | Writes | Error surface |
 | --- | --- | --- | --- |
-| `payment_intent.succeeded` | `PaymentService.PaymentSucceeded` | `Rides.driver_payout` for rides whose `payment_intent_id` matches. `PaymentIntents.status`, zero rows in practice | DB errors |
-| `payment_intent.payment_failed` | `PaymentService.PaymentFailed` | `PaymentIntents.status` only, zero rows in practice | DB errors |
+| `payment_intent.succeeded` | `PaymentService.PaymentIntentUpdated`, then `PaymentService.PaymentSucceeded` | The wake-up, then `Rides.driver_payout` and `Rides.estimated_stripe_fee_cents` for rides whose `payment_intent_id` matches. `PaymentIntents.status`, zero rows in practice | DB errors |
+| `payment_intent.payment_failed` | `PaymentService.PaymentIntentUpdated`, then `PaymentService.PaymentFailed` | The wake-up, then `PaymentIntents.status` only, zero rows in practice | DB errors |
+| `payment_intent.canceled`, `payment_intent.processing`, `payment_intent.requires_action`, `payment_intent.amount_capturable_updated` | `PaymentService.PaymentIntentUpdated` only | The wake-up. No ride column | DB errors |
 | `payment_intent.attached` | none | Nothing | Never |
 | `checkout.session.completed` | `PaymentService.CheckoutSessionCompleted` | One `QrPayments` row | Insert errors |
 | `account.updated` | `PaymentService.AccountUpdated` | `Fleets.stripe_status`, `Fleets.is_active`, driver application Stripe step | Missing owner, DB errors |
 | `payout.paid`, `payout.failed`, `payout.canceled` | `earnings.Service.HandlePayoutEvent` | Push notification | Missing owner |
 | Anything else | none | Nothing | Never |
+
+All six `payment_intent.*` types in the first three rows enter through `handlePaymentIntentUpdated`. It unmarshals the PaymentIntent, logs `[stripe-webhook] payment intent update` with the event type, intent ID, connected account, and status, and calls `PaymentIntentUpdated` first. Only then does it run the legacy handler for `succeeded` or `payment_failed`. The "wake-up" is described in [Waking ride operations](#waking-ride-operations).
+
+### Waking ride operations
+
+`PaymentService.PaymentIntentUpdated` treats a signed event as a hint to retry sooner, never as a financial receipt. It doesn't read the event's amounts or status.
+
+It returns without touching the database when any of these is missing:
+
+- `metadata.ride_id` on the PaymentIntent, parsed as a UUID
+- `event.account`
+- the PaymentIntent ID
+
+Ride fare intents and dedicated tip intents carry `ride_id` metadata (`internal/data/stripe/intent.go`). Platform events and intents without that metadata, such as QR Checkout charges, skip the wake-up.
+
+Otherwise it runs `WakeRidePaymentOperations` with four inputs: `ride_id` from metadata, `event.account`, the intent ID, and `metadata.operation_id`. The query sets `scheduled_at` to now on `river_job` rows that match all of these:
+
+| Condition | Detail |
+| --- | --- |
+| Job kind | `ride_operation` |
+| Job state | `scheduled` or `retryable`, with `attempt < max_attempts` and `scheduled_at` still in the future |
+| Operation | The job's `operation_id` argument is a `RideOperations` row for that ride in state `pending` |
+| Connected account | One of the operation's `RideOperationSteps` has a request `merchant_id` equal to `event.account` |
+| PaymentIntent | The same step names the intent in `request.payment_intent_id`, `request.intent_id`, or `result.payment_intent_id`. Or the step is `create_authorization` or `create_tip` with no result yet, and the operation ID equals `metadata.operation_id` |
+
+The last branch covers a creation call whose response was lost: the journal has no intent ID yet, so the match falls back to the operation ID that the journal stamps into the intent's metadata.
+
+The query only pulls `scheduled_at` in to the current time. It doesn't change a job's state or attempt count, so a duplicate event can't revive an exhausted or canceled job. `PaymentIntentUpdated` discards the affected row count.
+
+<Note>
+The wake-up matches zero rows in production on `main`. `RideOperations` rows and `ride_operation` jobs come from `payment.NewRideOperations`, which only tests construct. `RideOperations.RegisterWorkers` and `RideOperationRecoveryJob` have no callers either. See [Ride operation journal](/engineering/payments/ride-operation-journal#what-is-live-today). The `UPDATE` still runs for every ride and tip PaymentIntent event, so a database error there fails the webhook before the legacy handler runs.
+</Note>
 
 ### payment_intent.succeeded
 
@@ -68,7 +101,8 @@ WHERE ride.id = ANY($ids)
 
 - `driver_payout` becomes `amount_received / 100`, the amount Stripe actually captured.
 - Tip PaymentIntents, QR Checkout PaymentIntents, and Payment Link charges don't match any `payment_intent_id`, so they're no-ops.
-- The `RideOperations` guard is for a durable command journal that isn't wired into production (`RideOperationJournal`, migration `000339`). No rows exist, so the guard never blocks.
+- `MarkRidePaymentSucceeded` also snapshots `estimated_stripe_fee_cents` in the same statement. See [Stripe fee estimates](/engineering/payments/payouts-and-earnings#stripe-fee-estimates).
+- The `RideOperations` guard fences rides owned by the durable command journal (`RideOperationJournal`, migration `000339`), which isn't wired into production. No rows exist, so the guard never blocks.
 
 The write is unconditional. It doesn't compare with the current value or with event order.
 
@@ -122,6 +156,7 @@ Yelo doesn't store processed event IDs, so every delivery runs its handler again
 | Event | Duplicate delivery | Out-of-order delivery |
 | --- | --- | --- |
 | `payment_intent.succeeded` | Same value written again | Can overwrite a newer `driver_payout`, as in the tip case above |
+| Any routed `payment_intent.*` wake-up | Sets `scheduled_at` again on a job that's still waiting. No effect once the job ran | Order doesn't matter. The wake-up never applies event data |
 | `checkout.session.completed` | Ignored by the unique session ID | n/a |
 | `account.updated` | Status rewritten. Slack alert sent again for complete drivers. Fleet activation re-runs | An older event can regress `stripe_status`, for example from `complete` to `restricted`. Reconciliation corrects it within about 24 hours |
 | `payout.*` | Deduplicated by the notification event key | Pushes can arrive in any order |
@@ -135,6 +170,7 @@ Yelo doesn't store processed event IDs, so every delivery runs its handler again
 | Bad signature, stale timestamp, API version mismatch | 500 | Retries |
 | JSON unmarshal of the data object fails | 500 | Retries |
 | `account.updated` or `payout.*` for an account with no fleet and no user | 500. `GetUserProfileByStripeMerchantID` returns no rows, wrapped as a server error | Retries, then gives up |
+| DB error in `WakeRidePaymentOperations` | 500, wrapped as `failed to wake ride payment operation`. `PaymentSucceeded` and `PaymentFailed` don't run for that delivery | Retries |
 | DB error in any handler | 500 | Retries |
 | Unhandled type | 200 | Done |
 
@@ -159,15 +195,19 @@ stripe listen --forward-connect-to localhost:8080/stripe-webhook \
 | --- | --- |
 | Route registration | `yelo-api/internal/server/http/router.go`, `yelo-api/internal/server/http/payment/payment_routes.go` |
 | Verification and dispatch | `yelo-api/internal/server/http/payment/payment_handler.go` (`HandleStripeEvent`) |
-| Ride payout and QR recording, account status | `yelo-api/internal/service/payment/payment.go` |
+| `payment_intent.*` routing | `yelo-api/internal/server/http/payment/payment_handler.go` (`handlePaymentIntentUpdated`) |
+| Wake-up, ride payout and QR recording, account status | `yelo-api/internal/service/payment/payment.go` (`PaymentIntentUpdated`) |
+| Wake-up SQL | `yelo-api/internal/data/repository/queries/ride_operation.sql` (`WakeRidePaymentOperations`) |
 | Payout pushes | `yelo-api/internal/service/earnings/webhook.go` (`HandlePayoutEvent`) |
 | Webhook SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`LockRidePaymentWebhookTargets`, `MarkRidePaymentSucceeded`), `education_commerce.sql` (`InsertQrPayment`, `UpdatePaymentIntentStatus`) |
-| Unused journal guard | `yelo-api/internal/data/repository/ride_operation.go`, `yelo-api/migrations/000339_ride_operation_journal.up.sql` |
+| Unwired journal and worker | `yelo-api/internal/data/repository/ride_operation.go`, `yelo-api/internal/service/payment/ride_operations.go`, `ride_operation_worker.go`, `ride_operation_recovery.go`, `yelo-api/migrations/000339_ride_operation_journal.up.sql` |
 
 ## Gotchas and edge cases
 
-- **No failed-payment handling.** `payment_intent.payment_failed` only touches the unused `PaymentIntents` table. Ride state never changes from a webhook. Failures surface only through the synchronous Stripe call that caused them.
-- **No refund or dispute handling.** `charge.refunded`, `charge.dispute.*`, and `payment_intent.canceled` are ignored. A refund issued in the Stripe Dashboard leaves `driver_payout` and `tip_amount` unchanged.
+- **No failed-payment handling.** `payment_intent.payment_failed` runs the wake-up and then only touches the unused `PaymentIntents` table. Ride state never changes from a webhook. Failures surface only through the synchronous Stripe call that caused them.
+- **Cancellations write nothing.** `payment_intent.canceled` is routed, but only to the wake-up. A hold canceled in the Stripe Dashboard leaves the ride row unchanged.
+- **No refund or dispute handling.** `charge.refunded` and `charge.dispute.*` are ignored. A refund issued in the Stripe Dashboard leaves `driver_payout` and `tip_amount` unchanged.
+- **The wake-up needs a connected-account event.** `PaymentIntentUpdated` returns early when `event.account` is empty, so the same event delivered through a platform endpoint skips it.
 - **Synchronous side effects.** Fleet activation and driver reconciliation run inside the webhook request. A slow reconciliation can push the response past Stripe's timeout, which triggers a retry that runs everything again.
 - **Signature errors look like outages.** Because verification failures return 500, a rotated secret shows up as a spike of 500s on `/stripe-webhook`, not 400s.
 - **Slack noise.** Any `account.updated` for a complete driver account re-sends the "Stripe signup completed" Slack alert, including events caused by `PUT /earnings/payout-schedule`.
