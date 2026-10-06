@@ -125,9 +125,9 @@ Example: a user submits three strings with no region. Two are different formats 
 
 ### New friend push
 
-`UserService` writes friendships through `mapchanges.Service.WrapFriendships`, which covers contact matching, signup referrals (`applyReferralCode`), and invite links (`ConnectFriend`). The first user passed to `AddMutual` or `AddMutualBatch` is the joiner: the user who uploaded contacts, signed up, or tapped the invite. Referral and invite call sites pass the new user first, so the referrer or inviter receives the push.
+Every service writes friendships through `mapchanges.Service.WrapFriendships`, which wraps the shared `Friendship` repository. That covers contact matching (`UserService.linkMutualContacts`), signup referrals (`AuthV2Service.applyReferralCode`), and invite links (`UserService.ConnectFriend`). The first user passed to `AddMutual` or `AddMutualBatch` is the joiner: the user who uploaded contacts, signed up, or tapped the invite. Referral and invite call sites pass the acting user first (the new signup, or the existing user who tapped the invite), so the referrer or inviter receives the push.
 
-After the write, the wrapper compares against `FriendsAmong` and keeps only edges that did not exist before. When there is at least one, it:
+Before the write, the wrapper reads the existing edges with `FriendsAmong`. After the write, it keeps only edges that did not exist before. If that read fails, it logs `map.change.friendship_lookup_failed` and treats every edge as new. When there is at least one, it:
 
 - Emits `friend_joined` to those other users with `friend_first_name` set to the joiner's first name, `triggered_by` set to the joiner, and event key `friend_joined:{joiner}:{first 8 bytes of SHA-256 over the sorted recipient IDs}`.
 - Emits the `friends` map-change refresh to the joiner and the new friends.

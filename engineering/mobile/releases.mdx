@@ -132,7 +132,10 @@ Every OTA-safe PR merged to `main` is considered for the supported release branc
 ### How devices pick up updates
 
 - `updates.checkAutomatically` is `ON_LOAD` with a 3-second `fallbackToCacheTimeout`. A cold launch checks for an update natively, which recovers even when JS cannot mount.
-- `providers/EasUpdateObserver.tsx` checks again when the app returns to the foreground, at most every 30 minutes, and only when `EXPO_PUBLIC_IS_PRODUCTION` is `true`. It downloads the update for the next restart. It does not reload the app.
+- `providers/EasUpdateObserver.tsx` checks again when the app returns to the foreground, at most every 30 minutes, and only when `EXPO_PUBLIC_IS_PRODUCTION` is `true`. It downloads the update for the next restart.
+- Once `Updates.useUpdates()` reports `isUpdatePending`, the observer shows an **Update ready** dialog: "A new version of Yelo has been downloaded. Reload to get the latest." A pending update comes from either the foreground fetch or a cold-launch check that downloaded after the 3-second `fallbackToCacheTimeout`. Without the prompt, a slow launch check took two launches to apply, and a foreground fetch never applied until the next cold launch.
+  - **Reload now** calls `Updates.reloadAsync()` and logs `eas.update.reloadPrompt.accept`. If the reload fails, the app logs `eas.update.reload.error` and hides the dialog.
+  - **Later** hides the dialog for the rest of the session. The update still applies on the next cold launch.
 - After sign-in, the `(app)` layout reports `app_version` and `Updates.updateId` to the API with `useUserUpdateAppVersion`.
 - `lib/analytics/AnalyticsProvider.tsx` registers `ota_update_id` (`embedded` when running the binary's bundle), `ota_runtime_version`, and `ota_is_embedded` as PostHog super properties, so every event records which update was loaded.
 - Tapping repeatedly on the auth entry screen reveals the app version and the first 8 characters of the update id.
