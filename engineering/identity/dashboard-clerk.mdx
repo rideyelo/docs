@@ -15,6 +15,7 @@ The API and the web app read the same keys:
 | `community_id` | UUID string | Interns. Also the legacy single-fleet shape. |
 | `fleet_id` | UUID string | Legacy single-fleet shape only |
 | `fleet_assignments` | Array of `{ fleet_id, community_id }` | Fleet managers |
+| `manual_payments` | Boolean | Admins only, web app only. `true` shows the **Send payment** action in user details. See [Manual payments grant](/administration/dashboard-roles#manual-payments-grant). |
 | `onboarded` | Boolean | Written by invites and updates. Nothing reads it for gating. |
 
 ## Where each side reads it
@@ -38,6 +39,8 @@ The API only sees roles that appear in the session token under a `metadata` clai
 4. Else if only `community_id` is set, it's treated as an intern community.
 
 The web hook does the same, but it also drops assignments whose `fleet_id` or `community_id` is empty. The API keeps them and lets the scope gate reject malformed values.
+
+The web hook also exposes `canSendManualPayments`. It's `true` only when `role` is `admin` and `manual_payments` is exactly `true`. The invite and update endpoints don't write `manual_payments`, so set it directly in Clerk.
 
 ## Request flow
 
