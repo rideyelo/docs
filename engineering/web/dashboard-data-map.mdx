@@ -69,6 +69,15 @@ All KPI handlers call `requireAdmin` (`kpi/handlers.go:28`). `GetMarketKPIs`, us
 
 `UserDetailSheet` returns `null` for non-admins, so interns can browse the table but cannot open a user. For admins it loads `GET /dashboard/users/detail/{id}`, `GET /dashboard/fleets`, `GET /dashboard/users/detail/{id}/notifications?limit=20`, and, in `UserQuo`, `GET /dashboard/users/detail/{id}/messages` (30 s stale, no focus refetch). Mutations: tags, test status, profile, fleet assignment, and move to Yelo, all under the admin-gated `/dashboard/users` group.
 
+Manual payments add two calls, both from `components/users/ManualPaymentDialog.tsx`. `UserDetailSheet` mounts the dialog only when the user has a Stripe account ID and `useRole().canSendManualPayments` is true (`admin` plus `manual_payments: true` in Clerk public metadata).
+
+| Component | Call | Endpoint | Refresh | API gate |
+| --- | --- | --- | --- | --- |
+| `ManualPaymentDialog` | `useDashboardGetManualPaymentFundSources` | `GET /dashboard/users/manual-payments/fund-sources` | `staleTime: 0`, `retry: false`. Fetches on every open. | Group gate admin, then `manualPaymentAdmin` (`service/dashboard/manual_payment.go`) requires `Role == "admin"` and `CanSendManualPayments`, else `403` |
+| `ManualPaymentDialog` | `dashboardSendManualPayment` (`useMutation`) | `POST /dashboard/users/detail/{id}/manual-payment` with `amount`, `description`, `internal_note`, `source_type`, `idempotency_key` | Invalidates nothing | Same. `validateManualPayment` caps `amount` at 50000 cents, `description` at 40 characters, `internal_note` at 500, and `idempotency_key` at 100; `source_type` must be `card` or `bank_account`. |
+
+Both routes are registered in `server/http/dashboard/users/routes.go`. `clerkAuthMiddleware` copies `metadata.manual_payments` from the session token claims into `CanSendManualPayments`. See [ManualPaymentDialog](/engineering/web/dashboard-components#manualpaymentdialog) for the idempotency key rules.
+
 ## Rides (`/rides`)
 
 `RidesShellPage` reads `?tab=`: `kpis`, `trips` (default), `issues`, `searches`. Fleet managers are forced to `trips`.
