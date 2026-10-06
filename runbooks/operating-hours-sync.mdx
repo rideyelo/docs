@@ -1,0 +1,184 @@
+---
+title: "Fleet calendar not syncing"
+description: "Triage a fleet operating-hours calendar stuck in needs_auth, validation_error, stale, or error: read the stored sync state, find the cause, and confirm the next import publishes"
+---
+
+Each fleet and service community pair can import operating hours from one Google Calendar. `calendar_sync_dispatch` runs every 15 seconds and queues one `calendar_sync` job per due calendar. Each job claims the connection, fetches events from Google, validates them, and publishes a new snapshot or records a failure. Read [Operating calendars](/engineering/fleets/service-communities-and-calendars#operating-calendars) for the pipeline and [Fleet operating hours](/admin/operating-hours) for the dashboard workflow.
+
+<Note>
+A failed import never removes published hours. The dashboard and riders keep the last successful snapshot until a new one publishes. A failed import also completes its River job, so a failing calendar shows `completed` jobs, not `retryable` or `discarded` ones.
+</Note>
+
+## Symptoms
+
+The fleet's **Hours** tab shows one of these messages under **Imported operating hours**:
+
+| State | Dashboard message |
+| --- | --- |
+| `needs_auth` | The calendar owner needs to reconnect Google. Showing the last successful import. |
+| `validation_error` | Some Google events could not be imported. The hours below are from the last successful import. Fix the events in Google Calendar. |
+| `error` | Google could not be refreshed. Showing the last successful import. |
+| `stale` | This copy has not refreshed recently. Check the last import time before relying on these hours. |
+
+Other signs:
+
+- **Last imported** stops advancing. A healthy calendar imports every 270 to 330 seconds.
+- A partner edits Google Calendar and the change never appears.
+- Rider-facing hours for a community lag behind its primary fleet's calendar.
+
+## Diagnose
+
+<Steps>
+  <Step title="Read the dashboard state">
+    Open the fleet, select the **Hours** tab, and choose the service community. Note the message, the **Last imported** time, and any listed event problems. The dashboard lists the first 10 problem events.
+
+    `needs_auth`, `validation_error`, and `error` are stored in `CalendarConnections.sync_state`. `stale` is never stored. `CalendarDashboardRepository.View` derives it in `internal/data/repository/calendar_dashboard.go`. See [Dashboard states](/engineering/fleets/service-communities-and-calendars#dashboard-states).
+  </Step>
+  <Step title="Read the connection row">
+    **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    SELECT x.id, x.enabled, x.sync_state, x.last_error_code,
+           x.last_success_at, x.next_sync_at, x.lease_until,
+           x.published_revision, x.dirty_generation,
+           jsonb_array_length(x.diagnostics) AS diagnostic_count
+    FROM "CalendarConnections" x
+    JOIN "FleetCommunityServices" s ON s.id = x.service_id
+    WHERE s.fleet_id = '<fleet-id>' AND s.community_id = '<community-id>';
+
+    -- Event problems from the last failed import
+    SELECT d ->> 'event_id' AS event_id, d ->> 'code' AS code, d ->> 'summary' AS summary
+    FROM "CalendarConnections" x
+    JOIN "FleetCommunityServices" s ON s.id = x.service_id
+    CROSS JOIN LATERAL jsonb_array_elements(x.diagnostics) AS d
+    WHERE s.fleet_id = '<fleet-id>' AND s.community_id = '<community-id>';
+
+    ROLLBACK;
+    ```
+
+    `summary` is the Google event title, cut to 200 characters. Yelo stores no other Google error text. `SyncService.recordFailure` in `internal/service/operatinghours/sync.go` maps every failure to a fixed code.
+  </Step>
+  <Step title="Read the state and code">
+    | `sync_state` | `last_error_code` | Meaning |
+    | --- | --- | --- |
+    | `needs_auth` | `needs_auth` | The stored owner credential can't be used for this connection, or Google rejected it. |
+    | `validation_error` | `invalid_events` | At least one event failed validation. `diagnostics` lists every bad event. |
+    | `validation_error` | `invalid_calendar` | The import scope is unusable or the fetch returned a different range. `diagnostics` is empty. |
+    | `error` | `rate_limited` | Google returned 429, or 403 with a quota reason. |
+    | `error` | `resource_unavailable` | Google returned 403, 404, or 410, or the owner's access role on the calendar isn't `owner` or `writer`. |
+    | `error` | `google_unavailable` | Any other Google or token-refresh failure, including 5xx responses, timeouts, and incomplete or inconsistent responses. |
+    | `error` | `publication_failed` | The snapshot was fetched and validated but couldn't be stored. |
+    | `ready` | empty | The last import succeeded. If the dashboard says `stale`, imports stopped after that. |
+    | `pending` | any | An import is claimed or due. A claim sets `pending` before it calls Google. |
+  </Step>
+  <Step title="Check the schedule fields">
+    - `next_sync_at` in the future is backoff. Nothing runs until then.
+    - `next_sync_at` in the past with `lease_until` empty or in the past means the calendar is due. `calendar_sync_dispatch` should queue it within 15 seconds.
+    - `lease_until` in the future means a worker holds the lease. A claim holds it for four minutes.
+  </Step>
+  <Step title="Check the jobs">
+    In the dashboard, expand **Administration** and click **Jobs**. Filter by kind `calendar_sync_dispatch` and `calendar_sync`. A new `calendar_sync_dispatch` job should appear every 15 seconds. `calendar_sync` jobs run on the `operating_hours` queue with two workers and carry `connection_id` in their arguments. If either kind is missing or failing, follow [River job failures](/runbooks/river-jobs).
+  </Step>
+</Steps>
+
+### Event diagnostic codes
+
+`ValidateSnapshot` in `internal/service/operatinghours/ingest.go` checks every event. One bad event fails the whole import. Cancelled events are skipped. `confirmed` and `tentative` events are imported.
+
+| Code | Cause |
+| --- | --- |
+| `calendar_timezone_mismatch` | The Google calendar's timezone differs from the community's timezone. Recorded once, with no event. |
+| `invalid_zone_prefix` | The title doesn't start with `[KEY]` or `[KEY,KEY]`, a key isn't valid, or a key isn't registered for this calendar. |
+| `invalid_start_time` | The start is an all-day date, has no timestamp, has no explicit UTC offset, or names an invalid timezone. |
+| `invalid_end_time` | The end fails the same checks as the start, or isn't after the start. |
+| `explicit_end_required` | Google reports the end time as unspecified. |
+| `unsupported_event_status` | The status isn't `confirmed` or `tentative`. |
+| `unsupported_event_type` | The event type isn't empty or `default`. |
+| `unexpanded_recurrence` | The event still carries recurrence rules instead of being an expanded instance. |
+| `invalid_original_start` | A recurring instance has an invalid original start time. |
+| `missing_recurring_parent` | The event has an original start time but no recurring event ID. |
+| `invalid_event_metadata` | The ETag is missing, or the ID or ETag is longer than 1,024 characters, or the title is longer than 4,096 characters. |
+| `duplicate_or_missing_event_id` | The event has no ID, or the ID repeats in the batch. |
+| `event_outside_coverage` | The event doesn't overlap the fetched range. |
+
+The dashboard shows a specific fix for `invalid_zone_prefix`, `calendar_timezone_mismatch`, `invalid_start_time`, `invalid_end_time`, `explicit_end_required`, and `unsupported_event_type`. Every other code shows "Check this event’s title, start and end times." Use the SQL above to see the code.
+
+## Fix
+
+<AccordionGroup>
+  <Accordion title="needs_auth: reconnect the calendar owner">
+    `ownerAccessToken` in `sync.go` returns `needs_auth` when any of these is true:
+
+    - The `GoogleCalendarOwner` row has no subject, no refresh token, or is missing a required scope (`openid`, email, and read-only calendar access).
+    - The stored owner email differs from `GOOGLE_CALENDAR_OWNER_EMAIL`, or the stored client ID differs from `GOOGLE_CALENDAR_CLIENT_ID`.
+    - The stored owner subject differs from the connection's `owner_subject`.
+    - The refresh token can't be decrypted with `GOOGLE_CALENDAR_TOKEN_KEYS`.
+    - Google answers the token refresh with `invalid_grant`, or answers a Calendar request with 401.
+
+    An admin opens **Access**, finds the **Google Calendar for operating hours** card, and clicks **Reconnect Google**. They must sign in as the owner account shown on the card and grant every requested permission. See [Connect the calendar owner](/admin/operating-hours#connect-the-calendar-owner).
+
+    Saving the owner fires the `calendar_owner_dirty` trigger. It sets every connection with that owner subject to `pending` and makes it due immediately, so the next dispatch retries without waiting for backoff.
+
+    <Warning>
+    The **Access** card can show **Connected as** while a calendar stays in `needs_auth`. The card doesn't compare the owner subject with each connection. A connection's `owner_subject` is fixed when the calendar is attached, and the `guard_calendar_connection` trigger rejects changes to it. If the owner reconnects as a different Google account subject, existing connections stay in `needs_auth`. No dashboard control or API route rebinds them.
+    </Warning>
+  </Accordion>
+  <Accordion title="validation_error: fix the events or the calendar">
+    For `invalid_events`, fix each listed event in Google Calendar. See [Import problems](/admin/operating-hours#import-problems) and [Zone prefixes](/admin/operating-hours#zone-prefixes).
+
+    - **`invalid_zone_prefix` after a prefix rename.** Yelo doesn't rewrite Google titles. Update every event that uses the old prefix, including whole recurring series.
+    - **`invalid_start_time` on all-day events.** Replace them with timed events.
+    - **`calendar_timezone_mismatch`.** Set the Google calendar's timezone to the community's timezone. The attach step checks this once, so a mismatch here means one side changed later.
+
+    The import retries five minutes after a validation failure. Renaming a prefix in the dashboard schedules an import immediately.
+
+    For `invalid_calendar`, the events aren't the problem. `validateIngestScope` rejected the community's timezone or geography revision, or the calendar's stored zone prefixes. Check the community's timezone and service area. See [Community timezone](/admin/operating-hours#community-timezone).
+  </Accordion>
+  <Accordion title="error: wait for backoff or restore access">
+    | Code | Action |
+    | --- | --- |
+    | `rate_limited` | Wait. The retry honors Google's `Retry-After`, with a five-minute minimum and a 24-hour cap. |
+    | `resource_unavailable` | Confirm in Google that the calendar still exists and that the owner account owns it or can edit it. If the calendar was deleted, an admin attaches a replacement with **Change calendar ID** on the **Hours** tab. |
+    | `google_unavailable` | Wait for the next retry. If it persists, check Cloud Logging and Google's status. A calendar that returns more than 20,000 events or more than 100 pages for the range also lands here. |
+    | `publication_failed` | Check database health and API logs. The next attempt refetches and republishes. |
+
+    Replacing the calendar ID clears `last_success_at`, the error code, and the diagnostics. It hides the old hours until the new calendar imports.
+  </Accordion>
+  <Accordion title="stale: find why imports stopped">
+    `stale` has two causes in `loadDashboardSnapshot`:
+
+    - The connection is `ready` and `last_success_at` is more than seven minutes old.
+    - The published snapshot's coverage has ended. Coverage runs 90 days past the last successful import, so this means no import has succeeded for about 90 days. This overrides any stored state.
+
+    Work through these in order:
+
+    1. **Dispatch isn't running.** With `GOOGLE_CALENDAR_SYNC_ENABLED=false` (the default), the API builds no sync service, the periodic job inserts nothing, and both workers return without doing anything. Check that `calendar_sync_dispatch` jobs appear. Sync also needs `GOOGLE_CALENDAR_ENABLED=true`. `Calendar.Validate` in `internal/utilities/config/calendar.go` rejects sync enabled without it. See [Operating calendars configuration](/engineering/fleets/service-communities-and-calendars#configuration).
+    2. **The queue is backed up.** The `operating_hours` queue has two workers and each `calendar_sync` job can run for three minutes. One dispatch queues at most 100 due calendars. Look for long-running `calendar_sync` jobs on the **Jobs** page.
+    3. **River isn't working.** Follow [River job failures](/runbooks/river-jobs).
+
+    An inactive or archived community, an inactive or deleted fleet, or a retired service row doesn't produce `stale`. `ListDueCalendarSyncs` skips those calendars and the published snapshot is hidden, so the dashboard shows `pending` with no hours. Reactivate the community or fleet, or restore the service. See [Retire and restore](/engineering/fleets/service-communities-and-calendars#retire-and-restore).
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+You can't force an import by retrying a `calendar_sync` job in River UI. `ClaimCalendarSync` only claims a connection whose `next_sync_at` has passed and whose lease is free. A retried job for a calendar in backoff completes without calling Google. The dashboard has no **Sync now** control.
+</Warning>
+
+## Verify
+
+- The **Hours** tab shows no status message, and **Last imported** is within the last few minutes.
+- The connection row shows `sync_state = 'ready'`, an empty `last_error_code`, a higher `published_revision`, and `next_sync_at` about five minutes ahead.
+- **Show preview** lists the hours the partner entered in Google Calendar.
+- For a community's primary fleet, the rider-facing hours match. See [Rider-facing hours](/engineering/fleets/service-communities-and-calendars#rider-facing-hours).
+
+## Root causes seen in code
+
+- **Backoff lives in the database, not in River.** `recordFailure` writes `next_sync_at` and returns `nil`, so River never retries a failed import. The dispatcher queues it again when the row is due.
+- **Validation is all or nothing.** One bad event blocks every other change on that calendar until it's fixed.
+- **Owner identity is pinned per connection.** `owner_subject` must match the stored owner, and it can't be changed after attach.
+- **Only a fixed set of codes is stored.** Google's messages can contain calendar IDs and event details, so `responseError` in `internal/data/googlecalendar/client.go` drops them. `google_unavailable` covers many distinct failures.
+- **Limited access looks like a failure, not an empty calendar.** `appendEvents` in `internal/data/googlecalendar/events.go` rejects any response whose access role isn't `owner` or `writer`.
+- **Inactive scopes pause imports without an error.** The `ActiveFleetCommunityServices` view gates both the due list and the published snapshot. A paused calendar shows `pending`, not `stale`.
+- **A crashed worker delays one cycle.** The lease lasts four minutes. The connection stays `pending` until the lease expires and the dispatcher queues it again.
