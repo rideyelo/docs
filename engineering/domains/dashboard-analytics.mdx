@@ -43,7 +43,10 @@ All routes sit under the `/dashboard` group, which runs Clerk auth and `dashboar
 | GET | `/dashboard/community/{id}/cancellations/kpis`, `/cancellations`, `/cancellations/breakdowns` | Admin, or intern GET for own community | Matched-cancellation KPIs, table, breakdowns |
 | GET | `/dashboard/community/{id}/uncompletes/kpis`, `/uncompletes`, `/uncompletes/breakdowns` | Same | Uncompleted-ride KPIs, table, breakdowns |
 | GET | `/dashboard/{id}/search-insights`, `/search-map-data` | Admin, or intern for own community | Search conversion and map points |
-| GET | `/dashboard/fleet/{fleet_id}/kpis`, `/histogram` | Admin, or fleet with `HasFleetAccess` | Fleet KPIs and hourly histogram |
+| GET | `/dashboard/fleet/{fleet_id}/kpis?range=` | Admin, or fleet with `HasFleetAccess` (scope and handler) | `CommunityHandler.GetFleetKPIs`: fleet KPIs |
+| GET | `/dashboard/fleet/{fleet_id}/histogram?range=` | Same | `CommunityHandler.GetFleetRideHistogram`: hourly ride-request bins for the current window. `range` defaults to `last_7_days` |
+| GET | `/dashboard/drivers/global/active` | Admin (scope and handler) | `GetGlobalActiveDrivers`: active drivers across every community |
+| GET | `/dashboard/drivers/global/pending`, `/in-process`, `/inactive` | Admin (scope and handler) | `GetGlobalPendingDrivers`, `GetGlobalInProcessDrivers`, `GetGlobalInactiveDrivers`: pending, in-process, and inactive driver lists across every community |
 | GET | `/dashboard/live/analytics?period=` | Admin (scope) | `SupplyDemandHandler.getAnalytics`: period KPIs, service timing, outcome counts, ride journey |
 | GET | `/dashboard/live/competitor-prices?period=` | Admin (scope) | `getCompetitorPrices`: observed UberX and Lyft Standard quotes |
 | GET | `/dashboard/live/kpis`, `/markets` | Admin (scope) | `getKPIs` (no dashboard caller), `getMarkets` |
@@ -59,6 +62,10 @@ All routes sit under the `/dashboard` group, which runs Clerk auth and `dashboar
 | GET | `/dashboard/rides` | Admin, intern, fleet | `DashboardRidesHandler.ListRides` |
 | GET | `/dashboard/rides/{id}/events`, `/{id}/route` | Admin (scope and handler) | Ride timeline and stored route |
 | GET | `/dashboard/notifications/analytics/variants`, `/analytics/types` | Admin (group role gate) | Notification delivery analytics |
+| GET | `/dashboard/notifications` | Admin (group role gate) | `DashboardNotificationsHandler.ListNotifications`: paginated notification dispatches with filters |
+| GET | `/dashboard/notifications/history?limit=&offset=` | Admin (group role gate) | `GetNotificationHistoryGlobal`: notification history across every community |
+| GET | `/dashboard/notifications/detail/{id}` | Admin (group role gate) | `GetNotificationDetail`: one notification log entry |
+| GET | `/dashboard/{id}/notifications/history?limit=&offset=` | Admin (scope and handler) | `CommunityHandler.GetNotificationHistory`: notification history for one community |
 
 ## Time windows and delta math
 
@@ -388,6 +395,18 @@ Both analytics endpoints accept `community_id`, `ride_id`, `user_id`, `variant_i
 | `average_dispatches_per_day` (types) | `COUNT(DISTINCT n.id) / GREATEST((MAX(created_at) - MIN(created_at)) in days, 1)` |
 
 Ratios are `null` when the denominator is 0. Test notifications and test deliveries are excluded unless `include_test=true`.
+
+### Notification history and detail
+
+Three read endpoints back the notification log views.
+
+| Endpoint | Pagination | Source |
+| --- | --- | --- |
+| `GET /dashboard/notifications/history` | `limit` defaults to 50 and is capped at 100. An invalid `limit` or `offset` is ignored | `GetNotificationHistoryTableGlobal` (`ListGlobalNotificationHistory`, `CountGlobalNotificationHistory`) |
+| `GET /dashboard/{id}/notifications/history` | `limit` defaults to 50 with no maximum | `GetNotificationHistoryTable` (`ListNotificationHistoryByCommunity`, `CountNotificationHistoryByCommunity`) |
+| `GET /dashboard/notifications/detail/{id}` | None. A malformed ID returns 400 **invalid notification ID** | `GetNotificationLogByID` |
+
+Both history endpoints return `models.NotificationHistoryResponse`, which is `data` plus `total_count`. In `yelo-web`, `hooks/useNotifications.ts` calls the global route when `allCommunities` is set and the community route otherwise. `NotificationDetailSheet.tsx` and `RideEventsTimeline.tsx` call the detail route.
 
 ## GTM snapshot and refresh job
 

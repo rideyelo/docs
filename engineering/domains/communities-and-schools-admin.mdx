@@ -270,6 +270,212 @@ The `school_management(school_id)` SQL function builds the `management` object o
 
 Command defaults (`cmd/sync-school-catalog/main.go`): `--dry-run=true`, `--min-catalog-schools=5000`, `--max-created-schools=500`, `--max-coordinate-changes=5000`, `--max-domain-additions=2000`, `--geocode-max-requests=100`. Downloads make up to 3 attempts with 1 and 2 second backoff, or a longer `Retry-After`. The default ROR source gets 4 attempts, alternating with a pinned mirror URL. Mapbox geocoding needs exactly one address result with `exact` or `high` confidence and `rooftop`, `parcel`, or `point` accuracy. See `cmd/sync-school-catalog/README.md` for apply constraints.
 
+## Reviewed decisions and audit report
+
+The catalog sync never trusts a name or domain match on its own. `syncDatabase` in `cmd/sync-school-catalog/main.go` loads the existing schools, applies two bundled review files, plans every identity, and only then plans changes:
+
+```mermaid
+flowchart TD
+  A[loadExistingSchools] --> B[prepareInstitutionDecisions]
+  B --> C[reviewedIdentityDecisions]
+  C --> D[planIdentitySnapshot]
+  D --> E[prepareCoordinateProposals]
+  E --> F[Plan updates and creates]
+  F --> G[databasePreflightIssues]
+  G -->|blocking_issues empty| H[safe_to_apply = true]
+  G -->|any issue| I[Dry run reports it, apply fails]
+```
+
+A dry run uses a read-only `REPEATABLE READ` transaction. An apply sets `lock_timeout = '5s'` and locks `"Communities"` and `"Schools"` in `SHARE ROW EXCLUSIVE` mode before it reads the plan. Downloads and geocoding finish before those locks are taken.
+
+### Supplemental sources
+
+`--with-supplemental-sources` fills in the default ROR, Wikidata, and HIFLD URLs. You can also set `--ror-url`, `--wikidata-url`, or `--hifld-url` individually. `EnrichSupplemental` in `internal/data/schoolcatalog/supplemental.go` skips a source with an empty URL and fails the build when a configured source returns no records.
+
+| Source | Default | How it is read | Evidence `precision` | Evidence `status` |
+| --- | --- | --- | --- | --- |
+| ROR | `DefaultRORURL`, a pinned Zenodo `v2.12-2026-08-25` data dump ZIP | The first `.json` entry whose name contains `schema_v2` or starts with `v2.`. Keeps records with type `education` and a US location | `city_identity_only`. No coordinates | The ROR record status |
+| Wikidata | `DefaultWikidataURL` (SPARQL) | Keyset pages of 500 entities, at most 100 pages. Entities with country `Q30` that have an IPEDS ID (`P1771`) or are an instance of a subclass of `Q3918` | `campus_candidate`, or `ambiguous_or_missing` when the entity doesn't have exactly one valid coordinate | `unknown`, `closed` (has `P576`), or `multiple_campuses` (more than one IPEDS ID, which also clears the unit ID) |
+| HIFLD | `DefaultHIFLDURL`, FEMA's public mirror | ArcGIS point layer, 1,000 features per page ordered by object ID | `historical_campus`, or `missing` for invalid coordinates | `historical`, or `inactive_or_unknown` when `STATUS` isn't `A` |
+
+HIFLD rows from the default URL get `source_year` `2019-2020`. Any other HIFLD URL uses the row's `SOURCEDATE` field.
+
+Each parser fails closed. A missing or repeated source ID, a truncated ROR array, a Wikidata row that doesn't advance the cursor, or an HIFLD page that reports more rows but returns none aborts the run.
+
+A supplemental record matches a catalog school by IPEDS unit ID when it has one. Otherwise a name and the school's website domain must both agree, and exactly one school may qualify. Two or more qualifying schools are listed in `sources.supplemental.conflicts` as `source:source_id`. A match only adds the record's names as aliases. It never adds an email domain or changes a coordinate.
+
+### Downloads, cache, and checksums
+
+Every source goes through `download` in `internal/data/schoolcatalog/download.go`.
+
+| Behavior | Rule |
+| --- | --- |
+| Size limit | 128 MiB per response (`maxDownloadBytes`) |
+| Timeouts | 3 minutes per request and 15 minutes for the whole run (`run` in `main.go`) |
+| Retried failures | HTTP 429, HTTP 5xx, network errors, and an unexpected EOF. Any other non-2xx status fails at once |
+| Backoff | `1 << attempt` seconds, or a longer `Retry-After`. `Retry-After` is capped at 30 seconds |
+| ROR mirror | Only for `DefaultRORURL`. Attempts alternate with `rorDirectURL`, which is the same Zenodo record and file |
+| Local files | A `file:` URL must be absolute with no host or query. It skips the cache and retries. `--ror-file` builds one, and it can't be combined with `--ror-url` |
+
+`--source-cache-dir` turns on a local cache. It stores only URLs whose path ends in `.zip`, plus the default ROR URL. Paged ArcGIS and Wikidata responses are never cached, because separate pages could come from different snapshots.
+
+- The cache file is `<sha256 of the URL>.json` and holds `sha256`, `saved`, and `data`.
+- A read rejects an entry that is older than 24 hours, has a `saved` time in the future, is over the size limit, doesn't match its stored SHA-256, or isn't a valid ZIP. A rejected entry falls back to a download.
+- A write goes to a temporary file in the same directory and is renamed into place. A failed write doesn't fail the run.
+- A cache hit still runs the normal source parser.
+
+`--verbose` logs each attempt, status, byte count, elapsed time, and the SHA-256 of the downloaded bytes to stderr with the prefix `school-source`. `sourceLabel` strips userinfo, query, and fragment from logged URLs and appends a short hash of the full URL, so paged requests stay distinguishable without exposing tokens or queries.
+
+### Geocoding and coordinate proposals
+
+Coordinates from supplemental sources and Mapbox never apply directly. They become `coordinate_candidates` in the report, and a reviewer approves them in a second run (`cmd/sync-school-catalog/coordinates.go`).
+
+A school is eligible only when it is non-synthetic, has `0, 0` coordinates, and has no catalog match, hold, or preservation in the identity plan.
+
+<Steps>
+  <Step title="Collect candidates">
+    `MatchEvidence` returns every supplemental record that matches the school by unit ID, or by name plus a domain. Each one with valid coordinates becomes a candidate.
+  </Step>
+  <Step title="Geocode confirmed addresses (optional)">
+    `--geocode-addresses-file` takes a JSON array of `ConfirmedAddress` objects: `school_id`, `school_name`, `address`, `city`, `state`, `postal_code`, `evidence_url`, and `confirmed_at`. It needs `MAPBOX_API_KEY`, works only in dry-run mode, and can't be combined with `--catalog-only`. The whole file is validated before the first billable request.
+  </Step>
+  <Step title="Review">
+    Each candidate carries a `fingerprint`, the SHA-256 of the proposal with `approved` false. Set `approved` to `true` on the ones you accept.
+  </Step>
+  <Step title="Apply">
+    `--approved-coordinates-file` reads the reviewed list. `applyCoordinateProposal` locks the school row, re-validates the proposal, writes the coordinates, and upserts `SchoolCoordinateProvenance` with the evidence `precision` as `accuracy`.
+  </Step>
+</Steps>
+
+`ConfirmedAddress.Validate` in `internal/data/schoolcatalog/geocoding.go` requires:
+
+- An address that starts with a street number and isn't a PO box.
+- A city, a two-letter uppercase state, and a ZIP in `12345` or `12345-6789` form.
+- An `http` or `https` `evidence_url` with a host.
+- A `confirmed_at` that is not in the future and is at most 366 days old.
+
+`PermanentGeocoder` calls the Mapbox v6 forward endpoint with `permanent=true`, `types=address`, `country=US`, and `limit=5`. It doesn't follow redirects.
+
+- It retries HTTP 429 and 5xx up to 3 attempts, waiting 1 and then 2 seconds. Every attempt counts against `--geocode-max-requests`.
+- It caches results in memory for the run, keyed by the lowercased address, city, state, and ZIP.
+- `parsePermanentGeocode` accepts a response only when it has exactly one feature of type `address` with a point geometry, `exact` or `high` confidence, `matched` codes for `address_number`, `street`, `postcode`, `place`, and `region`, a `matched` or `inferred` country, and `rooftop`, `parcel`, or `point` accuracy. The returned country, region code, and five-digit ZIP must equal the confirmed address.
+- A failure is recorded in `geocoding_failures` and the run continues.
+
+`validateCoordinateProposal` rejects an approved proposal when:
+
+- The fingerprint doesn't match, which means the proposal was edited.
+- The school is synthetic, already has coordinates, or its name or domains changed since review.
+- The evidence source isn't `wikidata`, `hifld`, or `mapbox_permanent`.
+- The evidence status is `closed`, `multiple_campuses`, or `inactive_or_unknown`.
+- The evidence was retrieved more than 366 days ago.
+
+Two approved proposals for one school also fail. Review files are capped at 32 MiB, reject unknown JSON fields, and must hold exactly one JSON document.
+
+### Bundled review files
+
+Both files are compiled into the binary with `go:embed`. Each entry pins a snapshot of a production row, and the run stops when the database or the catalog no longer matches that snapshot. Entries for school IDs that aren't in the database are skipped, so other environments still run.
+
+| File | Entries | Purpose |
+| --- | --- | --- |
+| `cmd/sync-school-catalog/reviewed_identities.json` | 16 | Preserve a legacy or system row that shares a catalog identity with a canonical row |
+| `cmd/sync-school-catalog/institution_decisions.json` | 22 | Preserve a row's coordinates, or replace a wrong email domain |
+
+**Reviewed identities.** Each entry names an `existing` row, the `canonical` row, and the catalog institution (`unit_id`, `catalog_name`, `catalog_website`, `ipeds_year`). The `reason` must be one of:
+
+| `reason` | Entries |
+| --- | --- |
+| `reviewed_legacy_duplicate_preserved` | 13 |
+| `reviewed_system_or_healthcare_row_preserved` | 3 |
+
+`validateReviewedIdentities` (`reviewed_identities.go`) fails with `identity review is stale` when any of these is true:
+
+- The existing row is synthetic, or its name or exact domain list differs from the snapshot.
+- The existing row now has a stored IPEDS unit ID.
+- The canonical row is missing, synthetic, renamed, lacks a snapshot domain, or gained a domain that isn't an approved catalog domain of that institution.
+- The catalog institution is missing, excluded from import, or its name, website domain, or first identity evidence year differs from the entry.
+
+It then fails with `identity review evidence drifted` when the canonical row no longer matches that institution unambiguously. For a legacy duplicate, the legacy row must also still be a candidate for it.
+
+These decisions only preserve the existing row. They never merge, delete, rename, move users, or approve domains.
+
+**Institution decisions.** Each entry pins `existing` and carries a `reason`, a `note`, and at least one evidence URL. The reasons in the file:
+
+| `reason` | Entries |
+| --- | --- |
+| `reviewed_distinct_campus_preserved` | 10 |
+| `reviewed_institution_without_single_campus` | 6 |
+| `reviewed_domain_mapping_correction` | 3 |
+| `reviewed_namesake_preserved` | 2 |
+| `reviewed_historical_identity_preserved` | 1 |
+
+Two optional fields change what an entry does:
+
+| Field | Effect |
+| --- | --- |
+| `preserve_coordinates: true` | `applyDisposition` marks the row preserved. The planner skips it, so it gets no domain, coordinate, or metadata change. The entry is stale if the row has a stored IPEDS unit ID |
+| `domains_after` with `domain_source_unit_id` | Replaces the row's domains. The three entries are Central Methodist College (`cmc.edu` to `centralmethodist.edu`), Johnson Bible College (`jbc.edu` to `johnsonu.edu`), and West Virginia University at Parkersburg (`westliberty.edu` to `wvup.edu`) |
+
+`validateInstitutionDecision` (`institution_decisions.go`) checks a domain correction as follows:
+
+- The source institution must exist and be eligible for import, and must not conflict with the row's stored unit ID.
+- Every domain in `domains_after` must be approved for that institution under the `corroborated` policy, or be the institution's website domain with directory evidence.
+- If the row still has the pinned domains, the correction is planned as a `reviewed_domain_correction` change.
+- If the row was already corrected, the run accepts it only when no removed domain came back, every corrected domain is present, and every current domain is approved.
+- After all entries, every corrected domain must have exactly one existing owner.
+
+An apply writes the corrections first, in the same transaction as the ordinary import.
+
+### Identity reviews
+
+`planIdentitySnapshot` in `identity_review.go` resolves every existing row before any change is planned. It adds an `identity_reviews` entry for each row that needed a decision.
+
+| `status` | `reason` values | What the planner does |
+| --- | --- | --- |
+| `held` | `conflicting_identity_evidence`, `multiple_existing_rows_for_institution` | No change to the row. The name goes to `ambiguous_existing`, and every candidate institution is suppressed so it can't be created as a new school |
+| `preserved` | A reviewed reason, or `non_us_domains_preserved_outside_us_catalog` | No change to the row, other than a reviewed domain correction |
+| `resolved_match` | `ipeds_name_and_website_agree`, `reviewed_canonical_identity`, or an institution decision reason | Planned normally. `selected_unit_id` names the matched institution when there is one |
+
+- A row with no stored unit ID whose domains all end in `.ca` is preserved as non-US.
+- `corroboratedIdentity` resolves a row with no stored unit ID only when an IPEDS release agrees on both the name and the exact website domain, and exactly one eligible institution does. An alias on a website shared with another matching institution resolves nothing.
+- A non-synthetic row is held when another existing row could own its matched institution.
+
+Each review lists its `candidates` with `evidence` labels: `stored_unit_id`, `primary_name`, `alias_or_state_qualified_name`, `official_website:<domain>`, `approved_domain:<domain>`, and `ipeds_name_and_website:<source URL>`. `competing_school_ids` names the other rows that could own the same institution.
+
+### Audit report
+
+`--report-file` writes indented JSON with mode `0600`. The file is also written when the database sync returns an error, so a stale review or a blocked apply still leaves a report. It isn't written when the catalog build fails, the catalog is below `--min-catalog-schools`, or the database connection can't be opened.
+
+| Top-level key | Content |
+| --- | --- |
+| `dry_run` | The `--dry-run` value |
+| `domain_policy` | `corroborated` or `union` |
+| `sources` | `schoolcatalog.Report`: row counts per source and `supplemental` (`rows`, `matched_current`, `conflicts`, `aliases_added`) |
+| `database` | `databaseReport`. Absent with `--catalog-only` |
+
+Key `database` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `safe_to_apply` | True when `blocking_issues` is empty |
+| `blocking_issues` | Reasons an apply would be refused |
+| `changes` | One entry per planned change. `action` is `update`, `create`, `reviewed_domain_correction`, or `approved_coordinate_backfill`, with before and after domains, coordinates, and community |
+| `identity_reviews` | See [Identity reviews](#identity-reviews) |
+| `reviewed_domain_corrections` | The domain corrections planned this run, with evidence URLs |
+| `coordinate_candidates`, `geocoding_failures`, `approved_coordinate_changes` | See [Geocoding and coordinate proposals](#geocoding-and-coordinate-proposals) |
+| `historical_coordinate_candidates` | Historical IPEDS locations for unmatched schools without coordinates. Review only, never applied |
+| `held_catalog_records` | Catalog institutions kept out of the plan, for example `catalog_identity_collision`, `possible_existing_institution`, or `shared_institution_website` |
+| `ambiguous_existing`, `unmatched_existing`, `protected_test_schools` | School names by planning outcome |
+| `domain_conflicts`, `name_resolutions` | Domain ownership conflicts with their resolution, and new schools renamed to avoid a name clash |
+
+`databasePreflightIssues` fills `blocking_issues`:
+
+- `identityPlanIssues` adds an `identity safety violation` when a held or preserved school has a planned change other than its reviewed domain correction, when a `reviewed_domain_correction` change has no matching reviewed entry, or when two `update` or `create` changes target the same institution.
+- Planned creates, coordinate changes, or domain additions exceed their `--max-*` limits.
+- A community has invalid or empty bounds.
+- The school management schema from migration `000307` is missing.
+
+A dry run returns the report with the issues listed. An apply fails with `preflight blocked apply` and writes nothing.
+
 ## Where this lives in code
 
 | Concern | File | Function or type |
@@ -291,6 +497,8 @@ Command defaults (`cmd/sync-school-catalog/main.go`): `--dry-run=true`, `--min-c
 | Models | `internal/models/community.go`, `community_timezone.go`, `schools.go`, `school_management.go` | `CommunityUpdate`, `CommunityTimezone`, `SchoolUpdate`, `SchoolManagement` |
 | Triggers | `migrations/000301_*`, `000303_*`, `000307_*`, `000315_*` | `resolve_school_community`, `mark_community_timezone_dirty` |
 | Catalog | `internal/data/schoolcatalog/`, `cmd/sync-school-catalog/` | `Build`, `ImportExclusion`, `ApprovedDomains` |
+| Catalog downloads and supplemental sources | `internal/data/schoolcatalog/download.go`, `supplemental.go`, `geocoding.go` | `download`, `EnrichSupplemental`, `PermanentGeocoder` |
+| Catalog review and report | `cmd/sync-school-catalog/identity_review.go`, `institution_decisions.go`, `reviewed_identities.go`, `coordinates.go` | `planIdentitySnapshot`, `validateInstitutionDecision`, `validateReviewedIdentities`, `prepareCoordinateProposals` |
 
 ## Gotchas and edge cases
 
@@ -309,4 +517,5 @@ Command defaults (`cmd/sync-school-catalog/main.go`): `--dry-run=true`, `--min-c
 - **The public community list is broad.** `GET /community/` needs no auth and returns every non-archived community, including hidden, inactive, and test ones, with user counts and `active_experiments`.
 - **Archive doesn't refresh user sessions.** `ArchiveCommunity` rewrites `Users.community_id` in SQL but doesn't invalidate user profile caches. The cache outbox only clears community keys.
 - **Reconciliation stops on the first error.** `communityMaintenanceWorker` returns on the first failed `UpdateCommunity`, and the candidate query orders by ID, so one failing community can block the rest of the batch.
+- **Bundled review files go stale with the data.** A renamed school, a changed domain list, or a new IPEDS release that changes a pinned name, website, or year makes `sync-school-catalog` fail before it plans anything, in dry-run mode too. Re-review the entry and update the JSON file. See [Bundled review files](#bundled-review-files).
 - **Legacy community service writes are unused.** `CommunityService.CreateCommunity`, `UpdateCommunity`, `AddCommunitySchool`, and `RemoveCommunitySchool` in `internal/service/community/community.go` have no callers. The dashboard uses `DashboardService`.
