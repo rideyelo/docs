@@ -1,6 +1,6 @@
 ---
 title: "User directory"
-description: "Find users with global search, filter the directory by tag, review user details and Quo messages, edit profiles, and understand automatic fleet tags."
+description: "Find users with global search, filter the directory by tag, review user details and Quo messages, edit profiles, send manual driver payments, and understand automatic fleet tags."
 ---
 
 The user directory lists every Yelo rider and driver in the dashboard. Use it to look up an account, check recent activity, review contacts and messages, and correct profile details.
@@ -65,12 +65,16 @@ Admins can select a row to open the user detail sheet. The sheet shows:
 - **Fleet membership**, where admins edit the fleets a driver belongs to. See [Manage fleet memberships](#manage-fleet-memberships).
 - **Driver Info** for drivers, including the payout fleet, active fleet, rating, drives, and cancels.
 - **Driver fleet enrollment**, where admins assign a payout-ready fleet.
-- **Operations**, with the **Test account** toggle, user ID, app version, and device.
+- **Operations**, with the **Test account** toggle, user ID, Stripe connected account, app version, and device. See [Stripe connected account](#stripe-connected-account).
 - **Contacts & friends**. See [Registered contacts](#registered-contacts).
 - **Quo · recent contact**. See [Quo messages](#quo-messages).
 - **Recent Notifications**, **Ride History**, and **Drive History**.
 
 Ride and drive counts include completed rides that are still waiting for the rider's rating. A driver's cancels include rides the driver canceled and rides Yelo requeued to another driver after this driver canceled. Those rides also appear in **Drive History** as **Cancelled by driver**, even though another driver may have completed them.
+
+### Stripe connected account
+
+For drivers with a driver application linked to Stripe, **Operations** shows a **Stripe connected account** row with the account ID (`acct_…`). Select it to open the account in the Stripe dashboard in a new tab. You need access to Yelo's Stripe account to view it. The row is hidden for users without a connected Stripe account.
 
 ### Registered contacts
 
@@ -110,6 +114,57 @@ Yelo rejects the change when:
 
 - The phone number belongs to another account or lead. The error reads "This phone number is already assigned to an account or lead."
 - The user or a selected community is no longer available.
+
+## Send a manual payment
+
+Admins with the manual payments grant can send a one-time payment to a driver's Stripe connected account. Use it for bonuses, corrections, or reimbursements that don't come from a ride. The payment reaches the driver's bank with their next Stripe payout.
+
+<Note>
+The dashboard side is merged, but the API endpoints it calls ([yelo-api#302](https://github.com/rideyelo/yelo-api/pull/302)) are not. Until they ship, **Send payment** can't load balances or send a payment. The cap, balance check, and retry handling below describe what the dashboard enforces.
+</Note>
+
+### Prerequisites
+
+- An `admin` role with `manual_payments: true` in your Clerk public metadata. See [Manual payments grant](/administration/dashboard-roles#manual-payments-grant).
+- The driver has a Stripe connected account. The **Send payment** action appears under the **Stripe connected account** row only when both conditions are met.
+
+### Send the payment
+
+<Steps>
+  <Step title="Open the dialog">
+    Open the driver's detail sheet. Under **Operations**, find **Manual payment** and select **Send payment**.
+  </Step>
+  <Step title="Fill in the payment">
+    Enter these fields. All are required.
+
+    - **Amount (USD)**: a dollar amount such as `25` or `25.50`. Manual payments are capped at $500.00.
+    - **Title the driver sees**: up to 40 characters, such as `Airport run bonus`. A preview shows how the payment appears in the driver's activity in the Yelo app.
+    - **Paid from**: **Card balance** or **Bank account balance**. Each option shows the live amount available in Yelo's Stripe balance. The amount can't exceed the selected balance.
+    - **Internal note (driver never sees this)**: why you're sending the payment.
+
+    Select **Review payment**.
+  </Step>
+  <Step title="Confirm">
+    Check the summary of driver, Stripe account, amount, title, fund source, and internal note. Type the amount again to confirm, for example `25.00`, then select **Send $25.00**. Select **Back** to change anything.
+  </Step>
+</Steps>
+
+When the payment succeeds, the dashboard shows **Sent $25.00 to *driver name*** and closes the dialog. If the payment went through but Stripe didn't apply the title, the dashboard shows a warning instead. Don't send that payment again.
+
+You can't close the dialog while a payment is sending. If Stripe balances fail to load, the dialog shows **Could not load Stripe balances** and you can't send a payment until you select **Retry**.
+
+### Retries and duplicate protection
+
+Each payment carries an idempotency key, so retrying never pays a driver twice.
+
+- If the request times out, drops, or returns a server error, the dashboard can't tell whether the payment went through. Select the **Send** button again. Yelo reuses the same key, and Stripe returns the original payment instead of creating a second one.
+- If you go back and review the same payment without changes, the dashboard keeps the same key.
+- If the API refuses the payment with a `4xx` error, nothing was sent. The dashboard shows the reason and uses a new key for the next attempt.
+- If you change the amount, title, fund source, or note, the dashboard treats it as a new payment with a new key.
+
+<Warning>
+  The dashboard has no way to reverse a manual payment. To reverse one, open the driver's connected account in the Stripe dashboard and reverse the transfer there.
+</Warning>
 
 ## Manage fleet memberships
 
