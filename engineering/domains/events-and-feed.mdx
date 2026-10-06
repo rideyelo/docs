@@ -152,7 +152,7 @@ The server ignores `display_start_time` and `display_end_time`. The app filters 
 | --- | --- | --- |
 | Events | Commented out | `events` is always an empty slice. `ListFeedEventIDs` exists but is unused. |
 | Ads | `GetCommunityAds` | Every ad whose `community_ids` contains the community, ordered by `tier DESC, RANDOM()`. The 30-row limit is ignored. |
-| Rides | `ListPublicFeedRideIDs` | Status `complete`, `confirmed`, or `pending_rider_rating`, with `confirm_time` set and a public pickup or destination. Newest `confirm_time` first, 30 rows. |
+| Rides | `ListPublicFeedRideIDs` | Status `complete`, `confirmed`, or `pending_rider_rating`, with `confirm_time` set and `is_public_destination = TRUE`. A public pickup alone doesn't qualify, because the ride summary redacts a private destination. Newest `confirm_time` first, 30 rows. |
 | Bumps | `GetFeedBumps` | Unexpired bumps with coordinates, excluding bumps already fulfilled by a matching public ride. Newest first, 30 rows. |
 
 For the ad model itself, see [Coupons, ads, and promo bars](/engineering/domains/coupons-ads-and-promo-bars).
@@ -211,7 +211,7 @@ Nothing invalidates the feed on write. A new ride, bump, or ad shows up on the n
 
 ### Consumers
 
-- **App.** `MapFeedProvider.tsx` requests only page 0 and keeps only `ride` items. It feeds their IDs to `useRideFeedSummaries`. The Spot comes from the community map layer instead.
+- **App.** `MapFeedProvider.tsx` requests only page 0 and keeps `ride` and `bump` items in feed order for the **Moves** rail. It fetches summaries for the ride IDs with `useRideFeedSummaries`. Bumps arrive inline, so the provider shapes each one like a ride summary (sender name and initials, destination, `created_at` as `confirm_time`) and renders it with the same move card. A bump whose `created_at` matches a friend move from `/map/friends` is skipped, because the friend move already leads the rail. The Spot comes from the community map layer instead.
 - **Dashboard.** `FeedPreview.tsx` takes the Spot and events from the dashboard community layer and only `ride` items from `GET /dashboard/communities/{id}/feed`. Top locations render as **Popular place** cards.
 
 ## Top locations
@@ -298,7 +298,7 @@ Changes reach the rider map on the next `Mobility` tick, about one minute later.
 - **Attendance has no gates.** `Attend`, `Leave`, and `GetAttendees` don't check status or community. Any signed-in user can list names and photos for any event ID.
 - **Uploaded photos get a malformed content type.** The handler keeps the dot in the extension, and storage builds `"image/" + photo.Extension`, which gives `image/.png` (`storage.go:180`, `:206`). There is no file-type check, and the size limit is `MaxMultipartFormSize`, 100 MiB.
 - **Expired ads stay in the feed.** `GetCommunityAds` doesn't filter on `start_time` or `end_time`, and the repository ignores its `limit`.
-- **Bumps crowd out rides.** Moves are all bumps, then all rides. With 10 or more live bumps, page 0 holds no rides. With ads interleaved, as few as 7 bumps can fill it (groups of 3, 3, and 1 plus 3 ads). The app then shows no ride activity, because it reads only page 0.
+- **Bumps crowd out rides.** Moves are all bumps, then all rides. With 10 or more live bumps, page 0 holds no rides. With ads interleaved, as few as 7 bumps can fill it (groups of 3, 3, and 1 plus 3 ads). The app then shows bumps but no ride activity, because it reads only page 0.
 - **The page count is unbounded.** Up to 60 moves and one ad per group can produce more than 3 pages. Docs that say "up to 3 pages" describe the query limit, not the output.
 - **The memory fallback starts empty in Redis mode.** Startup warming writes only Redis. Until the first refresh tick, two minutes after boot, any Redis read error falls back to an empty map and returns 400 **Invalid Community ID**. The app does not retry 400s.
 - **Cold reads can return an empty feed.** The key's 2-minute TTL equals the refresh interval, so it can expire just before a tick. A reader that loses the `SETNX` race sleeps 100 ms and then reads a missing hash, getting an empty page. A community with zero items never gets a key, so every read regenerates it.

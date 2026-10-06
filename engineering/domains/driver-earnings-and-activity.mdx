@@ -63,8 +63,8 @@ Other `/driver/*` routes are documented by their owners:
 | Rider tips within the $5.00 buffer | `CompleteRideTip` via `captureTipWithinBuffer` | `fare + tip`, status `complete` | `estimated_stripe_fee_cents` (unchanged by the tip) |
 | Rider rates with no tip, or tip window expires | `CompleteRideTip` with tip 0 | `fare`, status `complete` | `estimated_stripe_fee_cents` |
 | Tip over the buffer, after the fare settled | `RecordCompletedRideTip` | `COALESCE(driver_payout, 0) + tip`, only when `tip_amount = 0` | `estimated_tip_stripe_fee_cents` on the tip alone |
-| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists | None |
-| Cancellation with a fee | Same webhook, or the cancellation operation | Captured fee amount | `estimated_stripe_fee_cents` on the fee (operation path) |
+| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists | `estimated_stripe_fee_cents`, re-estimated on the fare (plus the $5.00 buffer when tips are enabled) |
+| Cancellation with a fee | Same webhook, or the cancellation operation | Captured fee amount | `estimated_stripe_fee_cents` on the fee (operation path, `stripe_fee_estimate_cents(fee_cents)`), or on the fare (webhook path) |
 
 ### Worked example
 

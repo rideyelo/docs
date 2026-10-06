@@ -8,6 +8,7 @@ Each repository ships independently. Merging to `main` deploys the API and the w
 | Repository | Trigger | Target | Pipeline |
 | --- | --- | --- | --- |
 | `yelo-api` | Push to `main`, or manual dispatch with a SHA | Cloud Run service `yelo-api-testflight` | `release-api.yml` then `cloudbuild.yaml` |
+| `yelo-api` legacy update gate | Manual | App Engine, project `prod-yelo` | `gcloud app deploy` |
 | `yelo-web` sites | Push to `main` | Firebase Hosting, project `yelo-dashboard-v2` | `firebase.yml` |
 | `yelo-web` workers | Manual | Cloudflare Workers | `pnpm worker:<name>:deploy` |
 | `yelo-frontend` store builds | Manual dispatch | App Store, Google Play | `build.yml` then EAS Workflows |
@@ -82,6 +83,31 @@ The runtime image is `gcr.io/distroless/static-debian12:nonroot` with `GOMEMLIMI
 `release-e2e.yml` keeps the isolated `yelo-api-e2e` Cloud Run service identical to production. It runs after each successful **Release API** run, hourly, and on demand. When the E2E service's commit, image digest, or migration version drifts from production, it runs `cloudbuild.e2e.yaml`. That build migrates the isolated `yelo_e2e` database and deploys the exact production image digest with E2E-only secrets. It never rebuilds the API. The workflow only runs when the `E2E_RELEASE_ENABLED` variable is `true`.
 
 See [testing](/engineering/testing#mobile-e2e) for how the mobile suite uses this service.
+
+### Legacy update gate
+
+App builds up to 4.x have the retired App Engine API host `prod-yelo.uc.r.appspot.com` baked in. `cmd/legacy-update-gate` is a small standalone Go module that now serves that host so those builds are told to update:
+
+- A request whose path ends in `/update-required` is proxied to `https://api.rideyelo.com/update-required`. The minimum version stays defined only in the main API. Old builds join a trailing-slash base URL, so `//update-required` also matches.
+- Every other request gets `426 Upgrade Required` with `Cache-Control: no-store` and this body:
+
+  ```json
+  {
+    "success": false,
+    "app_link": "https://apps.apple.com/us/app/yelo-social-ride-network/id1667384111",
+    "error": { "code": "UpdateRequired", "body": "Please update Yelo to continue." }
+  }
+  ```
+
+- If the main API is unreachable, the proxied `/update-required` request also gets the 426 body, because an old build on this host needs the update either way.
+
+The release pipeline doesn't deploy it. Deploy it by hand from `cmd/legacy-update-gate`:
+
+```bash
+gcloud app deploy --project=prod-yelo --version=update-gate --no-promote
+```
+
+`--no-promote` uploads the version without sending traffic to it. Move traffic to `update-gate` once you've checked the version. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#legacy-app-engine-host).
 
 ## Web deployment
 

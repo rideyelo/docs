@@ -254,7 +254,7 @@ The auto-queue explainer uses the driver order: `driver_profile_picture_thumbnai
 
 - `GetDriversWithMissingStripeFees` selects up to 100 (driver, merchant) pairs with a due `stripe_fee_repair_after` and either a `payment_intent_id` with null `stripe_fee_cents`, or a `tip_payment_intent_id` with `tip_amount > 0` and null `tip_stripe_fee_cents`.
 - Each repair job lists balance transactions with `created >= oldest missing request_time - 8 days` (`driveFeeCaptureCushion`), 100 per page.
-- After each page it calls `PersistStripeFees`, which writes fare and tip charge fees and logs `stripe_fee_estimate_mismatch` for each fee that differs from its stored estimate. It stops as soon as `HasMissingStripeFees` is false.
+- After each page it calls `PersistStripeFees`, which writes fare and tip charge fees, then logs `stripe_fee_estimate_mismatch` for each fee that differs from its stored estimate. It stops as soon as `HasMissingStripeFees` is false.
 - When Stripe has no more pages, `DeferMissingStripeFeeRepair` pushes the unresolved rides 24 hours out.
 - After 10 pages it enqueues a continuation with the cursor, 1 second later, `MaxAttempts` 25.
 - Jobs are unique by args across available, pending, running, retryable, and scheduled states.

@@ -47,8 +47,9 @@ flowchart TD
   BG -->|yes| GOS["GoOnlineConfirmationSheet"]
   GOS -->|Go Online| ON["Shift sheet: ONLINE"]
   ON -->|board ride| CARD["RideRequestCard modal"]
-  CARD -->|Accept or 30s timeout| CUR["CurrentRideBottomSheet"]
+  CARD -->|Accept| CUR["CurrentRideBottomSheet"]
   CARD -->|Decline| DEC["DeclineReasonSheet"]
+  CARD -->|30s timeout| TO["Declined: No response"]
   CUR -->|Complete ride| DONE["RideCompleteScreen overlay"]
   DONE -->|Continue or Next Ride| ON
   ON -->|hand icon| GOFF["End your shift?"]
@@ -73,8 +74,8 @@ On first load, if no navigation app is stored in SecureStore (`defaultNavApp`), 
 **Go online** checks background location first. See [Permissions](/engineering/mobile/permissions-and-device#location). Then `GoOnlineConfirmationSheet` shows:
 
 - A **vehicle tile** (make and model of the vehicle chosen by `goOnlineVehicle` for the active fleet, or "No vehicle"). Tapping opens `VehiclePickerSheet`, which is locked while online ("You're online — go offline to change vehicles.") or on a ride.
-- An **auto-queue tile** ("[N] min" or "Off"). Tapping opens `AutoQueueDurationSheet`.
-- A **What is auto-queue?** link to `AutoQueueExplainerSheet`.
+- An **auto-queue tile** ("[N] min"), only when auto-queue is on. Tapping opens `AutoQueueDurationSheet`.
+- A **What is auto-queue?** link to `AutoQueueExplainerSheet`, only when auto-queue is on.
 - A warning if the vehicle has `in_use_by_other_driver`.
 
 **Go Online** refreshes vehicles ("Checking vehicle…"). If another driver has an open session, it asks **Vehicle already in use** with **Go online anyway**. Then `driveActions.setOnline(true, vehicleId)` runs. See [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#going-online) for the API sequence.
@@ -90,17 +91,21 @@ Client-side errors from `setOnline`:
 
 ### Online
 
-`OnlineSheetContent` shows a green sonar pulse, **ONLINE** (or **ONLINE · PAUSED** with a countdown), an auto-queue chip (**Auto-queue on**, **Auto-queue off**, or **Paused · 4m**), a red hand button that opens **End your shift?** / "You'll stop getting ride requests.", and the list of eligible board rides.
+`OnlineSheetContent` shows a green sonar pulse, **ONLINE** (or **ONLINE · PAUSED** with a countdown), an auto-queue chip (**Auto-queue on** or **Paused · 4m**), a red hand button that opens **End your shift?** / "You'll stop getting ride requests.", and the list of eligible board rides.
+
+The auto-queue chip and the paused state only render when auto-queue is on. With it off, the sheet offers only going offline, and a leftover `paused_until` from an earlier opt-in doesn't show as paused.
 
 ### Auto-queue controls
+
+Auto-queue is opt-in. Drivers turn it on from the **Auto-queue** row under DRIVE in the [driver hub](#driver-hub), which opens `AutoQueueDurationSheet`. Until then, the drive screen hides every auto-queue control.
 
 | Sheet | Options | Endpoint |
 | --- | --- | --- |
 | `AutoQueueDurationSheet` | On or off, then 30, 45, 60, 90, or 120 minutes, filtered to `community_max_minutes` | `PUT /driver/auto-queue` with `enabled`, `max_minutes`. Turning it on runs the version gate first. |
-| `AutoQueuePauseSheet` | Pause for 5, 10, 15, or 30 minutes, **Resume auto-queue now**, or **Turn on auto-queue** when off | `POST /driver/auto-queue/pause` with `duration_minutes` |
+| `AutoQueuePauseSheet` | Pause for 5, 10, 15, or 30 minutes, or **Resume now** while paused. Reachable only when auto-queue is on. | `POST /driver/auto-queue/pause` with `duration_minutes` |
 | `AutoQueueExplainerSheet` | **Show yourself to riders**: "Riders see you when picking a ride", "Riders can pick you by name", with a preview card | none |
 
-Settings come from `GET /driver/auto-queue` (`enabled`, `paused_until`, `effective_max_minutes`, `community_max_minutes`). The save path updates the cache optimistically and refetches either way.
+Settings come from `GET /driver/auto-queue` (`enabled`, `paused_until`, `effective_max_minutes`, `community_max_minutes`). The hub row, the go-online sheet, and the drive screen share one save path (`useAutoQueueSettings`). It updates the cache optimistically, runs the version gate when turning on, and refetches either way.
 
 ## Ride requests
 
@@ -108,15 +113,21 @@ Settings come from `GET /driver/auto-queue` (`enabled`, `paused_until`, `effecti
 
 When the driver is online and `DriveProvider` selects an `activeCardRide`, `DriverMapOverlay` opens a full-screen slide-up `Modal` with `RideRequestCard`, plays `ride_sound.mp3`, and disables map gestures.
 
-The card's header band shows the driver's pay, the rider's first name and last initial, and the elapsed wait since `request_time` (green, then yellow after 30 seconds, red after 120). Pay is `driver_earnings`, the fare less Stripe's fee (`lib/ride/driverEarnings.ts`). The app falls back to `price` only against an API without the field. Below the header, a route map shows the driver's position, the pickup leg, and the trip, with a table of miles and minutes per leg and in total.
+The card has three parts:
 
-The pickup leg is routed on the device from the current GPS fix with Mapbox Directions. The board's `pickup_distance` and `pickup_duration` are the fallback.
+- **Header band**: **YOU EARN** with the driver's pay, a rider tile, and a wait ticker. Pay is `driver_earnings` (the fare plus any tip, less the Stripe fee). Against an API without that field, the card falls back to `price`. The rider tile shows the photo or initials, the first name and last initial (`Elle A.`), and the school and graduation year (`'27`). The **WAITING** ticker counts up from `request_time` as `m:ss` and turns from green to yellow after 30 seconds and red after 120.
+- **Route map**: a large map with the driver's position, the pickup leg, and the trip.
+- **Mileage table**: **TO PICKUP**, **TO DROPOFF**, and **TOTAL** rows with miles and minutes for each leg and the sum.
 
-<Note>
-Unanswered requests expire to a decline. `RideAcceptButton` drains over 30 seconds (`durationSeconds={30}`) with the label **Accept [pay]** and a seconds counter. When it runs out with no tap, `onTimeout` calls `declineRide` with the reason `No response`. The ride is never accepted automatically.
-</Note>
+The pickup leg is routed on the device. `RideRequestCard` requests a Mapbox Directions driving route from the current GPS fix to the pickup. When GPS or Mapbox is unavailable, the card uses the board's `pickup_distance` and `pickup_duration` instead.
 
-**Accept** (tap):
+Driver views outside the card follow the same rules. The queue and chat threads show `driver_earnings` and the rider's first name and last initial. Drive history rows show `driver_earnings`, and ride details shows the abbreviated rider name. Earnings activity shows the abbreviated rider name and the activity item's `earnings` amount.
+
+<Warning>
+An unanswered request is declined, not accepted. `RideAcceptButton` reads **Accept $X.XX** with the seconds remaining on the right. Its yellow fill drains over 30 seconds. When it empties without a tap, `DriverMapOverlay` declines the ride with reason `No response`, using the same path as a manual decline.
+</Warning>
+
+**Accept** (tap only):
 
 1. Marks the ride id as accepted locally so it leaves the board.
 2. Runs the version gate, then `POST /ride/i/{id}/accept`.
@@ -124,6 +135,8 @@ Unanswered requests expire to a decline. `RideAcceptButton` drains over 30 secon
 4. On any failure except the version gate: the ride id is un-accepted and `TooSlowPopup` shows **RIDE GONE** / **Too slow this time.** / "Rides on Yelo move fast. Monitor your notifications and tap in fast." It auto-dismisses after 5 seconds.
 
 **Decline** pauses the countdown and opens `DeclineReasonSheet` with four reasons: **Not enough money**, **Too far away**, **Not actively driving**, **Other**. Submitting hides the ride for the rest of the session before the network call, then sends `POST /ride/i/{id}/decline` with `reason` (retried twice with backoff). Cancelling the sheet resumes the countdown.
+
+**Timeout** hides the ride for the rest of the session and sends `POST /ride/i/{id}/decline` with `reason` set to `No response`. The API stores the reason verbatim, so timeouts show up alongside manual decline reasons.
 
 If a ride vanishes from the board within 15 seconds without being accepted, `DriveProvider` sets `tooSlowRideId` and the same popup shows.
 
@@ -192,6 +205,7 @@ Ratings of 4 or 5 count as positive for the shift. Going offline after 3 or more
 | DRIVE | **My vehicles** | `DriverHubVehiclesSheet`: set default (`PUT /vehicle/{id}`), add or edit via `5-vehicle-basic` and `6-vehicle-details` |
 | DRIVE | **Navigation** | `DriverHubNavigationSheet` |
 | DRIVE | **Switch fleet** | `DriverHubFleetSwitcherSheet`: "Choose the network you're driving for right now." `POST /driver/active-fleet`. Blocked while online or on a ride. |
+| DRIVE | **Auto-queue** ("On · up to [N] min ahead" or "Off") | `AutoQueueDurationSheet`: `PUT /driver/auto-queue` |
 | Support | **Contact Yelo** | `ContactYeloSheet` |
 
 ## Earnings and payouts
@@ -247,8 +261,8 @@ The app refreshes `/earnings/balance`, `/earnings/activity`, and `/user/drive-hi
 
 ## Gotchas and edge cases
 
-- **Silence means accept.** This is the intended card design, not a bug. A driver who looks away from a ride card for 30 seconds accepts it. Pausing only happens while the decline sheet is open.
-- **Every accept failure reads as "too slow".** `DriverMapOverlay.tsx:282` sets `tooSlowRideId` for network errors, 5xx, and validation errors alike.
+- **Silence means decline.** A driver who looks away from a ride card for 30 seconds declines it with reason `No response`, and the ride doesn't return for the rest of that drive session. Pausing only happens while the decline sheet is open.
+- **Every accept failure reads as "too slow".** `DriverMapOverlay.tsx:255` sets `tooSlowRideId` for network errors, 5xx, and validation errors alike.
 - **Server go-online reasons are hidden.** The API returns specific titles (Application Incomplete, Payment Setup Required, Fleet Not Found, No Vehicle, Outside Service Area), but `DriveProvider.tsx:369` replaces them all with "Failed to update online status."
 - **Disabled Go online has no explanation.** When `canGoOnline` is false the button just greys out.
 - **The demand dashboard is fetched and never shown.** `DriveProvider` prefetches `GET /driver/demand-dashboard` on mount (`DriveProvider.tsx:215`), but no component reads that query.

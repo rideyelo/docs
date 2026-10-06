@@ -13,7 +13,19 @@ Markers on each line:
 
 Dependency bumps, CI changes, and E2E tooling are summarized in one line per week.
 
-<Update label="Week of October 5, 2026" description="Driver net earnings after Stripe fees, pending (uncaptured) earnings, and dependency updates">
+<Update label="Week of October 5, 2026" description="Driver net earnings after Stripe fees, pending earnings, friend_joined push, idempotent ride accept, 10,000-number contact snapshots, legacy update gate, and dependency updates">
+  **Notifications**
+
+  - New `friend_joined` push ("[Name] is on Yelo 👋", opens `/map`). It goes to the other side of each newly created friendship from a contact match, signup referral, or invite link, and is deduplicated per joiner and recipient set. It is a `marketing` template, so it defers to quiet hours. [#299](https://github.com/rideyelo/yelo-api/pull/299). See [Notification catalog](/engineering/notifications/catalog#operator-and-friends).
+
+  **Rides**
+
+  - Manual accepts are serialized per ride under the ride's advisory lock, so a duplicate request can't place a second authorization on the rider's card. A repeat accept from the driver who already holds the ride returns success instead of an error. A lifecycle conflict while saving the payment intent returns the conflict instead of a 500. [#295](https://github.com/rideyelo/yelo-api/pull/295). See [Concurrency and races](/engineering/matching/concurrency#race-scenarios).
+
+  **Social**
+
+  - `POST /user/friends/contacts` accepts up to 10,000 `phone_numbers`, up from 5,000. The mobile app raised its snapshot cap to match in [yelo-frontend#657](https://github.com/rideyelo/yelo-frontend/pull/657). [#295](https://github.com/rideyelo/yelo-api/pull/295). See [User social graph](/engineering/domains/user-social-graph#request-validation).
+
   **Payments**
 
   - Driver-facing earnings are net of Stripe's processing fee. Ride board, queue, ride details for drivers, message threads, drive history, and activity rows return `driver_earnings` (dollars) or `earnings` (cents). Status poll earnings and the weekly headline sum net earnings instead of `driver_payout`. Fees use the actual Stripe fee per charge when known, else a stored 2.9% + 30¢ estimate. Driver-facing reads show the rider's first name and last initial only. The fee repair job also stores dedicated tip charge fees and logs `stripe_fee_estimate_mismatch` when Stripe's fee differs from the estimate. **Migration** `000348` adds three fee columns to `Rides` and the `stripe_fee_estimate_cents` and `ride_driver_earnings_cents` functions. `000349` and `000350` add concurrent tip-fee repair indexes. **Breaking:** drive history `fee_cents` is now gross less `driver_earnings`, and rider history no longer returns a fee. [#298](https://github.com/rideyelo/yelo-api/pull/298). See [Driver earnings and activity](/engineering/domains/driver-earnings-and-activity#net-earnings-after-stripe-fees).
@@ -21,6 +33,7 @@ Dependency bumps, CI changes, and E2E tooling are summarized in one line per wee
 
   **Platform**
 
+  - New standalone App Engine service for the retired host `prod-yelo.uc.r.appspot.com`. App builds 4.x and older get `426 Upgrade Required` with the store link. `/update-required` is proxied to the live API. **Config:** deployed manually with `gcloud app deploy`, outside the release pipeline. [#295](https://github.com/rideyelo/yelo-api/pull/295). See [Legacy update gate](/engineering/deployment#legacy-update-gate).
   - Dependencies: maps, Dub, OTLP trace exporter, `x/net`, and Google API modules. [#291](https://github.com/rideyelo/yelo-api/pull/291)
 </Update>
 
