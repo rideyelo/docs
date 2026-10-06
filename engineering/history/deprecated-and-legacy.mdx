@@ -30,6 +30,7 @@ This page lists what is still in the codebase for compatibility or by accident, 
 | [Auth v2 routes](#auth-v2) | Auth v3 | Mobile and web, for 6 of 12 routes | No; 6 unused routes need log evidence |
 | [`EmailOTP` and `PhoneOTP` repositories](#retired-otp-tables-and-repositories) | Redis (v2) and `AuthPhoneAttempts` (v3) | None | Code yes; tables after export |
 | [v1 error envelope](#v1-error-envelope) | v2 envelope via `X-API-Version: v2` | Every client without the header | No |
+| [Legacy App Engine host](#legacy-app-engine-host) | `api.rideyelo.com` | App builds 4.x and older | Only after log evidence that no 4.x build calls it |
 | [Clerk single-fleet metadata](#clerk-single-fleet-metadata) | `fleet_assignments` | Any Clerk user not yet migrated | Only after a Clerk metadata audit |
 | [Legacy `/user/status` response](#legacy-user-status-response) | Negotiated ride state snapshot | Clients without `X-Ride-State-Protocol: 1` | No |
 | [`no_drivers_available` ride status](#no_drivers_available-ride-status) | Unmatched request expiry and outcome categories | Readers of historical rows | Not without a data migration |
@@ -100,6 +101,15 @@ Dashboard users used to carry one `fleet_id` and `community_id` in Clerk metadat
 ### Legacy API hostname
 
 The auth v3 web design keeps `api.rideyelo.com` as an alias of `api.joinyelo.com` "while installed app versions still use it" (`yelo-web/docs/authv3-web-native.md`). Don't retire the hostname without checking request logs by host.
+
+### Legacy App Engine host
+
+The API used to run on App Engine at `prod-yelo.uc.r.appspot.com`, and builds up to 4.x still call that host. The full API there is retired. [#295](https://github.com/rideyelo/yelo-api/pull/295) replaced it with `cmd/legacy-update-gate`, a standalone App Engine service whose only job is to make those builds update:
+
+- `/update-required` is proxied to `api.rideyelo.com`, so the same `minimumFrontendVersion` applies.
+- Every other path returns `426 Upgrade Required` with the App Store `app_link` and the `UpdateRequired` error code.
+
+It isn't part of the API release pipeline. See [Deployment](/engineering/deployment#legacy-update-gate) for how to deploy it. Keep it running until App Engine request logs show no 4.x traffic.
 
 ## Rides
 

@@ -46,12 +46,13 @@ Manual accept and auto-queue admission skip `declined_drivers`. A driver who dec
 | 1 | Driver has an open session | `getDriverSessionAndFleet` | 400 "No Active Session" |
 | 2 | `IsOnlineDriver` | `validateDriverAvailability` | 400 "Driver Not Online" |
 | 3 | `QueueLength` below `matching.MaxQueueLength` (100) | `validateDriverAvailability` | 400 "Driver Queue Length Exceeded" |
-| 4 | Ride is `confirmed` | `validateRideRequestAcceptance` | 400 "Ride request no longer valid" |
-| 5 | No live hold for another driver | `validateRideRequestAcceptance` | 400 "Ride is awaiting the selected driver" |
-| 6 | Ride fleet is null or equals session fleet | `validateRideFleet` | 400 "This ride is for a different fleet" |
-| 7 | Pickup route | `getPickupRoute` | Mapbox error |
-| 8 | Payment authorization, when the effective price is above 0 | `processRidePayment` | Stripe error |
-| 9 | Transaction checks (below) | `Ride.Accept` | See below |
+| 4 | Take the ride's advisory lock and reread the ride. If the ride is already assigned to this driver in `queued` or `driver_en_route`, return success with no further work | `AcquireLock`, `rideAcceptedBy` | None. A repeat accept is idempotent |
+| 5 | Ride is `confirmed` | `validateRideRequestAcceptance` | 400 "Ride request no longer valid" |
+| 6 | No live hold for another driver | `validateRideRequestAcceptance` | 400 "Ride is awaiting the selected driver" |
+| 7 | Ride fleet is null or equals session fleet | `validateRideFleet` | 400 "This ride is for a different fleet" |
+| 8 | Pickup route | `getPickupRoute` | Mapbox error |
+| 9 | Payment authorization, when the effective price is above 0 | `processRidePayment` | Stripe error |
+| 10 | Transaction checks (below) | `Ride.Accept` | See below |
 
 Inside `acceptRide` in `internal/data/repository/ride_lifecycle.go`, under participant and ride row locks:
 

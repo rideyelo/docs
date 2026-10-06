@@ -13,8 +13,18 @@ Markers on each line:
 
 Dependency bumps, CI changes, and E2E tooling are summarized in one line per week.
 
-<Update label="Week of October 5, 2026" description="Dependency updates">
+<Update label="Week of October 5, 2026" description="Idempotent ride accept, 10,000-number contact snapshots, legacy update gate, and dependency updates">
+  **Rides**
+
+  - Manual accepts are serialized per ride under the ride's advisory lock, so a duplicate request can't place a second authorization on the rider's card. A repeat accept from the driver who already holds the ride returns success instead of an error. A lifecycle conflict while saving the payment intent returns the conflict instead of a 500. [#295](https://github.com/rideyelo/yelo-api/pull/295). See [Concurrency and races](/engineering/matching/concurrency#race-scenarios).
+
+  **Social**
+
+  - `POST /user/friends/contacts` accepts up to 10,000 `phone_numbers`, up from 5,000. The mobile app raised its snapshot cap to match in [yelo-frontend#657](https://github.com/rideyelo/yelo-frontend/pull/657). [#295](https://github.com/rideyelo/yelo-api/pull/295). See [User social graph](/engineering/domains/user-social-graph#request-validation).
+
   **Platform**
+
+  - New standalone App Engine service for the retired host `prod-yelo.uc.r.appspot.com`. App builds 4.x and older get `426 Upgrade Required` with the store link. `/update-required` is proxied to the live API. **Config:** deployed manually with `gcloud app deploy`, outside the release pipeline. [#295](https://github.com/rideyelo/yelo-api/pull/295). See [Legacy update gate](/engineering/deployment#legacy-update-gate).
 
   - Dependencies: maps, Dub, OTLP trace exporter, `x/net`, and Google API modules. [#291](https://github.com/rideyelo/yelo-api/pull/291)
 </Update>
