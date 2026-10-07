@@ -9,17 +9,18 @@ Each answer describes what the app and API do today. Links go to the engineering
 
 ### How do two people become friends?
 
-Yelo has no friend request to accept. A friendship is created in one of three ways, and it's always mutual:
+Yelo has no friend request to accept. A friendship is created in one of four ways, and it's always mutual:
 
 | How | What happens |
 | --- | --- |
 | Mutual contacts | Both people share contacts with Yelo, and each has the other's number saved. The friendship is created during contact sync. |
 | Signing up with an invite | A new user signs up with a friend's referral code. They become friends with the referrer at sign-up. |
 | Opening an invite link | An existing user opens a friend's invite link and taps **Add friend**. The app shows "You and [name] are now friends". |
+| Bumping a contact | A user bumps someone on Yelo who isn't a friend yet but is linked by a one-sided contact. The first bump creates the friendship. See [Who can I bump?](#who-can-i-bump) |
 
-When a friendship is created, the other person gets a push. By default it reads **[Name] is on Yelo 👋** / "You're now friends. See where they're headed." The person who acted doesn't get it.
+When a friendship is created through contacts or an invite, the other person gets a push. By default it reads **[Name] is on Yelo 👋** / "You're now friends. See where they're headed." The person who acted doesn't get it. A friendship created by a bump sends no separate push, because the bump already tells the other person who reached them.
 
-A one-sided contact isn't enough. If Alice has Bob's number but Bob doesn't have Alice's, they aren't friends. The settings sheet says it this way: "Find friends who have saved your number too."
+A one-sided contact doesn't create a friendship during contact sync. If Alice has Bob's number but Bob doesn't have Alice's, they aren't friends until one of them bumps the other. The settings sheet says it this way: "Find friends who have saved your number too."
 
 See [Friends](/engineering/mobile/social-and-contacts#friends).
 
@@ -89,10 +90,27 @@ Two kinds of people appear in the row:
 
 | Legend | Who | What a tap does |
 | --- | --- | --- |
-| **friends** (yellow dot) | Yelo friends | Selects them for the bump. Yelo delivers it. |
+| **friends** (yellow dot) | Yelo friends, then Yelo users linked by a one-sided contact | Selects them for the bump. Yelo delivers it. |
 | **in contacts** (grey dot) | Contacts who aren't friends | Opens the phone's Messages app with an invite text. The user sends it. |
 
 Friends the user has bumped before on this device start selected.
+
+### Who can I bump?
+
+A user can bump two kinds of people:
+
+- **Friends.** Anyone they're already friends with on Yelo.
+- **Reachable contacts.** People on Yelo who aren't friends yet, where at least one side has the other's number saved and shared with Yelo. Either the user saved the other person's number, or the other person saved the user's.
+
+Deleted and banned accounts, and accounts that haven't finished signing up, can't be bumped.
+
+People who saved the user's number show in the sheet with the name on their Yelo account, even if the user never shared contacts. The sheet lists up to 200 of them. People the user saved show with the name from the user's own address book.
+
+The first bump to a reachable contact makes the two users friends. After that, they see each other on the friends map like any other friends, unless one of them has location sharing off. See [Can my friends see where I am?](#can-my-friends-see-where-i-am)
+
+<Note>
+Saving someone's number and sharing contacts is enough to let them see you in their bump sheet and bump you. Their first bump makes you friends, and that shares your location with them on the map. A user who doesn't want this can turn contacts access off. That clears the user's own uploaded contacts. It doesn't remove the user from the sheets of people who saved the user's number.
+</Note>
 
 ### What does my friend receive?
 
@@ -133,7 +151,7 @@ The red line above the buttons explains the failure:
 | "That took too long. Check your connection and try again." | No answer from the server in 15 seconds. |
 | "You appear to be offline. Check your connection and try again." | The phone has no connection. |
 | "Your session expired. Sign in and try again." | The user's sign-in is no longer valid. |
-| "That bump couldn't be sent. Your friend list may have changed." | The server rejected the bump. The usual cause is that a selected person isn't a confirmed friend. Bumps only go to friends. |
+| "That bump couldn't be sent. Your friend list may have changed." | The server rejected the bump. The usual cause is that a selected person is no longer a friend or reachable contact. For example, their account was deleted or a contact sync removed the link. |
 | "Something went wrong on our end. Try again in a moment." | A server error. |
 | "Couldn't send that bump. Please try again." | Anything else. |
 
@@ -158,7 +176,7 @@ A bump also stops showing if the sender has location sharing off.
 
 ### What does Yelo do with my contacts?
 
-The app uploads the phone numbers from the address book, not names or photos. The server turns each number into a one-way hash and stores only the hash. It never stores the raw numbers. Yelo uses them for one thing: creating a friendship when two users have each other's number.
+The app uploads the phone numbers from the address book, not names or photos. The server turns each number into a one-way hash and stores only the hash. It never stores the raw numbers. Yelo uses them for two things: creating a friendship when two users have each other's number, and letting users bump people on Yelo when either side has the other's number. See [Who can I bump?](#who-can-i-bump)
 
 The upload is capped at 10,000 numbers. A larger address book isn't synced, and the app shows a **Share invite link** action instead. The earlier matches stay in place.
 

@@ -46,20 +46,20 @@ flowchart TD
 
 `NotificationService.NotifyFriendBump` (`internal/service/notifications/bump.go`):
 
-1. **Friends only.** `Friendship.FriendsAmong` must return exactly the requested set. One non-friend rejects the whole bump with `You can only bump people who are already your friends on Yelo.`
+1. **Friends or reachable contacts.** Recipients already returned by `Friendship.FriendsAmong` pass. Every other recipient must be returned by `UserContacts.ReachableAmong`. A recipient is reachable when either side holds the other's number in their synced contacts: the recipient's snapshot contains the sender's contact hash, or the sender's snapshot contains the recipient's. Deleted, banned, and auth v3 provisional accounts are never reachable. One recipient that fails both checks rejects the whole bump with `You can only bump your friends and contacts on Yelo.`
+   - The match uses the `CONTACT_HASH_PEPPER` HMAC. Without the pepper, no one is reachable and bumps are friends-only.
 2. **Rate limit.** `bumpRateLimited` calls `RedisClient.ReserveSlidingWindow` on key `friend_bump:{sender}` with the idempotency key as the member, a 1-hour window, and a limit of 20.
    - It's a reservation, not a count, so concurrent requests can't all pass.
    - A retry with the same idempotency key reuses its slot.
    - A refused bump releases its slot.
    - If Redis is disabled or errors, the limit **fails open**.
    - Over the limit, the API returns a rate-limit error: `Slow down` / `You've sent a lot of bumps recently. Try again in a little while.`
-3. **Sender name.** A blank first name becomes `A friend`.
+3. **Link on first bump.** For recipients who aren't friends yet, the service calls `Friendship.AddMutualBatch` with source `bump`. The write is best-effort. A failure is logged and the bump still sends. The pair stays reachable, so the next bump retries the write.
+4. **Sender name.** A blank first name becomes `A friend`.
 
-<Note>
-  Since [yelo-frontend#664](https://github.com/rideyelo/yelo-frontend/pull/664), the mobile bump sheet also lists reachable Yelo users: registered non-friends linked by a one-sided contact share. The app expects the first bump to one of them to create the friendship. The API side ([yelo-api#303](https://github.com/rideyelo/yelo-api/pull/303)) has not merged. Until it does, the API returns no `reachable` users and the friends-only check above still applies. See [Social and contacts](/engineering/mobile/social-and-contacts#friend-bumps).
-</Note>
+The bump sheet gets its reachable list from the same query that authorizes the send, so it never offers someone the API would reject. See [Social and contacts](/engineering/mobile/social-and-contacts#friend-bumps).
 
-New friendships from contact matches, referrals, and invite links send a separate `friend_joined` push. See [Notification catalog](/engineering/notifications/catalog#operator-and-friends).
+New friendships from contact matches, referrals, and invite links send a separate `friend_joined` push. Bump-created friendships skip it, because the bump already tells the recipient who reached them. See [Notification catalog](/engineering/notifications/catalog#operator-and-friends).
 
 ### Persistence
 
@@ -213,6 +213,7 @@ There are no quiet hours, templates, or cooldowns on OTP texts. Auth v3 rate lim
 | Bump service and preview | `yelo-api/internal/service/notifications/bump.go`, `bump_preview.go` |
 | Bump copy, rendering, enqueue | `yelo-api/internal/notify/friendbump.go`, `friendbump_render.go`, `bump_sms.go` |
 | Bump SMS worker | `yelo-api/internal/notify/queue/bump_sms.go` |
+| Bump reachability | `yelo-api/internal/data/repository/user_contacts.go` (`ReachableAmong`), `queries/contacts.sql` |
 | TextMessages claim | `yelo-api/internal/data/repository/text_messages.go`, `queries/engagement.sql` |
 | SMS consent | `yelo-api/internal/service/userrequirements/user.go` (`CanReceiveSMS`), `queries/user_profile.sql` (`SetUsersSMSOptOut`) |
 | STOP/START webhook | `yelo-api/internal/server/http/twiliowebhook/twiliowebhook.go` |
