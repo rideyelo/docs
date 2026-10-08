@@ -72,9 +72,9 @@ The effect runs only while the request screen is focused and Fare Finder is enab
 
 For each of `uber`, `lyft`, and `empower`, in parallel:
 
-1. **Connection check.** `isConnected` reads SecureStore. A provider with no stored session stops here and shows the log-in card. A connected provider whose route has no valid stop also stops here, with no request.
+1. **Connection check.** `isConnected` reads SecureStore. A provider with no stored session stops here and shows the log-in card. A connected provider whose route lacks a valid pickup or dropoff also stops here, with no request, and its card shows the spinner.
 2. **Cache check.** `getFreshQuotes` serves the cached options for the same route. See [Quote cache and cooldown](#quote-cache-and-cooldown).
-3. **Fetch.** The provider module gets a valid access token, calls the provider, and parses the response into `RideQuoteOption[]` (`lib/ride/types.ts`). Each quote call has a 10-second timeout. If the call fails with no HTTP response at all (`error_kind: network`), the hook retries it once before reporting an error.
+3. **Fetch.** The provider module gets a valid access token, calls the provider, and parses the response into `RideQuoteOption[]` (`lib/ride/types.ts`). Each provider's fare request has a 10-second timeout. Empower's bootstrap lookup allows 15 seconds. If the call fails with no HTTP response at all (`error_kind: network`), the hook retries it once before reporting an error.
 4. **Filter.** `toAggregatorOptions` maps quotes to `AggregatorRideOption`. `hasUsablePrice` drops any option with no numeric fare and a blank label.
 5. **Empty result.** An empty list can mean a dead refresh cleared the tokens, so the hook calls `isConnected` again. Disconnected becomes the log-in card. Still connected becomes `unavailable`.
 6. **Error.** `classifyQuoteError` maps a thrown HTTP 401 or 403 to `auth`. Every other failure (5xx, timeout, network after the retry) is `unavailable`. The hook logs `ride.quotes.error`.
@@ -141,7 +141,7 @@ On iOS, after a cancelled or failed attempt, the screen offers **Try a fresh sig
 
 **Quotes.** `getUberQuotes` posts the pickup and destination coordinates to Uber's fare-estimate endpoint with a bearer token and device headers, with a 10-second timeout. The device-location headers carry the pickup, not `0.0`. With zeros, Uber doesn't answer when the pickup is outside the city the account was last in.
 
-In parallel, `getUberVehicleViews` posts the pickup to Uber's rider status endpoint (10-second timeout) to get the city's product catalog and nearby-vehicle ETAs. The request body carries only `targetLocation`. The response is cached in memory, keyed by the pickup rounded to two decimal places, but only when it named at least one product. A response with ETAs and no names is refetched on the next quote. A catalog failure is swallowed.
+In parallel, `getUberVehicleViews` posts the pickup to Uber's rider status endpoint (10-second timeout) to get the city's product catalog and nearby-vehicle ETAs. The request body carries only `targetLocation`. The response is cached in memory, keyed by the pickup rounded to two decimal places. The cache is reused only when it named at least one product, so a response with ETAs and no names is refetched on the next quote. A catalog failure is swallowed.
 
 `parseUberFareEstimate` (`lib/ride/parsers.ts`) walks `packageVariants`:
 
@@ -372,7 +372,7 @@ The action bar's **Accounts** badge does not read the store. It reads the live p
 
 `useThirdPartyInstalled` probes the provider's bare scheme with `Linking.canOpenURL`. The CTA stays disabled until the probe returns true. The schemes are declared in `LSApplicationQueriesSchemes` in `app.json` and in `RIDE_PROVIDER_SCHEMES` in `app.config.ts`.
 
-`openAggregatorRide` (`components/map/request/aggregatorHandoff.ts`) fires `ride_aggregator_provider_opened`, adds a `ride_aggregator` Sentry breadcrumb, and calls `openThirdPartyRide` with the dropoff and the option's `deepLinkId`.
+`openAggregatorRide` (`components/map/request/aggregatorHandoff.ts`) fires `ride_aggregator_provider_opened`, adds a `ride_aggregator` Sentry breadcrumb, and calls `openThirdPartyRide` with the dropoff and the option's `deepLinkId`. When the link resolves, it fires `ride_aggregator_handoff_result` with `result` (`app`, `web`, `failed`, or `no_dropoff`).
 
 | Provider | App link | Tier | Web fallback |
 | --- | --- | --- | --- |
@@ -426,10 +426,14 @@ Only `quotes` calls pass a route. Each event also carries the `quote_pass_id` th
 
 | Operations | Fields projected |
 | --- | --- |
-| All | `body_kind`, `has_error`, and `error_code` only when it is one of seven allowlisted codes |
+| All | `body_kind`, `has_error`, `error_code` only when it is one of seven allowlisted codes, and `body_keys` (up to 12 top-level key names, no values) |
+| `quotes`, `catalog`, `bootstrap` | `error_token`: an unlisted provider error enum, kept only when it is a short letters-and-underscores token |
 | `exchange`, `refresh`, `anonymous_token`, `otp`, `email_challenge` | `has_access_token`, `has_refresh_token`, `expires_in_seconds`, `challenge_count`. Token values are never copied. |
-| `quotes` | `has_offers_array`, `offer_count`, and one `fares` row per offer |
-| `catalog`, `profile` | Shape only. These bodies can contain nearby drivers and full account details. |
+| Uber and Lyft `quotes` | `has_offers_array`, `offer_count`, and one `fares` row per offer |
+| Empower `quotes` | `service_available` and `estimate_count` |
+| Empower `bootstrap` | `operation_names`: up to 40 operation names |
+| Uber `catalog` | `vehicle_view_count`, `named_view_count`, and `vehicle_views`: up to 60 named products with `id`, `name`, and `seats`. Nearby drivers are never copied. |
+| `profile`, `send_code` | Shape only. These bodies can contain full account details. |
 
 A `fares` row carries an array `index`. Uber product UUIDs and Lyft offer IDs are not copied:
 
@@ -483,7 +487,7 @@ The event also carries `schema_version: 1`, a random `request_id`, `started_at_m
 | PostHog | `ride_provider_request_completed` for every wrapped request | First 30 `fares` rows and 30 parsed options, with `offers_truncated` and `parsed_options_truncated` flags |
 | PostHog | `ride_provider_request_options` | One event per further chunk of 30 rows, keyed by `request_id`, `chunk_index`, and `chunk_count`. Carries `trip_offers` for that chunk when the completion event had `trip`. |
 | PostHog error tracking | `RideProviderRequestError` named `<provider> <operation> <outcome>` | Same throttle as the Sentry issue. Carries the bounded summary and `request_id`, never `route` or `trip`. |
-| Sentry breadcrumb | Category `ride.provider`, message `<provider>.<operation>`, level `warning` on failure | Same 30-row bound, with `route` removed |
+| Sentry breadcrumb | Category `ride.provider`, message `<provider>.<operation>`, level `warning` on failure | Same 30-row bound, with `route` and `trip` removed |
 | Sentry issue | `captureMessage('Ride provider request failed')` at `warning` | At most one per provider, operation, and outcome every 60 seconds |
 
 Sentry never receives coordinates or trip facts from this path. An issue is raised for every outcome except `success`, `empty`, `challenge`, and `cancelled`. It uses a fixed message, the fingerprint `['ride-provider', provider, operation, outcome]`, and the sanitized summary as context, not the Axios exception. The 60-second throttle is an in-memory map, so it resets when the app restarts.
