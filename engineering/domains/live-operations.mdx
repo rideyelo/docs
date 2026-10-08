@@ -71,7 +71,7 @@ The handlers still carry their own scoping, written before the middleware existe
 
 | Helper | Used by | Admin behavior | Non-admin behavior (unreachable today) |
 | --- | --- | --- | --- |
-| `resolveCommunityScope` | `analytics`, `competitor-prices`, `kpis`, `markets` | `community_id` query param, or `nil` (all communities) when it's empty | Pinned to the claim's `CommunityID`, 403 if missing |
+| `resolveCommunityScope` | `analytics`, `competitor-prices`, `competitor-quotes`, `kpis`, `markets` | `community_id` query param, or `nil` (all communities) when it's empty | Pinned to the claim's `CommunityID`, 403 if missing |
 | `resolveCommunityID` | Every `/markets/{id}/...` route | Path `{id}`, 400 if empty | Ignores the path and uses the claim's `CommunityID` |
 | `requireAdmin` | `/drivers/{id}/ping`, `/riders/{id}/ping` | Passes | 403 **Admin role required** |
 
@@ -84,7 +84,8 @@ All responses use the standard envelope, `{"success": true, "data": ...}`. Paths
 | Method | Path | Operation ID | Params | Response `data` | Web caller |
 | --- | --- | --- | --- | --- | --- |
 | GET | `/analytics` | `dashboard.GetLiveAnalytics` | `community_id`, `period` = `24h` (default), `7d`, `30d`, `all` | `LiveAnalytics` | `useLiveData('analytics')` |
-| GET | `/competitor-prices` | `dashboard.GetLiveCompetitorPrices` | `community_id`, `period` | `LiveCompetitorPrices` | `LivePricing` |
+| GET | `/competitor-prices` | `dashboard.GetLiveCompetitorPrices` | `community_id`, `period` = `<n>h`, `<n>d`, or `all` (default `24h`) | `LiveCompetitorPrices` | `LivePricing` |
+| GET | `/competitor-quotes` | `dashboard.GetLiveCompetitorQuotes` | `community_id`, `period` = `<n>h`, `<n>d`, or `all` (default `24h`) | `LiveProviderQuotes` | `useParity` on **Pricing** > **Parity**, not the Live page |
 | GET | `/kpis` | `dashboard.GetSupplyDemandKPIs` | `community_id` | `SupplyDemandKPIs` (24 h vs. prior 24 h) | None |
 | GET | `/markets` | `dashboard.GetMarketSummaries` | `community_id` (optional) | `{ markets: MarketSummary[] }` | `useLiveMarkets` |
 | GET | `/markets/{id}/drivers` | `dashboard.GetMarketDrivers` | none | `{ drivers: MarketDriver[] }` | `useLiveDrivers` |
@@ -212,9 +213,18 @@ On the web, `rideJourneyLayout` (`src/components/live/rideJourneyLayout.ts`) kee
 
 ## Competitor quotes
 
-`GetLiveCompetitorPrices` (`internal/service/dashboard/live.go`) accepts the same periods and delegates to `liveQuoteClient` (`internal/service/dashboard/live_pricing.go`). The client sends a HogQL query to `POST {POSTHOG_QUERY_HOST}/api/projects/{POSTHOG_PROJECT_ID}/query/` with a bearer `POSTHOG_PERSONAL_API_KEY`.
+Two endpoints read Fare Finder quotes from PostHog. Both live in `internal/service/dashboard/live.go` and delegate to `liveQuoteClient` (`internal/service/dashboard/live_pricing.go`).
 
-The query reads `ride_aggregator_prices_loaded` events in the window, scoped by `properties.community_id` and excluding `properties.is_test`. It explodes `properties.options` and keeps UberX (`provider = 'uber'`, `name = 'UberX'`) and Lyft Standard (`provider = 'lyft'`, `key = 'standard'`) options that have a positive `price_value`, `needs_connect = false`, and an empty `error_kind`. It returns one row per provider with the average fare, sample count, and last timestamp. The mobile app emits these events in `lib/analytics/events/rideAggregator.ts` when the rideshare price aggregator experiment loads quotes. See [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments#experiments).
+| Endpoint | Returns | Used by |
+| --- | --- | --- |
+| `GET /dashboard/live/competitor-prices` (`GetLiveCompetitorPrices`) | One averaged UberX row and one averaged Lyft Standard row | The **Pricing** card on Live |
+| `GET /dashboard/live/competitor-quotes` (`GetLiveCompetitorQuotes`) | One row per priced Fare Finder offer: provider, product, trip miles and minutes, surge, fare, `at_minimum`, and Lyft's `rate_card` | **Pricing** > **Parity** |
+
+Both parse `period` with `livePeriod`, which is wider than the analytics endpoint's fixed list. It accepts `<n>h` or `<n>d` with `n` from 1 to 999, or `all`. Empty means `24h`, and anything else returns 400. For the per-offer query, response shape, and row filters of `competitor-quotes`, see [Competitor quotes](/engineering/domains/dashboard-analytics#competitor-quotes) in Dashboard analytics.
+
+The rest of this section covers `competitor-prices`. The client sends a HogQL query to `POST {POSTHOG_QUERY_HOST}/api/projects/{POSTHOG_PROJECT_ID}/query/` with a bearer `POSTHOG_PERSONAL_API_KEY`.
+
+The query reads `ride_aggregator_prices_loaded` events in the window, scoped by `properties.community_id` and excluding `properties.is_test`. It explodes `properties.options` and keeps UberX (`provider = 'uber'`, `name = 'UberX'`) and Lyft Standard (`provider = 'lyft'`, `key = 'standard'`) options that have a positive `price_value`, `needs_connect = false`, and an empty `error_kind`. It returns one row per provider with the average fare, sample count, and last timestamp. The mobile app emits these events in `lib/analytics/events/rideAggregator.ts` when Fare Finder finishes loading quotes on the request sheet. Fare Finder is on for every rider unless the community's `fare_finder_disabled` kill switch is set. See [Rideshare aggregator](/engineering/mobile/rideshare-aggregator#when-it-runs).
 
 | `status` | When | Cached |
 | --- | --- | --- |
@@ -222,7 +232,7 @@ The query reads `ride_aggregator_prices_loaded` events in the window, scoped by 
 | `unavailable` | Network error, non-200, undecodable body, or a row without four columns | No |
 | `ready` | Parsed | 5 minutes, keyed by scope and window length in hours. The cache clears when it reaches 512 entries. |
 
-The HTTP client times out after 12 seconds and the response body is capped at 1 MiB. The endpoint always returns 200 for a valid period.
+The HTTP client times out after 12 seconds and the response body is capped at 1 MiB. Both endpoints always return 200 for a valid period, and `competitor-quotes` uses the same three `status` values with its own cache.
 
 ## Drivers table and map
 
@@ -382,7 +392,8 @@ Queries use TanStack Query. `useLiveData` (`src/components/live/useLiveData.ts`)
 | 24-hour ride views | `['live','recent-rides',{...}]` | 30 s | The filter isn't **Live / active** |
 | Analytics | `['live','analytics',{community_id,period}]` | 60 s | A market is selected |
 | Pricing overview | generated | 60 s | Always |
-| Competitor quotes | `['live','competitor-prices',{community_id,period}]` | 5 min | Always |
+| Competitor prices | `['live','competitor-prices',{community_id,period}]` | 5 min | Always |
+| Competitor quotes (**Pricing** > **Parity**, not Live) | generated: `['/dashboard/live/competitor-quotes',{community_id,period}]` | 5 min | A community is selected |
 | User coordinates | `['dashboard-user-coords',id]` | 10 s | See [Map layers](#map-layers) |
 | Driver operations | generated | 15 s | The driver sheet is open |
 
@@ -423,7 +434,7 @@ The web app has no Live-specific environment variables. The map needs the dashbo
 | --- | --- | --- | --- |
 | Routes | `yelo-api` | `internal/server/http/dashboard/supply_demand/router.go`, `handlers.go` | `RegisterRoutes`, `resolveCommunityScope`, `resolveCommunityID`, `requireAdmin` |
 | Mount and scope gate | `yelo-api` | `internal/server/http/router.go`, `dashboard_scope.go` | `registerDashboardRoutes`, `dashboardScopeAllows` |
-| Service | `yelo-api` | `internal/service/dashboard/supply_demand.go`, `live.go`, `live_pricing.go` | `GetMarketSummaries`, `populateLivePresence`, `GetMarketDrivers`, `SetSurge`, `GetLiveAnalytics`, `liveQuoteClient` |
+| Service | `yelo-api` | `internal/service/dashboard/supply_demand.go`, `live.go`, `live_pricing.go` | `GetMarketSummaries`, `populateLivePresence`, `GetMarketDrivers`, `SetSurge`, `GetLiveAnalytics`, `GetLiveCompetitorPrices`, `GetLiveCompetitorQuotes`, `livePeriod`, `liveQuoteClient` |
 | Repository and SQL | `yelo-api` | `internal/data/repository/supply_demand.go`, `live.go`, `queries/supply_demand.sql` | `ListMarketSummaries`, `ListMarketDrivers`, `GetLiveRideCohorts`, `aggregateLiveCohorts`, `SetCommunitySurge`, `surge_history` queries |
 | Models | `yelo-api` | `internal/models/live.go`, `supply_demand.go` | `LiveAnalytics`, `MarketSummary`, `MarketDriver`, `SetSurgeRequest` |
 | Ride list filters | `yelo-api` | `internal/data/repository/queries/analytics.sql`, `internal/server/http/dashboard/rides/` | `ListDashboardRides` `live` and `recent_only` |
