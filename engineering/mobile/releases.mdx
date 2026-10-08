@@ -147,18 +147,22 @@ The API sets a minimum store version. `GET /update-required?version=<native vers
 - `200` with `data.needs_update: false` when the version is supported.
 - `426 Upgrade Required` with `app_link` (in `data` and at the top level) when it is not.
 
-The minimum lives in `minimumFrontendVersion` in `yelo-api` `internal/server/http/healthcheck/healthcheck_handler.go`. It is `5.7.3` today.
+The minimum lives in `minimumFrontendVersion` in `yelo-api` `internal/server/http/healthcheck/healthcheck_handler.go`. It is `5.7.4` today, so 5.7.3 and older get 426.
+
+The floor applies everywhere the app checks it, including during an active trip. A rider or driver on 5.7.3 mid-trip is blocked by the update screen until they update.
 
 The app checks it in two places:
 
 | Where | Behavior |
 | --- | --- |
-| `app/_layout.tsx` | On launch and every 10 minutes while foregrounded. A 426 replaces the whole app with `UpdateRequiredScreen`, which opens the store link. Errors are logged and ignored. |
+| `app/_layout.tsx` | On launch and every 10 minutes while foregrounded, signed in or signed out. A 426 replaces the whole app with `UpdateRequiredScreen`, an alert card titled **Update required** whose **Update** button opens the store link. Errors are logged and ignored. |
 | `ensureRideEntryVersion()` | Before confirming a ride request and before a driver goes online. A 426 shows an alert. An error or malformed response blocks the action with a retryable message. |
 
 <Note>
 The ride-entry gate is admission only. Never put it on cancel, pickup, or completion of an existing ride. A store-version floor also does not prove OTA or protocol support. It only checks `Application.nativeApplicationVersion`.
 </Note>
+
+`GET /update-required` is a public route in `AxiosProvider`. The app sends it without an `Authorization` header and doesn't wait for a JWT, so installs below the floor are blocked on the sign-in screens too. Before this, the request was cancelled with `No active jwt` when signed out, and signed-out installs were never gated.
 
 To force an update, raise `minimumFrontendVersion` in the API and deploy it. Only raise it once the new version is live in both stores.
 

@@ -16,6 +16,7 @@ This page is the inventory of every workflow under `.github/workflows/` in the t
 | `yelo-api` | `sync-frontend-release.yml` | **Sync frontend release branch** | Hourly, manual | Disabled in GitHub. See [Gotchas](#gotchas-and-edge-cases) |
 | `yelo-web` | `ci.yml` | **CI** | Pull request, manual | Quality gate, affected builds, `home` preview |
 | `yelo-web` | `firebase.yml` | **Firebase** | Push to `main` | Deploy affected Firebase Hosting sites |
+| `yelo-web` | `workers.yml` | **Workers** | Pull request and push to `main` touching workers or dependencies, manual | Verify Cloudflare workers in workerd, deploy changed workers |
 | `yelo-frontend` | `ci.yml` | **CI** | Pull request | Merge gates |
 | `yelo-frontend` | `fingerprint.yml` | **Fingerprint** | Pull request | OTA-ability report and release-branch guard |
 | `yelo-frontend` | `build.yml` | **EAS Build** | Manual | Queue the EAS build-and-submit workflow |
@@ -31,7 +32,7 @@ This page is the inventory of every workflow under `.github/workflows/` in the t
 | Label | Used by | Notes |
 | --- | --- | --- |
 | `ubuntu-latest` | Lightweight jobs: API **Migration Policy** and **Coverage**, **Release API** on the Cloud Build backend, the API bot workflows, frontend backport and finalize, E2E `resolve-app` | GitHub-hosted |
-| `blacksmith-2vcpu-ubuntu-2404` | Web CI and deploy, frontend CI, Fingerprint, EAS Build, OTA Promote, API **Converge E2E API** | Blacksmith-hosted. Frontend CI measured cheaper on 2 vCPU x64 than on arm |
+| `blacksmith-2vcpu-ubuntu-2404` | Web CI, Firebase deploy, and Workers, frontend CI, Fingerprint, EAS Build, OTA Promote, API **Converge E2E API** | Blacksmith-hosted. Frontend CI measured cheaper on 2 vCPU x64 than on arm |
 | `blacksmith-4vcpu-ubuntu-2404` | API **Generated Code**, **Lint**, **Unit Tests**, **Integration Tests**, **Release API** when `API_RELEASE_BUILDER` is `blacksmith`, and **OTA Stage** | OTA Stage stays on x64 because `hermesc` ships for linux-x64 only |
 | `self-hosted`, `macOS`, `ARM64`, `yelo-e2e` | **Mobile E2E** (default) | The team's Mac. Keeps its pnpm store and a build cache in `~/.cache/yelo-e2e-builds` between runs |
 | `macos-15` | **Mobile E2E** with `runner: github-hosted` | Paid fallback |
@@ -96,8 +97,8 @@ Steps that run on both backends:
 2. **Authenticate to Google Cloud** with Workload Identity Federation, then set up `gcloud` for `prod-yelo`.
 3. **Check release order.** Reads the `commit-sha` label of the revision serving 100% of `yelo-api-testflight` and runs `scripts/release/release-required.sh`.
 4. The backend's release steps. See the table below.
-5. **Resolve promoted revision.** Confirms the 100% revision carries the release SHA and records the startup time in the summary.
-6. **Notify Slack on release failure.** Runs on failure after auth succeeded. Formats with `format-release-failure-slack.sh`. On the direct backend the message links to the Actions run as **Blacksmith build** instead of to a Cloud Build.
+5. **Resolve promoted revision.** Confirms the 100% revision carries the release SHA and records the revision in the summary.
+6. **Notify Slack on release failure.** Runs on failure after auth succeeded. Formats with `format-release-failure-slack.sh`. The second line links **gcp**, **github**, and **pr**, then names the first failed stage, for example `smoke failed`. On the Cloud Build backend it adds a **build** link and reports `cloud build <status>` instead.
 
 | Backend | Release steps |
 | --- | --- |
@@ -136,7 +137,7 @@ See [Bots and automation](/engineering/ci/bots-and-automation#openapi-propagatio
 
 ## yelo-web
 
-Both workflows set `permissions: {}` at the top and grant permissions per job. Both export the same `VITE_*` values from repository variables: `VITE_API_URL`, `VITE_E2E_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_SENTRY_DSN`, `VITE_MAPBOX_API_KEY`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`, `VITE_APPLE_REDIRECT_URI`, `VITE_SUPABASE_URL`, `VITE_SIGNUP_URL`, `VITE_APP_ENV`, and `VITE_POSTHOG_KEY`.
+All three workflows set `permissions: {}` at the top and grant permissions per job. **CI** and **Firebase** export the same `VITE_*` values from repository variables: `VITE_API_URL`, `VITE_E2E_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_SENTRY_DSN`, `VITE_MAPBOX_API_KEY`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`, `VITE_APPLE_REDIRECT_URI`, `VITE_SUPABASE_URL`, `VITE_SIGNUP_URL`, `VITE_APP_ENV`, and `VITE_POSTHOG_KEY`.
 
 ### CI (`ci.yml`)
 
@@ -156,7 +157,21 @@ Both workflows set `permissions: {}` at the top and grant permissions per job. B
 - **Concurrency:** `firebase-<ref>`, not cancelled.
 - **Secrets:** `SLACK_WEBHOOK_URL`. Google auth uses Workload Identity Federation with a fixed provider and service account in the workflow file.
 
-One job, `deploy`, on Blacksmith 2 vCPU. It computes the affected range from the last successful `main` run, builds affected sites, runs `pnpm firebase:config:check`, and runs one `firebase deploy --only hosting:<site>,...` with the message `<sha7>: <commit subject>`. The Slack step is `continue-on-error`. See [Release pipelines](/engineering/ci/release-pipelines#web).
+One job, `deploy`, on Blacksmith 2 vCPU. It computes the affected range from the last successful `main` run, builds affected sites, runs `pnpm firebase:config:check`, and runs one `firebase deploy --only hosting:<site>,...` with the message `<sha7>: <commit subject>`. The Slack step runs `scripts/notify-deploy-slack.sh` and is `continue-on-error`. See [Release pipelines](/engineering/ci/release-pipelines#web).
+
+### Workers (`workers.yml`)
+
+- **Triggers:** `pull_request` and `push` to `main`, both filtered to `workers/**`, `scripts/og-worker-smoke.sh`, `package.json`, `pnpm-lock.yaml`, and the workflow file. `workflow_dispatch` takes a required `worker` choice: `og`, `experience-router`, or `world-cup-router`.
+- **Run name:** `Workers · PR <number>` or `Workers · deploy <sha>`.
+- **Concurrency:** `workers-<PR number or ref>`. Pull request runs cancel in progress. Deploy runs are never interrupted.
+- **Secrets:** `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `SLACK_WEBHOOK_URL`.
+
+| Job (check name) | Runs when | Runner | What it does |
+| --- | --- | --- | --- |
+| **Worker checks** (`verify`) | Every run | Blacksmith 2 vCPU, 10-minute timeout | Runs `pnpm worker:og:check`, `pnpm worker:experience-router:check`, and `pnpm worker:world-cup:check`, then `scripts/og-worker-smoke.sh`, which renders six cards concurrently through `yelo-og` in workerd. Outside pull requests it lists the workers to deploy: the dispatched worker, or every directory under `workers/` that changed since the previous push |
+| **Deploy changed workers** (`deploy`) | Not a PR, on `main`, and at least one worker to deploy | Blacksmith 2 vCPU, 10-minute timeout, one matrix job per worker, `fail-fast: false` | Runs `wrangler deploy --config workers/<worker>/wrangler.jsonc`, then posts a **Worker deployed** Slack alert (`continue-on-error`) |
+
+A push that only changes `package.json` or the lockfile runs **Worker checks** but deploys nothing. Run **Workers** manually and pick the worker to ship it. See [Release pipelines](/engineering/ci/release-pipelines#cloudflare-workers).
 
 ## yelo-frontend
 
@@ -305,6 +320,7 @@ Workflows that don't gate merges: **Release API**, **Firebase**, and every manua
 | API release scripts | `yelo-api/scripts/release/` |
 | API direct release backend | `yelo-api/scripts/release/deploy-production.sh`, `prepare-blacksmith.py`, `verify-image.py`, `revision-state.py` |
 | Web workflows | `yelo-web/.github/workflows/` |
+| Web deploy alerts and worker smoke test | `yelo-web/scripts/notify-deploy-slack.sh`, `format-deploy-slack.sh`, `og-worker-smoke.sh` |
 | Web site registry | `yelo-web/sites.config.json`, `src/sites/<site>/project.json` (`metadata.requiredBuildEnv`) |
 | Mobile workflows | `yelo-frontend/.github/workflows/` |
 | EAS workflow | `yelo-frontend/.eas/workflows/build-and-submit.yml` |

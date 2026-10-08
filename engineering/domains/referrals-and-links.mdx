@@ -65,11 +65,11 @@ Auth v2 reuses an existing code on re-verify and only calls `CreateDubLinkAsync`
 
 ## Share links
 
-A user's Dub link is a projection of three inputs: their referral code, their profile (name and photo, baked into the signed card), and the current link configuration (`REFERRAL_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, and `shareLinkVersion`). The API records what Dub holds in `share_link_created_at` and `share_link_fingerprint`, so drift is detected and repaired automatically instead of by a manual backfill.
+A user's Dub link is a projection of three inputs: their referral code, their profile (name and photo, baked into the signed card), and the current link configuration (`INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, and `shareLinkVersion`). The API records what Dub holds in `share_link_created_at` and `share_link_fingerprint`, so drift is detected and repaired automatically instead of by a manual backfill.
 
 <Steps>
   <Step title="Build the link">
-    `GetOrCreateShareLink` loads the user and builds `https://join.yelo.link/<code>?v=3`. `shareLinkVersion` is `"3"`; bump it to force iMessage to re-scrape previews.
+    `GetOrCreateShareLink` loads the user and builds `https://join.yelo.link/<code>?v=4`. `shareLinkVersion` is `"4"`. Bump it to force iMessage to re-scrape previews. Because it is part of the config version, a bump also makes the sweep rewrite every existing link with the current card.
   </Step>
   <Step title="Migrate legacy codes">
     If the code has no hyphen, `migrateLegacyCode` generates a new code, upserts the Dub link, and runs `UpdateReferralCode` to set `referral_code` and keep the old code in `old_referral_code`. It then marks the link synced.
@@ -86,7 +86,7 @@ A user's Dub link is a projection of three inputs: their referral code, their pr
 
 The fingerprint has the form `<config version>:<request hash>`.
 
-- **Config version**: the first 4 bytes (8 hex characters) of SHA-256 over `join.yelo.link`, `REFERRAL_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, and `shareLinkVersion`.
+- **Config version**: the first 4 bytes (8 hex characters) of SHA-256 over `join.yelo.link`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, and `shareLinkVersion`.
 - **Request hash**: the first 8 bytes (16 hex characters) of SHA-256 over the request's `Domain`, `Key`, `URL`, `Title`, `Description`, and `Image`.
 
 A name or photo change alters the request hash. A configuration change alters the config version prefix, which makes every existing link stale at once.
@@ -98,7 +98,7 @@ A name or photo change alters the request hash. A configuration change alters th
 | `Domain` | `join.yelo.link` (`dubBaseDomain`) |
 | `Key` | The referral code |
 | `ExternalID` | The user ID |
-| `URL` | `REFERRAL_LANDING_BASE_URL + "/" + code`. Falls back to `INVITE_LANDING_BASE_URL`, then `https://invite.yelo.link`. Set to `https://joinyelo.com/i` for the first-party landing page. |
+| `URL` | `INVITE_LANDING_BASE_URL + "/" + code`. `INVITE_LANDING_BASE_URL` defaults to `https://joinyelo.com/i`, the first-party landing page. |
 | `FolderID` | `DUB_SYSTEM_FOLDER_ID` |
 | `Title` | `Join <first name> on Yelo` |
 | `Description` | `<first name> invited you to Yelo — tap to get the app and ride together.` |
@@ -109,7 +109,7 @@ A name or photo change alters the request hash. A configuration change alters th
 
 The Dub client (`internal/data/dub/dub.go`) builds a new SDK client per call from `DUB_API_KEY`. Empty fields are omitted from the upsert body.
 
-Dub's upsert matches an existing link by destination URL, not by key. Changing the destination of an existing key (for example, after `REFERRAL_LANDING_BASE_URL` changes) makes Dub return a duplicate-key conflict. On that conflict, `UpsertLink` looks the link up by domain and key with `Links.Get` and rewrites it in place with `Links.Update`, sending the URL, title, description, image, `TrackConversion`, and `Proxy`.
+Dub's upsert matches an existing link by destination URL, not by key. Changing the destination of an existing key (for example, after `INVITE_LANDING_BASE_URL` changes) makes Dub return a duplicate-key conflict. On that conflict, `UpsertLink` looks the link up by domain and key with `Links.Get` and rewrites it in place with `Links.Update`, sending the URL, title, description, image, `TrackConversion`, and `Proxy`.
 
 ### Background creation and refresh
 
@@ -133,20 +133,27 @@ The `share_link_sweep` River job runs once a minute (`RunOnStart: true`, unique 
 
 At 40 links per minute, the sweep rewrites a few thousand links an hour. A normal run finds nothing to do. The job is skipped when the Dub client is not configured.
 
-To repoint every existing invite link, change `REFERRAL_LANDING_BASE_URL` (or `OG_IMAGE_BASE_URL`) and deploy. The config version changes, so the sweep rewrites each link once. The old `cmd/backfill-referral-links` command was removed.
+To repoint every existing personal invite link, change `INVITE_LANDING_BASE_URL` (or `OG_IMAGE_BASE_URL`) and deploy. The config version changes, so the sweep rewrites each link once. The sweep does not cover fleet driver links. `RotateLink` is the only writer of a fleet's Dub link, so an existing fleet link keeps its old destination until the fleet rotates its code or someone edits the link in Dub. The old `cmd/backfill-referral-links` command was removed.
 
 ### Signed OG card
 
-`ogcard.InviteCardURL` (`internal/utilities/ogcard/url.go`) builds `OG_IMAGE_BASE_URL/og/invite?<params>&sig=<hmac>`.
+`ogcard.InviteCardURL` (`internal/utilities/ogcard/url.go`) builds `OG_IMAGE_BASE_URL/og/invite?<params>&sig=<hmac>`. Query keys are sorted, so `sig` sits between `p` and `v`:
+
+```text
+https://rideyelo.com/og/invite?c=c05a5a&n=Alex&sig=<hmac>&v=2
+```
 
 | Param | Source | Included when |
 | --- | --- | --- |
 | `n` | First name | Always |
-| `c` | `HexColor(DeterministicColor(user_id))` | Always |
+| `c` | `HexColor(DeterministicColor(user_id))`: six lowercase hex digits with no `#` | Always |
+| `v` | Card design version (`inviteCardDesign`, currently `"2"`) | Always |
 | `l` | Last name | Non-empty |
 | `p` | `PhotoThumbnailUrl` | Non-empty |
 
-The signature is HMAC-SHA256 with `OG_SIGNING_SECRET` over a canonical string, truncated to 32 hex characters (`SigLength`). The canonical string sorts keys, skips `sig`, and length-prefixes each key and decoded value in bytes, for example `1:c=6:5AC0771:n=3:Sam`. Length prefixes stop a crafted first name from forging a `p` parameter. `yelo-web/workers/og/src/sign.ts` must produce identical strings.
+The worker ignores `v`, but it is part of the signed URL. Card responses are cached as immutable, so bump `inviteCardDesign` after deploying a new invite template to the `og` worker. Otherwise every preview keeps serving the old image. The new image URL changes each link's request hash, so the next sync rewrites it.
+
+The signature is HMAC-SHA256 with `OG_SIGNING_SECRET` over a canonical string, truncated to 32 hex characters (`SigLength`). The canonical string sorts keys, skips `sig`, and length-prefixes each key and decoded value in bytes, for example `1:c=6:5ac0771:n=3:Sam1:v=1:2`. Length prefixes stop a crafted first name from forging a `p` parameter. `yelo-web/workers/og/src/sign.ts` must produce identical strings.
 
 After each upsert, `warmOGCardAsync` sends a `GET` to the image URL on a detached 15-second context. A non-200 only logs "OG card warm failed".
 
@@ -154,8 +161,8 @@ After each upsert, `warmOGCardAsync` sends a `GET` to the image URL on a detache
 
 | Path | Function | Lookup | Self-referral | Failure behavior | Side effects |
 | --- | --- | --- | --- | --- | --- |
-| Auth v3 profile completion | `CompleteAuthV3Profile` calls `applyAuthV3Referral` | `GetAuthV3ReferrerIDByCode`: `upper(btrim(referral_code))`, excludes deleted and banned users | 400 "referral code is invalid" | Fails the whole profile transaction | None beyond the `Referrals` row |
-| Auth v3 ambient referral | `CompleteAuthV3Profile` calls `applyAuthV3AmbientReferral` when the user presented no code | `GetAuthV3AmbientReferralCode`: most recent code on the user's claimed anonymous touches (touches made inside an auth transaction are excluded) | Dropped | Invalid, stale, or conflicting codes are dropped. Only a server error fails the profile. | None beyond the `Referrals` row |
+| Auth v3 profile completion | `CompleteAuthV3Profile` calls `applyAuthV3Referral` | `GetAuthV3ReferrerIDByCode`: `upper(btrim(referral_code))`, excludes deleted and banned users | 400 "referral code is invalid" | Fails the whole profile transaction | Mutual friendship (`source = referral`) in the same transaction as the `Referrals` row |
+| Auth v3 ambient referral | `CompleteAuthV3Profile` calls `applyAuthV3AmbientReferral` when the user presented no code | `GetAuthV3AmbientReferralCode`: most recent code on the user's claimed anonymous touches (touches made inside an auth transaction are excluded) | Dropped | Invalid, stale, or conflicting codes are dropped. Only a server error fails the profile. | Same as above |
 | Auth v2 profile setup | `AuthV2Service.applyReferralCode` | `GetAuthUserByReferralCode`: exact match on `referral_code` **or** `old_referral_code` | "Cannot refer yourself" | Logged and ignored; setup continues | Mutual friendship (`source = referral`), `acquisition_source` promoted from `app_organic` to `app_referral` |
 | Auth v2 community signup | `applyReferralCode` from `service/authv2/community.go` | Same as above | Same | Logged and ignored | Same, plus `fireDubTrackLead` |
 
@@ -251,10 +258,10 @@ Personal invite links land on `joinyelo.com/i/<code>`, served by the signup site
 - Plants `yelo_anon_id` and, when the URL carries `dub_id`, a `dub_id` cookie on `.joinyelo.com` (90 days, `SameSite=Lax`).
 - Calls `POST /authv3/attribution/touch` with `keepalive`, so the request outlives an immediate App Store redirect.
 - Redirects Apple mobile devices to the App Store with `ct=<code>`.
-- Shows a **Continue → sign up** button that forwards the code and the allowlisted attribution parameters (`dub_id`, `utm_*`, `source_channel`, `channel`, `ref`, `referral_code`) to `/auth/v3`. Other parameters, including `qr` and `v`, are dropped.
-- On Android, links to Google Play with `referrer=deepLink=https://join.yelo.link/<code>`, which the Dub SDK reads on first open.
+- Leads with the store for the device. The primary button reads **Continue → App Store**, or **Continue → Google Play** on Android. On Android it links to Google Play with `referrer=deepLink=https://join.yelo.link/<code>`, which the Dub SDK reads on first open.
+- Shows a secondary **Continue → web** link that forwards the code and the allowlisted attribution parameters (`dub_id`, `utm_*`, `source_channel`, `channel`, `ref`, `referral_code`) to `/auth/v3`. Other parameters, including `qr` and `v`, are dropped.
 
-`invite.yelo.link/<code>` redirects to `https://joinyelo.com/i/<code>` with the query string preserved. Fleet invites at `invite.yelo.link/fleet/<code>` are unchanged.
+Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on the same site. `invite.yelo.link` only forwards links shared before the move: `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect to the matching `https://joinyelo.com/i/...` path with the query string preserved, and the root `invite.yelo.link/` returns a 302 to `https://joinyelo.com/`.
 
 ## Path shortener
 
