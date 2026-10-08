@@ -327,21 +327,23 @@ The sheet morphs between a compact `CollapsedRideSummary` and the full list as i
 
 ### No Yelo options
 
-If the community is inactive, or the draft returns zero `vehicle_options`, the sheet falls back to third-party options:
+If the community is inactive, or the draft returns zero `vehicle_options`, the sheet falls back to third-party options. For every rider, that fallback is **Fare Finder**, the live rideshare price aggregator. The per-community `fare_finder_disabled` kill switch is the only gate:
 
-| `rideshare-price-aggregator` experiment | UI |
+| Community kill switch | UI |
 | --- | --- |
-| Off | `ThirdPartyDeepLinkFallback`: static Uber, Lyft, and Waymo cards that deep-link with the dropoff |
-| On | Live quotes from connected Uber, Lyft, and Empower accounts. The CTA reads **Open [provider]** and stays disabled until that app is confirmed installed. With nothing connected, it becomes a **Sign in** CTA that opens **Accounts**. |
+| Off or absent (default) | Fare Finder: live quotes from connected Uber, Lyft, and Empower accounts. The CTA reads **Open [provider]** and stays disabled until that app is confirmed installed. With nothing connected, it becomes a **Sign in** CTA that opens **Accounts**. |
+| On | `ThirdPartyDeepLinkFallback`: static Uber, Lyft, and Waymo cards that deep-link with the dropoff |
 
-In aggregator mode the action bar adds **Accounts** (badge counts unconnected providers, "!" on an auth error) and **Refresh** with a cooldown countdown. See [Social and contacts](/engineering/mobile/social-and-contacts#connect-uber-lyft-and-empower) for the connection screens.
+Each provider card is a header with the provider name and "from" its lowest fare, over up to three ride rows sorted by price: the cheapest standard ride, a real step up from it, and the cheapest large ride. Niche tiers, such as WAV, pet, Comfort, and Black, and near-duplicate fares sit behind **See all**. The first provider sign-in shows a one-time **Set up Fare Finder** disclosure. See [Rideshare aggregator](/engineering/mobile/rideshare-aggregator#card-layout) for the ranking rules.
+
+In Fare Finder the action bar adds **Accounts** (badge counts unconnected Uber and Lyft accounts, "!" on an auth error) and **Refresh**. **Refresh** is disabled while prices load and shows a countdown during its cooldown. See [Social and contacts](/engineering/mobile/social-and-contacts#connect-uber-lyft-and-empower) for the connection screens.
 
 #### Citi Bike card
 
 Lyft's live bike-share tiers appear on their own **Citi Bike** card instead of the Lyft card. The app detects bike tiers by name (bike or e-bike) and moves them off the Lyft quote.
 
 - The card only appears when Lyft is connected, so its prices are always live.
-- Electric bikes are the main option. Classic bikes are nested below.
+- Electric bikes are listed first. Classic bikes follow.
 - Booking hands off to the Lyft app. The CTA reads **Open Lyft**.
 - Bike tiers never get the **Cheapest** or **Fastest** badges and are never auto-selected.
 - The Citi Bike card always sorts last.

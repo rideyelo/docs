@@ -48,11 +48,10 @@ Experiments are opt-in features that a community makes available and a user turn
 
 ### Enablement rule
 
-An experiment is on when all of these are true:
+An experiment is on when both of these are true:
 
 1. The community's `active_experiments` contains the key. Admins edit this list in the dashboard community editor (`CommunityEditor.tsx`, **Experimental Features**).
 2. The user's `active_experiments` contains the key. Users edit this list on **Settings** > **Experiments**.
-3. For `rideshare-price-aggregator` only, the user has accepted the on-device disclosure.
 
 ```mermaid
 sequenceDiagram
@@ -74,7 +73,6 @@ sequenceDiagram
 | Constant | Key | Gates | Read in |
 | --- | --- | --- | --- |
 | `glassLab` | `glass_lab` | **Settings** > **Glass Lab**, a Liquid Glass diagnostic harness | `app/(app)/profile/settings.tsx`, `glass-lab.tsx` |
-| `ridesharePriceAggregator` | `rideshare-price-aggregator` | Third-party quotes on the request sheet, provider connect screens, provider diagnostics | `map/request.tsx`, `connect-uber.tsx`, `connect-lyft.tsx`, `connect-empower.tsx`, `profile/accounts.tsx`, `lib/ride/useAggregatorPlatforms.ts`, `providers/ProviderDiagnosticsObserver.tsx` |
 | `colorLab` | `color-lab` | **Settings** > **Color Lab** | `settings.tsx`, `color-lab.tsx` |
 | `designSystemLab` | `design-system-lab` | **Settings** > **Design System Lab** | `settings.tsx`, `design-system-lab.tsx` |
 
@@ -86,26 +84,23 @@ sequenceDiagram
 | `useExperimentEnabled(key)` | `boolean` | Most UI. False while loading or on error, so gated UI never flashes. |
 | `<ExperimentGate experiment={key} fallback={...}>` | Children or fallback | Declarative gating |
 
-The sources are `useCurrentUser` (user list) and `useCurrentCommunity` (community list). For the aggregator key, `useAggregatorDisclosure` is a third source.
+The sources are `useCurrentUser` (user list) and `useCurrentCommunity` (community list).
 
 ### Experiments screen
 
-`app/(app)/profile/experiments.tsx` lists every key in the community's `active_experiments`, including keys the app doesn't know, humanized for display (`new_map_ui` becomes **New Map UI**). **Settings** only shows the **Experiments** row when the community list is non-empty.
+`app/(app)/profile/experiments.tsx` lists every key that `availableExperiments` returns from the community's `active_experiments`, including keys the app doesn't know, humanized for display (`new_map_ui` becomes **New Map UI**). **Settings** only shows the **Experiments** row when that list is non-empty.
 
 - Each toggle updates a local set, then `save()` sends the full sorted list with `PUT /user/experiments`. The API replaces the stored list.
 - Saves are serialized. A toggle during a save sets a pending flag, and the loop resends the newest list. Only the last attempt's failure shows the **Something went wrong** alert.
 - After each attempt the screen invalidates `['currentUser']`. The switches reseed from the server once no save is running, which reverts a failed toggle.
 
-### Price aggregator disclosure
+### Retired price aggregator experiment
 
-Turning on `rideshare-price-aggregator` for the first time shows `PRICE_AGGREGATOR_DISCLAIMER`. The switch stays off until the user confirms.
+The `rideshare-price-aggregator` experiment graduated to Fare Finder, which is on for every rider. `availableExperiments` filters the key out, so the **Experiments** screen no longer shows a toggle for it, and a community whose only key is the retired one shows no **Experiments** row.
 
-- Acceptance is a per-user, on-device flag (`createUserFlag('price-aggregator-disclaimer:diagnostics-v1:', ...)` in `lib/ride/aggregatorDisclosure.ts`). It's written to AsyncStorage before the experiment is enabled, and a storage failure blocks enabling.
-- The `diagnostics-v1` prefix is a new disclosure version, so users who accepted the older disclaimer must accept again.
-- Turning the experiment off also disables provider diagnostic consent (`useProviderDiagnosticConsentStore`). `ProviderDiagnosticsObserver` keeps that store in sync with the experiment state, the JWT, and the current user for non-React transports.
-- The server-side user list can contain the key while the disclosure is missing, for example after a reinstall. The experiment stays off on that device until the user accepts again.
+Communities keep the key so older app versions still see their opt-in. The per-community `fare_finder_disabled` kill switch now gates the feature, and its disclosure moved to the first provider sign-in. See [Rideshare aggregator](/engineering/mobile/rideshare-aggregator#when-it-runs).
 
-Analytics events: `experiments_screen_viewed`, `experiment_toggled`, `experiment_disclaimer_shown`, `experiment_disclaimer_confirmed`, `experiment_disclaimer_cancelled`, and `experiment_save_failed`.
+Analytics events: `experiments_screen_viewed`, `experiment_toggled`, and `experiment_save_failed`.
 
 ## Feedback and review prompts
 
@@ -200,7 +195,6 @@ The app doesn't read PostHog feature flags.
 | Widget registration | `app/_layout.tsx` (`import '@/widgets'`) |
 | Experiment keys and hooks | `lib/experiments/index.ts` |
 | Experiments screen | `app/(app)/profile/experiments.tsx` |
-| Aggregator disclosure | `lib/ride/aggregatorDisclosure.ts`, `providers/ProviderDiagnosticsObserver.tsx` |
 | Experiments API | `yelo-api` `internal/server/http/user/user_routes.go` (`PUT /user/experiments`) |
 | Feedback and review state | `lib/prompts/feedbackPrompt.ts`, `lib/prompts/reviewPrompt.ts` |
 | Prompt UI | `providers/FeedbackPromptProvider.tsx`, `components/feedback/FeedbackTextModal.tsx` |
