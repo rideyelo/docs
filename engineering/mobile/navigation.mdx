@@ -156,6 +156,7 @@ Changing any of these is a native change. See [Releases](/engineering/mobile/rel
 | Incoming URL | Rewritten to |
 | --- | --- |
 | `com.rideyelo://auth/v3/callback?...` | `/auth-return`. Ignored while an Auth v3 browser session is active, because `WebBrowser.openAuthSessionAsync` consumes it. |
+| `com.rideyelo://stripe-redirect` | Not routed. `redirectSystemPath` returns `null` so the Stripe SDK consumes its own PaymentSheet return URL and the payment screen stays mounted. |
 | `uberauth://...` | `/connect-uber`. Credentials stay out of router params. |
 | `https://yelo.link/fleet-<code>` | `/fleet-join/<code>` |
 | `https://invite.yelo.link/fleet/<code>` | `/fleet-join/<code>` |
@@ -172,7 +173,7 @@ Any other URL passes through unchanged, so `com.rideyelo://<route>` opens that r
 
 ### Building links
 
-- `lib/navigation/deepLink.ts` wraps a router path as `http://redirect.rideyelo.com/?deepLink=com.rideyelo://<path>`.
+- The app no longer wraps router paths in `redirect.rideyelo.com` links. The Stripe PaymentSheet `returnURL` is the literal `com.rideyelo://stripe-redirect` (`lib/payments/paymentSheetConfig.ts`).
 - Push notifications carry a `url` or `route` field in their data. Tapping one calls `router.push` with that value. See [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#push-notifications).
 
 ## Adding a route

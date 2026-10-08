@@ -15,8 +15,8 @@ Which Firebase site answers on which custom domain is configured in the Firebase
   <Accordion title="API">
     | Host | Purpose | Referenced at |
     | --- | --- | --- |
-    | `https://api.rideyelo.com` | Production API. Mobile release builds always use it | `yelo-frontend` `lib/config.ts:1`; `yelo-web` `tools/vite/base/config.ts:18` (dev proxy default); `workers/world-cup-router/wrangler.jsonc` |
-    | `https://api.joinyelo.com` | Production API alias. Web production builds fall back to it when `VITE_API_URL` is relative | `yelo-web` `src/lib/api-client.ts:10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:3`; `yelo-frontend` `lib/config.ts:2` (treated as production) |
+    | `https://api.joinyelo.com` | Production API. Mobile release builds always use it, and web production builds fall back to it when `VITE_API_URL` is relative | `yelo-frontend` `lib/config.ts:1`; `yelo-web` `src/lib/api-client.ts:10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:3` |
+    | `https://api.rideyelo.com` | Production API under its older name. Same deployment. The mobile app no longer calls it for API requests but still treats it as production, so E2E builds refuse it | `yelo-frontend` `lib/config.ts:2`; `yelo-web` `tools/vite/base/config.ts:18` (dev proxy default); `workers/world-cup-router/wrangler.jsonc` |
     | `https://yelo-api-e2e-798668004250.us-central1.run.app` | E2E API on Cloud Run | `yelo-frontend` `lib/config.ts:6`, `eas.json` (`e2e-simulator`) |
     | `http://localhost:8080` | Local API default (`API_URL`) | `yelo-api` `internal/utilities/config/config.go:257` |
 
@@ -67,8 +67,6 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | URL | Purpose | Referenced at |
     | --- | --- | --- |
     | `https://rideyelo.com` | Default `YELO_WEBSITE_URL`, `STRIPE_RETURN_URL`, and `OG_IMAGE_BASE_URL` | `config.go:260,288,365` |
-    | `http://redirect.rideyelo.com/?deepLink=com.rideyelo://<path>` | App-open wrapper built by the mobile app. Plain HTTP | `yelo-frontend` `lib/navigation/deepLink.ts:3`, `providers/SocialContext.tsx:32,63` |
-    | `https://redeem.rideyelo.com` | Coupon redemption link | `yelo-frontend` `components/modals/CouponModal.tsx:108` |
     | `https://yelo.link/terms`, `https://yelo.link/privacy` | Legal links in the app | `app/(app)/profile/settings.tsx:294,301`, `app/(auth-v3)/phone.tsx:69,79` |
     | `https://joinyelo.com/_yelo/signup/app-store-badge.svg`, `.../app-store-qr.svg`, `.../apple-touch-icon.png` | Signup assets proxied through the experience router | `yelo-web` `src/shared/signup/openApp.ts:11-12`, `src/shared/signup/StyledQrCode.tsx:3` |
     | `https://u.expo.dev/174d3057-0fb3-49db-bbf5-6caa04fe0e3c` | EAS Update endpoint | `yelo-frontend` `app.config.ts:109` |
@@ -114,14 +112,15 @@ Expo Router maps each file under `app/` to a path. Route groups in parentheses d
     | Incoming URL | Rewritten to | Line |
     | --- | --- | --- |
     | `com.rideyelo://auth/v3/callback` (or `.e2e`) | `/auth-return`. Returns `null` when an Auth v3 browser session is active and the link is not the initial URL | `:10-20` |
-    | `uberauth://...` | `/connect-uber`. The WebBrowser listener consumes the credentials | `:21-25` |
-    | `https://yelo.link/fleet-<code>` | `/fleet-join/<code>` | `:27-34` |
-    | `https://invite.yelo.link/fleet/<code>` | `/fleet-join/<code>` | `:36-42` |
-    | `https://join.yelo.link/<code>`, `https://invite.yelo.link/<code>` | `/invite/<code>?medium=<m>`, where `m` is `utm_medium`, or `qr` when the link has `qr=1`. `/invite/<code>` with no medium, or `/` with no code | `:44-53` |
-    | `https://signup.yelo.link/.../tip/<slug>?...` | `/tip/<slug>?...` | `:55-64` |
-    | `https://joinyelo.com/*`, `https://www.joinyelo.com/*` | `/` | `:66-69` |
-    | Any other `yelo.link` or `*.yelo.link` URL | `/` | `:71-74` |
-    | Anything else, including `com.rideyelo://<path>` | Unchanged, so it matches a file route | `:76-80` |
+    | `com.rideyelo://stripe-redirect` | Nothing. Returns `null` so the Stripe SDK consumes its own return URL and the payment screen stays mounted | `:21-24` |
+    | `uberauth://...` | `/connect-uber`. The WebBrowser listener consumes the credentials | `:25-29` |
+    | `https://yelo.link/fleet-<code>` | `/fleet-join/<code>` | `:31-38` |
+    | `https://invite.yelo.link/fleet/<code>` | `/fleet-join/<code>` | `:40-46` |
+    | `https://join.yelo.link/<code>`, `https://invite.yelo.link/<code>` | `/invite/<code>?medium=<m>`, where `m` is `utm_medium`, or `qr` when the link has `qr=1`. `/invite/<code>` with no medium, or `/` with no code | `:48-57` |
+    | `https://signup.yelo.link/.../tip/<slug>?...` | `/tip/<slug>?...` | `:59-68` |
+    | `https://joinyelo.com/*`, `https://www.joinyelo.com/*` | `/` | `:70-73` |
+    | Any other `yelo.link` or `*.yelo.link` URL | `/` | `:75-78` |
+    | Anything else, including `com.rideyelo://<path>` | Unchanged, so it matches a file route | `:80-84` |
   </Accordion>
   <Accordion title="Linkable routes">
     | Path | Screen | File |
@@ -143,7 +142,7 @@ Expo Router maps each file under `app/` to a path. Route groups in parentheses d
     | `/fleet-join/<code>` | Fleet driver join | `app/fleet-join/[code].tsx` |
     | `/tip/<slug>` | Opens `https://signup.yelo.link/web/tip/<slug>` in the in-app browser | `app/(app)/tip/[slug].tsx:14` |
     | `/events/<eventId>`, `/deals/<dealId>` | Event and deal detail | `app/(app)/events/*`, `app/(app)/deals/*` |
-    | `/link?yeloLink=<encoded>` | Decodes through `GET /link/decode`, then navigates to the stored path after 1 second | `app/(app)/link.tsx`, `providers/SocialContext.tsx:73-86` |
+    | `/link?yeloLink=<encoded>` | Decodes through `GET /link/decode`, then navigates to the stored path after 1 second | `app/(app)/link.tsx`, `providers/SocialContext.tsx:51-65` |
     | `/connect-uber`, `/connect-lyft`, `/connect-empower` | Provider account linking | `app/(app)/connect-*.tsx` |
     | `/scan-qr`, `/save-location`, `/referral-share`, `/verify/*`, `/post-signup/*` | Utility screens | `app/(app)/*` |
     | `/auth-return` | Auth v3 callback landing | `app/auth-return.tsx` |
@@ -201,10 +200,7 @@ Expo Router maps each file under `app/` to a path. Route groups in parentheses d
 | `/redirect` HTML | Tries `APP_URL_SCHEME`, then the App Store after 1 second | `internal/server/http/router.go:449-492` |
 | `https://calendar.google.com/calendar/r` | Operating-hours calendar link | `internal/service/operatinghours/dashboard.go:90` |
 
-The mobile app builds two URLs of its own through `createDeepLink`:
-
-- `http://redirect.rideyelo.com/?deepLink=com.rideyelo://ride/2-select-ride` as the Stripe PaymentSheet `returnURL` (`lib/payments/paymentSheetConfig.ts:80`).
-- `http://redirect.rideyelo.com/?deepLink=com.rideyelo://link?yeloLink=<encoded>` for shareable in-app links (`providers/SocialContext.tsx:63`).
+The mobile app sets the Stripe PaymentSheet `returnURL` to the literal `com.rideyelo://stripe-redirect` (`lib/payments/paymentSheetConfig.ts:79`). `app/+native-intent.tsx` leaves it to the Stripe SDK. The app no longer builds `redirect.rideyelo.com` wrapper links or encodes `/link?yeloLink=` links. It only decodes them.
 
 ## Web routes of note
 

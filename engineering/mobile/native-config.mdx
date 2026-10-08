@@ -44,7 +44,7 @@ Settings that are the same in both identities:
 | App Store Connect app ID | `1667384111` (`submit.production.ios.ascAppId`) |
 | Marketing version | `app.json` `version`. Build numbers come from EAS (`appVersionSource: remote`). |
 | Platforms | `ios`, `android` |
-| Orientation, appearance | `portrait`, `userInterfaceStyle: automatic` |
+| Orientation, appearance | `portrait`, `userInterfaceStyle: light`. It was `automatic` before 5.8.0. See [Architecture](/engineering/mobile/architecture#theming). |
 | iOS tablets | `supportsTablet: true` |
 | iOS deployment target | `16.4` (`expo-build-properties`) |
 | Associated domains | `applinks:yelo.link`, `applinks:join.yelo.link`, `applinks:invite.yelo.link` |
@@ -107,7 +107,7 @@ Every other `EXPO_PUBLIC_*` value comes from the EAS environment named in the pr
 
 ### Widget extension
 
-`expo-widgets` adds a second iOS target, `ExpoWidgetsTarget`, with its own bundle ID and a shared app group. `enablePushNotifications: true` enables push-to-update for Live Activities. For the E2E variant, `app.config.ts` rewrites only this plugin's `bundleIdentifier` and `groupIdentifier`. See [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments#ios-live-activities).
+`expo-widgets` adds a second iOS target, `ExpoWidgetsTarget`, with its own bundle ID and a shared app group. `enablePushNotifications: true` enables push-to-update for Live Activities, and `frequentUpdates: true` (new in 5.8.0) requests the frequent-update budget for them. For the E2E variant, `app.config.ts` rewrites only this plugin's `bundleIdentifier` and `groupIdentifier`. See [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments#ios-live-activities).
 
 ## Android
 
@@ -157,10 +157,10 @@ Plugins are applied in array order. `app.config.ts` appends its four plugins aft
 | `expo-notifications` | `app.json` | Icon `notification-icon.png`, color `#F7F169`, `defaultChannel: default`, sound `kaching.wav` | Push notification resources |
 | `react-native-share` | `app.json` | iOS query schemes `fb`, `instagram`, `twitter`, `tiktoksharesdk` | Share targets |
 | `expo-font` | `app.json` | Switzer (six weights) and Boston Angel Medium, per platform | Embedded fonts |
-| `@rnmapbox/maps` | `app.json` | `RNMapboxMapsVersion: 11.20.1` | Mapbox native SDK version |
+| `@rnmapbox/maps` | `app.json` | `RNMapboxMapsVersion: 11.23.1` | Mapbox native SDK version |
 | `@stripe/stripe-react-native` | `app.json` | `merchantIdentifier: merchant.com.rideyelo.yelo`, `enableGooglePay: true` | Apple Pay and Google Pay |
 | `@sentry/react-native/expo` | `app.json` | `url: https://sentry.io/`, project `yelo`, organization slug | Native crash reporting and source map upload |
-| `expo-widgets` | `app.json` (rewritten for E2E) | `bundleIdentifier`, `groupIdentifier`, `enablePushNotifications: true` | Live Activity extension target |
+| `expo-widgets` | `app.json` (rewritten for E2E) | `bundleIdentifier`, `groupIdentifier`, `enablePushNotifications: true`, `frequentUpdates: true` | Live Activity extension target |
 | `expo-audio` | `app.config.ts` | `enableBackgroundPlayback: false`, `microphonePermission: false`, `recordAudioAndroid: false` | Ride alert sounds, no recording |
 | `expo-contacts` | `app.config.ts` | Contacts usage string | Contact sync |
 | `expo-camera` | `app.config.ts` | Camera string, `microphonePermission: false`, `recordAudioAndroid: false` | QR scanning and identity photos |
@@ -174,7 +174,7 @@ Inline mods in `app.config.ts`:
 | `withRideProviderQueries` | `withAndroidManifest` | Adds the ride-provider `<queries>` block |
 | `withoutBackgroundFetch` | `withInfoPlist` | Removes `fetch` from `UIBackgroundModes` |
 
-Two dependencies carry pnpm patches, declared in `pnpm-workspace.yaml` under `patchedDependencies`: `expo-glass-effect@57.0.3` (GlassView touch areas, explained in `patches/expo-glass-effect.md`) and `expo-linear-gradient@57.0.2`. Patches to native modules change the native binary, so treat them like any other native change.
+Two dependencies carry pnpm patches, declared in `pnpm-workspace.yaml` under `patchedDependencies`: `expo-glass-effect@57.0.4` (GlassView touch areas, explained in `patches/expo-glass-effect.md`) and `expo-linear-gradient@57.0.2`. Patches to native modules change the native binary, so treat them like any other native change.
 
 ## Runtime version and fingerprint
 

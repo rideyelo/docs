@@ -41,7 +41,7 @@ The request always sends `X-Features: tips,driver-options`, so every ride create
   setupIntentClientSecret,
   customFlow: true,
   style: 'automatic',
-  returnURL: createDeepLink('ride/2-select-ride'),
+  returnURL: 'com.rideyelo://stripe-redirect',
   applePay: {                       // omitted on simulator + live key
     merchantCountryCode: 'US',
     cartItems: [
@@ -56,6 +56,7 @@ The request always sends `X-Features: tips,driver-options`, so every ride create
 - The fare is `discounted_price` when the selected option `is_discounted`, otherwise `price`.
 - `TIP_AUTHORIZATION_BUFFER = 5` mirrors `models.TipBuffer` on the API. Change both together.
 - **Apple Pay is suppressed** only when `Device.isDevice` is false and the key is live. Stripe's SDK crashes on a simulator's dummy token under live keys. Test keys work on the simulator.
+- `returnURL` is the bare scheme link `com.rideyelo://stripe-redirect`. `app/+native-intent.tsx` returns `null` for it, so the Stripe SDK consumes the link and the request screen stays mounted.
 - **Google Pay isn't configured.** The params don't include a `googlePay` block, so PaymentSheet doesn't offer Google Pay on Android despite `enableGooglePay` in the plugin config.
 
 ## Component lifecycle

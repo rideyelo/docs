@@ -383,11 +383,17 @@ The API and web client never call `group` or `GroupIdentify`.
 | Web | Analytics context fields | `analytics.ts:177`, `:191` | Registered at init and again on each context update, with `email: undefined` |
 | Mobile | `ota_update_id`, `ota_runtime_version`, `ota_is_embedded` | `lib/analytics/AnalyticsProvider.tsx:32` | From `expo-updates`: `Updates.updateId` (`embedded` when null), `Updates.runtimeVersion` (`unknown` when null), and `Updates.isEmbeddedLaunch` |
 | Mobile | `glass_usable`, `glass_liquid_available`, `glass_effect_api_available` | `lib/analytics/AnalyticsProvider.tsx:32` | From `glassCapability()` |
+| Mobile | `display_color_scheme` | `lib/analytics/displayEnvironment.ts`, registered at `AnalyticsProvider.tsx:50` | String. The OS color scheme read at launch before the light lock (`light`, `dark`, or `unspecified`). Always `light` on binaries from 5.8.0 |
+| Mobile | `display_font_scale`, `display_text_size`, `display_pixel_ratio` | Same | `display_font_scale` is the OS text-size multiplier as a number rounded to two decimals. `display_text_size` is its bucket: `smaller` (below 0.99), `default` (0.99 to 1.01), `larger` (up to 1.4), or `accessibility`. `display_pixel_ratio` is a number from `PixelRatio.get()` |
+| Mobile | `a11y_reduce_transparency`, `a11y_reduce_motion`, `a11y_increase_contrast`, `a11y_bold_text`, `a11y_grayscale`, `a11y_invert_colors`, `a11y_screen_reader`, `a11y_prefers_cross_fade` | Same | Boolean from the matching `AccessibilityInfo` query, or `null` when the platform can't answer |
+| Mobile | `power_low_power_mode`, `power_battery_level`, `power_battery_state` | Same | From `expo-battery`. Boolean or `null`; a number from 0 to 1 rounded to two decimals, `-1` when the OS reports no level (simulator), or `null`; and the `Battery.BatteryState` member name as a string, or `null` |
 | Mobile | `user_role`, `community_id`, `is_test`, `is_internal` | `api/helpers/authUser.ts:102` | `user_role: rider` on every `currentUser` fetch. `is_internal` is true for `@rideyelo.com` emails. |
 | Mobile | `user_role` | `providers/DriveProvider.tsx:333`, `:346`, `:365` | `driver` on go-online; `rider` on go-offline or error |
 | Mobile | `community_id` | `app/(app)/profile/community-switch.tsx:144` | New community after a switch |
 | Mobile | `fare_finder_enabled`, `fare_finder_disclosed` | `providers/ProviderDiagnosticsObserver.tsx` | Fare Finder availability for the community and the rider's on-device disclosure, registered once both resolve |
 | API | `authv3.step` defaults | `internal/utilities/metrics/posthog.go:73` | See [API business events](#api-business-events) |
+
+The mobile `display_*`, `a11y_*`, and `power_*` properties are registered when `AnalyticsProvider` mounts and again each time the app returns to the foreground, because these settings change outside the app.
 
 ### Redaction and exclusion
 

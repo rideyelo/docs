@@ -267,13 +267,13 @@ Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on the same site. `in
 
 `LinkService.Encode` stores `NewShortenedPathRecord(path)`: an 8-character code from `math/rand` over `[a-zA-Z0-9]` (62^8 possible values). `Decode` reads it back. There is no TTL and no ownership.
 
-The mobile app decodes these in `app/(app)/link.tsx`. It handles `com.rideyelo://link?yeloLink=<code>`, waits 1 second, then navigates to the decoded path. `SocialContext.encodeLink` builds `http://redirect.rideyelo.com/?deepLink=com.rideyelo://link?yeloLink=<code>`, but no component calls it.
+The mobile app decodes these in `app/(app)/link.tsx`. It handles `com.rideyelo://link?yeloLink=<code>`, waits 1 second, then navigates to the decoded path. The app only decodes: `SocialContext` exposes `decodeLink` and nothing in the app calls the encode endpoint.
 
 ## Deep-link redirect
 
 `GET /redirect` renders the inline `redirectTemplate` in `router.go`. It sets `window.location.href` to `APP_URL_SCHEME` (default `com.rideyelo://`), then to `APP_STORE_URL` after 1,000 ms. It ignores query parameters.
 
-`internal/server/http/redirect.html` is a different page. It reads `deepLink` and `appStore` from the query string. No Go code references it. The mobile app links to `http://redirect.rideyelo.com/?deepLink=...` (`lib/navigation/deepLink.ts`, `SocialContext.tsx`), which matches the query-string variant.
+`internal/server/http/redirect.html` is a different page. It reads `deepLink` and `appStore` from the query string. No Go code references it. The mobile app no longer builds `http://redirect.rideyelo.com/?deepLink=...` links, which matched the query-string variant.
 
 ## Where this lives in code
 

@@ -16,7 +16,8 @@ For the API and web deploys, see [Deployment](/engineering/deployment).
 
 - `main` is the next release.
 - When a store version goes live, a **release branch** named after the version (for example `5.7.4`) is cut from its tag. It takes OTA backports until the next store version ships.
-- `version` in `app.json` is the only hand-edited version. It is `5.7.4` on `main` today.
+- `version` in `app.json` is the only hand-edited version. It is `5.8.0` on `main` today.
+- The latest published GitHub release is `v5.7.4-270`, so `5.7.4` is the supported release branch. `v5.8.0-271` is tagged, and its GitHub release is still a draft.
 
 ## OTA versus native rebuild
 
@@ -109,7 +110,7 @@ flowchart LR
 - Run it manually with `source_ref`, `platforms`, and `message`, or with `make eas-stage MESSAGE="..." [REF=main] [PLATFORM=all]`.
 - It also runs nightly at 09:00 UTC. The nightly run skips platforms already staged from the same commit.
 - Before publishing, it computes the fingerprint for each platform and requires a finished `staging` or `preview` build with that runtime. If a platform has none, nothing is staged.
-- The bundle always targets `https://api.rideyelo.com/`.
+- The bundle always targets `https://api.joinyelo.com/`.
 
 ### Promote
 
@@ -122,7 +123,7 @@ flowchart LR
 
 ### Backports
 
-Every OTA-safe PR merged to `main` is considered for the supported release branch by `backport-supported-release.yml`. Add the `skip-supported-release-backport` label to opt out. PRs that touch native inputs are never auto-backported, and the Fingerprint check blocks native drift on release branches.
+Every OTA-safe PR merged to `main` is considered for the supported release branch by `backport-supported-release.yml`. Add the `skip-supported-release-backport` label to opt out. The Fingerprint check adds that label itself to a PR into `main` whose native fingerprint changed, and never removes it. PRs that touch native inputs are never auto-backported, and the Fingerprint check blocks native drift on release branches.
 
 - The workflow triggers only on PRs merged into `main`. Merging a rolling backport PR into a release branch does not re-trigger it. You can also run it manually with a merged `main` PR number.
 - The supported branch comes from the latest GitHub release tag (for example `v5.7.3-269` maps to `5.7.3`).

@@ -195,7 +195,9 @@ One job, **OTA-ability**, on non-draft PRs from this repository, Blacksmith 2 vC
 2. Pulls the production EAS environment with `eas env:pull` and prepares `google-services.json` with `scripts/prepare-google-services.mjs`.
 3. Does a clean `pnpm install` and runs `expo-updates fingerprint:generate` for iOS and Android on the PR head, then on the base SHA.
 4. Writes `scripts/fingerprint-report.mjs` output to the job summary and to one sticky PR comment marked `<!-- fingerprint-report -->`.
-5. Emits a warning when the fingerprint changed, and fails if the PR targets a version branch.
+5. Emits a warning when the fingerprint changed.
+6. When the fingerprint changed on a PR into `main`, adds the `skip-supported-release-backport` label with `gh pr edit --add-label`. The step only adds. It never removes the label, because a person may have set it for a reason the hash can't see.
+7. Fails when the fingerprint changed on a PR into a version branch.
 
 ### EAS Build (`build.yml`)
 
@@ -329,7 +331,7 @@ Workflows that don't gate merges: **Release API**, **Firebase**, and every manua
 
 ## Gotchas and edge cases
 
-- **The frontend release-branch rules name `5.7.1` explicitly.** The supported release is currently `5.7.3` (latest release `v5.7.3-269`), and no ruleset applies to it. **OTA-ability** still runs and fails on native drift there, but GitHub doesn't require it before merge. Add each new release branch to both frontend rulesets, or switch the condition to a pattern.
+- **The frontend release-branch rules name `5.7.1` explicitly.** The supported release is currently `5.7.4` (latest release `v5.7.4-270`, published 2026-10-08), and no ruleset applies to it. Both rulesets still include only `refs/heads/main` and `refs/heads/5.7.1`. **OTA-ability** still runs and fails on native drift there, but GitHub doesn't require it before merge. Add each new release branch to both frontend rulesets, or switch the condition to a pattern.
 - **Draft PRs skip every gate.** Web **Quality and affected builds**, frontend **Checks**, and **OTA-ability** don't run on drafts. A skipped job counts as passing, so mark the PR ready before you trust a green status.
 - **Fork PRs never get OTA-ability.** The job condition requires the head repository to be `rideyelo/yelo-frontend`. A fork PR can't satisfy that required check.
 - **`allow_non_main` can't bypass the environment.** `build.yml` production runs use the `ota-production` environment, which only deploys from protected branches. The override works only for a protected branch other than `main`.
