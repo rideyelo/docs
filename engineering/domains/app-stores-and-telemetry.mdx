@@ -237,11 +237,11 @@ Before calling a production service, the handler checks that the ride is free (`
 | --- | --- |
 | `/healthcheck` | Always returns `"OK"` |
 | `/healthcheck/deep` | 5-second timeout. Pings Postgres and reports pool stats, disk, and Go runtime stats. Returns 503 when Postgres fails or disk is unhealthy |
-| `/update-required` | Compares `version` with `minimumFrontendVersion` (`5.7.3`) via `helpers.VersionStringLessThan`. Below the floor returns 426 with `app_link` (from `App.StoreUrl`) both at the top level and in `data`. Otherwise 200 with `needs_update: false`. Sets `Cache-Control: no-store` |
+| `/update-required` | Compares `version` with `minimumFrontendVersion` (`5.7.4`) via `helpers.VersionStringLessThan`. Below the floor returns 426 with `app_link` (from `App.StoreUrl`) both at the top level and in `data`. Otherwise 200 with `needs_update: false`. Sets `Cache-Control: no-store` |
 | `/error` | Always returns a test server error, for Sentry and alert checks |
 | `/score-driver` | Runs `matching.GetDriverScore` on a posted config and inputs. See [Auto-queue scoring](/engineering/matching/auto-queue-scoring) |
 
-`evaluateDiskHealth` marks disk unhealthy only when free space is below 1 GiB **and** usage is at least 90%. The mobile app calls `/update-required` from `checkRequiredAppUpdate` with a 10-second timeout. `ensureRideEntryVersion` gates only new ride entry, never cancel, pickup, or completion.
+`evaluateDiskHealth` marks disk unhealthy only when free space is below 1 GiB **and** usage is at least 90%. The mobile app calls `/update-required` from `checkRequiredAppUpdate` with a 10-second timeout, without an `Authorization` header, so signed-out installs are gated too. A 426 blocks the app even during an active trip. `ensureRideEntryVersion` gates only new ride entry, never cancel, pickup, or completion.
 
 `internal/server/http/routeopt` isn't an endpoint. It holds `routeopt.Errors` and `routeopt.Error`, which add the standard error responses to the OpenAPI spec. `Errors` panics at startup on a status code with no standard description.
 
