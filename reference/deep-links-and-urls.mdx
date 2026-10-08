@@ -31,7 +31,7 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | signup | `yelo-signup` | `https://signup.yelo.link`, and under `joinyelo.com` (including the `/i/<code>` invite landing) via the experience router | CORS list (`config.go:745-746`), `workers/experience-router/wrangler.jsonc` |
     | home | `yelo-home` | `https://joinyelo.com` (likely also `rideyelo.com`) | `og:url` in `src/sites/home/index.html:33`, CORS list (`config.go:734-735,746-748`) |
     | event | `yelo-event` | `https://event.yelo.link` | CORS list (`config.go:742-743`) |
-    | invite | `yelo-invite` | `https://invite.yelo.link`. Forwards only: `/<code>` redirects to `joinyelo.com/i/<code>`, `/fleet/<code>` to `joinyelo.com/i/fleet/<code>`, and `/` to `joinyelo.com` | CORS list (`config.go:751-752`) |
+    | invite | `yelo-invite` | `https://invite.yelo.link`. Forwards only: `/<code>` redirects to `joinyelo.com/i/<code>`, `/fleet/<code>` to `joinyelo.com/i/fleet/<code>`, and `/` to `joinyelo.com` | CORS list (`config.go:747-748`) |
     | world-cup | `yelo-world-cup` | `https://world-cup.yelo.link`, and under `/world-cup` via the world-cup router | CORS list (`config.go:740-741`) |
     | maestro | `yelo-maestro` | `https://yelo-maestro.web.app` | E2E Auth v3 origin (`cloudbuild.e2e.yaml:120`, `eas.json`) |
 
@@ -61,7 +61,7 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | `yelo.link` | `yelo.link/fleet-<code>` | `INVITE_LANDING_BASE_URL/fleet/<code>` (default `https://joinyelo.com/i/fleet/<code>`) | `internal/service/fleetjoin/fleet_join.go:22-23,181-184,238` |
     | `pay.yelo.link` | `pay.yelo.link/<slug>` | `https://joinyelo.com/pay/tip/<slug>` | `internal/service/qrpayment/qrpayment.go:18-19,80,192` |
 
-    `shareLinkVersion` (`"4"`, `referral.go`) is appended as `?v=` so iMessage re-scrapes previews after card changes. Dub links go into `DUB_SYSTEM_FOLDER_ID` when set (`internal/data/dub/dub.go:72`).
+    `shareLinkVersion` (`"4"`, `referral.go`) is appended as `?v=` so iMessage re-scrapes previews after card changes. Dub links go into `DUB_SYSTEM_FOLDER_ID` when set (`internal/data/dub/dub.go:74`).
   </Accordion>
   <Accordion title="Other Yelo hosts">
     | URL | Purpose | Referenced at |
@@ -210,15 +210,16 @@ The mobile app builds two URLs of its own through `createDeepLink`:
 
 | Site | Route | Behavior | Where |
 | --- | --- | --- | --- |
-| signup | `/auth/v3`, `/auth/v3/callback` | Auth v3 web page | `src/sites/signup/App.tsx:250`, `firebase.json` rewrites |
-| signup | `/delete-account` | Account deletion page | `App.tsx:258` |
-| signup | `/i/<code>` (public `joinyelo.com/i/<code>`) | Referral invite landing. Logs a link touch, then iOS devices jump to the App Store with `ct=<code>`; Android gets a Google Play link with the install referrer. Served `no-cache, no-store, must-revalidate` | `App.tsx:266-269`, `src/sites/signup/invite/InvitePage.tsx` |
+| signup | `/auth/v3`, `/auth/v3/callback` | Auth v3 web page | `src/sites/signup/App.tsx:251`, `firebase.json` rewrites |
+| signup | `/delete-account` | Account deletion page | `App.tsx:259` |
+| signup | `/i/<code>` (public `joinyelo.com/i/<code>`) | Referral invite landing. Logs a link touch, then iOS devices jump to the App Store with `ct=<code>`; Android gets a Google Play link with the install referrer. Served `no-cache, no-store, must-revalidate` | `App.tsx:272-275`, `src/sites/signup/invite/InvitePage.tsx` |
+| signup | `/i/fleet/<code>` (public `joinyelo.com/i/fleet/<code>`) | Fleet driver invite landing. Checked before `/i/<code>` | `App.tsx:267-270`, `src/sites/signup/invite/FleetInvitePage.tsx` |
 | signup | `/tip/<slug>`, `/web/tip/<slug>` | Tip flow. `?status=success` shows completion; `?auth=complete` skips the auth redirect | `App.tsx:278-302` |
 | signup | `/world-cup`, `/world-cup/claim`, `?intent=world-cup` | World Cup claim flow after Auth v3 | `App.tsx:285-308` |
-| signup | anything else | Redirects to Auth v3 entry | `App.tsx:314` |
+| signup | anything else | Redirects to Auth v3 entry | `App.tsx:320` |
 | invite | `/<code>` | Client-side redirect (`location.replace`) to `https://joinyelo.com/i/<code>`, keeping the query string | Inline script in `src/sites/invite/index.html` |
-| invite | `/fleet/<code>` | Fleet join landing | `src/sites/invite/App.tsx:18` |
-| invite | `/` | 302 to `https://signup.yelo.link/` | `firebase.json:382-392` |
+| invite | `/fleet/<code>` | Client-side redirect (`location.replace`) to `https://joinyelo.com/i/fleet/<code>`, keeping the query string | Same inline script |
+| invite | `/`, `/index.html` | 302 to `https://joinyelo.com/` | `firebase.json:402-409` |
 | event | `/<slug>` | Public event page | `src/sites/event/App.tsx:18` |
 | home | `/partner`, `/drivers`, `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, `/terms` | Static pages | `firebase.json` home rewrites |
 | world-cup | `/` | 302 to `/world-cup` | `firebase.json:420-425` |

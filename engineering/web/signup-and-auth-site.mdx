@@ -3,7 +3,7 @@ title: "Signup and Auth v3 site"
 description: "How the signup site's two bundles, the hosted Auth v3 page, the referral invite landing, tip links, World Cup claims, and account deletion work in the browser: routing, storage keys, cookies, redirects, and API calls"
 ---
 
-The `signup` site (`src/sites/signup/`) is the browser half of Yelo sign-in. It hosts the Auth v3 transaction page that the app opens in a browser, runs a web-only PKCE flow for people who arrive without the app, serves the personal referral invite landing at `/i/<code>`, and carries three intent flows: tipping, World Cup claims, and account deletion. The API side of Auth v3 is covered in [Identity overview](/engineering/identity/overview) and [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions). This page covers what the browser does.
+The `signup` site (`src/sites/signup/`) is the browser half of Yelo sign-in. It hosts the Auth v3 transaction page that the app opens in a browser, runs a web-only PKCE flow for people who arrive without the app, serves the personal referral invite landing at `/i/<code>` and the fleet driver invite landing at `/i/fleet/<code>`, and carries three intent flows: tipping, World Cup claims, and account deletion. The API side of Auth v3 is covered in [Identity overview](/engineering/identity/overview) and [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions). This page covers what the browser does.
 
 ## Two bundles, one site
 
@@ -26,7 +26,8 @@ On every path that is not `/auth/v3`, the main entry (`main.tsx`) also calls `re
 | --- | --- |
 | `isAuthV3Path()`: `/auth/v3` or `/auth/v3/callback`, trailing slashes ignored | `AuthV3Page` (lazy) |
 | `isDeleteAccountPath()`: `/delete-account`, case-insensitive | `DeleteAccountPage` (lazy) |
-| `inviteCodeFromPath()`: `/i/<code>`, optional trailing slash | `InvitePage` (not lazy, because under the `joinyelo.com` proxy only assets referenced by the HTML are namespaced) |
+| `/i/fleet/<code>`, optional trailing slash | `FleetInvitePage` (not lazy, because under the `joinyelo.com` proxy only assets referenced by the HTML are namespaced) |
+| `inviteCodeFromPath()`: `/i/<code>`, optional trailing slash | `InvitePage` (not lazy, for the same reason) |
 | Dev build and `?preview=all` or `?preview=<step>` | `PreviewGallery` or a single step. Stubs `GET /tips/*` with sample data. |
 | A `tip` path segment followed by a slug, and `?status=success` | `TipComplete` |
 | A `tip` segment with a slug | `TipStep`, authenticated if `?auth=complete` |
@@ -110,7 +111,7 @@ People who reach `/auth/v3` without a request secret, for example from a tip lin
 
 ## Referral invite landing
 
-Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on this site (see [Public sites](/engineering/web/public-sites#fleet-driver-invites-joinyelo-com-i-fleet-code)). `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect here too. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
+Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on this site (see [Public sites](/engineering/web/public-sites#fleet-driver-invites)). `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect here too. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
 
 `InvitePage` (`src/sites/signup/invite/InvitePage.tsx`) loads the inviter preview with `GET /referral/invite/{code}`, which returns the inviter's first name, photo, and user ID. Without a photo, the avatar color comes from an FNV-1a hash of the user ID over a five-color palette. The app and `ogcard.DeterministicColor` in `yelo-api/internal/utilities/ogcard/color.go` implement the same function, and all three must agree. The page then branches on the device:
 
@@ -181,7 +182,7 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 | --- | --- |
 | Main router | `yelo-web/src/sites/signup/App.tsx` |
 | Entries | `src/sites/signup/main.tsx`, `src/sites/signup/auth/v3/main.tsx` |
-| Invite landing | `src/sites/signup/invite/` (`InvitePage.tsx`, `referralHandoff.ts`, `api.ts`) |
+| Invite landing | `src/sites/signup/invite/` (`InvitePage.tsx`, `FleetInvitePage.tsx`, `appLink.ts`, `referralHandoff.ts`, `api.ts`) |
 | Auth v3 page and helpers | `src/sites/signup/auth-v3/` (`AuthV3Page.tsx`, `requestSecret.ts`, `webFlow.ts`, `webIntent.ts`, `redirects.ts`, `authV3Fetch.ts`, `attribution.ts`, `touch.ts`, `analytics.ts`) |
 | Recovery notes | `src/sites/signup/auth-v3/README.md` |
 | Shared steps | `src/shared/signup/steps/` (`TipStep`, `EduClaimStep`, `Handoff`, `OtpStep`, `PhoneStep`, `OAuthStep`) |
@@ -195,7 +196,7 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 - **Web completion loses the intent.** On the callback load, `completeAuthV3WebFlow()` restores the saved return search with `replaceState`, so `intent`, `tip_slug`, `amount`, and `after` are briefly back in the URL. Its `.then` then calls `initializeAuthV3Analytics()` before `authV3WebCompletionPath(window.location.search)` (`AuthV3Page.tsx:602-603`). The provider round trip was a full page load, so analytics initializes again, and `sanitizedAuthV3Search()` rewrites the URL to the safe correlation keys only. The completion path then sees no intent, and the user lands on the generic **Open Yelo** screen instead of the tip or World Cup page. Computing the path from the pending record's `returnSearch` would avoid this.
 - **Stale comment about tip config.** The preview stub in `App.tsx` says the tip config "needs a verified session". `GET /tips/{slug}` is public (`tipping/routes.go`); only `visit` and `checkout` need a token.
 - **Authenticated tippers see a signup prompt.** Stripe returns to `?status=success&checkout=yelo` without `signed_up=true`, so `TipComplete` still shows **continue with yelo signup** after a signed-in tip.
-- **Two app schemes.** Auth v3 uses `VITE_AUTH_V3_APP_SCHEME` (default `com.rideyelo`, `com.rideyelo.e2e` for maestro). The fleet invite page on the `invite` site uses `yelo:///`.
+- **Two app schemes.** Auth v3 uses `VITE_AUTH_V3_APP_SCHEME` (default `com.rideyelo`, `com.rideyelo.e2e` for maestro). The fleet invite page at `/i/fleet/<code>` uses `yelo:///`.
 - **Invite pages are never cached.** Firebase sends `Cache-Control: no-cache, no-store, must-revalidate` for `/i/**` (`src/sites/signup/firebase.json`).
 - **US phone numbers only.** The phone view prefixes `+1` and strips a leading `1` from 11-digit input.
 - **World Cup `.edu` check is loose.** The browser regex accepts any address ending in `.edu`, including subdomains; the API normalizes and validates.

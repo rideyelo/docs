@@ -133,34 +133,27 @@ The `share_link_sweep` River job runs once a minute (`RunOnStart: true`, unique 
 
 At 40 links per minute, the sweep rewrites a few thousand links an hour. A normal run finds nothing to do. The job is skipped when the Dub client is not configured.
 
-To repoint every existing personal invite link, change `INVITE_LANDING_BASE_URL` (or `OG_IMAGE_BASE_URL`) and deploy. The config version changes, so the sweep rewrites each link once. The old `cmd/backfill-referral-links` command was removed.
+To repoint every existing personal invite link, change `INVITE_LANDING_BASE_URL` (or `OG_IMAGE_BASE_URL`) and deploy. The config version changes, so the sweep rewrites each link once. The sweep does not cover fleet driver links. `RotateLink` is the only writer of a fleet's Dub link, so an existing fleet link keeps its old destination until the fleet rotates its code or someone edits the link in Dub. The old `cmd/backfill-referral-links` command was removed.
 
 ### Signed OG card
 
-`ogcard.InviteCardURL` (`internal/utilities/ogcard/url.go`) builds `OG_IMAGE_BASE_URL/og/invite?<params>&sig=<hmac>`. The signed params are:
-
-| Param | Value |
-| --- | --- |
-| `n` | First name |
-| `l` | Last name, omitted when blank |
-| `c` | Deterministic avatar color from the user ID |
-| `p` | Photo URL, omitted when blank |
-| `v` | Card design version (`inviteCardDesign`, currently `"2"`) |
-
-The worker ignores `v`, but it is part of the signed URL. Card responses are cached as immutable, so bump `inviteCardDesign` after deploying a new invite template to the `og` worker. Otherwise every preview keeps serving the old image. The new image URL changes each link's request hash, so the next sync rewrites it.
+`ogcard.InviteCardURL` (`internal/utilities/ogcard/url.go`) builds `OG_IMAGE_BASE_URL/og/invite?<params>&sig=<hmac>`. Query keys are sorted, so `sig` sits between `p` and `v`:
 
 ```text
-https://<og-worker>/og/invite?c=%23C05A5A&n=Alex&v=2&sig=<hmac>
+https://rideyelo.com/og/invite?c=c05a5a&n=Alex&sig=<hmac>&v=2
 ```
 
 | Param | Source | Included when |
 | --- | --- | --- |
 | `n` | First name | Always |
-| `c` | `HexColor(DeterministicColor(user_id))` | Always |
+| `c` | `HexColor(DeterministicColor(user_id))`: six lowercase hex digits with no `#` | Always |
+| `v` | Card design version (`inviteCardDesign`, currently `"2"`) | Always |
 | `l` | Last name | Non-empty |
 | `p` | `PhotoThumbnailUrl` | Non-empty |
 
-The signature is HMAC-SHA256 with `OG_SIGNING_SECRET` over a canonical string, truncated to 32 hex characters (`SigLength`). The canonical string sorts keys, skips `sig`, and length-prefixes each key and decoded value in bytes, for example `1:c=6:5AC0771:n=3:Sam`. Length prefixes stop a crafted first name from forging a `p` parameter. `yelo-web/workers/og/src/sign.ts` must produce identical strings.
+The worker ignores `v`, but it is part of the signed URL. Card responses are cached as immutable, so bump `inviteCardDesign` after deploying a new invite template to the `og` worker. Otherwise every preview keeps serving the old image. The new image URL changes each link's request hash, so the next sync rewrites it.
+
+The signature is HMAC-SHA256 with `OG_SIGNING_SECRET` over a canonical string, truncated to 32 hex characters (`SigLength`). The canonical string sorts keys, skips `sig`, and length-prefixes each key and decoded value in bytes, for example `1:c=6:5ac0771:n=3:Sam1:v=1:2`. Length prefixes stop a crafted first name from forging a `p` parameter. `yelo-web/workers/og/src/sign.ts` must produce identical strings.
 
 After each upsert, `warmOGCardAsync` sends a `GET` to the image URL on a detached 15-second context. A non-200 only logs "OG card warm failed".
 
