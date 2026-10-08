@@ -300,40 +300,56 @@ Removing a community spot only hides it on that device. It has no confirmation, 
 
 ### Why don't I see other apps' prices?
 
-Price comparison is an experiment called **Rideshare Price Aggregator**. A user sees live prices only when all of these are true:
+Price comparison is called **Fare Finder**. It's on for every rider. There's nothing to opt in to and no switch for it in the app. A user sees live prices only when all of these are true:
 
-- An admin added the `rideshare-price-aggregator` key to the user's community. See [Experimental features](/dashboard/communities#experimental-features).
-- The user turned it on in **Profile** → **Settings** → **Experiments** and tapped **Enable experiment** on the disclaimer.
 - Yelo has no ride options for the trip. That means the community is inactive or has rides disabled, or no Yelo vehicle serves the trip.
-- The user signed in to at least one provider.
+- No admin turned **Fare Finder** off for the user's community. See [How do I turn price comparison off?](#how-do-i-turn-price-comparison-off)
+- The user signed in to at least one provider. Until then, the cards show blurred prices and the button reads **Sign in to see prices**.
 
 <Note>
 Other apps' prices never appear next to Yelo's own ride options. When Yelo has options for a trip, the request screen shows only those.
 </Note>
 
-The **Experiments** row only appears in **Settings** when the community has at least one experiment. An empty screen reads "No experiments available".
+Fare Finder used to be an experiment called **Rideshare Price Aggregator**. The current app no longer lists it under **Profile** → **Settings** → **Experiments**, and a user doesn't need that switch. An app version from before Fare Finder still treats price comparison as that opt-in experiment, so ask a user who still sees the switch to update the app. See [Retired price aggregator experiment](/engineering/mobile/widgets-and-experiments#retired-price-aggregator-experiment).
 
-The disclaimer is accepted once per user per device. On a new phone, the switch shows off until the user accepts it again.
+### What do users see when Fare Finder is off?
 
-See [Experiments](/engineering/mobile/widgets-and-experiments#experiments).
+When Yelo has no options for a trip and an admin turned Fare Finder off for the community, the request screen shows **Need a ride?** with three cards: **Open in Uber**, **Open in Lyft**, and **Open in Waymo**, followed by "Yelo rides are coming soon". The cards show no prices. Each one opens that app with the destination filled in.
 
-### What do users see without the experiment?
+Empower isn't in this list. It only appears in Fare Finder.
 
-When Yelo has no options for a trip and the experiment is off, the request screen shows **Need a ride?** with three cards: **Open in Uber**, **Open in Lyft**, and **Open in Waymo**, followed by "Yelo rides are coming soon". The cards show no prices. Each one opens that app with the destination filled in.
-
-Empower isn't in this list. It only appears with the experiment on.
+The same cards can show for a moment while the app loads the user's community.
 
 ### How do I connect Uber, Lyft, or Empower?
 
-With the experiment on, open **Profile** → **Settings** → **Accounts** and pick a provider under **RIDESHARE PROVIDERS**. The **Accounts** button on the request screen opens the same list, titled **Rideshare accounts**.
+Open **Profile** → **Settings** → **Accounts** and pick a provider under **FARE FINDER**. On the request screen, the **Accounts** button and **Sign in to see prices** open the same list, titled **Fare Finder accounts**. Tapping a card with a blurred price opens that provider's screen directly.
 
 | Row status | Meaning |
 | --- | --- |
 | "Not connected" | The user hasn't signed in. |
-| The account's email, or "Connected" | Signed in and working. |
+| The account's email, or "Connected", with a check mark | Signed in and working. |
 | A red warning icon | Signed in, but the provider rejected the saved sign-in on the last price request. |
 
-Each provider screen starts with **Sign in to [provider]** and **Continue to [provider]**. Lyft asks for a phone number and a texted code, and sometimes the account's email.
+The first time a user opens any provider screen, the app shows **Set up Fare Finder** in place of the sign-in:
+
+| Point | Text |
+| --- | --- |
+| **Connect what you want** | "Link only the services you choose. Sign out of any of them anytime." |
+| **Your logins stay yours** | "Yelo never receives your passwords, cookies or payment details." |
+| **Estimates, not quotes** | "Prices and times can change. The final fare is set by the ride service when you book." |
+
+**Agree and continue** moves on to the sign-in. **Not now** goes back, and the user can't sign in to a provider until they agree. The app asks once per user per device, so a new phone or a reinstall asks again.
+
+Each provider screen then shows **Sign in to [provider]** and **Continue to [provider]**. Uber and Empower open the provider's own sign-in page. Lyft asks for a phone number (**Send code**), a 6-digit texted code (**Verify**), and sometimes the full email on the Lyft account (**Continue**). A signed-in screen reads "Signed in as [email]" or "Signed in".
+
+| What the user sees | Meaning | What the user does |
+| --- | --- | --- |
+| **Could not continue**: "Please try again. Your confirmation could not be saved." | The app couldn't save the user's agreement on the phone. | Tap **Agree and continue** again. |
+| **Could not connect to Uber**: "Uber sign-in could not be completed. Please try again." | The Uber sign-in failed. | Try again. On iPhone, **Try a fresh sign-in** appears below the button after a failed or cancelled attempt. |
+| "Something went wrong. Please try again." on the Lyft screen | Lyft didn't accept the phone number, the code, or the email. | Try again. On the code step, **Get a new code.** sends another one. |
+| The Empower sign-in page closes and nothing changes | The sign-in failed or was cancelled. The app shows no message for Empower. | Tap **Continue to Empower** again. |
+| "Error logging you in. Try again later." with **Log back in** | The provider rejected the saved sign-in. | Tap **Log back in**, or **Sign out** and sign in again. |
+| The provider screen jumps to **Accounts**, which has no **FARE FINDER** section | Fare Finder is off for the user's community. | Nothing. An admin has to turn it back on. |
 
 The sign-in is kept on the phone. The screen says "Login is stored only on this device". Yelo's servers don't hold it, so support can't see, reset, or disconnect a provider account. The user signs out with **Sign out** on the provider's screen. A new phone needs a fresh sign-in.
 
@@ -341,28 +357,32 @@ See [Connect Uber, Lyft, and Empower](/engineering/mobile/social-and-contacts#co
 
 ### What do the price cards mean?
 
-Each provider gets one card. Its other ride types nest underneath, with **Show [n] more** for the rest.
+Each provider gets a header card with its name and its lowest price, shown as "from" and the amount. Up to three ride types sit in rows below it, cheapest first. Each row shows the ride type, seats, pickup time, and price. **See all** lists every ride type for that provider, and **See less** folds the list back.
+
+Uber and Lyft always show. Empower shows only after the user signs in to it from **Accounts**.
 
 | Card shows | Meaning | What the user does |
 | --- | --- | --- |
-| A blurred price | Not signed in to that provider. | Tap the card to sign in. |
-| A blurred price on a connected provider | The provider rejected the saved sign-in. The **Accounts** button flags it. | Tap the card to sign in again. |
+| A blurred price | Not signed in to that provider. The blurred amount is a placeholder, not a real price. | Tap the card to sign in. |
+| A blurred price on a connected provider | The provider rejected the saved sign-in. The **Accounts** button shows "!". | Tap the card to sign in again. |
 | A spinner | Prices are loading. | Wait. |
 | **Unavailable** | The provider returned no priced rides for this trip, or the request failed. | Tap the refresh button, or try another provider. |
-| A price, with "from" when tiers nest below | A live quote from the user's own account. | Tap to select it. |
+| "from" and a price on the header card | The provider's lowest live quote, from the user's own account. | Tap the header to select that ride, or tap a row below it. |
 
-A cheapest badge and a fastest badge mark the best option across all providers.
+A **CHEAPEST** badge and a **FASTEST** badge mark the best ride across all providers.
+
+The bar above the cards has an **Accounts** button, a refresh button, and two icon buttons that select the fastest or the cheapest ride. The red badge on **Accounts** counts Uber and Lyft accounts that aren't connected yet. Until the user connects a provider or opens **Accounts**, a **Sign in** tip points at it: "Connect your rideshare accounts here to get started."
 
 The button at the bottom changes with the state:
 
 | Button | When |
 | --- | --- |
-| **Sign in to see prices** | No provider is connected. It opens **Rideshare accounts**. |
+| **Sign in to see prices** | No provider is connected. It opens **Fare Finder accounts**. |
 | **Select an option** | Nothing is selected yet. |
-| **Open [provider]** | A ride is selected. It opens that provider's app. |
 | **[Provider] not installed** | The selected provider's app isn't on the phone. |
+| **Open [provider]** | A ride is selected. It opens that provider's app. |
 
-A Citi Bike card can appear when Lyft returns bike options. Its button opens Lyft.
+A Citi Bike card can appear when Lyft returns bike options. Its button reads **Open Lyft**.
 
 ### Can I book an Uber or Lyft in Yelo?
 
@@ -370,14 +390,18 @@ No. Yelo shows the price and hands off. **Open [provider]** opens that app with 
 
 ### Why is the price in the other app different?
 
-The prices are estimates from the provider at the moment Yelo asked. The disclaimer says "Estimates may be delayed, inaccurate, or unavailable." The provider sets the final price in its own app.
+The prices are estimates from the provider at the moment Yelo asked. The **Set up Fare Finder** screen says "Prices and times can change. The final fare is set by the ride service when you book."
 
 Yelo reuses a provider's prices for the same trip for 20 seconds. The refresh button on the request screen is disabled during that time and shows a countdown.
 
-Yelo isn't affiliated with these companies. The disclaimer says Yelo "is not affiliated with, endorsed by, or sponsored by Uber Technologies, Inc., Lyft, Inc., or any other supported ride-hailing service" and "provides no support or warranties for third-party services."
+Yelo isn't affiliated with these companies. The setup screen says "Fare Finder is provided as is and may change or stop working at any time" and "Desi Technologies, Inc. (dba Yelo) is not affiliated with or endorsed by Uber, Lyft or any other ride service."
 
 ### How do I turn price comparison off?
 
-Turn the switch off in **Profile** → **Settings** → **Experiments**. Per the disclaimer, Yelo collects diagnostic information about the feature while it's on, without account credentials, cookies, or payment details. Turning the experiment off stops that.
+A user can't. The app has no Fare Finder switch. An admin turns it off for a whole community with the **Fare Finder** switch in the dashboard community workspace. See [Controls](/dashboard/communities#controls). Open apps pick up the change within about a minute and show the **Need a ride?** cards instead.
 
-Turning it off doesn't sign the user out of the providers, and it hides the provider screens. To sign out, the user taps **Sign out** on each provider's screen before turning the experiment off.
+A user who doesn't want price comparison can leave the providers unconnected, or tap **Sign out** on each provider's screen. With no provider connected, the app requests no prices from any provider.
+
+The setup screen says "We collect diagnostic data while you use it to fix issues and improve it." Provider diagnostics start only after the user taps **Agree and continue**. The same screen says "Yelo never receives your passwords, cookies or payment details."
+
+Turning Fare Finder off for a community doesn't sign its users out of the providers, and it hides the provider screens. A user can't reach **Sign out** again until an admin turns Fare Finder back on.
