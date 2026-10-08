@@ -20,14 +20,24 @@ Unmarked product changes are OTA. For how this is decided, see [Mobile releases]
 | 5.7.2 | `v5.7.2-267` | Sep 1 | Expo SDK 57 patch updates and ride-provider URL visibility. |
 | 5.7.3 | `v5.7.3-268`, `v5.7.3-269` | Sep 11 | Android background location, app links, Firebase, native glass hit testing, Uber callback on Android. Build 269 compiles `expo-contacts` from source. |
 | 5.7.4 | not yet tagged | in development | `main` moved to 5.7.4 on Sep 15. |
+| 5.8.0 | not yet tagged | in development | `main` moved to 5.8.0 on Oct 8. Light appearance only, Mapbox native SDK 11.23.1, and Expo SDK 57 patch updates. |
 
 OpenAPI contract syncs (`chore(api): update OpenAPI contract to ...`) and rolling backport PRs into release branches are left out of the weekly lists below.
 
-<Update label="Week of October 5, 2026" description="Ride requests time out to a decline, reworked request card, driver net and pending earnings, opt-in auto-queue, invite link attribution, OTA reload prompt, and reachable Yelo users in the bump sheet">
+<Update label="Week of October 5, 2026" description="5.8.0 native build prep, Fare Finder for all riders, api.joinyelo.com as the production API, signed-out update gate, ride requests time out to a decline, reworked request card, driver net and pending earnings, opt-in auto-queue, invite link attribution, OTA reload prompt, and reachable Yelo users in the bump sheet">
   **Releases**
+
+  - **Native:** `main` moves to 5.8.0. The app is locked to the light appearance (`userInterfaceStyle: light`), the widget extension enables frequent Live Activity updates, and the Mapbox native SDK is pinned to 11.23.1, the version `@rnmapbox/maps` 10.3.7 targets. Expo SDK 57 packages move to their latest patches, along with PostHog, Orval, oxlint, and oxfmt. The fingerprint workflow now adds the `skip-supported-release-backport` label to any PR into `main` whose fingerprint changes, so native changes aren't backported as OTA. [#678](https://github.com/rideyelo/yelo-frontend/pull/678). See [OTA versus native rebuild](/engineering/mobile/releases#ota-versus-native-rebuild) and [Backports](/engineering/mobile/releases#backports).
+  - The update-required and crash screens now render as alert cards instead of the full-screen car layout. `GET /update-required` skips the auth gate, so signed-out installs below the minimum version are blocked too. The API raised the minimum to 5.7.4 in [yelo-api#313](https://github.com/rideyelo/yelo-api/pull/313). [#675](https://github.com/rideyelo/yelo-frontend/pull/675)
+  - Production builds, the OTA stage workflow, and the dev and simulator scripts default to `https://api.joinyelo.com`, which serves the same API deployment as `api.rideyelo.com`. `api.rideyelo.com` stays in the production origin set, so E2E builds still refuse it. [#669](https://github.com/rideyelo/yelo-frontend/pull/669)
 
   - When an OTA update has downloaded, the app shows an **Update ready** dialog. **Reload now** applies it immediately. **Later** hides the dialog for the session, and the update applies on the next cold launch. [#662](https://github.com/rideyelo/yelo-frontend/pull/662). See [Mobile releases](/engineering/mobile/releases#how-devices-pick-up-updates).
   - **OTA Stage** and **OTA Promote** Slack alerts are shorter. They link an 8-character SHA to the commit and platform names to their Expo update groups. The staged alert links to **OTA Promote**. Runtime versions and group IDs moved to the workflow run summary. [#662](https://github.com/rideyelo/yelo-frontend/pull/662). See [Bots and automation](/engineering/ci/bots-and-automation).
+
+  **Rides**
+
+  - Fare Finder, the third-party fare comparison on the request sheet, is on for every rider. It no longer needs the `rideshare-price-aggregator` experiment, which this build hides from the Experiments screen. The only gate is the community's `fare_finder_disabled` kill switch. When it is on, the sheet falls back to the static deep-link cards. Provider sign-in and diagnostics still need the one-time disclosure. Uber tiers show their product names: the app keeps every vehicle view name it sees on the device and reuses it when a later Uber response omits the catalog. Fare Finder analytics add per-provider card states and fetch-pass outcomes. [#671](https://github.com/rideyelo/yelo-frontend/pull/671). See [Rideshare aggregator](/engineering/mobile/rideshare-aggregator).
+  - The Stripe payment sheet's `returnURL` is now `com.rideyelo://stripe-redirect`, and the app leaves that link to the Stripe SDK instead of routing it. The dead `redirect.rideyelo.com` deep link helper and the unused Deals feed and coupon modal are removed. [#669](https://github.com/rideyelo/yelo-frontend/pull/669)
 
   **Friends**
 
