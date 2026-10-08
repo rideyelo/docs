@@ -299,6 +299,10 @@
      "description": {
       "type": "string"
      },
+     "earnings": {
+      "format": "int64",
+      "type": "integer"
+     },
      "fee": {
       "format": "int64",
       "type": "integer"
@@ -313,6 +317,9 @@
      "net": {
       "format": "int64",
       "type": "integer"
+     },
+     "pending": {
+      "type": "boolean"
      },
      "ride_id": {
       "type": "string"
@@ -503,6 +510,11 @@
       "nullable": true,
       "type": "integer"
      },
+     "fare_finder_disabled": {
+      "description": "Kill switch for Fare Finder (third-party fare comparison)",
+      "nullable": true,
+      "type": "boolean"
+     },
      "is_active": {
       "description": "Whether community is operational",
       "nullable": true,
@@ -537,6 +549,18 @@
       "description": "Community name",
       "nullable": true,
       "type": "string"
+     },
+     "parity_ratio_max": {
+      "description": "Upper bound of the target Yelo \u00f7 competitor fare ratio (0.5\u20131.5)",
+      "format": "double",
+      "nullable": true,
+      "type": "number"
+     },
+     "parity_ratio_min": {
+      "description": "Lower bound of the target Yelo \u00f7 competitor fare ratio (0.5\u20131.5)",
+      "format": "double",
+      "nullable": true,
+      "type": "number"
      },
      "primary_fleet_id": {
       "description": "Default fleet ID",
@@ -1522,6 +1546,10 @@
       },
       "type": "array"
      },
+     "fare_finder_disabled": {
+      "description": "Kill switch for Fare Finder (third-party fare comparison)",
+      "type": "boolean"
+     },
      "featured_discount_partner": {
       "nullable": true,
       "type": "string"
@@ -1597,6 +1625,16 @@
        "$ref": "#/components/schemas/OperatingWindow"
       },
       "type": "array"
+     },
+     "parity_ratio_max": {
+      "description": "Upper bound of the target Yelo \u00f7 competitor fare ratio",
+      "format": "double",
+      "type": "number"
+     },
+     "parity_ratio_min": {
+      "description": "Lower bound of the target Yelo \u00f7 competitor fare ratio",
+      "format": "double",
+      "type": "number"
      },
      "primary_fleet_id": {
       "format": "uuid",
@@ -1705,6 +1743,7 @@
      "driver_referral_reward",
      "driver_signup_count",
      "extensions",
+     "fare_finder_disabled",
      "featured_discount_partner",
      "featured_discount_partner_logo_url",
      "geography_revision",
@@ -1725,6 +1764,8 @@
      "name",
      "next_operating_window",
      "operating_windows",
+     "parity_ratio_max",
+     "parity_ratio_min",
      "primary_fleet_id",
      "primary_school_ids",
      "primary_vehicle_type",
@@ -2310,6 +2351,12 @@
       },
       "type": "array"
      },
+     "reachable": {
+      "items": {
+       "$ref": "#/components/schemas/ContactMatch"
+      },
+      "type": "array"
+     },
      "sync_id": {
       "type": "string"
      }
@@ -2317,6 +2364,7 @@
     "required": [
      "matched_phone_numbers",
      "matches",
+     "reachable",
      "sync_id"
     ],
     "type": "object"
@@ -5008,13 +5056,22 @@
      "pending": {
       "format": "int64",
       "type": "integer"
+     },
+     "uncaptured": {
+      "format": "int64",
+      "type": "integer"
+     },
+     "uncaptured_rides": {
+      "type": "integer"
      }
     },
     "required": [
      "available",
      "currency",
      "instant_available",
-     "pending"
+     "pending",
+     "uncaptured",
+     "uncaptured_rides"
     ],
     "type": "object"
    },
@@ -5313,6 +5370,10 @@
       "nullable": true,
       "type": "string"
      },
+     "driver_earnings": {
+      "format": "double",
+      "type": "number"
+     },
      "id": {
       "format": "uuid",
       "type": "string"
@@ -5380,6 +5441,7 @@
      "destination_longitude",
      "destination_name",
      "destination_route",
+     "driver_earnings",
      "id",
      "num_riders",
      "pickup_distance",
@@ -7087,10 +7149,17 @@
        "$ref": "#/components/schemas/Friend"
       },
       "type": "array"
+     },
+     "reachable": {
+      "items": {
+       "$ref": "#/components/schemas/ReachableUser"
+      },
+      "type": "array"
      }
     },
     "required": [
-     "friends"
+     "friends",
+     "reachable"
     ],
     "type": "object"
    },
@@ -7529,6 +7598,11 @@
      "distance": {
       "type": "integer"
      },
+     "driver_earnings": {
+      "format": "double",
+      "nullable": true,
+      "type": "number"
+     },
      "duration": {
       "type": "integer"
      },
@@ -7544,6 +7618,9 @@
      "payment_method_brand": {
       "nullable": true,
       "type": "string"
+     },
+     "pending": {
+      "type": "boolean"
      },
      "pickup": {
       "$ref": "#/components/schemas/Location"
@@ -7576,6 +7653,7 @@
      "fee_cents",
      "id",
      "payment_method_brand",
+     "pending",
      "pickup",
      "price",
      "rating",
@@ -8264,6 +8342,109 @@
     ],
     "type": "object"
    },
+   "LiveProviderQuote": {
+    "properties": {
+     "at_minimum": {
+      "type": "boolean"
+     },
+     "fare": {
+      "format": "double",
+      "type": "number"
+     },
+     "product": {
+      "type": "string"
+     },
+     "provider": {
+      "type": "string"
+     },
+     "quote_pass_id": {
+      "type": "string"
+     },
+     "rate_card": {
+      "$ref": "#/components/schemas/LiveProviderRateCard"
+     },
+     "surge": {
+      "format": "double",
+      "type": "number"
+     },
+     "timestamp": {
+      "format": "date-time",
+      "type": "string"
+     },
+     "trip_miles": {
+      "format": "double",
+      "type": "number"
+     },
+     "trip_minutes": {
+      "format": "double",
+      "type": "number"
+     }
+    },
+    "required": [
+     "at_minimum",
+     "fare",
+     "product",
+     "provider",
+     "quote_pass_id",
+     "surge",
+     "timestamp",
+     "trip_miles",
+     "trip_minutes"
+    ],
+    "type": "object"
+   },
+   "LiveProviderQuotes": {
+    "properties": {
+     "quotes": {
+      "items": {
+       "$ref": "#/components/schemas/LiveProviderQuote"
+      },
+      "type": "array"
+     },
+     "status": {
+      "type": "string"
+     },
+     "updated_at": {
+      "format": "date-time",
+      "nullable": true,
+      "type": "string"
+     }
+    },
+    "required": [
+     "quotes",
+     "status",
+     "updated_at"
+    ],
+    "type": "object"
+   },
+   "LiveProviderRateCard": {
+    "nullable": true,
+    "properties": {
+     "base": {
+      "format": "double",
+      "type": "number"
+     },
+     "minimum": {
+      "format": "double",
+      "type": "number"
+     },
+     "per_mile": {
+      "format": "double",
+      "type": "number"
+     },
+     "per_minute": {
+      "format": "double",
+      "type": "number"
+     }
+    },
+    "required": [
+     "base",
+     "minimum",
+     "per_mile",
+     "per_minute"
+    ],
+    "type": "object"
+   },
    "Location": {
     "properties": {
      "address": {
@@ -8571,6 +8752,60 @@
      "id",
      "name",
      "type"
+    ],
+    "type": "object"
+   },
+   "ManualPaymentFundSource": {
+    "properties": {
+     "available": {
+      "format": "int64",
+      "type": "integer"
+     },
+     "currency": {
+      "type": "string"
+     },
+     "source_type": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "available",
+     "currency",
+     "source_type"
+    ],
+    "type": "object"
+   },
+   "ManualPaymentFundSourcesResponse": {
+    "properties": {
+     "sources": {
+      "items": {
+       "$ref": "#/components/schemas/ManualPaymentFundSource"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "sources"
+    ],
+    "type": "object"
+   },
+   "ManualPaymentResult": {
+    "properties": {
+     "amount": {
+      "format": "int64",
+      "type": "integer"
+     },
+     "title_applied": {
+      "type": "boolean"
+     },
+     "transfer_id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "amount",
+     "title_applied",
+     "transfer_id"
     ],
     "type": "object"
    },
@@ -9774,6 +10009,11 @@
     "properties": {
      "destination_name": {
       "type": "string"
+     },
+     "driver_earnings": {
+      "format": "double",
+      "nullable": true,
+      "type": "number"
      },
      "latest_index": {
       "maximum": 18446744073709552000,
@@ -12353,6 +12593,11 @@
      "driver": {
       "$ref": "#/components/schemas/RideDriver"
      },
+     "driver_earnings": {
+      "format": "double",
+      "nullable": true,
+      "type": "number"
+     },
      "id": {
       "format": "uuid",
       "type": "string"
@@ -12708,6 +12953,10 @@
      "destination_name": {
       "type": "string"
      },
+     "driver_earnings": {
+      "format": "double",
+      "type": "number"
+     },
      "estimated_start_minutes": {
       "type": "integer"
      },
@@ -12752,6 +13001,7 @@
      "deadhead_miles",
      "deadhead_minutes",
      "destination_name",
+     "driver_earnings",
      "estimated_start_minutes",
      "id",
      "pickup_name",
@@ -12851,6 +13101,30 @@
       "type": "string"
      }
     },
+    "type": "object"
+   },
+   "ReachableUser": {
+    "properties": {
+     "first_name": {
+      "type": "string"
+     },
+     "id": {
+      "format": "uuid",
+      "type": "string"
+     },
+     "last_name": {
+      "type": "string"
+     },
+     "photo_url": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "first_name",
+     "id",
+     "last_name",
+     "photo_url"
+    ],
     "type": "object"
    },
    "RecentDestination": {
@@ -14903,10 +15177,10 @@
       "type": "string"
      },
      "recipient_user_ids": {
-      "description": "Confirmed Yelo friends to notify",
+      "description": "Yelo friends or reachable contacts to notify",
       "example": "[\"550e8400-e29b-41d4-a716-446655440000\"]",
       "items": {
-       "description": "Confirmed Yelo friends to notify",
+       "description": "Yelo friends or reachable contacts to notify",
        "example": "[\"550e8400-e29b-41d4-a716-446655440000\"]",
        "format": "uuid",
        "type": "string"
@@ -14918,6 +15192,35 @@
      "destination_name",
      "idempotency_key",
      "recipient_user_ids"
+    ],
+    "type": "object"
+   },
+   "SendManualPaymentRequest": {
+    "description": "SendManualPaymentRequest schema",
+    "properties": {
+     "amount": {
+      "format": "int64",
+      "type": "integer"
+     },
+     "description": {
+      "type": "string"
+     },
+     "idempotency_key": {
+      "type": "string"
+     },
+     "internal_note": {
+      "type": "string"
+     },
+     "source_type": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "amount",
+     "description",
+     "idempotency_key",
+     "internal_note",
+     "source_type"
     ],
     "type": "object"
    },
@@ -19307,6 +19610,52 @@
     ],
     "type": "object"
    },
+   "StandardResponse_models.LiveProviderQuotes": {
+    "description": "StandardResponse_models.LiveProviderQuotes schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/LiveProviderQuotes"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
+   "StandardResponse_models.ManualPaymentResult": {
+    "description": "StandardResponse_models.ManualPaymentResult schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/ManualPaymentResult"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
    "StandardResponse_models.MapDetails": {
     "description": "StandardResponse_models.MapDetails schema",
     "properties": {
@@ -21124,6 +21473,29 @@
     "properties": {
      "data": {
       "$ref": "#/components/schemas/UpdateLocationResponse"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
+   "StandardResponse_users.ManualPaymentFundSourcesResponse": {
+    "description": "StandardResponse_users.ManualPaymentFundSourcesResponse schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/ManualPaymentFundSourcesResponse"
      },
      "error": {
       "$ref": "#/components/schemas/ErrorInfo"
@@ -26881,6 +27253,118 @@
     "summary": "Get signup status",
     "tags": [
      "AuthV2"
+    ]
+   }
+  },
+  "/authv3/attribution/touch": {
+   "post": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/authv3.(*Handler).RecordTouch`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nStores a bounded attribution snapshot for a link landing page before any sign-in starts. Sign-in later claims touches that share the anonymous id.",
+    "operationId": "authv3.RecordTouch",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Attribution"
+       }
+      }
+     },
+     "description": "Request body for requests.Attribution",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_json.SuccessResponse"
+        }
+       }
+      },
+      "description": "Touch recorded"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Invalid request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Authentication failed"
+     },
+     "409": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Identity conflict"
+     },
+     "410": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Transaction expired or already consumed"
+     },
+     "429": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Rate limit exceeded"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal server error"
+     },
+     "503": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Authentication temporarily unavailable"
+     }
+    },
+    "summary": "Record an anonymous link touch",
+    "tags": [
+     "Auth v3"
     ]
    }
   },
@@ -37996,7 +38480,7 @@
       }
      },
      {
-      "description": "24h, 7d, 30d or all",
+      "description": "<n>h, <n>d (for example 6h, 3d, 30d) or all",
       "in": "query",
       "name": "period",
       "schema": {
@@ -38044,6 +38528,73 @@
      }
     },
     "summary": "Get observed competitor prices",
+    "tags": [
+     "Dashboard Live"
+    ]
+   }
+  },
+  "/dashboard/live/competitor-quotes": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/supply_demand.(*SupplyDemandHandler).getCompetitorQuotes`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nOne row per priced Fare Finder tier riders saw in the market, with trip distance, duration, surge and the provider rate card when published. Test devices are excluded.",
+    "operationId": "dashboard.GetLiveCompetitorQuotes",
+    "parameters": [
+     {
+      "description": "Admin-only community scope",
+      "in": "query",
+      "name": "community_id",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "description": "<n>h, <n>d (for example 6h, 3d, 30d) or all",
+      "in": "query",
+      "name": "period",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_models.LiveProviderQuotes"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Bad Request _(validation or deserialization error)_"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Internal Server Error _(panics)_"
+     }
+    },
+    "summary": "Get observed competitor quotes per offer",
     "tags": [
      "Dashboard Live"
     ]
@@ -42419,6 +42970,76 @@
     ]
    }
   },
+  "/dashboard/users/detail/{id}/manual-payment": {
+   "post": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/users.(*DashboardUsersHandler).SendManualPayment`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nTransfers the amount from the chosen platform balance to the driver's own connected account. The description is the title the driver sees in their activity feed. Retrying with the same idempotency_key never pays twice.",
+    "operationId": "dashboard.SendManualPayment",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "id",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "*/*": {
+       "schema": {
+        "$ref": "#/components/schemas/SendManualPaymentRequest"
+       }
+      }
+     },
+     "description": "Request body for users.SendManualPaymentRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_models.ManualPaymentResult"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Bad Request _(validation or deserialization error)_"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Internal Server Error _(panics)_"
+     }
+    },
+    "summary": "Send a one-off payment to a driver's Stripe account (admin only)",
+    "tags": [
+     "Dashboard Users"
+    ]
+   }
+  },
   "/dashboard/users/detail/{id}/messages": {
    "get": {
     "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/users.(*DashboardUsersHandler).ListUserMessages`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
@@ -42801,6 +43422,57 @@
      }
     },
     "summary": "Set user test status",
+    "tags": [
+     "Dashboard Users"
+    ]
+   }
+  },
+  "/dashboard/users/manual-payments/fund-sources": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/users.(*DashboardUsersHandler).GetManualPaymentFundSources`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.GetManualPaymentFundSources",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_users.ManualPaymentFundSourcesResponse"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Bad Request _(validation or deserialization error)_"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Internal Server Error _(panics)_"
+     }
+    },
+    "summary": "List platform balances a manual driver payment can draw from (admin only)",
     "tags": [
      "Dashboard Users"
     ]
