@@ -1,0 +1,151 @@
+---
+title: "Inventory"
+description: "Browse every Yelo app screen, state, and flow with its latest test capture, coverage status, and recording from the dashboard Inventory page"
+---
+
+The **Inventory** page is a catalog of the Yelo app's screens, their states, and the flows that connect them. Each entry is joined to screenshots and recordings from end-to-end test runs. Use it to see what a screen looks like in a given state, check which states have current test evidence, and open the recording of a flow.
+
+## Prerequisites
+
+- An admin account. See [Dashboard roles and access](/administration/dashboard-roles).
+
+## Open the inventory
+
+1. Expand **Administration** in the sidebar.
+2. Click **Inventory**.
+
+The page heading is **Product design inventory**. The browser tab reads **Product inventory**.
+
+The page loads the catalog, then one manifest per test run. While manifests load, the filter bar shows **Loading run evidence** with a count, and coverage numbers aren't final. When loading finishes it shows how many run manifests loaded.
+
+<Note>
+  Sign-in protects the dashboard page, not the evidence. Screenshots and recordings are served from a public storage bucket, and the standalone viewer at `https://yelo-maestro.web.app` shows the same inventory without sign-in. Test runs use synthetic accounts only.
+</Note>
+
+## Read the revision strip
+
+The strip under the heading tells you which catalog you are looking at.
+
+| Item | What it shows |
+| --- | --- |
+| **Published bucket catalog** or **Bundled frontend snapshot** | Where the catalog came from. The page reads a published catalog from the evidence bucket. If none is published, it uses the snapshot built into the dashboard. |
+| **Frontend** and a short commit | The app commit the catalog describes. Click it to open that commit on GitHub. |
+| **routes registered** | How many app routes the catalog accounts for, out of all routes found. |
+| **Inventory** and a short hash | The catalog revision. Hover to see the full hash. |
+
+If the published catalog can't be read, a notice starting **Using bundled inventory:** appears and the page falls back to the snapshot. If the list of runs can't be read, the notice starts **Run index unavailable:**. If some runs fail to load, expand **run manifests unavailable; coverage is incomplete** to see which.
+
+Click **Refresh evidence** to reload the catalog, the run list, and every run manifest. Without it, the page reuses a run manifest for up to five minutes.
+
+## Switch sections
+
+| Button | Opens |
+| --- | --- |
+| **Screens** | The screen gallery. The number is the count of screens in scope, excluding redirects. |
+| **Flows** | The flow list. The number is the count of flows in scope. |
+| **Test runs** | The list of published test runs. See [Open a test run](#open-a-test-run). |
+
+## Read the coverage meters
+
+Four meters summarize coverage for the current filters. Each shows a percentage, the count behind it, and what is counted.
+
+| Meter | What it counts |
+| --- | --- |
+| **Screens fully captured** | Screens where every declared state has current evidence. |
+| **Screen state coverage** | Combinations of state, role, and platform that have current evidence. |
+| **Verified flow cases** | Flow cases with current evidence for every required role. |
+| **Capture automation mapped** | Combinations of state and role that a test is set up to capture. |
+
+Expand **How coverage is counted** for the rules. In short:
+
+- Every declared state stays in the total, captured or not.
+- Only the newest attempt on the current catalog counts. An older passing run can't hide a newer failure.
+- Redirects are listed but don't count toward visual coverage.
+- These are percentages of the declared inventory. They are not code coverage.
+
+## Evidence status
+
+Every capture and recording carries one status badge.
+
+| Badge | Meaning |
+| --- | --- |
+| **Current** | The run passed, and it matches the current catalog and app source with complete evidence. Only this status counts toward coverage. |
+| **Historical** | The run passed, but it predates this catalog revision or was built from different app source. |
+| **Failed** | The test scenario or one of its device roles did not pass. |
+| **Unverified** | The run passed but can't be trusted for coverage: build or backend details are missing or inconsistent, a test needed a retry, or a required screenshot, role, or recording is missing. |
+| **Not captured** | No test run has produced evidence for this entry. |
+
+The line under a badge gives the specific reason.
+
+## Filter the inventory
+
+The filter bar applies to both **Screens** and **Flows**.
+
+| Control | What it does |
+| --- | --- |
+| Search box | Matches your text against everything in an entry, including titles, state names, routes, and conditions. |
+| **Every area** | Limits results to one product area. |
+| **Every role** | Limits results and evidence to **Rider**, **Driver**, or **App**. |
+| Platform | **iOS**, **Android**, or **Both platforms**. Starts on **iOS**. |
+| **Every status** | **Coverage gaps** shows entries with no current evidence. **Historical captures**, **Current evidence**, and **Failed runs** show entries that have evidence with that status. |
+| **Include internal labs** | Adds internal-only screens, which are hidden by default. |
+| **Backend revision** | Limits evidence to runs against one exact backend revision. Leave it empty to accept any revision. |
+
+Role, platform, **Include internal labs**, and **Backend revision** are saved in the page address, so they survive a reload and travel with a copied link. Search, area, and status are not.
+
+## Browse screens
+
+The **Screen gallery** shows one card per capture. Two menus above it change the layout:
+
+- **Show**: **Captured variations** shows a card for every captured state, role, and platform. **One per screen** shows a single card per screen.
+- **Sort**: **Captured first**, **Product order**, or **Name**.
+
+Each card shows the capture, the product area and kind, the status badge, the screen title, and the state, role, and platform of the capture. The footer shows the screen's ID, its number of states, the run date, and the app commit. A screen with no capture shows **Awaiting capture**, or **Navigation entry** if it's a redirect.
+
+Click a card to open the screen's details above the gallery:
+
+- **Capture.** Click the image to open the full-resolution original in a new tab. Below it are the status, the reason, the role, platform, and date, and **Open test replay**, which opens the run at that test.
+- **State variations.** Every declared state with its status. Click one to switch.
+- **State details.** The conditions that produce the state, the **Expected** behavior, and the state's ID. **Capture mappings** lists the tests set up to capture it.
+- **Capture history.** Pick an older or failed capture of the same state.
+- **App sources.** The route and the source files, linked to GitHub at the catalog's commit.
+- **Flows through this screen.** Links to each flow that includes the screen.
+
+## Browse flows
+
+The **Flow inventory** lists each flow with its number of cases, how many have recordings, and how many are current. Click a flow to open its details.
+
+- **Cases.** Each case with its status. The line under the title names the test that covers it, or **Workflow not authored** if none does.
+- **Case details.** The expected behavior, the conditions, and the case ID.
+- **Screen checkpoints by role.** The screens the case passes through, in order. Click one to open that screen and state. A case without a test shows **Screen sequence** instead.
+- **Test sources.** The test script for each role, linked to GitHub.
+- **Test recordings.** Pick a role to play its recording. **Open synchronized replay and action log** opens the run at that role. **Run history** switches to an older run.
+
+### Flow series
+
+**Flow series** lays the case out step by step.
+
+- **Pictures** shows one row per role, with a numbered capture for each step. Click a capture to open the original. A step without a capture says why, and links to the screen's details.
+- **Diagram** draws the same steps as a flowchart. Expand **Mermaid source** to copy the diagram text.
+
+The order follows each role's test script. Rows for different roles are not synchronized with each other.
+
+## Open a test run
+
+Click **Test runs** to list published runs under **Yelo E2E reports**.
+
+- Filter with **all**, **failed**, or **passed**.
+- Click a run to open its recordings, screenshots, and action log.
+- Use the pin icon to keep a run at the top of the list. Pins are saved in your browser only.
+- Use the copy icon to copy a link to a run.
+
+Inside a run, **← all reports** returns to the list and **Product inventory** returns to the screen gallery. From the list, **← product inventory** does the same.
+
+## Share a link
+
+Your selection is part of the page address. Click **Copy link** in a screen's or flow's details to copy a link that reopens the same screen and state, or flow and case, with your role, platform, and backend revision filters. The browser's back button steps through your selections.
+
+## Related pages
+
+- [Dashboard roles and access](/administration/dashboard-roles)
+- [End-to-end tests](/engineering/qa/e2e#evidence-viewer) for how runs and evidence are produced
