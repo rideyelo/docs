@@ -151,7 +151,7 @@ https://rideyelo.com/og/invite?c=c05a5a&n=Alex&sig=<hmac>&v=2
 | `l` | Last name | Non-empty |
 | `p` | `PhotoThumbnailUrl` | Non-empty |
 
-The worker ignores `v`, but it is part of the signed URL. Card responses are cached as immutable, so bump `inviteCardDesign` after deploying a new invite template to the `og` worker. Otherwise every preview keeps serving the old image. The new image URL changes each link's request hash, so the next sync rewrites it.
+The worker ignores `v`, but it is part of the signed URL. Card responses are cached as immutable, so bump `inviteCardDesign` after deploying a new invite template to the `og` worker. Otherwise every preview keeps serving the old image. CI does not enforce that order across `yelo-web` and `yelo-api`; see [Edge and routing](/engineering/web/edge-and-routing#og). The new image URL changes each link's request hash, so the next sync rewrites it.
 
 The signature is HMAC-SHA256 with `OG_SIGNING_SECRET` over a canonical string, truncated to 32 hex characters (`SigLength`). The canonical string sorts keys, skips `sig`, and length-prefixes each key and decoded value in bytes, for example `1:c=6:5ac0771:n=3:Sam1:v=1:2`. Length prefixes stop a crafted first name from forging a `p` parameter. `yelo-web/workers/og/src/sign.ts` must produce identical strings.
 

@@ -17,8 +17,8 @@ There are no `pay` or `drive` sites. Both folders were removed from `yelo-web`, 
 | `signup` | Riders and drivers signing up, opening personal invite links, tipping, or deleting accounts | Auth v3 and phone OTP, no Clerk | `renderSite` | `@/generated/signup`, `@/generated/auth-v3` | `yelo-signup` | Live |
 | `event` | Anyone with a shared event link | Public | `renderSite` | `@/generated/event` | `yelo-event` | Live |
 | `home` | Marketing visitors | Public | Plain `createRoot` | None | `yelo-home` | Live |
-| `maestro` | Engineers reviewing E2E runs | Public viewer | `renderSite` | Supabase Storage JSON | `yelo-maestro` | Internal |
-| `invite` | Recipients of fleet invite links, plus a redirect for older personal invite links | Public | `renderSite` | `@/generated/dashboard` (`useFleetJoinGetPreview`) | `yelo-invite` | Live |
+| `maestro` | Engineers reviewing the product inventory and E2E runs | Public viewer | `renderSite` | Supabase Storage JSON | `yelo-maestro` | Internal |
+| `invite` | Anyone opening an `invite.yelo.link` link shared before invites moved to `joinyelo.com/i` | Public | `renderSite` | None | `yelo-invite` | Live |
 | `world-cup` | Students in the World Cup campus race | Public | `renderSite` | `@/generated/dashboard` (world-cup functions) | `yelo-world-cup` | Live |
 
 The Hosting site IDs come from `.firebaserc`. Each Hosting target has the same name as its site.
@@ -45,7 +45,7 @@ The public web entry point for account creation and several one-off flows. It ha
 | --- | --- |
 | `/auth/v3`, `/auth/v3/callback` | Auth v3 sign-in page (`auth-v3/AuthV3Page`). Normally served by the dedicated entry; the main bundle lazy-loads it as a fallback. |
 | `/delete-account` | Account deletion: phone OTP, then confirmation with the word `DELETE`. |
-| `/i/<code>` | Personal referral invite landing (`invite/InvitePage`). Apple mobile devices go to the App Store with `ct=<code>`; Android sees a Google Play link carrying the invite as install referrer; **Continue → sign up** goes to Auth v3 with the landing's allowlisted attribution parameters plus the code. |
+| `/i/<code>` | Personal referral invite landing (`invite/InvitePage`). Apple mobile devices go to the App Store with `ct=<code>`. Everyone else sees the landing, which leads with the store for the device: **Continue → Google Play** on Android, carrying the invite as install referrer, and **Continue → App Store** elsewhere. The secondary link, **Continue → web**, goes to Auth v3 with the landing's allowlisted attribution parameters plus the code. |
 | `.../tip/<slug>` | Rider tip for a driver or fleet (`TipStep`). If the tip API returns unauthorized, it redirects to Auth v3 with `intent=tip`. `?status=success` shows the confirmation screen. |
 | `.../world-cup`, `.../world-cup/claim`, or `?intent=world-cup` | World Cup claim: Auth v3 sign-in, then `.edu` email verification (`EduClaimStep`). |
 | Anything else | Redirects into the Auth v3 web flow. |
@@ -83,20 +83,23 @@ Read [Home site](/engineering/web/home-site) before you change this site.
 
 ## maestro
 
-An internal viewer for Maestro end-to-end test runs, with video, screenshots, and a synchronized timeline.
+An internal viewer for the product inventory and for end-to-end test runs. The hostname is historical: no Maestro runs anywhere.
 
-- **Data:** Reads a run index and per-run artifacts as JSON from Supabase Storage, at `VITE_SUPABASE_URL` + `/storage/v1/object/public/e2e`, or from `VITE_E2E_ARTIFACT_BASE_URL` if set. It does not call the Yelo API for reports.
+- **Views:** The default view is the product inventory: app screens and their states, joined to test captures. `?view=screens` (the default), `?view=flows`, and `?view=runs` pick the screen gallery, the flow list, and the run list. `?run=<run-id>` opens one run with video, screenshots, and a synchronized action log.
+- **Data:** Reads the run index, per-run manifests, and an optional `inventory/catalog.json` as JSON from Supabase Storage, at `VITE_SUPABASE_URL` + `/storage/v1/object/public/e2e`, or from `VITE_E2E_ARTIFACT_BASE_URL` if set. When the bucket has no catalog, the viewer uses the bundled `product-catalog.json`. It does not call the Yelo API.
 - **Auth:** None in the viewer. It stores pinned runs and the theme in `localStorage`.
+- **Dashboard embed:** The dashboard mounts the same `App` at `/inventory` behind Clerk sign-in and the `admin` role. The artifact bucket and this standalone site stay public. See [Inventory](/dashboard/inventory) and [Public sites](/engineering/web/public-sites#maestro).
+- **Hosting:** `**` is served `no-cache, max-age=0, must-revalidate` and `/assets/**` is immutable for a year, so the HTML revalidates and fingerprinted assets cache.
 - **Second entry:** `auth/v3/index.html` mounts the signup `AuthV3Page`. The build points `VITE_API_URL` at `VITE_E2E_API_URL` and sets the app scheme to `com.rideyelo.e2e`, so E2E app builds can run the web sign-in flow against the E2E API.
 - **Required build variables:** `VITE_SUPABASE_URL`, `VITE_E2E_API_URL`.
 
 ## invite
 
-Handles fleet invite links and redirects personal referral invite links to their new home on `joinyelo.com`.
+Forwards personal and fleet invite links shared before invites moved to `joinyelo.com/i`. It no longer renders an invite page.
 
-- **Routes:** `/fleet/:code` renders `FleetInvitePage`. The root path redirects (302) to `https://signup.yelo.link/`.
-- **Personal invites:** An inline script in `index.html` redirects `/<code>` to `https://joinyelo.com/i/<code>` with the query string before the bundle loads. The referral landing lives in the `signup` site so its attribution cookies are first-party to sign-up.
-- **API:** `useFleetJoinGetPreview`, a public hook from the dashboard client.
+- **Routes:** An inline script in `index.html` redirects `/<code>` to `https://joinyelo.com/i/<code>` and `/fleet/<code>` to `https://joinyelo.com/i/fleet/<code>`, with the query string, before the bundle loads. The root path redirects (302) to `https://joinyelo.com/`. Any other path renders "Invite not found".
+- **Where invites live:** Both landings are in the `signup` site (`src/sites/signup/invite/`), so their attribution cookies are first-party to sign-up. See [Public sites](/engineering/web/public-sites#invite).
+- **API:** None. `FleetInvitePage` and its `useFleetJoinGetPreview` call moved to the `signup` site.
 - **App links:** The Vite config emits an `apple-app-site-association` file with invite-specific path components so invite paths open the app.
 - **Analytics:** Dub, through `renderSite({ dubAnalytics: true })`.
 - **Required build variables:** `VITE_API_URL`.

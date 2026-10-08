@@ -13,7 +13,7 @@ Five `yelo-web` sites need no sign-in: `event`, `invite`, `world-cup`, `home`, a
 | `invite` | `renderSite({ query, router, dubAnalytics })` | None. `/:code` and `/fleet/:code` redirect in `index.html` before the bundle runs; anything else renders "Invite not found" | None | Static `og:*` in `index.html` | Dub |
 | `world-cup` | `renderSite(<LandingV5 />)`, no providers | None | `GET /world-cup/standings`, `GET /world-cup/activity` through `/world-cup/api` | `<meta name="description">` only | None |
 | `home` | Plain `createRoot` | Custom pathname switch | None | Full `og:*` and `twitter:*`, plus per-route static HTML | None |
-| `maestro` | `renderSite(<App />, {})`, no providers | `?run=` query param | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
+| `maestro` | `renderSite(<App />, {})`, no providers | Query params: `?view=screens\|flows\|runs`, `?run=` | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
 
 ## event
 
@@ -121,16 +121,41 @@ The base document sets `og:url` to `https://joinyelo.com/`, the single source fo
 
 ## maestro
 
-An internal viewer for Maestro end-to-end runs. It reads static JSON and media, not the Yelo API.
+An internal viewer for the product inventory and for end-to-end runs. It reads static JSON and media, not the Yelo API. The dashboard embeds the same `App` at `/inventory`; see [Inventory](/dashboard/inventory) for the operator view.
 
 | File | Role |
 | --- | --- |
 | `types.ts` | `ARTIFACT_ROOT` is `VITE_E2E_ARTIFACT_BASE_URL` or `VITE_SUPABASE_URL/storage/v1/object/public/e2e`. Runs live at `runs/<id>/`. |
-| `App.tsx` | Fetches `index.json`, filters by `passed` or `failed`, sorts pinned runs first. Pins persist in `localStorage` key `e2e-report:pins`. |
-| `RunViewer.tsx` | Loads `runs/<id>/manifest.json`, lists executions per device role, plays the MP4, and seeks the video when you click a timeline event. |
+| `App.tsx` | Picks the view from the query string: `?run=<id>` renders `RunViewer`, `?view=runs` renders the run list, and anything else renders `Inventory` on `screens` or `flows`. Fetches `index.json` with a 15-second timeout. The run list filters by `passed` or `failed` and sorts pinned runs first. Pins persist in `localStorage` key `e2e-report:pins`. |
+| `ViewerHost.tsx` | Context with `embedded` and `navigate`. Standalone, `navigate` calls `history.pushState` or `replaceState`. The dashboard's `InventoryPage` supplies React Router's `navigate` and sets `embedded`, which stops the viewer from setting `document.title` and hides the footer theme toggle. |
+| `useInventory.ts` | Fetches `inventory/catalog.json` from `ARTIFACT_ROOT`. A `404` falls back silently to the bundled `product-catalog.json`; any other failure falls back with a **Using bundled inventory** notice. Then loads every run manifest, four at a time. |
+| `evidenceCache.ts` | Caches parsed run manifests for five minutes in memory and in Cache Storage (`yelo-maestro-evidence-v1`, at most 100 entries). The key includes the run's status, start time, duration, commit, and counts from the index. **Refresh evidence** bypasses it. |
+| `inventory.ts` | Zod schemas for the catalog and for run evidence, plus the classification rules. See [Evidence status](#evidence-status). |
+| `ProductInventory.tsx` | The inventory UI: revision strip, coverage meters, filters, screen gallery, and screen and flow details. Selection (`screen`, `variant`, `flow`, `case`) and scope (`platform`, `role`, `internal`, `api`) live in the query string. |
+| `FlowSeries.tsx`, `series.ts` | The step-by-step picture strip per role and the Mermaid flowchart for a flow case. `mermaid` is imported lazily and rendered with `securityLevel: 'strict'`. |
+| `CaptureImage.tsx`, `imagePreview.ts` | Loads an image only within 240 px of the viewport. Uses the WebP thumbnails a manifest lists under `thumbnails/<sha256>/` when they match the original's hash; otherwise asks Supabase's image render endpoint for 360 and 720 px previews, then falls back to the original PNG. |
+| `RunViewer.tsx` | Loads `runs/<id>/manifest.json`, lists executions per device role, plays the MP4, and seeks the video when you click a timeline event. `?execution=<testId>:<role>` selects an execution and `&t=<seconds>` seeks to a time. |
 | `evidenceLog.ts` | Parses NDJSON timing records into a step log with offsets. |
 | `WorkflowCoverage.tsx` | Renders the declared-workflow coverage report. |
 | `ThemeToggle.tsx` | Stores `theme` in `localStorage`. |
+
+### Evidence status
+
+`classify` in `inventory.ts` gives each capture or recording one status. Only `current` earns coverage.
+
+| Status | Rule |
+| --- | --- |
+| `failed` | The scenario is missing, failed, or has an error, or any device role's execution did not pass. |
+| `historical` | The run's app `sourceTreeSha256` differs from the catalog's, the run's `inventoryEvidence.catalogHash` is not the catalog's hash, or the capture is not declared in the run's `inventoryEvidence`. |
+| `unverified` | Build, runner, or API provenance is missing, dirty, or inconsistent between the run and its roles; an execution has a non-zero exit code, evidence errors, or a test with `attempts` other than 1; the screenshot is missing; or, for a flow, a required role or its single MP4 is missing. |
+| `current` | None of the above. |
+| `missing` | No evidence. The UI labels it **Not captured**. |
+
+Within one screen state, role, and platform, the newest run wins, so an older passing run can't hide a newer failure. Redirect screens are excluded from coverage totals. With an `api` filter set, runs against any other API revision are dropped before classification.
+
+<Note>
+The catalog schema pins `source.repository` to `rideyelo/yelo-frontend`, and `src/sites/maestro/README.md` describes a registry and publish target in that repository. Neither exists on `yelo-frontend` `main`, and no script there writes `inventory/catalog.json` or `inventoryEvidence`. Until one does, the viewer shows the bundled snapshot, and a run produced from `yelo-frontend` `main` can classify as `historical` or `failed` but not `current`.
+</Note>
 
 The second entry, `auth/v3/index.html`, mounts the signup `AuthV3Page`. The Nx build target sets `VITE_API_URL=$VITE_E2E_API_URL` and `VITE_AUTH_V3_APP_SCHEME=com.rideyelo.e2e` so E2E app builds sign in against the E2E API and return to the E2E app.
 
