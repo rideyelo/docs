@@ -273,12 +273,14 @@ The HTTP client times out after 12 seconds. Any valid `period` returns 200, what
 
 `GetLiveCompetitorQuotes` returns the raw Fare Finder offers behind the **Pricing** > **Parity** tab. The API does no band or ratio math. The dashboard computes bands, rate card fits, and suggestions client-side against the community's pricing configs and `parity_ratio_min` / `parity_ratio_max`.
 
-The PostHog query flattens `properties.trip.offers[]` on `ride_provider_request_completed` events where `operation = 'quotes'` and `outcome = 'success'`, scoped by `properties.community_id`. It excludes `properties.is_test` but includes internal devices, because a provider's quote is the same whoever asks. It drops offers with an empty `product` or a non-positive `fare`, `trip_miles`, or `trip_minutes`, which skips rows from app versions before 5.7.5. Results are ordered newest first and capped at 5,000 offers, so a long period on a busy market loses its oldest quotes.
+The PostHog query flattens `properties.trip.offers[]` on `ride_provider_request_completed` events where `operation = 'quotes'` and `outcome = 'success'`, scoped by `properties.community_id`. It excludes `properties.is_test` but includes internal devices, because a provider's quote is the same whoever asks. It drops offers with an empty `product` or a non-positive `fare`, `trip_miles`, or `trip_minutes`, which skips rows from app versions before 5.7.5. The app attaches `trip` only while the rider's provider diagnostics consent is current, so riders without it contribute no rows (see [Rideshare aggregator](/engineering/mobile/rideshare-aggregator)). Results are ordered newest first and capped at 5,000 offers, so a long period on a busy market loses its oldest quotes.
 
 ```bash
 curl "$API_URL/dashboard/live/competitor-quotes?community_id=$COMMUNITY_ID&period=30d" \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+Example `data` payload:
 
 ```json
 {
@@ -289,11 +291,11 @@ curl "$API_URL/dashboard/live/competitor-quotes?community_id=$COMMUNITY_ID&perio
       "timestamp": "2026-10-08T13:58:12Z",
       "quote_pass_id": "b3f1c2e0-...",
       "provider": "lyft",
-      "product": "Lyft",
+      "product": "Standard",
       "trip_miles": 2.4,
       "trip_minutes": 9,
       "surge": 1.2,
-      "fare": 14.4,
+      "fare": 10.85,
       "at_minimum": false,
       "rate_card": { "base": 2.5, "minimum": 7.5, "per_mile": 1.6, "per_minute": 0.3 }
     }
@@ -307,8 +309,9 @@ curl "$API_URL/dashboard/live/competitor-quotes?community_id=$COMMUNITY_ID&perio
 | `provider`, `product` | Provider key and the tier name the rider app matched to the offer |
 | `trip_miles`, `trip_minutes` | The distance and duration the provider priced. For Uber, minutes come from `estimatedTripTime`. |
 | `fare` | The displayed fare. Divide by `surge` for the base rate. |
-| `at_minimum` | The provider priced the trip at its minimum fare |
-| `rate_card` | Published `base`, `minimum`, `per_mile`, `per_minute`. Only present for Lyft. |
+| `surge` | The provider's multiplier. The API returns values below 1, including a missing value, as 1. |
+| `at_minimum` | The provider priced the trip at its minimum fare. Only Lyft offers report it, so it is always `false` for Uber. |
+| `rate_card` | Published `base`, `minimum`, `per_mile`, `per_minute`. Only present for Lyft, and omitted when `per_mile` is not above 0. |
 
 `status` follows the same `not_configured`, `unavailable`, `ready` rules as competitor prices. A single row with an unexpected shape makes the whole response `unavailable`. Ready results are cached in a separate in-process map for 5 minutes per scope and window length in hours, cleared at 512 entries. There is no `include_internal` parameter.
 

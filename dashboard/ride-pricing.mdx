@@ -389,7 +389,7 @@ Use the controls in the tab header:
 | Control | What it does |
 | --- | --- |
 | **vs Uber** / **vs Lyft** | The reference provider. Defaults to Uber. |
-| **Standard** / **XL** / **Comfort** | The reference product class. Defaults to Standard. |
+| **Standard** / **XL** / **Comfort** | The reference product class. Defaults to Standard. Yelo fares come from the community's `x` config for Standard and its `xl` config for XL. No Yelo config maps to Comfort, so that class shows competitor quotes without ratios. |
 | Period | The quote window. Choose from **Last hour** through **Last 6 months**, or **All time**. Defaults to **Last 30 days**. |
 | **Target** | The community's parity window. See [Set the parity window](#set-the-parity-window). |
 
@@ -399,8 +399,8 @@ The status chip next to the title summarizes the result:
 | --- | --- |
 | **Inside band** | Every trip-length band with enough data sits inside the target window. |
 | **Below band** | At least one band is below the window, so Yelo is cheaper than the target. |
-| **Above band** | At least one band is above the window, so Yelo is more expensive than the target. |
-| **Thin data** | No band has enough quotes to score yet. |
+| **Above band** | At least one band is above the window and none is below, so Yelo is more expensive than the target. |
+| **Thin data** | Neither a band nor the pooled ratio has enough quotes to score yet. |
 
 A band needs at least 5 quotes to count. Until any band reaches 5, the pooled **All trips** ratio drives the chip once it has at least 3 quotes. The chip also names the band that put it out of range, or the pooled ratio and sample count.
 
@@ -438,12 +438,16 @@ The band tiles show the median ratio for each trip length:
 - **Too few** means there isn't enough data to fit a card yet. The row shows an effective per-mile rate only.
 - **Fit error** is the typical dollar miss per quote.
 
-**Match market** suggests a Standard config that targets the midpoint of the window against the reference provider. It compares current and suggested base price, per-mile, and per-minute rates, and the expected ratio at each band's preset trip.
+**Match market** suggests rates that target the midpoint of the window against the reference provider and class. It compares current and suggested base price, per-mile, and per-minute rates, and the expected ratio at each band's preset trip.
 
-- **Apply suggestion** opens the community's Standard (`x`) config in the editor with the suggested rates.
+- **Apply suggestion** opens the community's Standard (`x`) config in the editor with the suggested base price, per-minute rate, and a single per-mile tier.
 - **Keep tiers, scale rates** opens the same config with every rate multiplied by one factor, so your distance tiers keep their shape.
 
 Neither button saves anything. Review the config in the editor and save it yourself.
+
+<Warning>
+  Both buttons always open the Standard (`x`) config, even when the reference class is **XL**. Set the class to **Standard** before you apply a suggestion.
+</Warning>
 
 <Note>
   When every rate on a community's config for the reference class is zero, Yelo rides are free. The tab doesn't score parity in that case, but still plots competitor quotes.
@@ -451,8 +455,8 @@ Neither button saves anything. Review the config in the editor and save it yours
 
 ### Review provider responses
 
-The **Provider responses** table lists every priced option the app received from a connected provider in the period. Columns include provider, product, class, miles, minutes, surge, fare, the **Ex-surge** fare, the matching Yelo fare, the ratio, the band, and the quote pass. Filter by provider, class, or band, or search by product or quote pass. Expand a row to see the full quote pass the rider was shown.
+The **Provider responses** table lists every priced option the app received from a connected provider in the period. Columns include provider, product, class, miles, minutes, surge, fare, the **Ex-surge** fare, the matching Yelo fare, the ratio, the band, and the quote pass. **Minutes** and **Quote pass** are hidden until you turn them on under **Columns**. Filter by provider, class, or band, or search by product or quote pass. Expand a row to see the full quote pass the rider was shown.
 
-Quotes come from Fare Finder on rider app versions that report per-offer fares. Test devices are excluded. Internal devices are included, because a provider's quote is the same whoever asks for it. The tab refreshes every 5 minutes. It shows a message instead of data when quote analytics isn't connected or is temporarily unavailable.
+Quotes come from Fare Finder on rider app versions that report per-offer fares, and only from riders who allow Fare Finder diagnostics. Each period loads at most the newest 5,000 quotes. Test devices are excluded. Internal devices are included, because a provider's quote is the same whoever asks for it. The tab refreshes every 5 minutes. It shows a message instead of data when quote analytics isn't connected or is temporarily unavailable.
 
 For the endpoint behind this tab, see [Competitor quotes](/engineering/domains/dashboard-analytics#competitor-quotes).
