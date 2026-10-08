@@ -109,10 +109,10 @@ All routes in this group render inside the map sheet.
 | --- | --- | --- | --- |
 | `(tabs)/profile` | Photo, name, community (switch), student status with **Verify**, share, **Drive Mode** / **Enable Driver Mode**, ride history. Empty history CTA queues a map search. | `GET /authv2/status`, `GET /user/ride-history`, `GET /community/` | `profile/settings`, `profile/community-switch`, `verify/1-oauth`, `profile/ride-details`, drive flow |
 | `profile/settings` | ACCOUNT (Name editable, Phone and Email locked with copy), CONNECTED ACCOUNTS, PREFERENCES (Refer a friend, Notifications, Experiments, and lab rows when their experiments are on), SUPPORT (Help and feedback, Terms, Privacy, Delete account), **Sign Out**, build info | `PUT /user/name`, `PUT /user/allow-notifications` | Accounts, labs, `https://yelo.link/terms`, `https://yelo.link/privacy`, delete-account modal |
-| `profile/accounts` | LOGIN METHODS (Apple, Google), RIDESHARE PROVIDERS, STUDENT VERIFICATION. `mode=rideshare` titles it "Rideshare accounts". | `GET /authv3/user/identities`, `POST /authv3/user/link/authorize` | `connect-*`, `verify/1-oauth` |
+| `profile/accounts` | LOGIN METHODS (Apple, Google), FARE FINDER, STUDENT VERIFICATION. `mode=rideshare` titles it "Fare Finder accounts". | `GET /authv3/user/identities`, `POST /authv3/user/link/authorize` | `connect-*`, `verify/1-oauth` |
 | `profile/community-switch` | **Select a community** map and list | `GET /community/`, `PUT /user/community` | Replaces to the map once the new JWT settles |
 | `profile/ride-details?id=` | Rider receipt, or "Ride not found" | `GET /user/ride-history` (cache) | Back, Get help sheet |
-| `profile/experiments` | Toggle experiments. The price aggregator needs a disclosure dialog first. | `PUT /user/experiments` | Back |
+| `profile/experiments` | Toggle experiments. The retired `rideshare-price-aggregator` key is hidden. | `PUT /user/experiments` | Back |
 | `profile/glass-lab`, `color-lab`, `design-system-lab` | Internal labs | none | `<Redirect>` to settings unless the matching experiment is on |
 | `verify/1-oauth`, `2-email`, `3-email-confirm` | **Are you a student?** StudID, Google or Microsoft school OAuth, or `.edu` email code. Accepts an `email` param from the World Cup claim. | `/authv3/user/student/studid/*`, `/authv2/email/*` | Back |
 | `post-signup/10-marketing` | Rider-vs-driver pitch with **Continue** and **Interested in driving** | Requests notification permission | Map, or the drive flow |
@@ -126,7 +126,7 @@ All routes in this group render inside the map sheet.
 | `referral-share` | Referral share card (Reduce Motion aware) | `GET /referral/link` | Back |
 | `link?yeloLink=` | Decodes an encoded path and navigates. "Failed to open link" / "Link appears to be invalid." on failure. | `GET /link/decode` | The decoded route, or `/` |
 | `scan-qr` | Camera scanner, permission request, or simulator placeholder | none | Opens the URL, then back |
-| `connect-uber`, `connect-lyft`, `connect-empower` | Provider sign-in states via `ProviderAccountView`. Lyft adds phone, OTP, and email phases. | Provider APIs directly | `<Redirect>` to experiments unless `rideshare-price-aggregator` is on |
+| `connect-uber`, `connect-lyft`, `connect-empower` | Provider sign-in states via `ProviderAccountView`. Lyft adds phone, OTP, and email phases. | Provider APIs directly | `<Redirect>` to `profile/accounts` when the community's Fare Finder kill switch is on. Shows the Fare Finder disclosure until accepted. |
 | `events/[eventId]` | Event detail, slides up from the bottom with a vertical dismiss gesture | `GET /event/{id}`, `GET /event/{id}/attendees` | Tickets, bump sheet, `map/request` |
 | `deals/[dealId]` | Hard-coded placeholder deal | none | External deal URL |
 | `/fleet-join/[code]` | Fleet invite preview: invalid, preview failed, signed out (**Sign in or create account**), join, joined. Explains fleet-managed payouts or own Stripe. | `GET /fleet-join/{code}`, `GET /driver/fleet`, `POST /driver/fleet-join/{code}` | `/(auth-v3)` (code saved), `driver-signup/1-hub` if steps remain, else `drive/driver-hub/1-hub`. Auto-exits to `/` if already in the fleet. |

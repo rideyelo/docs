@@ -228,25 +228,39 @@ The typed hooks declare `driver_id` for the `rider_*` events, but `RiderFlowObse
 </Accordion>
 <Accordion title="Rideshare aggregator and provider accounts">
 
+Every Fare Finder UI event from `useRideAggregatorAnalytics` also carries `quote_pass_id`, the quote pass it happened in. See [Quote passes](/engineering/mobile/rideshare-aggregator#quote-passes).
+
 | Event | Source | When fired | Properties |
 | --- | --- | --- | --- |
-| `ride_aggregator_prices_loaded` | `lib/analytics/events/rideAggregator.ts:117`; `app/(app)/(tabs)/map/request.tsx:651` | Quotes settle for a new route (`initial`) or after a refresh (`refresh`) | `trigger`, `experiment_enabled`, `provider_count`, `option_count`, `connected_provider_count`, `providers`, `options[]` (each has `provider`, `key`, `name`, `price_label`, `price_value`, `eta_minutes`, `eta_max_minutes`, `seats`, `needs_connect`, `error_kind`), `cheapest_provider`, `cheapest_price`, `fastest_provider`, `fastest_eta_minutes`. The Citi Bike card reports `provider: citibike` on its options, but `provider_count`, `connected_provider_count`, and `providers` fold it back into `lyft`. `pickup_*` and `dropoff_*` are sent only with diagnostics consent. |
-| `ride_aggregator_option_selected` | `rideAggregator.ts:119`; `request.tsx:257` | Any option selected, including through the cheapest or fastest pills | `provider`, `option_key`, `price_value`, `price_label`, `eta_minutes` |
-| `ride_aggregator_cheapest_selected` | `rideAggregator.ts:121`; `components/map/request/useAggregatorSheet.ts:71` | Cheapest pill tapped | Same as `option_selected` |
-| `ride_aggregator_fastest_selected` | `rideAggregator.ts:123`; `useAggregatorSheet.ts:85` | Fastest pill tapped | Same as `option_selected` |
-| `ride_aggregator_prices_refreshed` | `rideAggregator.ts:125`; `request.tsx:287` | Refresh tapped | `provider_count` |
-| `ride_aggregator_accounts_opened` | `rideAggregator.ts:127`; `request.tsx:741`, `:926` | Connect accounts from the action bar or the sign-in call to action | `source`, `unconnected_count` |
-| `ride_aggregator_provider_opened` | `rideAggregator.ts:132`; `components/map/request/aggregatorHandoff.ts:35` | Rider deep-links out to a provider to book | Selection fields, `sign_in_mode`. Route fields are sent only with consent. |
-| `ride_provider_accounts_viewed` | `lib/analytics/events/rideProviders.ts:21`; `app/(app)/profile/accounts.tsx:44` | Accounts screen viewed | none |
-| `ride_provider_card_tapped` | `rideProviders.ts:23`; `accounts.tsx:191` | Provider card tapped | `provider`, `connected` |
-| `ride_provider_connect_started` | `rideProviders.ts:26`; `app/(app)/connect-uber.tsx:52`, `connect-lyft.tsx:99`, `connect-empower.tsx:35` | Connect flow begins | `provider`, `browserSession` (Uber only) |
-| `ride_provider_connect_cancelled` | `rideProviders.ts:29`; `connect-uber.tsx:72`, `connect-empower.tsx:42` | Browser dismissed | `provider`, `browserSession`, `browserResult`, `durationMs` (Uber only) |
-| `ride_provider_connect_succeeded` | `rideProviders.ts:31`; `connect-uber.tsx:88`, `connect-lyft.tsx:109`, `connect-empower.tsx:53` | Account connected | `provider`, `browserSession`, `durationMs` (Uber only) |
-| `ride_provider_connect_failed` | `rideProviders.ts:33`; `connect-uber.tsx:107`, `connect-lyft.tsx:86`, `connect-empower.tsx:59` | Connect flow throws | `provider`, `phase`, `browserSession`, `durationMs` |
-| `ride_provider_request_completed` | `lib/analytics/events/providerDiagnostics.ts:41`; called from `lib/ride/providerDiagnostics.ts:36` | Every Uber or Lyft API call wrapped by `diagnoseProviderRequest` (`lib/ride/uberProvider.ts`, `lib/ride/lyftProvider.ts`) | `schema_version`, `request_id`, `provider`, `operation`, `started_at_ms`, `duration_ms`, `processing_ms`, `status`, `outcome`, `response` summary (first 30 fares), `quotes` (first 30 options), `detailed_diagnostics`. `route` is sent only with consent. |
-| `ride_provider_request_options` | `providerDiagnostics.ts:48` | For each extra chunk of 30 rows past the first | `schema_version`, `request_id`, `provider`, `operation`, `chunk_index`, `chunk_count`, `fares`, `parsed_options` |
-| `ride_provider_session_changed` | `providerDiagnostics.ts:90`; called from `lib/ride/providerDiagnostics.ts:23` (from `lib/ride/tokenStore.ts`) | Provider token saved, loaded, cleared, or refreshed | `provider`, `action`, `reason` |
-| `ride_provider_diagnostics_consent_changed` | `providerDiagnostics.ts:94`; called from `stores/providerDiagnosticConsentStore.ts:20` | Consent flips, including the forced disable in `signOut` | `enabled`, `scope: experiment`, `disclosure_version: 1` |
+| `ride_aggregator_prices_loaded` | `lib/analytics/events/rideAggregator.ts:254`; `app/(app)/(tabs)/map/request.tsx` | Quotes settle for a new route (`initial`) or after a refresh (`refresh`) | `trigger`, `provider_count`, `option_count`, `connected_provider_count`, `providers`, `options[]` (live providers only; each has `provider`, `key`, `name`, `price_label`, `price_value`, `eta_minutes`, `eta_max_minutes`, `seats`), `provider_states` (`live`, `loading`, `needs_connect`, `auth`, or `unavailable` per provider), `provider_option_counts`, `provider_shown_counts` (tiers in the compact view), `hidden_providers` (live providers with nothing shown), `cheapest_provider`, `cheapest_price`, `fastest_provider`, `fastest_eta_minutes`. The Citi Bike card reports `provider: citibike` on its options, but `provider_count`, `connected_provider_count`, and `providers` fold it back into `lyft`. Route fields are sent only with consent: `pickup_name`, `pickup_address`, `pickup_lat`, `pickup_lng`, `pickup_place_id`, `pickup_place_source` (`yelo`, `mapbox`, or `google`), `pickup_geohash` (7 characters, about 150 m), `pickup_is_current_location`, the matching `dropoff_*` fields (there is no `dropoff_is_current_location`), and `route_straight_line_miles`. |
+| `ride_aggregator_option_selected` | `rideAggregator.ts:256`; `request.tsx` | Any option selected, including through the cheapest or fastest pills | `provider`, `option_key`, `price_value`, `price_label`, `eta_minutes` |
+| `ride_aggregator_cheapest_selected` | `rideAggregator.ts:258`; `components/map/request/useAggregatorSheet.ts:71` | Cheapest pill tapped | Same as `option_selected` |
+| `ride_aggregator_fastest_selected` | `rideAggregator.ts:260`; `useAggregatorSheet.ts:85` | Fastest pill tapped | Same as `option_selected` |
+| `ride_aggregator_prices_refreshed` | `rideAggregator.ts:262`; `request.tsx` | Refresh tapped | `provider_count` |
+| `ride_aggregator_accounts_opened` | `rideAggregator.ts:265`; `request.tsx` | Connect accounts from the action bar or the sign-in call to action | `source`, `unconnected_count` |
+| `ride_aggregator_provider_opened` | `rideAggregator.ts:270`; `components/map/request/aggregatorHandoff.ts` | Rider deep-links out to a provider to book | Selection fields, `sign_in_mode`. The same route fields as `prices_loaded`, sent only with consent. |
+| `ride_aggregator_handoff_result` | `rideAggregator.ts:292`; `aggregatorHandoff.ts:55` | The deep link resolves after **Open [provider]** | `provider`, `result` (`app`, `web`, `failed`, or `no_dropoff`), `has_product_id` |
+| `ride_aggregator_shown` | `rideAggregator.ts:277`; `request.tsx:849` | The third-party surface becomes visible on a focused request sheet | `surface` (`fare_finder` or `deeplink_fallback`), `reason` (`community_inactive` or `no_vehicle_options`) |
+| `ride_aggregator_connect_tapped` | `rideAggregator.ts:281`; `components/ride/RideAggregatorSection.tsx:120` | A card's own log-in or reconnect affordance tapped | `provider`, `state` (`needs_connect` or `auth`) |
+| `ride_aggregator_provider_not_installed` | `rideAggregator.ts:285`; `request.tsx:861` | The selected provider's app is not installed, so the CTA is disabled | `provider` |
+| `ride_aggregator_quote_pass_started` | `rideAggregator.ts:313`; `lib/ride/useAggregatorPlatforms.ts` | A quote pass starts | `quote_pass_id`, `trigger` (`route`, `refresh`, or `focus`), `has_route` |
+| `ride_aggregator_provider_result` | `rideAggregator.ts:328`; `useAggregatorPlatforms.ts` | One provider finishes its part of a pass | `quote_pass_id`, `provider`, `result` (`live`, `cached`, `not_connected`, `no_route`, `empty`, `session_lost`, or `error`), `duration_ms`, `returned_count`, `option_count`, `error_kind`, `error_class`, `error_status` |
+| `ride_aggregator_quote_pass_finished` | `rideAggregator.ts:336`; `useAggregatorPlatforms.ts` | Every provider settled, or the pass was cancelled | `quote_pass_id`, `outcome` (`settled` or `cancelled`), `duration_ms` |
+| `fare_finder_disclosure_shown` | `lib/analytics/events/rideProviders.ts:22`; `components/ride/FareFinderDisclosure.tsx:37` | **Set up Fare Finder** shown before the first provider sign-in | none |
+| `fare_finder_disclosure_confirmed` | `rideProviders.ts:23`; `FareFinderDisclosure.tsx:52` | **Agree and continue** tapped and the flag saved | none |
+| `fare_finder_disclosure_cancelled` | `rideProviders.ts:24`; `FareFinderDisclosure.tsx:41` | **Not now** tapped | none |
+| `ride_provider_accounts_viewed` | `lib/analytics/events/rideProviders.ts:26`; `app/(app)/profile/accounts.tsx:43` | Accounts screen viewed | none |
+| `ride_provider_card_tapped` | `rideProviders.ts:29`; `accounts.tsx:190` | Provider card tapped | `provider`, `connected` |
+| `ride_provider_connect_started` | `rideProviders.ts:31`; `app/(app)/connect-uber.tsx:53`, `connect-lyft.tsx:100`, `connect-empower.tsx:36` | Connect flow begins | `provider`, `browserSession` (Uber only) |
+| `ride_provider_connect_cancelled` | `rideProviders.ts:34`; `connect-uber.tsx:73`, `connect-empower.tsx:45` | Browser dismissed | `provider`, `browserSession`, `browserResult`, `durationMs` (Uber only) |
+| `ride_provider_connect_succeeded` | `rideProviders.ts:36`; `connect-uber.tsx:89`, `connect-lyft.tsx:110`, `connect-empower.tsx:57` | Account connected | `provider`, `browserSession`, `durationMs` (Uber only) |
+| `ride_provider_connect_failed` | `rideProviders.ts:39`; `connect-uber.tsx:108`, `connect-lyft.tsx:87`, `connect-empower.tsx:63` | Connect flow throws | `provider`, `phase`, `browserSession`, `durationMs` |
+| `ride_provider_request_completed` | `lib/analytics/events/providerDiagnostics.ts:46`; called from `lib/ride/providerDiagnostics.ts` | Every Uber, Lyft, or Empower API call wrapped by `diagnoseProviderRequest` (`lib/ride/uberProvider.ts`, `lyftProvider.ts`, `empowerProvider.ts`) | `schema_version`, `request_id`, `quote_pass_id`, `provider`, `operation`, `started_at_ms`, `duration_ms`, `processing_ms`, `status`, `outcome`, `response` summary (first 30 fares), `quotes` (first 30 options), `detailed_diagnostics`. Sent only with consent: `route`, and on `quotes` calls `trip` (`offer_key_paths`, `offers[]` with `index`, `product`, `fare`, `surge`, `trip_miles`, `trip_minutes`, raw provider fields, and for Lyft `rate_card` and `at_minimum`; first 30 rows, with `offers_truncated`). See [Trip facts](/engineering/mobile/rideshare-aggregator#trip-facts). |
+| `ride_provider_request_options` | `providerDiagnostics.ts:53` | For each extra chunk of 30 rows past the first | `schema_version`, `request_id`, `provider`, `operation`, `chunk_index`, `chunk_count`, `fares`, `parsed_options`, `trip_offers` (only when the completion event carried `trip`) |
+| `ride_provider_quotes_skipped` | `providerDiagnostics.ts:127`; `lib/ride/empowerProvider.ts` | A connected provider's quote pass ends before any HTTP request | `provider`, `reason` (`no_passenger_id`) |
+| `ride_uber_catalog_resolved` | `providerDiagnostics.ts:143`; `lib/ride/uberCatalog.ts` | An Uber quote result that differs from the last one reported | `tier_count`, `named_count`, `unknown_ids` (first 40), `name_sources` (count per `live`, `learned`, `bundled`, `learned_copy`, `copy`, `unknown`), `named` (first 40 of `id`, `name`, `seats`, `source`), `learned` (first 60 names this device just learned). `city_id` and `city_name` are sent only with consent. |
+| `ride_provider_session_changed` | `providerDiagnostics.ts:104`; called from `lib/ride/providerDiagnostics.ts:31` (from `lib/ride/tokenStore.ts`) | Provider token saved, loaded, cleared, or refreshed | `provider`, `action`, `reason` |
+| `ride_provider_diagnostics_consent_changed` | `providerDiagnostics.ts:108`; called from `stores/providerDiagnosticConsentStore.ts:20` | Consent flips, including the forced disable in `signOut` | `enabled`, `scope: fare_finder`, `disclosure_version: 1` |
 
 </Accordion>
 <Accordion title="Driver">
@@ -318,12 +332,9 @@ The typed hooks declare `driver_id` for the `rider_*` events, but `RiderFlowObse
 
 | Event | Source | When fired | Properties |
 | --- | --- | --- | --- |
-| `experiments_screen_viewed` | `lib/analytics/events/experiments.ts:10`; `app/(app)/profile/experiments.tsx:80` | Experiments screen loads community data | `available_count` |
-| `experiment_toggled` | `experiments.ts:12`; `experiments.tsx:150` | Experiment switched | `experiment`, `enabled` |
-| `experiment_disclaimer_shown` | `experiments.ts:15`; `experiments.tsx:159` | Price aggregator disclaimer shown on first enable | `experiment` |
-| `experiment_disclaimer_confirmed` | `experiments.ts:16`; `experiments.tsx:179` | Disclaimer accepted | `experiment` |
-| `experiment_disclaimer_cancelled` | `experiments.ts:17`; `experiments.tsx:196` | Disclaimer cancelled | `experiment` |
-| `experiment_save_failed` | `experiments.ts:19`; `experiments.tsx:116` | Opt-in save fails | none |
+| `experiments_screen_viewed` | `lib/analytics/events/experiments.ts:10`; `app/(app)/profile/experiments.tsx:67` | Experiments screen loads community data | `available_count` |
+| `experiment_toggled` | `experiments.ts:12`; `experiments.tsx:126` | Experiment switched | `experiment`, `enabled` |
+| `experiment_save_failed` | `experiments.ts:14`; `experiments.tsx:103` | Opt-in save fails | none |
 | `app_feedback_prompt_shown` | `lib/analytics/events/feedbackPrompt.ts:13`; `providers/FeedbackPromptProvider.tsx:84` | Feedback funnel starts (`ride-positive`, `first-like`, `driver-approved`, `driver-shift`) | `role`, `trigger_reason` |
 | `app_feedback_sentiment` | `feedbackPrompt.ts:15`; `FeedbackPromptProvider.tsx:120` | Love or meh chosen | `sentiment`, `role`, `trigger_reason` |
 | `app_feedback_declined` | `feedbackPrompt.ts:27`; `FeedbackPromptProvider.tsx:134` | Text step declined | `sentiment`, `role`, `trigger_reason` |
@@ -375,6 +386,7 @@ The API and web client never call `group` or `GroupIdentify`.
 | Mobile | `user_role`, `community_id`, `is_test`, `is_internal` | `api/helpers/authUser.ts:102` | `user_role: rider` on every `currentUser` fetch. `is_internal` is true for `@rideyelo.com` emails. |
 | Mobile | `user_role` | `providers/DriveProvider.tsx:333`, `:346`, `:365` | `driver` on go-online; `rider` on go-offline or error |
 | Mobile | `community_id` | `app/(app)/profile/community-switch.tsx:144` | New community after a switch |
+| Mobile | `fare_finder_enabled`, `fare_finder_disclosed` | `providers/ProviderDiagnosticsObserver.tsx` | Fare Finder availability for the community and the rider's on-device disclosure, registered once both resolve |
 | API | `authv3.step` defaults | `internal/utilities/metrics/posthog.go:73` | See [API business events](#api-business-events) |
 
 ### Redaction and exclusion
@@ -383,7 +395,7 @@ The API and web client never call `group` or `GroupIdentify`.
 - **API Auth v2.** Phone and email go through `phone.MaskPhone` and `maskEmail` before they are used as properties or distinct IDs.
 - **API funnel.** `SetFunnelProperty` only accepts bounded values. `recordUserClassification` (`internal/service/authv3/telemetry.go:129`) sends `is_internal` but not the email.
 - **Mobile Auth v3.** `trackAuthV3` drops events for staging, development, and emulator builds, and for test or `@rideyelo.com` accounts. `safeFailureReason` keeps only `error.code`, capped at 80 characters.
-- **Mobile route data.** `withConsentedAggregatorRoute` (`lib/analytics/events/rideAggregator.ts:77`) and `diagnoseProviderRequest` send pickup and dropoff coordinates only when provider diagnostics consent is current.
+- **Mobile route data.** `withConsentedAggregatorRoute` (`lib/analytics/events/rideAggregator.ts:216`) drops every `pickup_*`, `dropoff_*`, and `route_*` property unless provider diagnostics consent is current. `diagnoseProviderRequest` sends `route` and `trip` only under the consent that was current when the request started. Sentry never receives either.
 
 ## Session replay specifics
 
