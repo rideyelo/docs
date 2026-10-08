@@ -10,7 +10,7 @@ Five `yelo-web` sites need no sign-in: `event`, `invite`, `world-cup`, `home`, a
 | Site | Bootstrap | Router | Data | Link preview tags | Analytics |
 | --- | --- | --- | --- | --- | --- |
 | `event` | `renderSite({ query, router, toaster })` | React Router: `/:slug` | `GET /public/events/slug/{slug}` | None; static `<title>Yelo Event</title>`, runtime `document.title` | None |
-| `invite` | `renderSite({ query, router, dubAnalytics })` | React Router: `/fleet/:code`. `/:code` redirects in `index.html` before the router runs | `GET /fleet-join/{code}` | Static `og:*` in `index.html` | Dub |
+| `invite` | `renderSite({ query, router, dubAnalytics })` | None. `/:code` and `/fleet/:code` redirect in `index.html` before the bundle runs; anything else renders "Invite not found" | None | Static `og:*` in `index.html` | Dub |
 | `world-cup` | `renderSite(<LandingV5 />)`, no providers | None | `GET /world-cup/standings`, `GET /world-cup/activity` through `/world-cup/api` | `<meta name="description">` only | None |
 | `home` | Plain `createRoot` | Custom pathname switch | None | Full `og:*` and `twitter:*`, plus per-route static HTML | None |
 | `maestro` | `renderSite(<App />, {})`, no providers | `?run=` query param | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
@@ -41,17 +41,24 @@ The event site shows one published event at `/:slug`. The dashboard's event form
 
 ## invite
 
-The invite site handles two kinds of shared link. Firebase redirects `/` and `/index.html` to `https://signup.yelo.link/` with a `302` before the app loads (`src/sites/invite/firebase.json`).
+The invite site (`invite.yelo.link`) no longer renders any invite. Personal and fleet invites both live on the `signup` site under `joinyelo.com/i`, served through the `experience-router` Worker, so their attribution cookies (`yelo_anon_id`, `dub_id`) are first-party to the `joinyelo.com` sign-up page. `invite.yelo.link` only forwards links shared before the move.
 
-### Referral invites (`/:code`)
+| Request | Result |
+| --- | --- |
+| `/` or `/index.html` | Firebase `302` to `https://joinyelo.com/` (`src/sites/invite/firebase.json`) |
+| `/<code>` | `location.replace()` to `https://joinyelo.com/i/<code>` with the original query string |
+| `/fleet/<code>` | `location.replace()` to `https://joinyelo.com/i/fleet/<code>` with the original query string |
+| Any other path | The bundle renders "Invite not found" |
 
-Personal referral invites no longer render on this site. The landing moved to the `signup` site at `/i/<code>`, served on `joinyelo.com/i/<code>` through the `experience-router` Worker, so its attribution cookies (`yelo_anon_id`, `dub_id`) are first-party to the `joinyelo.com` sign-up page. See [Signup and Auth v3 site](/engineering/web/signup-and-auth-site#referral-invite-landing) for the page itself.
+The redirect is an inline script in `src/sites/invite/index.html` that runs before the bundle, so the hop costs no render. The API's `INVITE_LANDING_BASE_URL` defaults to `https://joinyelo.com/i`, so new personal and fleet Dub links already point at `joinyelo.com`. The [self-healing sweep](/engineering/domains/referrals-and-links#self-healing-sweep) rewrites existing personal links.
 
-An inline script in `src/sites/invite/index.html` runs before the bundle. For a single-segment path `/<code>`, it calls `location.replace()` with `https://joinyelo.com/i/<code>` and the original query string. Personal `join.yelo.link` Dub links use `REFERRAL_LANDING_BASE_URL` (intended value `https://joinyelo.com/i`) as their destination base, and the [self-healing sweep](/engineering/domains/referrals-and-links#self-healing-sweep) rewrites existing links. The redirect covers `invite.yelo.link/<code>` URLs still in circulation.
+### Referral invites
 
-### Fleet driver invites (`/fleet/:code`)
+See [Signup and Auth v3 site](/engineering/web/signup-and-auth-site#referral-invite-landing).
 
-`FleetInvitePage` calls `useFleetJoinGetPreview` → `GET /fleet-join/{code}` with `retry: false`. The service returns `404` for codes that fail `joinCodePattern` before touching the database (`service/fleetjoin/fleet_join.go:56`). When `available` is true, the page shows the fleet logo or initial, explains whether the fleet manages payouts, and links to `yelo:///fleet-join/<code>` (`appLink.ts`). Otherwise it asks the driver to get a current link from the fleet manager.
+### Fleet driver invites
+
+Fleet driver invites live at `joinyelo.com/i/fleet/<code>`. The signup site matches `/i/fleet/<code>` before the personal invite route and renders `FleetInvitePage` (`src/sites/signup/invite/FleetInvitePage.tsx`). It calls `useFleetJoinGetPreview` → `GET /fleet-join/{code}` with `retry: false`. The service returns `404` for codes that fail `joinCodePattern` before touching the database (`service/fleetjoin/fleet_join.go:57`). When `available` is true, the page shows the fleet logo or initial, explains whether the fleet manages payouts, links to `yelo:///fleet-join/<code>` (`appLink.ts`), and shows an App Store badge. Otherwise it asks the driver to get a current link from the fleet manager.
 
 ### App links
 
@@ -132,7 +139,7 @@ The second entry, `auth/v3/index.html`, mounts the signup `AuthV3Page`. The Nx b
 | Site | Paths |
 | --- | --- |
 | event | `yelo-web/src/sites/event/` (`EventPage.tsx`, `CheckoutModal.tsx`, `lib/`); API `yelo-api/internal/server/http/event/public_handler.go` |
-| invite | `src/sites/invite/` (`index.html` redirect script, `FleetInvitePage.tsx`, `appLink.ts`); API `server/http/fleetjoin/`. The referral landing is in `src/sites/signup/invite/` |
+| invite | `src/sites/invite/` (`index.html` redirect script, `firebase.json`). The personal and fleet invite pages are in `src/sites/signup/invite/` (`InvitePage.tsx`, `FleetInvitePage.tsx`, `appLink.ts`); API `server/http/fleetjoin/` |
 | world-cup | `src/sites/world-cup/` (`components/LandingV5.tsx`, `hooks/useWorldCupStandings.ts`, `lib/worldCup.ts`, `README.md`); API `server/http/worldcup/`, `service/worldcup/` |
 | home | `src/sites/home/` (`main.tsx`, `navigation.ts`, `contact.ts`), `scripts/emit-partner-html.mjs`, `tools/vite/home/gen-home-images.ts`. See [Home site](/engineering/web/home-site) |
 | maestro | `src/sites/maestro/` |
