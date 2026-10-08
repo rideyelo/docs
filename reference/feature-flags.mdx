@@ -117,7 +117,7 @@ The mobile app sends `X-Features: tips,driver-options` on every ride creation. `
 | --- | --- | --- | --- | --- |
 | `minimumFrontendVersion` | `server/http/healthcheck/healthcheck_handler.go:28`, compared at `:179` with `utilities/helpers/helpers.go:144` | `5.7.4` | `GET /update-required?version=` returns 426 with the store link for older native versions | Deploy (code change) |
 | Update-required screen | `app/_layout.tsx:207-259`, `lib/platform/appUpdateGate.ts:10-21` | | Checks on launch and every 10 minutes while foregrounded, signed in or signed out. A 426 replaces the app with `UpdateRequiredScreen`, including mid-trip | Follows the API value |
-| `ensureRideEntryVersion` | `lib/platform/appUpdateGate.ts:32-52` | | Fails closed before a ride request (`hooks/usePreRideRequest.ts:128`, `components/ride/StripePaymentScreen.tsx:223`) and before going online (`providers/DriveProvider.tsx:280`, `components/drive/DriverMapOverlay.tsx:237,261`) | Follows the API value |
+| `ensureRideEntryVersion` | `lib/platform/appUpdateGate.ts:32-52` | | Fails closed before a ride request (`hooks/usePreRideRequest.ts:163`, `components/ride/StripePaymentScreen.tsx:223`), before going online (`providers/DriveProvider.tsx:280`), before accepting a ride (`components/drive/DriverMapOverlay.tsx:234`), and before turning auto-queue on (`hooks/drive/useAutoQueueSettings.ts:37`) | Follows the API value |
 | OTA runtime | `app.config.ts:102-118` | `fingerprint` policy | OTA updates reach only binaries with the same native fingerprint. E2E builds disable updates | Native build |
 | Liquid Glass capability | `lib/theme/glassCapability.ts:22-28` | | `isLiquidGlassAvailable() && isGlassEffectAPIAvailable()` picks glass or fallback views | OS version |
 
@@ -133,7 +133,7 @@ No API behavior branches on `PUT /user/app-version`, telemetry `app_version`, or
 
 - `rideshare-price-aggregator` is retired. It graduated to Fare Finder, which is on for all riders and controlled by `Communities.fare_finder_disabled` (see [Per-entity flags](#per-entity-flags)). Communities keep the key so older app versions still honor it. Current builds hide it from **Settings > Experiments** (`lib/experiments/index.ts:19-26`).
 - An experiment is on only when `user.active_experiments` **and** `community.active_experiments` both contain the key (`lib/experiments/index.ts:43-52`). The client evaluates this; the API only stores and returns the lists (`Users.active_experiments`, `Communities.active_experiments`, migration 000265).
-- Admins edit the community list as free text in the community editor (`src/components/CommunityEditor.tsx:66,142,160-164`, `PATCH /dashboard/manage/{id}`).
+- Admins edit the community list as free text in the community editor (`src/components/CommunityEditor.tsx:72-73,160,177-186`, `PATCH /dashboard/manage/{id}`).
 - Users opt in on **Settings > Experiments** (`app/(app)/profile/experiments.tsx`, `PUT /user/experiments`). The row appears only when the community has at least one experiment besides the retired key.
 
 ## Admin-editable settings
