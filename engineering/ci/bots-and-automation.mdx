@@ -175,17 +175,16 @@ firebase · github · pr · signup · invite
 - **Second line.** Links to the host console (**gcp**, **firebase**, or **cloudflare**), the GitHub Actions run (**github**), and the PR (**pr**), then the detail:
   - API success: build and deploy durations measured in the release job.
   - API failure: the first failed stage, such as `migrate failed` or `smoke failed`. The Cloud Build backend adds a **build** link and reports `cloud build <status>`.
-  - Web: each deployed site, linked to its `<target>.web.app` Hosting address. When every registered site deploys, the line reads `all sites`.
+  - Web: each deployed site, linked to the `.web.app` address of its Hosting site from `.firebaserc`, such as `yelo-signup.web.app` for `signup`. When every registered site deploys, the line reads `all sites`.
   - Worker: the worker name.
 - **Dropped fields.** The emoji, environment, platform, service and revision, merger, startup time, commit SHA, and timestamp are no longer in the message.
 
 The formatters, `yelo-api/scripts/release/format-deploy-slack.sh`, `format-release-failure-slack.sh`, and `yelo-web/scripts/format-deploy-slack.sh`, share these rules:
 
 - Every field is required unless noted, whitespace-collapsed, length-capped, and escaped for `&`, `<`, and `>`.
-- Link URLs must be HTTPS on an allowed host: `github.com`, `console.cloud.google.com`, `console.firebase.google.com`, or `dash.cloudflare.com`. Any `|`, `<`, `>`, or newline fails the formatter.
+- Link URLs must be HTTPS on an allowed host: `github.com`, `console.cloud.google.com`, `console.firebase.google.com`, or `dash.cloudflare.com`. Any `|`, `<`, `>`, or newline fails the formatter. The per-site links in the web alert only need to be HTTPS.
 
-In `yelo-web`, `scripts/notify-deploy-slack.sh` looks up the merged PR and posts the payload for both **Firebase** and **Workers**. If `SLACK_WEBHOOK_URL` is unset, it logs a warning and exits `0`.
-- The web workflow also checks that the webhook host is `hooks.slack.com` before posting.
+In `yelo-web`, `scripts/notify-deploy-slack.sh` looks up the merged PR and posts the payload for both **Firebase** and **Workers**. If `SLACK_WEBHOOK_URL` is unset, it logs a warning and exits `0`. It also checks that the webhook URL starts with `https://hooks.slack.com/` before posting.
 
 Tests cover them: `scripts/release/release_scripts_test.sh` in the API (run by **Migration Policy**) and `pnpm test:deploy-slack` in web.
 
