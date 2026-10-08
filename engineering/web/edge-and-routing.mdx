@@ -113,6 +113,18 @@ Security and failure handling:
 
 The only template today is `invite` (`src/templates/invite.tsx`). Adding one means writing the `.tsx` file and registering it in `src/templates/index.ts`.
 
+The `invite` card mirrors the invite landing page at `joinyelo.com/i/<code>`, and the two should change together:
+
+- A black card with a 300 px avatar in a yellow ring. The avatar is the `p` photo, or the initials of `n` and `l` on the `c` fill color. With no name, the avatar shows `?`.
+- A headline in Instrument Serif: "`<n>` invited you to Yelo", or "You're invited to Yelo" when `n` is empty. First names longer than 14 characters drop from 84 px to 60 px so "to Yelo" stays on the card.
+- A soft pill reading "Tap to join" in Switzer.
+
+The template reads `n`, `l`, `p`, and `c` only. It ignores the API's design version `v`, so a URL with any `v` renders whatever template is deployed, and production caches that response as immutable.
+
+<Warning>
+Ship a card redesign in order: deploy the `og` worker first, then bump `inviteCardDesign` in `yelo-api`. The **Workers** workflow deploys the worker when `workers/og` changes on `main`, and the API releases on its own pipeline. Nothing orders the two repositories. If the API bump goes out first, the API writes and warms the new URLs against the old template, and those cards stay on the old artwork until the next version bump. See [Signed OG card](/engineering/domains/referrals-and-links#signed-og-card).
+</Warning>
+
 ## Firebase Hosting rules per site
 
 Each site owns `src/sites/<site>/firebase.json`; `pnpm firebase:config` merges them into the root `firebase.json`.
@@ -124,10 +136,10 @@ Each site owns `src/sites/<site>/firebase.json`; `pnpm firebase:config` merges t
 | `event` | `/.well-known/apple-app-site-association`: JSON | `**` → `/index.html` | — | `firebase.json`, `node_modules` |
 | `home` | `.well-known`: JSON, 1 h. `/`: `no-cache`. `/assets/**`: immutable 1 y. Media and fonts by extension: 30 d. Named routes: `no-cache`. | `/partner`, `/drivers`, `/vision`, `/fleets`, `/safety`, `/privacy`, `/tos`, `/terms` (each `{,/}`) → `/<route>/index.html`; `**` → `/index.html` | — | `firebase.json`, `node_modules` |
 | `invite` | `.well-known`: JSON, 1 h | `**` → `/index.html` | `/` and `/index.html` → `https://signup.yelo.link/` (`302`). Personal invite paths redirect client-side; see below. | `firebase.json`, `node_modules` |
-| `maestro` | `/auth/v3{,/**}`: same security set as signup with a different CSP | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `**` → `/index.html` | — | `**/.*` |
+| `maestro` | `**`: `no-cache, max-age=0, must-revalidate`. `/assets/**`: `public, max-age=31536000, immutable`. `/auth/v3{,/**}`: same security set as signup with a different CSP | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `**` → `/index.html` | — | `**/.*` |
 | `world-cup` | `/world-cup{,/}`: no-store | `/world-cup{,/**}` → `/world-cup/index.html` | `/` → `/world-cup` (`302`) | `**/.*` |
 
-The `invite` site has no Firebase redirect for personal invites. An inline script in `src/sites/invite/index.html` runs before the bundle and, for any single-segment path `/<code>` without a dot, calls `location.replace('https://joinyelo.com/i/<code>')` with the original query string. `/fleet/<code>` is not matched and still renders the fleet invite page.
+The `invite` site has no Firebase redirect for personal invites. An inline script in `src/sites/invite/index.html` runs before the bundle and, for any single-segment path `/<code>` without a dot, calls `location.replace('https://joinyelo.com/i/<code>')` with the original query string. `/fleet/<code>` is matched the same way and goes to `https://joinyelo.com/i/fleet/<code>`. The site renders no invite page itself; any other path shows "Invite not found".
 
 Every site except `dashboard`, `maestro`, and `world-cup` sets `appAssociation: "NONE"`, so Firebase serves the committed `.well-known` files instead of generating its own.
 
