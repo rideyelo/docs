@@ -42,13 +42,13 @@ The process refuses to start in E2E mode unless every check in `Config.validateE
 | Control key | At least 32 bytes |
 | Background jobs | `E2E_BACKGROUND_JOBS_ENABLED` must be false |
 | Fixture TTL | `E2E_FIXTURE_TTL` greater than zero and at most 24 hours (default 30 minutes) |
-| Database | `DSN` must be a PostgreSQL URL whose database name equals `E2E_DATABASE_NAME`, whose Supabase project ref equals `E2E_DATABASE_PROJECT_REF`, and differs from the production ref. Both `db.<ref>.supabase.co` and pooler usernames are parsed. |
+| Database | `DSN` must be a PostgreSQL URL whose database name equals `E2E_DATABASE_NAME`, whose Supabase project ref equals `E2E_DATABASE_PROJECT_REF`, and differs from the production ref. Both `db.<ref>.supabase.co` and pooler usernames are parsed. One local exception: `E2E_DATABASE_PROJECT_REF=local` is accepted when the `DSN` host is a loopback IP literal, the database name starts with `yelo_e2e_`, and the URL has no `host` or `hostaddr` query parameter (`localE2EDatabase`). |
 | Redis | Enabled, `redis://` or `rediss://`, and a logical database of 1 or higher |
 | Stripe | `STRIPE_API_KEY` starts with `sk_test_` and `STRIPE_PUBLISHABLE_KEY` starts with `pk_test_` |
 | Integrations | `CONTACT_SYNC_RESEND_ENABLED` and `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` false. Twilio, Resend, Photon, Quo, Dub, Slack webhook, and Google or Apple Auth v3 credentials must all be unset. |
 | Auth v3 | See [Test, E2E, and internal auth paths](/engineering/identity/test-and-internal-auth#e2e-mode) |
 
-`cmd/api/main.go` skips notification workers, River UI, and mutating background tasks while E2E is enabled. Ride expiry, auto-queue tickers, and push delivery don't run on their own. The fixture API invokes the few production commands a test needs, such as `CancelUnmatchedRides`.
+`cmd/api/main.go` skips River UI and mutating background tasks while E2E is enabled. It still starts the River client, restricted to ride commands: `registerRideOperations` in `internal/notify/queue/queue.go` replaces the queue map with `ride_operations` alone and the periodic jobs with `ride_operation_recovery` alone, and startup logs "E2E mode: isolated ride command workers enabled". Ride accepts, completions, cancellations, and tips therefore finish their ride board and driver queue effects in E2E. Notification jobs are still inserted, and no worker consumes them. Ride expiry, auto-queue tickers, and push delivery don't run on their own. The fixture API invokes the few production commands a test needs, such as `CancelUnmatchedRides`.
 
 ### Deployed configuration
 
@@ -151,7 +151,7 @@ Phones are deterministic: `+1555` plus seven digits from an FNV-32a hash of the 
     Selects rides whose ID is in `metadata.ride_id` or `metadata.active_ride_id`, or any `requested` unassigned ride, only where the rider is the run's rider or active rider, the rider is `is_test`, and the community is `is_test`. Unconfirmed drafts created by the real app after setup are included.
   </Step>
   <Step title="Delete ride data">
-    `RideEvents`, `RideCancellationQuotes`, `RideNotifications`, `RideMessages`, `RideDeclineReasons`, then `Rides`. Financial journal rows are not deleted, so a run that created one fails cleanup visibly.
+    Cleanup first checks the fixture rides' ride operations. If any operation isn't `succeeded` or `failed`, or has no row in `RideOperationEffectReceipts`, cleanup fails with "fixture financial operations still require resolution or cache delivery" and deletes nothing. Otherwise it deletes, for those rides only: `notify_orchestrate` and `ride_operation` rows in `river_job`, `RideOperationEffectReceipts`, `RideOperationSteps`, `RideOperations`, `RideEvents`, `RideCancellationQuotes`, `RideNotifications`, `RideMessages`, `RideDeclineReasons`, then `Rides`.
   </Step>
   <Step title="Delete auth and actors">
     The active fixture rider, `AttributionTouches` and `AuthTransactions` found through the actors' `AuthPhoneAttempts`, driver sessions and application, the vehicle, and both users.

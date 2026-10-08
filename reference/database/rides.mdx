@@ -14,6 +14,7 @@ erDiagram
     Rides ||--o{ RideEvents : ride_id
     Rides ||--o{ RideOperations : ride_id
     RideOperations ||--o{ RideOperationSteps : operation_id
+    RideOperations ||--o| RideOperationEffectReceipts : operation_id
     Rides ||--o{ RideCancellationQuotes : ride_id
     Rides ||--o{ RideMessages : ride_id
     Rides ||--o| RideMessageStreams : ride_id
@@ -219,9 +220,9 @@ Event recording is best effort. If the channel stays full for 100 ms, the event 
 
 Idempotent journal for ride commands that have money side effects. Created in `000339_ride_operation_journal`. Each row records one command's immutable decision so a River `ride_operation` job can retry provider calls without recomputing the decision.
 
-<Warning>
-The journal is not wired into production yet. `RideOperationJournal` in `internal/data/repository/ride_operation.go` says so, and nothing outside tests constructs it. The live ride flow still calls Stripe directly from `internal/service/ride`. Some live queries already respect the table, for example `MarkRidePaymentSucceeded` skips rides that have an operation.
-</Warning>
+Every ride command that moves money writes here. `internal/service/ride` submits acceptance, auto-assignment, promotion, completion, cancellation, expiry, and tip commands to `payment.RideOperations`, and `RideOperationJournal.CreateTx` in `internal/data/repository/ride_operation.go` inserts the row together with its River job. No other code inserts into this table. See [Ride operation journal](/engineering/payments/ride-operation-journal).
+
+Other queries read the table as a guard. `HasConflictingRideOperation` rejects ride commands while another operation is unresolved, `MarkRidePaymentSucceeded` skips rides that have any operation, and the ride snapshot reports `transition_pending`.
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
@@ -243,7 +244,7 @@ Constraints and triggers:
 - `protect_ride_operation_identity` (`BEFORE UPDATE`) rejects changes to any identity column, any change after `succeeded` or `failed`, and moving a `quarantined` row anywhere except `succeeded` or `failed`.
 - `quarantined` means the operation finished while a step's provider outcome was still unknown. It keeps exclusive ownership of the ride until the step is reconciled.
 
-`ClaimRideOperationsWithoutLiveJob` finds pending operations with no live `ride_operation` River job so a recovery worker can re-enqueue them.
+`ClaimRideOperationsWithoutLiveJob` finds operations with no live `ride_operation` River job so the `ride_operation_recovery` worker can re-enqueue them. It selects `pending` operations, and `succeeded` or `failed` operations that have no row in [`RideOperationEffectReceipts`](#rideoperationeffectreceipts).
 
 ## RideOperationSteps
 
@@ -260,13 +261,30 @@ One row per external call inside a `RideOperations` row. Created in `000339_ride
 
 `protect_ride_operation_step` (`BEFORE UPDATE`) rejects changes to the request and any change once `result` is set.
 
-## RideCancellationQuotes
+## RideOperationEffectReceipts
 
-Short-lived, immutable quote of a cancellation fee shown to the user before they confirm a cancellation. Created in `000340_ride_cancellation_quotes`. Part of the same unwired operation work as `RideOperations`; only the queries and e2e fixtures reference it.
+Acknowledgement that a finished ride operation's cache effects were applied. Created in `000355_ride_operation_effects`. The effects are the ride board entry and the driver queue summary in Redis, which can't join the Postgres transaction that finishes the operation. The table is separate from `RideOperations` because a `succeeded` or `failed` operation row is immutable.
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
-| `id` | `uuid` | No | | Quote ID supplied by the caller. |
+| `operation_id` | `uuid` | No | | Primary key. FK to `RideOperations (id)`, with no `ON DELETE` action. |
+| `completed_at` | `timestamptz` | No | `now()` | When the receipt was inserted. |
+
+There are no other indexes, checks, or triggers.
+
+- **Writer.** `CompleteRideOperationEffects` in `queries/ride_operation.sql`, called from `RideOperationWorker.finishDelivery` after `ReconcileRideOperation` succeeds. It inserts only for an operation in `succeeded` or `failed`, with `ON CONFLICT (operation_id) DO NOTHING`.
+- **Readers.** `RideOperationEffectsCompleted` lets the worker skip effects that are already acknowledged. `ClaimRideOperationsWithoutLiveJob` uses the missing row to find terminal operations that still need a job.
+- **Deletes.** Only E2E fixture cleanup deletes rows, for its own fixture rides.
+
+A `pending` or `quarantined` operation never has a receipt. The migration has no backfill. An operation that was already terminal when the table was created has no receipt, so recovery enqueues a job for it and the worker reconciles from the ride's current state. See [Terminal effects](/engineering/payments/ride-operation-journal#terminal-effects).
+
+## RideCancellationQuotes
+
+Short-lived, immutable quote of a cancellation fee shown to the user before they confirm a cancellation. Created in `000340_ride_cancellation_quotes`. `RideService.CancelIntent` writes a row through `RideCancellationCommands.SaveQuote`, and a `cancel` ride operation can only be reserved from a quote that is unexpired and still matches the ride's revisions.
+
+| Column | Type | Null | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `id` | `uuid` | No | | Quote ID, generated by `SaveQuote` with `uuid.NewV4`. |
 | `ride_id` | `uuid` | No | | FK to `Rides`. |
 | `actor_id` | `uuid` | No | | User the quote was issued to. FK to `Users`. |
 | `lifecycle_revision`, `assignment_generation` | `bigint` | No | | Ride revisions at quote time. A quote is only current while both still match the ride. |

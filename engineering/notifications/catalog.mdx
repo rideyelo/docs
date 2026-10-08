@@ -21,31 +21,34 @@ Every push also carries `notification_id`, `notification_delivery_id`, `cohort_i
 
 | Code | Trigger | Seeded title / body | Deep link | Extra data |
 | --- | --- | --- | --- | --- |
-| `ride_confirmed` | `RideService.AcceptRide` (driver accepts), `notifyQueuePromotion` (queued ride promoted to active), `ActivationService.sendAutoQueueNotifications` (auto-queue assigns) | `Woohoo! {{driver_first_name}} is on the way.` / `Get ready — your driver is coming.` | `ride/4-ride` | `status`: `queued` or `driver_en_route` on accept (from `acceptedRideStatus`), `driver_en_route` on promotion, the ride's current status on auto-queue |
+| `ride_confirmed` | `notifyPreparationTx` in `internal/data/repository/ride_operation_notifications.go`, when an `accept` operation (driver accepts or auto-queue assigns) or a `promotion` operation (queued ride promoted to active) finishes | `Woohoo! {{driver_first_name}} is on the way.` / `Get ready — your driver is coming.` | `ride/4-ride` | `status`: the ride's status when the operation finishes. `queued` or `driver_en_route` on accept and auto-queue, `driver_en_route` on promotion |
+| `ride_payment_failed` | `RidePreparationCommands.FailAuthorization`, when the card authorization for an `accept` or `promotion` operation ends canceled. The ride is canceled in the same transaction | `Ride canceled` / `Your payment authorization could not be completed. Please check your payment method and request another ride.` | `ride` | `status: complete` |
 | `driver_arrived` | `RideService.AtPickup` | `Let's ride 🤙` / `{{driver_first_name}} is here in a {{vehicle_color}} {{vehicle_make}} {{vehicle_model}} - {{license_plate}}.` | `ride/4-ride` | `status: driver_waiting` |
-| `ride_completed` | `RideService.Complete` | `Thx!` / `See you soon. - Love, Yelo` | `ride?rate={{ride_id}}` | `status: pending_rider_rating` |
-| `ride_canceled_by_driver` | `RideService.Cancel`, via `notifyRiderOfDriverCancellation`, when the driver cancels outside `queued`, `driver_en_route`, or `driver_waiting` | `Ride canceled 😔` / `Shoot, your driver has canceled. Try again!` | `ride` | `status: complete` |
-| `ride_requeued` | `RideService.requeueAfterDriverCancel` (driver cancels while `queued`, `driver_en_route`, or `driver_waiting`) | `Finding a new driver` / `Your driver canceled. We're finding you a new driver!` | `ride` | `status: confirmed` |
+| `ride_completed` | `RideCompletionCommands.Finalize`, when a `complete` operation finishes | `Thx!` / `See you soon. - Love, Yelo` | `ride?rate={{ride_id}}` | `status: pending_rider_rating` |
+| `ride_canceled_by_driver` | `notifyCancellationTx`, when a driver's `cancel` operation finishes without a requeue, which means the driver canceled outside `queued`, `driver_en_route`, or `driver_waiting` | `Ride canceled 😔` / `Shoot, your driver has canceled. Try again!` | `ride` | `status: complete` |
+| `ride_requeued` | `notifyCancellationTx`, when a requeue `cancel` operation finishes (driver cancels while `queued`, `driver_en_route`, or `driver_waiting`) | `Finding a new driver` / `Your driver canceled. We're finding you a new driver!` | `ride` | `status: confirmed` |
 | `direct_request_fallback` | `RideService.DeclineRide` (selected driver declines), `ActivationService.finishExpiredDirectRide` (30-second direct offer expires) | `Finding another driver` / `Your selected driver couldn't take this ride. We're looking for another driver.` | `ride` | `type: ride_status_changed`, `status: confirmed` |
-| `ride_request_no_drivers` | `sqlRideRepository.CancelUnmatchedRides`, inside the expiry transaction, after `RideRequestExpiry` (10 minutes) | `Ride Request Canceled` / `No drivers were available this time.` | `ride` | `status: complete` |
+| `ride_request_no_drivers` | `notifyCancellationTx`, when the system `cancel` operation reserved by `ExpireUnmatched` finishes, after `RideRequestExpiry` (10 minutes) | `Ride Request Canceled` / `No drivers were available this time.` | `ride` | `status: complete` |
 
 ### Rider gating
 
-`ride_confirmed` (from `AcceptRide`), `driver_arrived`, `ride_completed`, and `ride_canceled_by_driver` go through `RideService.notifyRiderOfRideUpdate`:
+Pushes sent from a ride operation (`ride_confirmed`, `ride_payment_failed`, `ride_completed`, `ride_canceled_by_driver`, `ride_requeued`, `ride_request_no_drivers`) are emitted by `notifyLifecycleTx` inside the transaction that finishes the operation. The event key is `ride_operation:{operationId}:{code}`, so a replayed finalizer can't send twice. The emitter doesn't check the rider's token or `allow_notifications`, and it doesn't use `RideNotifications`.
+
+`driver_arrived` still goes through `RideService.notifyRiderOfRideUpdate`:
 
 - It skips the emit if the rider has no token or `allow_notifications` is false.
 - It checks the legacy `RideNotifications` table (`IsNotified`) for this ride and type and skips if one exists.
 - It writes the `RideNotifications` row only after the emit succeeds.
 
-This is a second, permanent dedupe on top of the event key. The promotion and auto-queue paths for `ride_confirmed` skip this gate and only check that the rider has a token.
+This is a second, permanent dedupe on top of the event key.
 
 ## Ride lifecycle (driver)
 
 | Code | Trigger | Seeded title / body | Deep link | Extra data |
 | --- | --- | --- | --- | --- |
-| `ride_canceled_by_rider` | `RideService.handleRiderCancellation` | `Ride Canceled` / `Your rider has canceled. {{fee_dollars}}` | `ride` | `status: complete` |
+| `ride_canceled_by_rider` | `notifyCancellationTx`, when a rider's `cancel` operation finishes on a ride that has a driver | `Ride Canceled` / `Your rider has canceled. {{fee_dollars}}` | `ride` | `status: complete` |
 
-`fee_dollars` is not a number. It is a whole sentence built in `NotifyDriverRideCanceledByRider`: `You will receive [$X.XX].` when the cancellation fee is above zero, or an empty string. The brackets are literal.
+`fee_dollars` is not a number. It is a whole sentence built in `notifyCancellationTx`: `You will receive [$X.XX].` when the cancellation fee is above zero, or an empty string. The brackets are literal.
 
 ## Driver dispatch
 
@@ -54,7 +57,7 @@ This is a second, permanent dedupe on top of the event key. The promotion and au
 | `ride_available` | `RideService.directAssignDriver` (rider picks a driver), `RideService.notifyDriversAboutNewRide` (fleet T0 on confirm and on requeue), `ActivationService.resumeExpiredDirectRide` (direct offer expired), `ActivationService.NotifyPendingRideForDriver` (driver comes online) | One driver, or all T0 fleet targets from `ListRideT0NotificationTargets` | `${{price_dollars}} New ride available` / `From {{pickup_name}} to {{destination_name}}` | `drive` | `type: ride_request` |
 | `unclaimed_ride` | `ActivationService.activateForConfigTier` | Tier candidates from the warm pool and inactive drivers | Same as `ride_available` | `drive` | `tier` is a variable, not in data |
 | `unclaimed_ride_fleet` | `ActivationService.notifyFleetOfMissedRide` when auto-queue finds no eligible driver for a fleet ride | Every active member of the fleet in the community (`GetFleetDriverIDs`) | Same as `ride_available` | `drive` | none |
-| `ride_auto_queued` | `ActivationService.sendAutoQueueNotifications` | The winning driver | `${{price_dollars}} ride auto-queued` / `{{pickup_name}} → {{destination_name}}` | `drive` | `vibration: "true"` |
+| `ride_auto_queued` | `notifyPreparationTx`, when an automatic `accept` operation finishes | The winning driver | `${{price_dollars}} ride auto-queued` / `{{pickup_name}} → {{destination_name}}` | `drive` | `vibration: "true"` |
 | `driver_renew_online` | `UserService.PurgeOfflineDrivers` (the `Operational` ticker, every 30 seconds) | Online drivers whose `last_pinged_driver` is 29 minutes 15 seconds to 29 minutes 45 seconds old, with no active ride and no ride completed in the last 30 minutes | `Renew Online Status` / `Click back to keep your status online.` | `drive` | none |
 
 `price_dollars` is formatted with two decimals and no currency symbol (`formatRidePrice`). The `$` in the title is literal template text.
@@ -86,7 +89,7 @@ These templates have `silent = true`. The send worker strips title, body, and so
 
 | Code | Trigger | Audience | Data |
 | --- | --- | --- | --- |
-| `ride_status_changed` | `RideService.Pickup` (rider, `in_progress`), `RideService.prepareAndPromoteQueuedRide` (driver, `driver_en_route`) | Named users | `ride_id`, `status` |
+| `ride_status_changed` | `RideService.Pickup` (rider, `in_progress`) | Named users | `ride_id`, `status` |
 | `ride_state_changed` | `finalizeRideCommand` and `withRideStateDelivery` in `internal/data/repository/ride_revision.go`, only when `RIDE_STATE_SNAPSHOT_ENABLED` is true (default false) | Every participant whose ride-state revision advanced: rider, driver, previous driver, and queued participants | `user_id`, `session_revision` |
 | `map_content_changed` | `mapchanges.Service` from place edits (`PlaceMetadataChanged`), community POI changes (`CommunityPOIsChanged`), likes and friend changes (`SocialChanged`) | Affected users, the whole community (`community_pois`), or the user plus their friends (`friends`) | `scope`, plus `community_id` for `community_pois` |
 
@@ -208,9 +211,6 @@ All seeded Android channels are `default`. No seeded template uses `kaching.wav`
   </Accordion>
   <Accordion title="Deep links that do not resolve in the app">
     `driver_application_approved` points at `/driver-signup/1-application-status`, which has no route. The payout codes point at `yelo://drive/earnings`, but earnings lives at `driver-earnings/`. `ride_completed` points at `ride?rate={{ride_id}}`, but `app/(app)/ride/index.tsx` redirects to the map and nothing reads `rate`.
-  </Accordion>
-  <Accordion title="Rider-cancel notification is marked sent even when it fails">
-    `handleRiderCancellation` writes the `RideNotifications` row even when the emit returns an error, unlike `notifyRiderOfRideUpdate`. A transient enqueue failure permanently suppresses `ride_canceled_by_rider` for that ride.
   </Accordion>
   <Accordion title="Activation marks drivers as notified even when the push is suppressed">
     `activateForConfigTier` adds drivers to the Redis notified set once the emit is enqueued. If the orchestrator then suppresses a driver for `user_cooldown` or a missing token, activation still treats them as pinged and excludes them from later tiers that do not re-ping.

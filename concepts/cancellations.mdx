@@ -17,24 +17,26 @@ For the statuses referenced here, see [Ride lifecycle](/concepts/ride-lifecycle)
 
 ## Who can cancel
 
-`POST /ride/i/{id}/cancel` takes a `reason` and an optional `comment`. Only the ride's rider or its assigned driver can call it. Anyone else gets an authorization error.
+`POST /ride/i/{id}/cancel` takes a `reason` and an optional `comment`. Only the ride's rider or its assigned driver can call it.
 
-The ride must be in `requested`, `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, or `in_progress`. Rides in `pending_rider_rating` or `complete` return "Ride is already completed."
+The ride must be in `requested`, `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, or `in_progress`. A caller who isn't a participant, or a ride in `pending_rider_rating` or `complete`, gets the same conflict as any other stale command: **Ride Unavailable**, "This ride has changed. Refresh and try again." (`validateRideCancellation`).
+
+Cancellation is two steps. `POST /ride/i/{id}/cancel-intent` prices the fee and saves a quote that is valid for 60 seconds and only for the ride's current revision. `POST /ride/i/{id}/cancel` then cancels against that quote. A rider canceling a ride that has a payment hold must have a current quote, or the cancel returns **Review cancellation fee**. A driver, or a rider on a ride with no hold, doesn't need to call `cancel-intent` first: the cancel creates its own zero-fee quote.
 
 ## Driver cancellations before pickup requeue the ride
 
-`RideService.Cancel` first checks `isReQueueEligible`. When the **assigned driver** cancels a ride in `queued`, `driver_en_route`, or `driver_waiting`, the ride takes the requeue path instead of ending:
+Every cancellation runs as a `cancel` ride operation. When the **assigned driver** cancels a ride in `queued`, `driver_en_route`, or `driver_waiting`, the operation is marked as a requeue (`freezeCancellation`) and the ride goes back to matching instead of ending:
 
 - The ride returns to `confirmed` and goes back on the board with a fresh 10-minute expiry window.
 - The driver is added to `declined_drivers`.
-- The payment authorization is kept and replaced when the next driver accepts.
+- The payment authorization is released at Stripe before the ride goes back on the board, and the ride's payment columns are cleared. The next driver's accept places a new hold.
 - No fee is charged, and the rider gets a single "finding you a new driver" push.
 
 See [Requeue after a driver cancels](/concepts/ride-lifecycle#requeue-after-a-driver-cancels).
 
 ## Fee rules
 
-Every other cancellation goes through `pricing.GetCancellationFee` (`internal/utilities/pricing/pricing.go`). Fees are based on the ride's effective price, which is the discounted fare when one exists. A free ride never incurs a fee.
+A rider's cancellation of a ride with a payment hold is priced by `pricing.GetCancellationFee` (`internal/utilities/pricing/pricing.go`) when the quote is created. Driver cancellations and rides without a hold are always quoted at $0. Fees are based on the ride's effective price, which is the discounted fare when one exists. A free ride never incurs a fee.
 
 ### Rider cancels
 
@@ -55,34 +57,32 @@ For `driver_en_route`, the API asks Mapbox for the drive time from the driver's 
 | `queued`, `driver_en_route`, `driver_waiting` | Requeued. No fee. |
 | `in_progress` | Ride ends. $0. |
 
-`calculateDriverCancellationFee` also defines a rider no-show fee: the greater of 40% of the fare or $1.00 when the driver cancels from `driver_waiting` after more than 7 minutes (`WaitTimeCancellationCutoff`, 420 seconds). Because `driver_waiting` cancellations by the driver take the requeue path first, `RideService.Cancel` never reaches this rule on `main`.
-
-<Warning>
-`POST /ride/i/{id}/cancel-intent` returns the fee preview by calling `GetCancellationFee` directly, without the requeue check. For a driver in `driver_waiting` after 7 minutes, the preview returns the 40% no-show fee, but the actual cancel requeues the ride and charges nothing.
-</Warning>
+`calculateDriverCancellationFee` also defines a rider no-show fee: the greater of 40% of the fare or $1.00 when the driver cancels from `driver_waiting` after more than 7 minutes (`WaitTimeCancellationCutoff`, 420 seconds). Nothing reaches this rule on `main`. `RideCancellationQuotes.Quote` saves a zero-fee quote for every driver without calling the pricing function, so both the `cancel-intent` preview and the actual cancel charge a driver's cancellation nothing.
 
 ## How fees are charged
 
-Fees are charged against the ride's existing Stripe PaymentIntent. No new charge is created. `handleCancellationPayment` in `internal/service/ride/ride.go` works like this:
+Fees are charged against the ride's existing Stripe PaymentIntent. No new charge is created. The `cancel` operation in `internal/service/payment/ride_cancellation_operation.go` works like this:
 
 ```mermaid
 flowchart TD
-    A[Cancel request] --> B{Requeue eligible?}
-    B -- Yes --> R[Back to confirmed, keep authorization]
-    B -- No --> C{Ride has a PaymentIntent?}
+    A[Cancel request] --> Q{Current quote?}
+    Q -- No, and the rider has a hold --> X[Rejected: review the fee]
+    Q -- Yes, or a zero-fee quote is created --> C{Ride has a PaymentIntent?}
     C -- No --> Z[No Stripe call, fee is 0]
-    C -- Yes --> D[Calculate fee]
-    D --> E{Fee above 0?}
+    C -- Yes --> E{Quoted fee above 0?}
     E -- Yes --> F[Capture the fee amount, release the rest]
     E -- No --> G[Cancel the PaymentIntent]
     F --> H[Ride ends as complete]
-    G --> H
-    Z --> H
+    G --> B{Driver requeue?}
+    Z --> B
+    B -- Yes --> R[Back to confirmed, payment columns cleared]
+    B -- No --> H
 ```
 
-- A PaymentIntent exists only after a driver accepts a paid ride. Cancellations in `requested`, or in `confirmed` before any driver has accepted, never touch Stripe.
-- A positive fee is captured with `PartiallyConfirm`, which calls Stripe's capture with `amount_to_capture` set to the fee in cents. Stripe releases the uncaptured remainder of the authorization.
+- A PaymentIntent exists only after a paid ride is assigned to a driver's active slot. Cancellations in `requested`, in `confirmed` before any driver has accepted, or in `queued`, never capture a fee.
+- A positive fee is captured with Stripe's capture, with `amount_to_capture` set to the quoted fee in cents. Stripe releases the uncaptured remainder of the authorization.
 - A $0 fee cancels the PaymentIntent, releasing the full hold.
+- The Stripe step is verified before the ride changes. If Stripe can't be reached, the cancel returns an error, the ride keeps its status, and a background job keeps retrying the same step. Until it resolves, no other action on the ride is accepted.
 - The captured fee lands on the same connected account that holds the authorization: the driver's account or the fleet's. See [Payments and payouts](/concepts/payments-and-payouts).
 
 After payment handling, the ride row is updated with:
@@ -92,18 +92,19 @@ After payment handling, the ride row is updated with:
 | `status` | `complete` |
 | `cancel_phase` | The status the ride was in when canceled |
 | `cancel_user` | `rider` or `driver` |
+| `driver_payout` | The cancellation fee |
 | `cancel_reason`, `cancel_comment` | From the request |
 | `complete_time` | The cancellation time |
 
-The ride is removed from the board. If the canceled ride belonged to a driver with queued rides, the next one is promoted. The other party gets a push. On a rider cancellation, the driver's push includes the fee amount. The event log records `ride_canceled` and the payment outcome.
+If the canceled ride belonged to a driver with queued rides, the next one is promoted in the same transaction. The other party gets a push. On a rider cancellation, the driver's push includes the fee amount. The event log records `ride_canceled` with the reason and fee. A background job then removes the ride from the board and refreshes the driver's queue.
 
 ## System-initiated endings
 
 | Trigger | Result |
 | --- | --- |
-| Unmatched for 10 minutes after confirm | `CancelUnmatchedRides` sets `cancel_phase = 'confirmed'` and `cancel_reason = 'automatic'`, with no `cancel_user`. No Stripe call. |
+| Unmatched for 10 minutes after confirm | `CancelUnmatchedRides` runs a system cancellation that sets `cancel_phase = 'confirmed'` and `cancel_reason = 'automatic'`, with no `cancel_user`. If the ride still carries a payment hold, the hold is released at Stripe first. |
 | Rider starts a new request | Older `requested` rides get `cancel_reason = 'superseded'`. |
-| Payment method clone or PaymentIntent creation fails | The service calls `Cancel` with reason `Payment Failed` as the requesting user. See the note below. |
+| The rider's card is declined when a driver accepts or a queued ride is promoted | The ride ends with `cancel_reason = 'Payment Failed'`, `cancel_comment = 'Payment authorization could not be completed.'`, no `cancel_user`, and `cancel_phase` set to the status it was in. The rider gets a `ride_payment_failed` push. See the note below. |
 | Driver offline more than 5 minutes with queued rides | Not a cancellation. Queued rides return to `confirmed` and go back on the board. |
 
 ## Admin silent cancellation
@@ -134,7 +135,7 @@ A silent cancellation skips payment handling, queue promotion, and every notific
 Participants' apps pick up the change on their next refresh. The dashboard can't undo it.
 
 <Note>
-The `Payment Failed` cancel runs through the same authorization check as a user cancel. During a manual accept, the caller is a driver who isn't assigned to the ride yet, so `Cancel` rejects the call and only logs it. The accept returns the payment error, and the ride stays `confirmed` on the board. When payment fails while promoting a queued ride and the request context carries that ride's driver, as in `RecoverIdleQueue`, the cancel counts as a driver cancel and takes the requeue path.
+A ride is canceled for `Payment Failed` only after Stripe confirms the authorization can't charge: the PaymentIntent ended canceled with nothing captured or capturable. A Stripe outage or a timeout isn't a decline. In that case the ride stays assigned to the driver, and a background job retries the authorization. The driver's next queued ride, if any, is promoted when a declined ride is canceled.
 </Note>
 
 ## Reporting on cancellations
@@ -145,11 +146,14 @@ The dashboard's cancellation and uncompleted-ride views read `cancel_phase`, `ca
 
 | Concern | Location |
 | --- | --- |
-| Cancel, requeue, fee charging | `yelo-api/internal/service/ride/ride.go` (`Cancel`, `requeueAfterDriverCancel`, `handleCancellationPayment`) |
+| Cancel entry points | `yelo-api/internal/service/ride/ride.go` (`Cancel`, `CancelIntent`), `financial_commands.go` |
+| Quote, requeue decision, fee charging | `yelo-api/internal/service/payment/ride_cancellation_operation.go`, `ride_legacy_cancellation.go`, `yelo-api/internal/data/repository/ride_cancellation_operation.go` |
+| Declined authorization | `yelo-api/internal/data/repository/ride_authorization_failure.go` |
+| Unmatched expiry | `yelo-api/internal/service/payment/ride_expiry_operation.go` |
 | Fee rules | `yelo-api/internal/utilities/pricing/pricing.go` (`GetCancellationFee`) |
 | Cutoff constants | `yelo-api/internal/utilities/config/constants.go` |
-| Cancel and requeue SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`CancelRideAndReturnDriver`, `RequeueRideAfterDriverCancel`) |
+| Cancel and requeue SQL | `yelo-api/internal/data/repository/queries/ride_operation.sql` (`CancelReservedRide`, `RequeueReservedRide`, `CancelDeclinedRideAuthorization`) |
 | Who may cancel from which status | `yelo-api/internal/data/repository/ride_command.go` (`validateRideCancellation`) |
-| Stripe capture and cancel | `yelo-api/internal/data/stripe/intent.go` |
+| Stripe capture and cancel | `yelo-api/internal/data/stripe/ride_capture.go`, `ride_void.go` |
 | Rider cancel button | `yelo-frontend/components/rider-flow/RiderCancelButton.tsx` |
 | Admin silent cancellation | `yelo-api/internal/service/dashboard/ride_admin_cancel.go`, `internal/data/repository/ride_admin_cancel.go`, `queries/ride_admin_cancel.sql`; `yelo-web/src/components/rides/SilentCancelRide.tsx` |

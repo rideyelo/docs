@@ -1,6 +1,6 @@
 ---
 title: "Migrations log"
-description: "Every yelo-api SQL migration from 000001 to 000352, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
+description: "Every yelo-api SQL migration from 000001 to 000355, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
 ---
 
 This page indexes every file in `yelo-api/migrations/`. Use it to find when a table or column appeared, which pull request shipped it, and which migrations rewrote or removed data. For the current shape of each table, see the [database reference](/reference/database/overview). For how migrations run in production, see [Deployment](/engineering/deployment) and [Failed migration](/runbooks/failed-migration).
@@ -25,7 +25,7 @@ This page indexes every file in `yelo-api/migrations/`. Use it to find when a ta
 | [Zones, social, and durable notifications](#zones-social-and-durable-notifications-summer-2026) | 000216 to 000253 | 2026-06 to 2026-07 | Zones and zone pricing, friendships and contacts, notification templates and deliveries, River. |
 | [Auth v3 and hardening](#auth-v3-and-hardening-august-2026) | 000254 to 000299 | 2026-08 to 2026-09 | Auth v3 storage and sessions, phone normalization, bumps and SMS consent, map layers, education verification, history indexes, Quo outbox, E2E runs. |
 | [Durable domain systems](#durable-domain-systems-september-2026) | 000300 to 000347 | 2026-09 | Durable messaging, school mapping, Stripe reconciliation, driver leads, recents, calendars, contact sync, place identity, fleet-owned vehicles, ride state protocol, canonical top locations. |
-| [Driver net earnings](#driver-net-earnings-october-2026) | 000348 to 000352 | 2026-10 | Stripe fee estimates and net driver earnings, dedicated tip charge fees, share link state. |
+| [Driver net earnings](#driver-net-earnings-october-2026) | 000348 to 000355 | 2026-10 | Stripe fee estimates and net driver earnings, dedicated tip charge fees, share link state, Fare Finder kill switch and parity window, ride operation effect receipts. |
 
 ## Migrations by domain
 
@@ -33,7 +33,7 @@ Use this map to jump to the migrations that shaped a domain.
 
 | Domain | Key migrations |
 | --- | --- |
-| Rides and lifecycle | 001, 006, 019, 033, 098, 107, 108, 162, 183, 186, 191, 288, 289, 298, 338 to 340 |
+| Rides and lifecycle | 001, 006, 019, 033, 098, 107, 108, 162, 183, 186, 191, 288, 289, 298, 338 to 340, 355 |
 | Pricing | 012, 077, 147, 159, 163, 166, 187, 196, 198, 199, 209, 210, 224, 225, 297, 311, 324, 325 |
 | Payments and tips | 017, 023, 024, 048 to 050, 173, 203 to 205, 207, 219, 236, 251, 287, 290, 291, 304, 348 to 350, 352 |
 | Identity and auth | 001, 013, 014, 036, 054, 090, 114, 115, 254 to 258, 261 to 263, 266, 267, 280, 284, 294 |
@@ -504,6 +504,9 @@ Driver-facing earnings become net of Stripe processing fees, with stored estimat
 | `000350_tip_stripe_fee_payment_intent_index` | 2026-10-05 | [#298](https://github.com/rideyelo/yelo-api/pull/298) | Concurrent partial index `rides_missing_tip_fee_payment_intent_idx` on `tip_payment_intent_id`. |  |
 | `000351_user_share_link_state` | 2026-10-05 | [#300](https://github.com/rideyelo/yelo-api/pull/300) | Adds `Users.share_link_created_at` and `share_link_fingerprint`; seeds `share_link_created_at` for users with a Dub link. | Backfill |
 | `000352_ride_fee_estimate_authorized_amount` | 2026-10-05 | [#301](https://github.com/rideyelo/yelo-api/pull/301) | Creates `ride_fare_fee_estimate_cents` (fee on the authorized amount, fare + $5.00 when tips are on) and the 9-argument `ride_driver_earnings_cents`. Re-estimates stored fare fees that have no actual fee yet. | Backfill |
+| `000353_add_fare_finder_disabled_to_communities` | 2026-10-07 | [#312](https://github.com/rideyelo/yelo-api/pull/312) | Adds `Communities.fare_finder_disabled`, default `false`. |  |
+| `000354_add_parity_window_to_communities` | 2026-10-08 | [#318](https://github.com/rideyelo/yelo-api/pull/318) | Adds `Communities.parity_ratio_min` (default `0.80`) and `parity_ratio_max` (default `0.95`). |  |
+| `000355_ride_operation_effects` | 2026-10-08 | [#315](https://github.com/rideyelo/yelo-api/pull/315) | Creates `RideOperationEffectReceipts` (`operation_id` primary key referencing `RideOperations`, `completed_at`). No backfill: terminal operations without a receipt are reconciled by the recovery worker. |  |
 
 ## Related pages
 

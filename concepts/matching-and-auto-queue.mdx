@@ -37,7 +37,7 @@ The `RideBoardProvider` (`ride_board_redis.go`, with an in-memory fallback in `r
 - The ride is still `confirmed`.
 - The ride's fleet matches the driver's session fleet.
 
-For paid rides, it authorizes payment first and then assigns the ride. If the driver already has an active or queued ride, the accepted ride goes to `queued`. Otherwise it goes straight to `driver_en_route`.
+If the driver already has an active or queued ride, the accepted ride goes to `queued`. Otherwise it goes straight to `driver_en_route`, and for a paid ride the accept then authorizes payment. A queued ride is authorized when it's promoted.
 
 Declining (`POST /ride/i/{id}/decline`) appends the driver to `declined_drivers` and stores the reason. The driver app also declines a ride card that goes unanswered for 30 seconds, with reason `No response`. It never accepts on the driver's behalf. Decline reasons feed the **Pricing decline** layer on the [Ride pricing](/dashboard/ride-pricing) map.
 
@@ -123,7 +123,7 @@ After tier activation, the same loop runs an auto-queue pass over rides that hav
     The final score is 0.5 × time + 0.5 × load. Lowest wins. Scores within 0.05 of each other count as a tie, and the driver with fewer queued rides wins the tie.
   </Step>
   <Step title="Assign">
-    `RideService.AutoAssignRide` assigns the ride as `queued` with `auto_queued = true` and records a `ride_auto_queued` event with the dispatch decision (candidate count, deadhead, score, and queue load). If the driver has no active ride, `RecoverIdleQueue` then calculates the pickup route, authorizes payment, and promotes it to `driver_en_route` before anyone is notified. If that preparation fails but the ride is still assigned, it stays `queued` for the 3-minute recovery loop. Finally the ride is removed from the board and both the driver and the rider are notified.
+    `RideService.AutoAssignRide` assigns the ride with `auto_queued = true` and records a `ride_auto_queued` event with the dispatch decision (candidate count, deadhead, score, and queue load). The status follows the same rule as a manual accept: `driver_en_route` when the driver has no other ride, `queued` otherwise. For a ride that takes the active slot, the same command then authorizes payment and calculates the pickup route. If that preparation fails after the assignment committed, the ride stays assigned and a background job retries it. When the command finishes, the driver and the rider are notified, and the ride is removed from the board.
   </Step>
 </Steps>
 
@@ -133,7 +133,7 @@ If the eligibility query returns no drivers, `notifyFleetOfMissedRide` pushes an
 
 A driver's queue is their `queued` rides ordered by `COALESCE(match_time, request_time)`, then `id`.
 
-- **After complete or cancel**: `PromoteNextQueuedRide` moves the next queued ride to `driver_en_route` in the same transaction. `advanceQueuedRide` then calculates the pickup route, authorizes payment, and notifies the rider.
+- **After complete or cancel**: `PromoteNextQueuedRide` moves the next queued ride to `driver_en_route` in the same transaction, which also reserves a `promotion` ride operation for it. That operation's background job then authorizes payment, calculates the pickup route, and notifies the rider.
 - **Idle recovery**: `RecoverIdleQueue` promotes the head of the queue when the driver has queued rides but no active one. The `QueueRefresh` loop runs it every 3 minutes for every driver with queued rides. It only promotes if the driver is online, pinged within the last 5 minutes, and has exactly one open session matching the ride's vehicle and fleet.
 - **Queue summaries**: the queue ETA and fare summary each driver sees is cached in Redis by `QueueSummaryService` and refreshed on every queue change.
 

@@ -66,14 +66,14 @@ stateDiagram-v2
 | `requested` → `confirmed` | Rider | `POST /ride/i/{id}/confirm` | `RideService.ConfirmRide` |
 | `confirmed` → `driver_en_route` or `queued` | Driver | `POST /ride/i/{id}/accept` | `RideService.AcceptRide` |
 | `confirmed` → `queued` | System | Operational loop (auto-queue pass) | `ActivationService.tryAutoQueueAssign` → `RideService.AutoAssignRide` |
-| `queued` → `driver_en_route` | System | After the driver's active ride ends, or queue recovery | `advanceQueuedRide`, `RecoverIdleQueue` |
+| `queued` → `driver_en_route` | System | After the driver's active ride ends, or queue recovery | A `promotion` ride operation, reserved when the driver's active ride ends or by `RecoverIdleQueue` |
 | `driver_en_route` → `driver_waiting` | Driver | `POST /ride/i/{id}/at-pickup` | `RideService.AtPickup` |
 | `driver_waiting` → `in_progress` | Driver | `POST /ride/i/{id}/pickup` | `RideService.Pickup` |
 | `in_progress` → `pending_rider_rating` | Driver | `POST /ride/i/{id}/complete` | `RideService.Complete` |
 | `pending_rider_rating` → `complete` | Rider | `POST /ride/i/{id}/rate` | `RideService.Rate` |
 | `pending_rider_rating` → `complete` | System | `TipCapture` loop, every 5 minutes | `RideService.AutoCaptureTipWindowExpired` |
 | Any active status → `complete` | Rider or driver | `POST /ride/i/{id}/cancel` | `RideService.Cancel` |
-| `queued`, `driver_en_route`, `driver_waiting` → `confirmed` | Driver | `POST /ride/i/{id}/cancel` | `RideService.requeueAfterDriverCancel` |
+| `queued`, `driver_en_route`, `driver_waiting` → `confirmed` | Driver | `POST /ride/i/{id}/cancel` | `RideService.Cancel`, as a `cancel` ride operation with `requeue` set |
 | `confirmed` → `complete` | System | Operational loop, every 30 seconds | `RideService.CancelUnmatchedRides` |
 | `driver_en_route`, `driver_waiting`, `in_progress` → `complete` | Admin | `POST /dashboard/rides/{id}/silent-cancel` (free rides only, no notifications) | `DashboardService.SilentCancelRide` → `SilentCancel` (`internal/data/repository/ride_admin_cancel.go`). See [Admin silent cancellation](/concepts/cancellations#admin-silent-cancellation) |
 
@@ -89,7 +89,7 @@ Every lifecycle write runs through a locked "ride command" transaction in `inter
     The rider selects a vehicle and payment method. `ConfirmRide` recomputes the fare server-side, stores the vehicle type, fleet, price, and payment method, and generates a confirm code if the fleet requires one. It then adds the ride to the ride board and notifies drivers. If the rider picked a specific driver, the ride is offered to that driver first. No money is authorized yet.
   </Step>
   <Step title="Accept or auto-assign">
-    A driver accepts from the board, or the auto-queue assigns the ride. For a paid ride, a manual accept authorizes the payment on the driver's or fleet's Stripe account **before** the ride is assigned. An auto-queued ride is authorized when it's promoted to the active slot. See [Payments and payouts](/concepts/payments-and-payouts).
+    A driver accepts from the board, or the auto-queue assigns the ride. The ride is assigned first. For a paid ride that takes the driver's active slot, the payment is then authorized on the driver's or fleet's Stripe account as part of the same accept. A ride that goes into a busy driver's queue is authorized when it's promoted to the active slot. If the card is declined, the ride is canceled. See [Payments and payouts](/concepts/payments-and-payouts).
   </Step>
   <Step title="Arrive and pick up">
     The driver taps arrived (`driver_waiting`, which stamps `at_pickup_time`), then enters the rider's confirm code to start the trip (`in_progress`).
@@ -117,7 +117,7 @@ The confirm code is the four-digit PIN the rider shows the driver at pickup.
 
 ## Ride board
 
-The ride board holds every `confirmed` ride that no driver owns yet. A ride is added on confirm and on requeue, and removed on accept, auto-assign, cancel, and expiry. Drivers only see board rides in their community and for the fleet they're online under. Details are on [Matching and auto-queue](/concepts/matching-and-auto-queue#the-ride-board).
+The ride board holds every `confirmed` ride that no driver owns yet. A ride is added on confirm and on requeue, and removed on accept, auto-assign, cancel, and expiry. After an accept, cancel, requeue, or expiry, a background job applies the board change a moment after the ride itself changes. Drivers only see board rides in their community and for the fleet they're online under. Details are on [Matching and auto-queue](/concepts/matching-and-auto-queue#the-ride-board).
 
 ## Expiry
 
@@ -125,20 +125,19 @@ The ride board holds every `confirmed` ride that no driver owns yet. A ride is a
 
 Expired rides get `status = 'complete'`, `cancel_phase = 'confirmed'`, `cancel_reason = 'automatic'`, and a null `cancel_user`. The rider receives the `ride_request_no_drivers` notification, and the ride event log records `no_drivers_available`.
 
-<Warning>
-The expiry sweep doesn't call Stripe. A requeued ride keeps its earlier authorization. If that ride then expires, the hold isn't released by this job.
-</Warning>
+Expiry runs as a system cancellation for each ride. If the ride still carries a payment hold, the hold is released at Stripe before the ride ends. A ride with an unresolved ride operation is skipped until that operation finishes.
 
 ## Requeue after a driver cancels
 
-When the assigned driver cancels a ride in `queued`, `driver_en_route`, or `driver_waiting`, the ride goes back to `confirmed` instead of ending. `RequeueRideAfterDriverCancel`:
+When the assigned driver cancels a ride in `queued`, `driver_en_route`, or `driver_waiting`, the ride goes back to `confirmed` instead of ending. Any payment hold is released at Stripe first. Then `RequeueReservedRide`:
 
 - Clears `driver_id`, `driver_vehicle_id`, and `match_time`.
 - Adds the driver to `declined_drivers` so they aren't offered the ride again.
 - Resets `confirm_time` to now, which restarts the 10-minute expiry clock.
-- Keeps the price, payment method, confirm code, and `payment_intent_id`.
+- Keeps the price, payment method, and confirm code.
+- Clears `payment_intent_id`, `stripe_merchant_id`, `pre_auth_amount`, and the pickup route fields.
 
-The service then re-adds the ride to the board, re-runs the immediate driver notification, sends the rider a single "finding you a new driver" push, and records an `auto_requeued` event. No cancellation fee applies. The next driver who accepts replaces the old authorization; see [Payments and payouts](/concepts/payments-and-payouts#authorization-at-accept).
+The same transaction sends the rider a single "finding you a new driver" push and records an `auto_requeued` event. A background job then re-adds the ride to the board and re-runs the immediate driver notification. No cancellation fee applies. The next driver who accepts gets a new authorization; see [Payments and payouts](/concepts/payments-and-payouts#authorization-at-accept).
 
 ## Offline drivers and queued rides
 
@@ -150,7 +149,7 @@ If a driver with queued rides drops offline, `PurgeOfflineDrivers` gives them a 
 
 ## Audit trail
 
-`internal/service/rideevents` writes an event for each step to the `"RideEvents"` table. See [Ride events](/reference/ride-events). Event types include `ride_requested`, `ride_confirmed`, `ride_accepted`, `ride_auto_queued`, `queue_promoted`, `driver_at_pickup`, `rider_picked_up`, `ride_completed`, `ride_canceled`, `auto_requeued`, `payment_intent_created`, `payment_confirmed`, `tip_captured`, and `tip_window_expired`. The full list lives in `internal/models/ride_event.go`.
+`internal/service/rideevents` writes an event for each step to the `"RideEvents"` table. See [Ride events](/reference/ride-events). Event types include `ride_requested`, `ride_confirmed`, `ride_accepted`, `ride_auto_queued`, `queue_promoted`, `driver_at_pickup`, `rider_picked_up`, `ride_completed`, `ride_canceled`, `auto_requeued`, `tip_captured`, and `tip_window_expired`. The full list lives in `internal/models/ride_event.go`.
 
 ## Where this lives in code
 

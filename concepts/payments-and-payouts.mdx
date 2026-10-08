@@ -19,12 +19,12 @@ Before creating a driver account, the API requires a completed profile. It also 
 
 ## Who receives the money
 
-At accept and at complete, `selectStripeMerchantID` in `internal/service/ride/driver.go` picks the connected account:
+When a driver is assigned to a ride, the connected account is chosen once (`GetRidePaymentPreparation` in `internal/data/repository/queries/ride_operation.sql`):
 
-- The **fleet's** account, when the driver's current session fleet has `has_custom_payouts = true` and a `stripe_merchant_id`.
+- The **fleet's** account, when the ride's fleet has `has_custom_payouts = true` and a `stripe_merchant_id`. The ride's fleet is set from the driver's session fleet at assignment.
 - Otherwise, the **driver's own** account.
 
-At accept, the chosen account is saved as `Rides.stripe_merchant_id`. Both selections are recorded in a `merchant_selected` ride event with `merchant_type` of `fleet` or `driver`. Cancels, tip captures, and deferred fare captures use the saved account. The immediate capture at complete does not: `Complete` recomputes the account from the driver's current session fleet and captures on that, without updating the ride row. See [Ride payment intents](/engineering/payments/ride-payment-intents).
+The choice is frozen into the ride's payment command and saved as `Rides.stripe_merchant_id` once the hold is confirmed. Completion, cancellation, and tips all use the saved account. Nothing recomputes it from the driver's current session. See [Ride payment intents](/engineering/payments/ride-payment-intents).
 
 A fleet is fully payout-ready (`Fleet.IsDriverPayoutReady`) when it's active, uses the `fleet_merchant` payment model, has custom payouts on, and its Stripe status is `complete`. Drivers only receive immediate ride pushes if they're payout-ready themselves or through such a fleet. See [Fleets](/concepts/fleets#payment-models) for payment models and [Fleet driver invitations](/fleets/driver-invitations) for how fleets and owner-operators enroll drivers.
 
@@ -64,23 +64,25 @@ The mobile app passes them to Stripe PaymentSheet in custom-flow mode (`yelo-fro
 
 ### Authorization at accept
 
-For a paid ride, `processRidePayment` runs before the ride is assigned. For a manual accept this happens in `AcceptRide`. For queued rides it happens when the ride is promoted to the active slot.
+For a paid ride, the hold is placed right after the ride is assigned to a driver's active slot. For a manual accept or an auto-queue assignment to an idle driver, that is part of the accept. For a ride accepted into a busy driver's queue, it happens when the ride is promoted to the active slot.
 
-1. **Clone the payment method**: `ClonePaymentMethod` copies the rider's platform payment method onto the connected account.
-2. **Create the PaymentIntent** on the connected account:
-   - `capture_method: manual` and `confirm: true`
-   - `off_session: true`, with mandate data from the confirm-time IP, user agent, and timestamp
-   - Metadata `ride_id`, `rider_id`, and `driver_id`
+1. **Clone the payment method** onto the connected account.
+2. **Create the PaymentIntent** on the connected account, unconfirmed:
+   - `capture_method: manual` and `confirm: false`
+   - Metadata `operation_id`, `ride_id`, `rider_id`, and `driver_id`
    - Amount: the effective fare, **plus a $5.00 tip buffer** (`models.TipBuffer`) when tips are enabled on the ride
-3. **Persist it**: `payment_intent_id`, `pre_auth_amount`, `cloned_payment_method_id`, and `stripe_merchant_id` are saved on the ride. The write is rejected if the ride changed in the meantime. In that case the new hold is canceled.
+3. **Confirm it** off-session, with mandate data from the confirm-time IP, user agent, and consent timestamp.
+4. **Persist it**: `payment_intent_id`, `pre_auth_amount`, `cloned_payment_method_id`, and `stripe_merchant_id` are saved on the ride after the hold is verified at Stripe.
 
-Free rides skip all of this. If cloning or PaymentIntent creation fails, the accept fails. See [Cancellations](/concepts/cancellations#system-initiated-endings) for what happens to the ride.
+Each of these steps is journaled before it runs, with its own Stripe idempotency key. If the request dies midway, a background job resumes from the last completed step instead of starting over. See [Ride operation journal](/engineering/payments/ride-operation-journal).
 
-**Rematch after a requeue.** A requeued ride keeps its PaymentIntent. When the next driver accepts, `reuseRideAuthorization` checks the existing intent. If it's the same driver and account, it reuses the hold. If the hold belongs to the previous driver (who is now in `declined_drivers`), it cancels that hold and creates a new one on the new driver's account. Any mismatch in amount, currency, capture method, or metadata stops the accept with an error rather than reusing a hold it can't verify.
+Free rides skip all of this. If the card is declined, the ride is canceled and the rider is told. See [Cancellations](/concepts/cancellations#system-initiated-endings).
+
+**Rematch after a requeue.** When a driver cancels before pickup, the hold is released at Stripe and the ride's payment fields are cleared before the ride goes back on the board. The next driver's accept places a new hold on the new driver's account.
 
 ### Capture
 
-Yelo never captures the full authorization blindly. Every capture uses `PartiallyConfirm` with an explicit `amount_to_capture`, so the rest of the hold, including an unused tip buffer, is released.
+Yelo never captures the full authorization blindly. Every capture sends an explicit `amount_to_capture` as the final capture, so the rest of the hold, including an unused tip buffer, is released.
 
 | Situation | When the fare is captured | Amount |
 | --- | --- | --- |
@@ -92,9 +94,9 @@ Yelo never captures the full authorization blindly. Every capture uses `Partiall
 | Canceled with a fee | At cancel | Fee |
 | Canceled with no fee | Never. The PaymentIntent is canceled. | — |
 
-`PartiallyConfirm` retries up to 3 times with jittered backoff. It treats Stripe's `charge_already_captured` error as success, so concurrent capture paths are safe to race.
+Each capture belongs to one ride command, and a ride can have only one unresolved command at a time, so two capture paths can't run against the same hold. A capture reads the PaymentIntent before and after the call, and only counts as done when Stripe shows exactly the expected amount received.
 
-If `Complete` captures the fare but the database write then fails, the service cancels the PaymentIntent when tips are disabled. For tip-enabled rides it logs the ride for manual review, because the hold is still uncaptured.
+If a capture succeeds but the database write that follows fails, the capture's receipt is already stored. The next attempt finishes the ride from that receipt without calling Stripe again.
 
 ## Webhooks
 
@@ -102,7 +104,7 @@ Stripe sends events to `POST /stripe-webhook`. The handler (`internal/server/htt
 
 | Event | Handling |
 | --- | --- |
-| `payment_intent.succeeded` | Sets `Rides.driver_payout` to `amount_received` for rides with that `payment_intent_id`, and updates the `PaymentIntents` status row. |
+| `payment_intent.succeeded` | Wakes any waiting ride payment job for that PaymentIntent, and updates the `PaymentIntents` status row. It sets `Rides.driver_payout` to `amount_received` only for a ride that has no ride operation rows. For every other ride, `driver_payout` is written when the completion, tip, or cancellation command finishes. |
 | `payment_intent.payment_failed` | Updates the `PaymentIntents` status row. |
 | `payment_intent.attached` | No-op. |
 | `account.updated` | Updates the Stripe status of the fleet or driver that owns the account. See below. |
