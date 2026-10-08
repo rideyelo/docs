@@ -144,9 +144,10 @@ Every CI message goes to an incoming webhook. The API reads its webhook from Sec
 
 | Event | Sender | Webhook | Message |
 | --- | --- | --- | --- |
-| API promoted | `cloudbuild.yaml` **Notify Slack** | Secret `yelo-api-deploy-slack-webhook` | `🚀 API deployed · production · GCP Cloud Run/us-central1 · yelo-api-testflight@<revision> · <sha8> "<title>" · author <name> · startup <time> · <date>` |
-| API release failed | `release-api.yml` | Secret `yelo-api-deploy-slack-webhook`, read with `gcloud secrets versions access` | `🚨 API release failed · production · <build status> · GitHub Actions · Cloud Build · <sha8> "<title>"` |
-| Web deployed | `firebase.yml` | `SLACK_WEBHOOK_URL` | `🚀 Web deployed · production · Firebase Hosting · <sites> · <sha8> · PR #<n> "<title>" · <people> · <date>` |
+| API promoted | `release-api.yml` **Notify Slack on direct release success**, or `cloudbuild.yaml` **Notify Slack** | Secret `yelo-api-deploy-slack-webhook` | `*API deployed* · <author> · <title>`, then `gcp · github · pr · build <time> · deploy <time>` |
+| API release failed | `release-api.yml` | Secret `yelo-api-deploy-slack-webhook`, read with `gcloud secrets versions access` | `*API release failed* · <author> · <title>`, then `gcp · github · pr · <stage> failed` |
+| Web deployed | `firebase.yml` | `SLACK_WEBHOOK_URL` | `*Web deployed* · <author> · <title>`, then `firebase · github · pr · <sites>` |
+| Worker deployed | `workers.yml` | `SLACK_WEBHOOK_URL` | `*Worker deployed* · <author> · <title>`, then `cloudflare · github · pr · <worker>` |
 | EAS builds queued | `build.yml` | `SLACK_WEBHOOK_URL` | `:hammer_and_wrench: Queued EAS builds: <targets>; auto-submit: <platforms> — by <actor>. <EAS URL>` |
 | EAS dispatch failed | `build.yml` | `SLACK_WEBHOOK_URL` | `:x: EAS build dispatch failed — by <actor>. <run URL>` |
 | iOS staging built | `staging-build-slack.yml` | `SLACK_WEBHOOK_URL` | Block Kit header `iOS staging <version> (<build>)`, source and runtime, **Install build** button, QR image |
@@ -157,12 +158,33 @@ Every CI message goes to an incoming webhook. The API reads its webhook from Sec
 
 In the OTA staged and promoted alerts, `<sha8>` links to the source commit page and each platform name links to its Expo update group. The staged alert's **promote** link opens the **OTA Promote** workflow, and its commit message is escaped for `&`, `<`, and `>`. Open the commit link to copy the full source SHA for **OTA Promote**. Runtime versions and group IDs are no longer in the message. Find them in the workflow run summary.
 
-The deploy formatters, `yelo-api/scripts/release/format-deploy-slack.sh`, `format-release-failure-slack.sh`, and `yelo-web/scripts/format-firebase-deploy-slack.sh`, share these rules:
+The API, web, and worker deploy alerts share one compact two-line shape, matching the OTA alerts:
+
+```text
+*API deployed* · 0cj · referral: befriend invited signups
+gcp · github · pr · build 58s · deploy 1m 6s
+
+*API release failed* · 0cj · referral: befriend invited signups
+gcp · github · pr · smoke failed
+
+*Web deployed* · 0cj · invite: lead with the store
+firebase · github · pr · signup · invite
+```
+
+- **First line.** The bold event, the PR author, and the PR title. When no merged PR is found for the commit, the commit author and subject are used and the **pr** link is dropped.
+- **Second line.** Links to the host console (**gcp**, **firebase**, or **cloudflare**), the GitHub Actions run (**github**), and the PR (**pr**), then the detail:
+  - API success: build and deploy durations measured in the release job.
+  - API failure: the first failed stage, such as `migrate failed` or `smoke failed`. The Cloud Build backend adds a **build** link and reports `cloud build <status>`.
+  - Web: each deployed site, linked to its `<target>.web.app` Hosting address. When every registered site deploys, the line reads `all sites`.
+  - Worker: the worker name.
+- **Dropped fields.** The emoji, environment, platform, service and revision, merger, startup time, commit SHA, and timestamp are no longer in the message.
+
+The formatters, `yelo-api/scripts/release/format-deploy-slack.sh`, `format-release-failure-slack.sh`, and `yelo-web/scripts/format-deploy-slack.sh`, share these rules:
 
 - Every field is required unless noted, whitespace-collapsed, length-capped, and escaped for `&`, `<`, and `>`.
-- Link URLs must be HTTPS on an allowed host: `github.com`, `console.cloud.google.com`, or `console.firebase.google.com`. Any `|`, `<`, `>`, or newline fails the formatter.
-- Timestamps render with Slack's `<!date^...^{date_short_pretty} {time}|fallback>` so each reader sees local time.
-- The people field reads `author X · merged by Y`, `X (author & merger)`, or `author X` when no merger is known.
+- Link URLs must be HTTPS on an allowed host: `github.com`, `console.cloud.google.com`, `console.firebase.google.com`, or `dash.cloudflare.com`. Any `|`, `<`, `>`, or newline fails the formatter.
+
+In `yelo-web`, `scripts/notify-deploy-slack.sh` looks up the merged PR and posts the payload for both **Firebase** and **Workers**. If `SLACK_WEBHOOK_URL` is unset, it logs a warning and exits `0`.
 - The web workflow also checks that the webhook host is `hooks.slack.com` before posting.
 
 Tests cover them: `scripts/release/release_scripts_test.sh` in the API (run by **Migration Policy**) and `pnpm test:deploy-slack` in web.

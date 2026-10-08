@@ -1,6 +1,6 @@
 ---
 title: "Web build helpers and fixtures"
-description: "The yelo-web scripts and dev fixtures not covered by the multisite docs: the home-site build wrapper, the /fleets coverage map generator, the school-management UI fixture, and Cloudflare worker package scripts."
+description: "The yelo-web scripts and dev fixtures not covered by the multisite docs: the home-site build wrapper, the /fleets coverage map generator, the school-management UI fixture, Cloudflare worker scripts, the og workerd smoke test, and deploy alert scripts."
 ---
 
 Most `yelo-web` scripts are covered in [Multisite](/engineering/web/multisite) and [Public sites](/engineering/web/public-sites). This page covers the remaining helpers.
@@ -13,7 +13,9 @@ Most `yelo-web` scripts are covered in [Multisite](/engineering/web/multisite) a
 | `scripts/gen-fleets-map.mjs` | `node scripts/gen-fleets-map.mjs` | Regenerates `src/sites/home/public/map/us-growth-map.svg`, the coverage map on `/fleets` |
 | `tools/testing/schools/` | `pnpm exec vite --config tools/testing/schools/vite.config.ts` | Standalone fixture for the dashboard school-management UI |
 | `tools/vite/home/gen-home-images.ts` | `pnpm images:home` | Home-site responsive images. See [Public sites](/engineering/web/public-sites) |
-| `scripts/format-firebase-deploy-slack.sh` | CI | Formats the Firebase deploy Slack message. Tested by `pnpm test:deploy-slack` |
+| `scripts/notify-deploy-slack.sh` | CI | Resolves the merged PR for the deployed commit and posts the web or worker deploy alert to `SLACK_WEBHOOK_URL`. Skips with a warning when the secret is unset |
+| `scripts/format-deploy-slack.sh` | CI | Formats the two-line **Web deployed** or **Worker deployed** Slack message, selected by `DEPLOY_KIND`. Tested by `pnpm test:deploy-slack` |
+| `scripts/og-worker-smoke.sh` | CI, or locally | Renders six invite cards concurrently through `yelo-og` in workerd and fails unless every response is a PNG |
 
 ## Home-site build wrapper
 
@@ -40,7 +42,7 @@ Use it to check UI behavior: deactivation previews, filters, provenance display,
 
 ## Cloudflare worker scripts
 
-Each worker has `check`, `dev`, and `deploy` package scripts that wrap `wrangler`:
+Each worker has `check`, `dev`, and `deploy` package scripts that wrap `wrangler`. The **Workers** GitHub Actions workflow runs every `check` on pull requests and deploys changed workers on merge to `main`, so you rarely need the `deploy` scripts. See [Cloudflare Workers](/engineering/ci/release-pipelines#cloudflare-workers).
 
 | Worker | Check | Dev | Deploy | Tests |
 | --- | --- | --- | --- | --- |
@@ -48,7 +50,23 @@ Each worker has `check`, `dev`, and `deploy` package scripts that wrap `wrangler
 | `experience-router` | `pnpm worker:experience-router:check` | `pnpm worker:experience-router:dev` | `pnpm worker:experience-router:deploy` | `pnpm test:experience-router` |
 | `og` | `pnpm worker:og:check` | `pnpm worker:og:dev` | `pnpm worker:og:deploy` | `pnpm test:og` |
 
-`check` verifies the generated `worker-configuration.d.ts` is current (router workers only), typechecks the worker, and runs `wrangler deploy --dry-run`. For what each worker does, see [Edge and routing](/engineering/web/edge-and-routing).
+`check` verifies the generated `worker-configuration.d.ts` is current (router workers only), typechecks the worker, and runs `wrangler deploy --dry-run`. Run it before you consider any worker change done. It catches bundle-size and binding errors that `tsc` alone can't. For what each worker does, see [Edge and routing](/engineering/web/edge-and-routing).
+
+### Smoke-testing the og worker in workerd
+
+`pnpm test:og` runs satori in Node, which can hide a dependency that fails only in the Workers runtime. Before you change `og` dependencies, run the same smoke test CI runs:
+
+```bash
+./scripts/og-worker-smoke.sh
+```
+
+The script starts `wrangler dev` on port `8799` (override with `OG_SMOKE_PORT`) with a throwaway signing secret, signs six invite card URLs through `/og/_sign`, and fetches them at the same time. Concurrent requests to a cold isolate are what expose a lazily initialized WASM module. On failure it prints the `wrangler dev` log and exits `1`.
+
+Keep `satori` below `0.33`. Version 0.33 loads harfbuzzjs, which crashes `yelo-og` at startup on Workers. `package.json` pins `^0.32.0` and Dependabot ignores `>=0.33.0`.
+
+### Deploying a worker
+
+Merging to `main` deploys every worker whose own directory changed. A change to only `package.json` or `pnpm-lock.yaml` is verified but not deployed. To ship it, open **Actions → Workers → Run workflow** in `yelo-web` and pick the worker. `pnpm worker:<name>:deploy` still works from a machine logged in to Wrangler.
 
 ## Where this lives in code
 
@@ -58,3 +76,5 @@ Each worker has `check`, `dev`, and `deploy` package scripts that wrap `wrangler
 | Coverage map | `yelo-web/scripts/gen-fleets-map.mjs`, `src/sites/home/public/map/us-growth-map.svg`, `src/sites/home/fleets/FleetsPage.tsx` |
 | School fixture | `yelo-web/tools/testing/schools/` |
 | Worker scripts | `yelo-web/package.json`, `workers/*/wrangler.jsonc` |
+| Worker CI and smoke test | `yelo-web/.github/workflows/workers.yml`, `scripts/og-worker-smoke.sh` |
+| Deploy alerts | `yelo-web/scripts/notify-deploy-slack.sh`, `scripts/format-deploy-slack.sh` |
