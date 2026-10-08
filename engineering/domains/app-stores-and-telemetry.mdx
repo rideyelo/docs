@@ -18,6 +18,7 @@ For how the shared-secret and webhook signatures fit into the wider auth model, 
 | `POST` | `/internal/e2e/runs` | `X-E2e-Key`, only when `E2E_ENABLED` | `e2econtrol.Handler.Create` |
 | `GET` | `/internal/e2e/runs/{id}` | `X-E2e-Key` | `e2econtrol.Handler.Get` |
 | `POST` | `/internal/e2e/runs/{id}/ride-transition` | `X-E2e-Key` | `e2econtrol.Handler.TransitionRide` |
+| `POST` | `/internal/e2e/runs/{id}/benchmark-presence` | `X-E2e-Key` | `e2econtrol.Handler.RefreshBenchmarkPresence` |
 | `DELETE` | `/internal/e2e/runs/{id}` | `X-E2e-Key` | `e2econtrol.Handler.Delete` |
 | `GET` | `/healthcheck` | Public | `healthcheck.HttpHandler.Healthcheck` |
 | `GET` | `/healthcheck/deep` | Public | `HttpHandler.DeepHealth` |
@@ -200,7 +201,7 @@ The `/internal/e2e` group is mounted only when `config.Load().E2E.Enabled` is tr
 
 ### Scenarios
 
-`POST /internal/e2e/runs` takes `scenario` and `idempotency_key` (required, at most 200 characters). A repeated key returns the existing run. Before creating, the handler expires up to 100 active runs past `expires_at`.
+`POST /internal/e2e/runs` takes `scenario` and `idempotency_key` (required, at most 200 characters), plus an optional `benchmark` object that only `auth_existing_rider` accepts. See [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-benchmark-replays). A repeated key returns the existing run. Before creating, the handler expires up to 100 active runs past `expires_at`.
 
 | Scenario | Creates |
 | --- | --- |

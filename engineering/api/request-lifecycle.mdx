@@ -57,12 +57,12 @@ The router registers these in order. Fuego applies them to each route when it's 
 | 1 | `middleware.Recoverer` (Chi) | Recovers panics and returns 500 |
 | 2 | `sentryhttp` | Only when Sentry is initialized; re-panics after capture |
 | 3 | `contextSetRequestInfo` | Generates a UUID request ID, stores method, path, `Origin`, and the start time in context |
-| 4 | `otelInstrumentation` | Wraps the request in an `otelhttp` span, records request and response size, inflight gauge, slow requests, and error counters. Span names and the `http.route` label use the raw path, because Fuego routes on `http.ServeMux` and the middleware looks for a Chi route pattern. See [Metrics](/reference/metrics#spans) |
+| 4 | `otelInstrumentation` | Wraps the request in an `otelhttp` span, sets the `X-Request-ID` response header, records request and response size, inflight gauge, slow requests, and error counters. For `POST /ride/v2/` it also records per-stage timing (see [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-api-records)). Span names and the `http.route` label use the raw path, because Fuego routes on `http.ServeMux` and the middleware looks for a Chi route pattern. See [Metrics](/reference/metrics#spans) |
 | 5 | `contextSetLogger` | Attaches a zerolog logger with trace correlation fields to the context |
 | 6 | `rateLimit` | Per-IP token bucket (see [Rate limiting](#rate-limiting)) |
 
 <Note>
-The request ID is generated per request. The API does not read an incoming `X-Request-ID` header. The ID appears in `metadata.request_id` on every standard response and on log lines.
+The request ID is generated per request. The API does not read an incoming `X-Request-ID` header. The ID appears in `metadata.request_id` on every standard response, in the `X-Request-ID` response header, and on log lines.
 </Note>
 
 A request is logged as slow when it exceeds `SLOW_REQUEST_THRESHOLD_MS` (default 150). See [Observability](/engineering/observability) for the metrics and traces this produces.
