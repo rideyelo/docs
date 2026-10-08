@@ -17,21 +17,21 @@ Versions come from `package.json` and `app.json` on `main`.
 
 | Layer | Library | Version |
 | --- | --- | --- |
-| Runtime | Expo SDK | `~57.0.22` |
+| Runtime | Expo SDK | `~57.0.27` |
 | Runtime | React Native (New Architecture) | `0.86.3` |
 | Runtime | React (React Compiler on) | `19.2.3` |
-| Routing | `expo-router` (typed routes on) | `~57.0.21` |
-| Server state | `@tanstack/react-query` + persist client | `^5.102.8` |
+| Routing | `expo-router` (typed routes on) | `~57.0.25` |
+| Server state | `@tanstack/react-query` + persist client | `^5.104.1` |
 | Client state | `zustand` | `^5.0.15` |
-| HTTP | `axios` + Orval-generated hooks | `^1.20.0` / Orval `8.31.0` |
-| Validation | `zod` | `^4.6.2` |
+| HTTP | `axios` + Orval-generated hooks | `^1.20.0` / Orval `8.40.0` |
+| Validation | `zod` | `^4.6.5` |
 | UI theme | `react-native-paper` (MD3) + `phosphor-react-native` icons | `^5.15.3` / `^3.0.6` |
-| Maps | `@rnmapbox/maps` (Mapbox SDK `11.20.1` via plugin) | `^10.3.5` |
+| Maps | `@rnmapbox/maps` (Mapbox SDK `11.23.1` via plugin) | `^10.3.7` |
 | Animation | `react-native-reanimated` + `react-native-worklets` | `4.5.1` / `^0.10.3` |
 | Sheets | `@gorhom/bottom-sheet` | `^5.2.14` |
 | Payments | `@stripe/stripe-react-native` | `0.64.0` |
-| Errors | `@sentry/react-native` | `^8.24.0` |
-| Analytics | `posthog-react-native` + session replay | `^4.70.0` |
+| Errors | `@sentry/react-native` | `^8.29.0` |
+| Analytics | `posthog-react-native` + session replay | `^4.79.1` |
 | Attribution | `@dub/react-native` | `^0.0.3` |
 | Logging | `react-native-logs` | `^5.6.0` |
 | Tooling | oxlint, oxfmt, ESLint (React Compiler rules), `tsgo`, Jest (`jest-expo`) | see `package.json` |
@@ -176,6 +176,7 @@ The patched packages are `expo-glass-effect@57.0.4` and `expo-linear-gradient@57
 
 Before any component mounts, the root layout:
 
+- Imports `@/lib/theme/appearanceLock`, which calls `Appearance.setColorScheme('light')` before any native view mounts. See [Theming](#theming).
 - Imports `@/widgets` so Live Activity layouts register with the native module.
 - Calls `installRideStatusProtocol(queryClient)` to attach the ride-state interceptors to `/user/status`. See [State and data](/engineering/mobile/state-and-data).
 - Configures `Observe` (`expo-observe`) with a list of filtered route params so IDs, codes, coordinates, and PKCE values never leave the device.
@@ -242,7 +243,12 @@ The root layout also polls `GET /update-required` every 10 minutes while foregro
 
 ## Theming
 
-The app has one light theme. There is no dark mode.
+The app has one light theme. There is no dark mode, and the app is locked to light appearance in two places:
+
+- `app.json` sets `userInterfaceStyle: light`, so binaries from 5.8.0 on are light natively.
+- `lib/theme/appearanceLock.ts` calls `Appearance.setColorScheme('light')` at import time. Binaries before 5.8.0 shipped `userInterfaceStyle: automatic`, which let native materials follow system Dark Mode, so Liquid Glass drew its dark variant over the light map. The JavaScript lock pins the whole window for those binaries.
+
+Surfaces that pass an explicit `colorScheme="dark"`, such as the driver screens, stay dark. The module also exports `systemColorSchemeAtLaunch`, the OS setting read before the lock, which analytics reports as `display_color_scheme`. See [Analytics events](/reference/analytics-events#super-properties-and-default-context).
 
 - `lib/theme/index.ts` exports `yeloLightTheme`, an MD3 theme extended with `yeloColors` and `textColors`, and passes it to `PaperProvider`. Read it with `useTheme()` from `@/lib/theme`.
 - `rem(n)` converts to pixels on a 16px base and scales up to 1.5x on screens wider than 600pt. `remFixed(n)` skips the tablet scale for the driver overlays.

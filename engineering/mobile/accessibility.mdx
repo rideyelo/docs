@@ -1,6 +1,6 @@
 ---
 title: "Accessibility"
-description: "What the mobile app does today for screen readers, Dynamic Type, Reduce Motion, and touch targets, with usage counts from the code and the places where coverage is uneven."
+description: "What the mobile app does today for screen readers, Dynamic Type, Reduce Motion, Increase Contrast, and touch targets, with usage counts from the code and the places where coverage is uneven."
 ---
 
 This page describes the accessibility support that exists in `yelo-frontend` today. It is a survey of the code, not a standard the app meets. There is no accessibility test suite, and coverage differs a lot between folders.
@@ -27,7 +27,7 @@ The counts below are line matches across the 469 non-test `.tsx` files in `app/`
 | `adjustsFontSizeToFit` | 18 | 11 | Shrinks single-line text to fit |
 | `allowFontScaling` | 4 | 3 | One JSX use on the entry screen title in `app/(auth-v3)/index.tsx`, the root default in `app/_layout.tsx` described below, and a comment in `YeloText.tsx` |
 
-The app does not use `accessibilityActions`, `accessibilityViewIsModal`, `AccessibilityInfo.announceForAccessibility`, or `AccessibilityInfo.isScreenReaderEnabled`. No code branches on whether a screen reader is running.
+The app does not use `accessibilityActions`, `accessibilityViewIsModal`, or `AccessibilityInfo.announceForAccessibility`. `AccessibilityInfo.isScreenReaderEnabled` is read only for the `a11y_screen_reader` analytics property (`lib/analytics/displayEnvironment.ts`). No code branches on whether a screen reader is running.
 
 ## Screen reader support
 
@@ -141,6 +141,19 @@ Motion handling is split across three mechanisms:
 
 The hooks gate decorative and looping animation. Nothing in the app applies Reduce Motion globally, so an animation that calls none of these still runs.
 
+## Increase Contrast
+
+With iOS **Increase Contrast** on (**Settings → Accessibility → Display & Text Size**), UIKit draws `clear` Liquid Glass as a dark, see-through grey in every color scheme. `regular` glass stays a light frosted material. `YeloGlassView` swaps the style for you.
+
+| Export in `lib/theme/increaseContrast.ts` | What it does |
+| --- | --- |
+| `useIncreaseContrast()` | `true` while the setting is on. The first subscriber reads `AccessibilityInfo.isDarkerSystemColorsEnabled()` and subscribes to `darkerSystemColorsChanged`, so a settings change applies without a restart. It is `false` until that read resolves, and stays `false` where the platform can't answer. |
+| `contrastSafeGlassStyle(style, increaseContrast)` | Returns `regular` in place of `clear` when the setting is on, for both the string and the object form of `glassEffectStyle`. `regular` and `none` pass through. |
+
+`YeloGlassView` applies the swap only to the native `GlassView`. The blur fallback is unchanged. `RouteSummary` and `RideCompleteScreen` render `GlassView` from `expo-glass-effect` directly, so they don't get the swap. `RouteSummary` uses `clear`.
+
+Analytics reports the setting as the `a11y_increase_contrast` super property, with the other display and accessibility settings. See [Analytics events](/reference/analytics-events#super-properties-and-default-context).
+
 ## Touch targets
 
 `components/design-system/glassTouchArea.ts` enlarges the hit area of glass controls without moving them.
@@ -205,6 +218,7 @@ What the table shows:
 | Area | Path |
 | --- | --- |
 | Reduce Motion | `hooks/useReduceMotion.ts`, `eas.json` (`e2e-simulator` env) |
+| Increase Contrast | `lib/theme/increaseContrast.ts`, `components/design-system/YeloGlassView.tsx` |
 | Touch targets | `components/design-system/glassTouchArea.ts`, `YeloGlassButton.tsx`, `YeloGlassIconButton.tsx`, `YeloGlassContainer.tsx`, `ActionBar.tsx` |
 | Font scaling | `lib/theme/index.ts` (`MAX_FONT_SIZE_MULTIPLIER`, `cappedFontScale`), `components/design-system/YeloText.tsx`, `YeloTextInput.tsx`, `YeloRawTextInput.tsx`, `app/_layout.tsx` |
 | Labeled primitives | `components/design-system/YeloTileRow.tsx`, `YeloActionTile.tsx`, `YeloGlowButton.tsx`, `YeloAlertDialog.tsx`, `YeloPaymentRow.tsx`, `YeloSelect.tsx`, `ProgressTrack.tsx` |
@@ -218,5 +232,6 @@ What the table shows:
 - **Raw `Text` bypasses the JavaScript cap.** The cap lives in `YeloText`, `YeloTextInput`, and `cappedFontScale()`. Seven files outside `YeloText.tsx` import React Native's `Text` directly: `app/(auth-v3)/index.tsx`, `referral-share.tsx`, `QRBottomSheet.tsx`, and four driver story screens. The story screens pass the native `maxFontSizeMultiplier` instead, which the `YeloText` comment says is not honored.
 - **Two Reduce Motion sources disagree in E2E.** Components on Reanimated's `useReducedMotion` or a direct `AccessibilityInfo` listener still animate in an E2E build, because only the Yelo hook reads `EXPO_PUBLIC_DISABLE_ANIMATIONS`.
 - **A new bottom sheet needs `accessible={false}`.** Use `YeloBottomSheet` or `GlassBottomSheet`. A raw sheet collapses into one element and hides its children from VoiceOver and from E2E selectors.
+- **Raw `GlassView` skips the Increase Contrast swap.** Use `YeloGlassView`. A `clear` `GlassView` from `expo-glass-effect` turns dark grey for users with Increase Contrast on.
 - **Icon-only glass buttons need a label.** `YeloGlassIconButton` passes through whatever `accessibilityLabel` it receives, including none.
 - **`press` is not a selector.** Thirty elements share that `testID`. Add a semantic ID before writing a flow or checklist step against one.
