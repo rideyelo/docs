@@ -106,7 +106,7 @@ Secret names only. Values stay in Secret Manager.
 
 | Group | Secrets | Consumer |
 | --- | --- | --- |
-| Release | `yelo-api-deploy-slack-webhook`, `yelo-api-migration-dsn` | Cloud Build Slack step, `release-api.yml` failure step, `yelo-api-migrate` |
+| Release | `yelo-api-deploy-slack-webhook`, `yelo-api-migration-dsn` | Cloud Build Slack step, the `release-api.yml` steps **Notify Slack on direct release success** and **Notify Slack on release failure**, `yelo-api-migrate` |
 | Auth v3 | `yelo-auth-v3-state-hmac-keys`, `yelo-auth-v3-subject-hmac-key`, `yelo-auth-v3-rate-limit-hmac-key`, `yelo-auth-v3-refresh-token-keys`, `yelo-auth-v3-apple-private-key`, `yelo-auth-v3-google-client-secret`, `yelo-auth-v3-onboarding-jwt-key` | Production API |
 | Integrations | `yelo-og-signing-secret`, `yelo-api-resend-api-key`, `yelo-api-resend-contacts-api-key`, `quo-dashboard-api-key`, `quo-background-api-key`, `yelo-google-calendar-client-secret`, `yelo-google-calendar-token-keys`, `yelo-api-metrics-auth-token` | Production API |
 | E2E | `yelo-e2e-dsn`, `yelo-e2e-jwt-key`, `yelo-e2e-redis-url`, `yelo-e2e-control-api-key`, `yelo-e2e-stripe-api-key`, `yelo-e2e-stripe-publishable-key`, `yelo-e2e-google-maps-api-key`, `yelo-e2e-mapbox-api-key`, `yelo-e2e-auth-state-key`, `yelo-e2e-auth-subject-key`, `yelo-e2e-auth-rate-key`, `yelo-e2e-auth-onboarding-key`, `yelo-e2e-auth-refresh-key` | `yelo-api-e2e` and its migration job |
@@ -205,7 +205,7 @@ Three Workers in `yelo-web/workers/` run on the zones `rideyelo.com` and `joinye
 | `yelo-og` | `workers/og` | `rideyelo.com/og/*`, `www.rideyelo.com/og/*` | `ENVIRONMENT=production`. CPU limit raised to 30,000 ms for PNG rendering |
 | `yelo-world-cup-router` | `workers/world-cup-router` | `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com`: `/world-cup*` | `WORLD_CUP_ORIGIN=https://yelo-world-cup.web.app`, `WORLD_CUP_API_ORIGIN=https://api.rideyelo.com` |
 
-Deploys are manual with `pnpm worker:<name>:deploy`. See [Edge and routing](/engineering/web/edge-and-routing) for behavior and the `OG_SIGNING_SECRET` Wrangler secret.
+The `yelo-web` **Workers** workflow deploys a worker when a merge to `main` changes that worker's own directory. A change to only shared dependencies is verified but not deployed, and you ship it with **Actions → Workers → Run workflow**. `pnpm worker:<name>:deploy` still works by hand. See [GitHub Actions workflows](/engineering/ci/workflows) for the workflow and [Edge and routing](/engineering/web/edge-and-routing) for behavior and the `OG_SIGNING_SECRET` Wrangler secret.
 
 ## EAS (Expo)
 

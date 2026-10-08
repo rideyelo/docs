@@ -12,6 +12,7 @@ This page is the inventory of every workflow under `.github/workflows/` in the t
 | `yelo-api` | `ci.yml` | **CI** | Pull request, manual | Merge gates |
 | `yelo-api` | `release-api.yml` | **Release API** | Push to `main`, manual | Production API release |
 | `yelo-api` | `release-e2e.yml` | **Converge E2E API** | After **Release API**, hourly, manual | Keep `yelo-api-e2e` identical to production |
+| `yelo-api` | `cloud-api-benchmark.yml` | **Benchmark isolated E2E API** | Manual | Compare two API images on `POST /ride/v2/` with zero-traffic `yelo-api-e2e` revisions |
 | `yelo-api` | `propagate-openapi.yml` | **Propagate OpenAPI contract** | Push to `main` touching `openapi.json`, hourly, dispatch, manual | Open client-update PRs in the consumers |
 | `yelo-api` | `sync-frontend-release.yml` | **Sync frontend release branch** | Hourly, manual | Disabled in GitHub. See [Gotchas](#gotchas-and-edge-cases) |
 | `yelo-web` | `ci.yml` | **CI** | Pull request, manual | Quality gate, affected builds, `home` preview |
@@ -32,7 +33,7 @@ This page is the inventory of every workflow under `.github/workflows/` in the t
 | Label | Used by | Notes |
 | --- | --- | --- |
 | `ubuntu-latest` | Lightweight jobs: API **Migration Policy** and **Coverage**, **Release API** on the Cloud Build backend, the API bot workflows, frontend backport and finalize, E2E `resolve-app` | GitHub-hosted |
-| `blacksmith-2vcpu-ubuntu-2404` | Web CI, Firebase deploy, and Workers, frontend CI, Fingerprint, EAS Build, OTA Promote, API **Converge E2E API** | Blacksmith-hosted. Frontend CI measured cheaper on 2 vCPU x64 than on arm |
+| `blacksmith-2vcpu-ubuntu-2404` | Web CI, Firebase deploy, and Workers, frontend CI, Fingerprint, EAS Build, OTA Promote, API **Converge E2E API** and **Benchmark isolated E2E API** | Blacksmith-hosted. Frontend CI measured cheaper on 2 vCPU x64 than on arm |
 | `blacksmith-4vcpu-ubuntu-2404` | API **Generated Code**, **Lint**, **Unit Tests**, **Integration Tests**, **Release API** when `API_RELEASE_BUILDER` is `blacksmith`, and **OTA Stage** | OTA Stage stays on x64 because `hermesc` ships for linux-x64 only |
 | `self-hosted`, `macOS`, `ARM64`, `yelo-e2e` | **Mobile E2E** (default) | The team's Mac. Keeps its pnpm store and a build cache in `~/.cache/yelo-e2e-builds` between runs |
 | `macos-15` | **Mobile E2E** with `runner: github-hosted` | Paid fallback |
@@ -117,7 +118,18 @@ See [Release pipelines](/engineering/ci/release-pipelines#api) for what Cloud Bu
 - **Permissions:** `contents: read`, `id-token: write`.
 - **Variables:** `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_RELEASE_SERVICE_ACCOUNT`, `E2E_DATABASE_PROJECT_REF`, `E2E_SERVICE_ACCOUNT`, `PRODUCTION_DATABASE_PROJECT_REF`.
 
-One job, **Match production**, on Blacksmith 2 vCPU with a 25-minute timeout. It reads the production revision's commit, image digest, and `migration-version`, compares them with `yelo-api-e2e`, and runs `gcloud builds submit --config=cloudbuild.e2e.yaml` only on drift. A healthy run stops before checkout. See [Release pipelines](/engineering/ci/release-pipelines#e2e-convergence).
+One job, **Match production**, on Blacksmith 2 vCPU with a 25-minute timeout. It reads the production revision's commit, image digest, and `migration-version`, compares them with `yelo-api-e2e`, and runs `gcloud builds submit --config=cloudbuild.e2e.yaml` only on drift. Every run first checks out the workflow's own commit and runs `python3 scripts/ride-replay/cloud.py sweep` to remove expired benchmark tags, with `continue-on-error`. A healthy run stops before it checks out the production source. See [Release pipelines](/engineering/ci/release-pipelines#e2e-convergence).
+
+### Benchmark isolated E2E API (`cloud-api-benchmark.yml`)
+
+- **Triggers:** `workflow_dispatch` only, with inputs `baseline_image` and `candidate_image` (required image digests), `manifest` (default `scripts/ride-replay/manifest.benchmark.json`), `iterations` (default `50`, 1 to 200), and `concurrency` (default `1`, 1 to 20).
+- **Gate:** the job runs only when the variable `E2E_RELEASE_ENABLED` is `true`.
+- **Concurrency:** `e2e-api-convergence`, not cancelled. It shares the lock with **Converge E2E API**, so a benchmark and a convergence never change `yelo-api-e2e` at the same time.
+- **Permissions:** `contents: read`, `id-token: write`.
+- **Variables:** `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_RELEASE_SERVICE_ACCOUNT`, and the optional `E2E_BENCHMARK_OTLP_ENDPOINT`. The control key comes from the Secret Manager secret `yelo-e2e-control-api-key`, not from a GitHub secret.
+- **Artifacts:** `cloud-api-benchmark-<run id>-<attempt>` from `.benchmark-results/`, hidden files included, kept 14 days, uploaded even on failure.
+
+One job, **benchmark**, on Blacksmith 2 vCPU with a 90-minute timeout. It sweeps expired benchmark tags, runs `scripts/ride-replay/cloud.py run`, and always runs `cloud.py cleanup` on the session file when one exists. See [Ride replay benchmark](/engineering/qa/ride-replay-benchmark).
 
 ### Propagate OpenAPI contract (`propagate-openapi.yml`)
 

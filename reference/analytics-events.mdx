@@ -13,7 +13,7 @@ Source paths are relative to each repository root: `yelo-api`, `yelo-web`, and `
 
 The API sends events to PostHog in two ways:
 
-- **Metrics provider.** `PostHogMetricsProvider` in `internal/utilities/metrics/posthog.go` turns `IncrementCounter`, `RecordHistogram`, and `SetGauge` calls into captures. It drops names that start with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` (`isBusinessMetric`, line 222). `cmd/api/main.go:175` wires it into `MultiMetricsProvider` only when `cfg.Telemetry.OtelEnabled` is true. Otherwise the API uses `NoOpMetricsProvider` and sends no business events.
+- **Metrics provider.** `PostHogMetricsProvider` in `internal/utilities/metrics/posthog.go` turns `IncrementCounter`, `RecordHistogram`, and `SetGauge` calls into captures. It drops names that start with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, `runtime.`, or `ride.operation.` (`isBusinessMetric`, line 222). `cmd/api/main.go:175` wires it into `MultiMetricsProvider` only when `cfg.Telemetry.OtelEnabled` is true. Otherwise the API uses `NoOpMetricsProvider` and sends no business events.
 - **Direct client.** `AuthV2Service.captureEvent` (`internal/service/authv2/authv2.go:189`) calls `posthog.Enqueue` directly. It skips the metrics provider and the `OtelEnabled` gate.
 
 Every other `IncrementCounter`, `RecordHistogram`, or `SetGauge` call in `internal/` uses a dropped prefix (`http.server.*`, `db.pool.*`, `rate.limiter.*`). Right now `authv3.step` is the only metric that reaches PostHog.

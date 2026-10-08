@@ -156,7 +156,9 @@ Partial index `e2e_runs_expiry_idx` on `expires_at` where active. The handler cl
 
 ## River job queue
 
-River (`github.com/riverqueue/river` v0.47.0) is the durable job queue for notifications, calendar sync, contact sync, Quo, top locations, place identity backfill, Play release checks, GTM, Stripe, and payment reconciliation. Its tables are created by the repository's own migrations `000242_river_v1` through `000248_river_v7`, which copy River's main migrations 001 to 007. The app never runs River's migrator.
+River (`github.com/riverqueue/river` v0.48.0) is the durable job queue for notifications, calendar sync, contact sync, Quo, top locations, place identity backfill, Play release checks, GTM, Stripe, and payment reconciliation. Its tables are created by the repository's own migrations `000242_river_v1` through `000248_river_v7`, which copy River's main migrations 001 to 007. The app never runs River's migrator.
+
+River 0.48.0 adds main migration 008, which changes only SQLite, so the repository has no copy of it. The release also derives `UniqueOpts.ByPeriod` keys from a job's effective scheduled time, measured in UTC. River's changelog says old and new clients can each insert one job for the same period during a rolling upgrade, but only for `ByPeriod` jobs that set `ScheduledAt` or are inserted from a process whose local time zone isn't UTC. Every `ByPeriod` job in `yelo-api` is a periodic job inserted without `ScheduledAt` (`internal/notify/queue/queue.go`, `share_link_sync.go`).
 
 The client is built in `internal/notify/queue/queue.go` with `riverpgxv5` on the dedicated River pool (see [Data layer](/engineering/api/data-layer#connection-pools)). Queues and worker limits:
 

@@ -31,7 +31,7 @@ The default registry also exposes a `target_info` series with resource attribute
 `cmd/api/main.go:168` builds a `MultiMetricsProvider` with two backends when `OTEL_ENABLED` is true:
 
 - `OtelMetricsProvider` (`internal/utilities/metrics/otel.go`) records everything below.
-- `PostHogMetricsProvider` (`internal/utilities/metrics/posthog.go`) forwards only `IncrementCounter`, `RecordHistogram`, and `SetGauge` calls whose name doesn't start with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` (`posthog.go:222`). Today that's only `authv3.step`. The `auth.v2.*` events go to the PostHog client directly and don't pass through this provider.
+- `PostHogMetricsProvider` (`internal/utilities/metrics/posthog.go`) forwards only `IncrementCounter`, `RecordHistogram`, and `SetGauge` calls whose name doesn't start with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, `runtime.`, or `ride.operation.` (`posthog.go:222`). Today that's only `authv3.step`. The `auth.v2.*` events go to the PostHog client directly and don't pass through this provider.
 
 When `OTEL_ENABLED` is false, both backends are replaced by `NoOpMetricsProvider`, which also stops `authv3.step` from reaching PostHog. Direct `auth.v2.*` captures are unaffected.
 
@@ -42,28 +42,39 @@ When `OTEL_ENABLED` is false, both backends are replaced by `NoOpMetricsProvider
 <AccordionGroup>
 <Accordion title="HTTP server (Yelo middleware)">
 
-Recorded in `otelInstrumentation` (`internal/server/http/middleware_otel.go:48`) for every request.
+Recorded in `otelInstrumentation` (`internal/server/http/middleware_otel.go:49`) for every request.
 
 | OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
 | --- | --- | --- | --- | --- | --- |
-| `http.server.errors` | `http_server_errors_total` | Counter | `http.method`, `http.route`, `http.status_code`, `error_type` (`client_error`, `server_error`, `response_write`) | Responses with status 400 or higher, or a failed write | Yes, `middleware_otel.go:161` |
-| `http.server.slow.requests` | `http_server_slow_requests_total` | Counter | `http.method`, `http.route`, `http.status_code` | Requests slower than `SLOW_REQUEST_THRESHOLD_MS` (default 150) | Yes, `middleware_otel.go:130` |
-| `http.server.request.size` | `http_server_request_size_bucket` | Histogram, default buckets, no unit | `http.method`, `http.route` | Request `Content-Length` when positive | Yes, `middleware_otel.go:109` |
-| `http.server.response.size` | `http_server_response_size_bucket` | Histogram, default buckets, no unit | `http.method`, `http.route` | Bytes written | Yes, `middleware_otel.go:122` |
-| `http.server.inflight` | `http_server_inflight` | Gauge | None | In-flight requests, sampled after each request completes | Yes, `middleware_otel.go:118` |
+| `http.server.errors` | `http_server_errors_total` | Counter | `http.method`, `http.route`, `http.status_code`, `error_type` (`client_error`, `server_error`, `response_write`) | Responses with status 400 or higher, or a failed write | Yes, `middleware_otel.go:176` |
+| `http.server.slow.requests` | `http_server_slow_requests_total` | Counter | `http.method`, `http.route`, `http.status_code` | Requests slower than `SLOW_REQUEST_THRESHOLD_MS` (default 150) | Yes, `middleware_otel.go:145` |
+| `http.server.request.size` | `http_server_request_size_bucket` | Histogram, default buckets, no unit | `http.method`, `http.route` | Request `Content-Length` when positive | Yes, `middleware_otel.go:107` |
+| `http.server.response.size` | `http_server_response_size_bucket` | Histogram, default buckets, no unit | `http.method`, `http.route` | Bytes written | Yes, `middleware_otel.go:137` |
+| `http.server.inflight` | `http_server_inflight` | Gauge | None | In-flight requests, sampled after each request completes | Yes, `middleware_otel.go:133` |
 | `http.server.requests` | `http_server_requests_total` | Counter | `http.method`, `http.route`, `http.status_code` | Request count | Never. `RecordHTTPRequest` has no callers. |
 | `http.server.duration` | `http_server_duration_seconds` | Histogram, buckets 0.001 to 10 s | `http.method`, `http.route`, `http.status_code` | Request latency | Never. `RecordHTTPRequest` has no callers. |
 
-`http.route` is always the raw URL path. `resolvedRoutePattern` (`middleware_otel.go:205`) reads Chi's route context, but Fuego registers routes on a standard `http.ServeMux`, so that context is never set. Every path that embeds an ID creates its own series.
+`http.route` is always the raw URL path. `resolvedRoutePattern` (`middleware_otel.go:226`) reads Chi's route context, but Fuego registers routes on a standard `http.ServeMux`, so that context is never set. Every path that embeds an ID creates its own series.
 
 The size, inflight, and error metrics are recorded through the generic `RecordHistogram`, `SetGauge`, and `IncrementCounter` methods. Those create instruments on demand with no unit or custom buckets. The typed fields registered for the same names in `otel.go:222-266` are never used.
 
 `OtelMetricsProvider.SetGauge` caches instruments in a plain map with no lock (`otel.go:505`, `:514`). `http.server.inflight` is set on every request while the pool monitors set their own gauges, so the first write of a new gauge name can race with concurrent reads.
 
 </Accordion>
+<Accordion title="Ride creation (POST /ride/v2/)">
+
+Recorded in `otelInstrumentation` only for `POST /ride/v2/`, once per completed measurement, after the handler returns.
+
+| OpenTelemetry name | Prometheus name | Type | Labels | Meaning | Recorded |
+| --- | --- | --- | --- | --- | --- |
+| `ride.operation.duration` | `ride_operation_duration_bucket` | Histogram, default buckets, no unit | `operation`, `kind` (`stage`, `postgres`, `postgres_pool`, `redis`, `http`), `outcome` (`ok`, `error`) | Duration in seconds of one stage or dependency call inside a ride request | Yes, `middleware_otel.go:126` |
+
+`operation` is a static stage name, a sqlc query name, a Redis command name, or a provider client name. It never holds an ID, SQL text, or a URL. The same request also logs one `ride performance completed` line with the full summary. See [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-api-records) for the stage list and the summary shape.
+
+</Accordion>
 <Accordion title="HTTP server and client (otelhttp)">
 
-`otelhttp.NewHandler` wraps every request, and `NewInstrumentedHTTPClient` (`internal/utilities/otel/http.go:12`) wraps the Mapbox and Quo clients. The library emits OpenTelemetry semantic-convention metrics on its own.
+`otelhttp.NewHandler` wraps every request, and `NewInstrumentedHTTPClient` (`internal/utilities/otel/http.go:15`) builds the Mapbox, Quo, and Stripe clients, each with a 10-second timeout. The library emits OpenTelemetry semantic-convention metrics on its own.
 
 | OpenTelemetry name | Prometheus name | Type | Labels |
 | --- | --- | --- | --- |
@@ -84,14 +95,14 @@ These are the only request-latency series the API exports today.
 | `pool.total` | `pool_total` | Gauge | `pool` | Open connections | Yes, same |
 | `pool.idle` | `pool_idle` | Gauge | `pool` | Idle connections | Yes, same |
 | `pool.acquired` | `pool_acquired` | Gauge | `pool` | Connections in use. For Redis this is total minus idle. | Yes, same |
-| `db.pool.total_conns` | `db_pool_total_conns` | Gauge | None | Postgres open connections | Yes, `internal/data/repository/storage.go:533` |
-| `db.pool.idle_conns` | `db_pool_idle_conns` | Gauge | None | Postgres idle connections | Yes, `storage.go:534` |
-| `db.pool.acquired_conns` | `db_pool_acquired_conns` | Gauge | None | Postgres connections in use | Yes, `storage.go:535` |
-| `db.pool.max_conns` | `db_pool_max_conns` | Gauge | None | Postgres pool size | Yes, `storage.go:536` |
-| `db.pool.utilization` | `db_pool_utilization` | Gauge | None | Acquired divided by max | Yes, `storage.go:537` |
-| `db.pool.empty_acquire_count` | `db_pool_empty_acquire_count_total` | Counter | None | pgx's cumulative `EmptyAcquireCount`, added in full on every tick, so the counter grows by the running total and its rate is not an acquire rate | Yes, `storage.go:540` |
-| `db.pool.acquire_duration` | `db_pool_acquire_duration_bucket` | Histogram | None | pgx's cumulative `AcquireDuration` in seconds, recorded as one sample every tick, so the buckets describe a growing total, not per-acquire waits | Yes, `storage.go:541` |
-| `db.pool.leaked_conns` | `db_pool_leaked_conns` | Gauge | None | Connections held longer than 5 minutes, set only when nonzero | Yes, `storage.go:581` |
+| `db.pool.total_conns` | `db_pool_total_conns` | Gauge | None | Postgres open connections | Yes, `internal/data/repository/storage.go:553` |
+| `db.pool.idle_conns` | `db_pool_idle_conns` | Gauge | None | Postgres idle connections | Yes, `storage.go:554` |
+| `db.pool.acquired_conns` | `db_pool_acquired_conns` | Gauge | None | Postgres connections in use | Yes, `storage.go:555` |
+| `db.pool.max_conns` | `db_pool_max_conns` | Gauge | None | Postgres pool size | Yes, `storage.go:556` |
+| `db.pool.utilization` | `db_pool_utilization` | Gauge | None | Acquired divided by max | Yes, `storage.go:557` |
+| `db.pool.empty_acquire_count` | `db_pool_empty_acquire_count_total` | Counter | None | Acquires that had to wait because the pool was empty. Each tick adds the change in pgx's cumulative `EmptyAcquireCount` since the previous tick (`recordEmptyAcquireDelta`) | Yes, `storage.go:560` |
+| `db.pool.acquire_duration` | `db_pool_acquire_duration_bucket` | Histogram | None | Wait for one pool acquisition in seconds, recorded per acquisition in `poolTracer.TraceAcquireEnd` | Yes, `storage.go:335` |
+| `db.pool.leaked_conns` | `db_pool_leaked_conns` | Gauge | None | Connections held longer than 5 minutes, set only when nonzero | Yes, `storage.go:600` |
 | `db.query.count` | `db_query_count_total` | Counter | `db.operation`, `db.table`, `status` | Query count | Never. `RecordDBQuery` has no callers. |
 | `db.query.duration` | `db_query_duration_seconds` | Histogram | `db.operation`, `db.table`, `status` | Query latency | Never |
 
@@ -237,9 +248,10 @@ For request error rate and latency today, use `http_server_request_duration_seco
 
 | Source | Tracer | Span name | Kind |
 | --- | --- | --- | --- |
-| Every HTTP request (`middleware_otel.go:50`) | otelhttp | `METHOD /raw/path`. The formatter checks Chi's route context first, but Fuego's `http.ServeMux` never sets it | Server |
-| Every pgx query (`internal/utilities/otel/pgx_tracer.go:44`) | `pgx` | `db.query.postgres` | Client |
-| Mapbox and Quo HTTP calls (`internal/utilities/otel/http.go:17`) | otelhttp | `<service>.<METHOD> <host>`, for example `mapbox.GET api.mapbox.com` | Client |
+| Every HTTP request (`middleware_otel.go:185`) | otelhttp | `METHOD /raw/path`. The formatter checks Chi's route context first, but Fuego's `http.ServeMux` never sets it | Server |
+| Every pgx query (`internal/utilities/otel/pgx_tracer.go:45`) | `pgx` | `db.query.postgres` | Client |
+| Mapbox, Quo, and Stripe HTTP calls (`internal/utilities/otel/http.go:18`) | otelhttp | `<service>.<METHOD> <host>`, for example `mapbox.GET api.mapbox.com` | Client |
+| Each `POST /ride/v2/` measurement (`internal/utilities/rideperf/recorder.go:91`) | `rideperf` | `ride.<name>`, for example `ride.route`, with the attribute `ride.measurement.kind`. See [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-api-records) | Internal |
 | Service methods (`otel.CustomSpan`, `otel.Span`) | Domain tracer (below) | `<Type>.<Method>`, for example `UserService.GetCurrentUser`, `Client.NewPaymentIntent` | Internal |
 | Auth v3 service (`internal/service/authv3/telemetry.go:18`) | `service.authv3` | `authv3.<Step>`, for example `authv3.Callback`, `authv3.PhoneVerify` | Internal |
 
@@ -254,15 +266,15 @@ The span end function from `CustomSpan` records the returned `errors.Error` and 
 
 | Attribute | Set by | Value |
 | --- | --- | --- |
-| `http.request_id` | `middleware_otel.go:77` | Request UUID, same as `metadata.request_id` |
-| `http.method`, `http.path` | `middleware_otel.go:78` | From request context |
-| `user.id`, `user.community_id` | `middleware_otel.go:84` | Only when a user is already in context. Group auth middleware runs later, so this is usually unset here. Auth v3 adds `user.id` later with `AddAttributes`. |
-| `http.route` | `middleware_otel.go:105` | Chi route pattern, set after the handler runs |
-| `http.status_code` | `middleware_otel.go:143` | Final status |
-| `external_dependency` | `middleware_otel.go:94` | `true` for routes marked with `MarkExternalRoute`. No route is marked. |
+| `http.request_id` | `middleware_otel.go:74` | Request UUID, same as `metadata.request_id` |
+| `http.method`, `http.path` | `middleware_otel.go:75` | From request context |
+| `user.id`, `user.community_id` | `middleware_otel.go:82` | Only when a user is already in context. Group auth middleware runs later, so this is usually unset here. Auth v3 adds `user.id` later with `AddAttributes`. |
+| `http.route` | `middleware_otel.go:102` | Chi route pattern when one exists, otherwise the raw path. Set after the handler runs, together with the span name |
+| `http.status_code` | `middleware_otel.go:158` | Final status |
+| `external_dependency` | `middleware_otel.go:91` | `true` for routes marked with `MarkExternalRoute`. No route is marked. |
 | Semantic-convention attributes | otelhttp | Method, URL, status, peer, user agent |
 
-The middleware reads the span with `trace.SpanFromContext` before `otelhttp` starts the server span (`middleware_otel.go:73`). At that point the context holds no span, because `otelhttp` extracts the trace context itself. Every attribute in this table except the semantic-convention ones, and the Error status for 4xx responses, is written to a no-op span and dropped. The server span's status comes from `otelhttp`, which marks only 5xx as Error.
+`otelhttp.NewHandler` wraps the measured handler, so `trace.SpanFromContext` (`middleware_otel.go:70`) returns the server span and every attribute in this table lands on it. The middleware also sets the span status to Error for any response with status 400 or higher, or a failed write (`middleware_otel.go:162`).
 
 </Accordion>
 <Accordion title="Database span">

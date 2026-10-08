@@ -1,0 +1,296 @@
+---
+title: "Ride replay benchmark"
+description: "How yelo-api times each stage of POST /ride/v2/, and how the isolated cloud benchmark replays the same seeded ride requests against two images on yelo-api-e2e and compares them"
+---
+
+The ride replay benchmark answers one question: does a candidate API image make `POST /ride/v2/` faster or slower than a baseline image? It deploys both images as tagged, zero-traffic revisions of the isolated E2E service, sends each the same seeded requests, joins every response to the server's own timing summary, and writes a per-stage comparison.
+
+This page covers the timing the API records, the replay manifest, how to run the benchmark, and how to read the output. For the E2E service and its fixture API, see [E2E environment](/engineering/qa/e2e). For the metric and span catalog, see [Metrics](/reference/metrics).
+
+<Note>
+Paths are relative to `yelo-api`. The tooling lives in `scripts/ride-replay/`.
+</Note>
+
+## What the API records
+
+`otelInstrumentation` (`internal/server/http/middleware_otel.go`) starts a `rideperf` recorder for `POST /ride/v2/` and for no other route. The recorder lives in the request context, so the instrumented code paths cost nothing on other requests. It doesn't depend on trace sampling.
+
+When the handler returns, the middleware does three things:
+
+- Logs one `ride performance completed` line at info level with `request_id`, `trace_id`, `status_code`, and a `ride_performance` summary.
+- Records every completed measurement in the `ride.operation.duration` histogram, in seconds, with the labels `operation`, `kind`, and `outcome`.
+- Leaves one `ride.<name>` span per measurement on the tracer `rideperf`, with the attribute `ride.measurement.kind`.
+
+Every response that passes through the middleware also carries the request ID in an `X-Request-ID` header. The replay uses that header to find the matching log line.
+
+### Summary shape
+
+| Field | Meaning |
+| --- | --- |
+| `duration_ms` | Time from recorder start to the snapshot |
+| `measurements` | Completed measurements in start order. Each has `id`, `parent_id` (`0` at the top level), `name`, `kind`, `outcome` (`ok` or `error`), `start_ms` relative to the recorder start, and `duration_ms` |
+| `attributes` | Bounded facts about the workload. At most 64 keys |
+| `counts` | Operation counts. At most 128 keys |
+| `incomplete` | Measurements that had started but not ended at the snapshot |
+| `dropped` | Measurements refused after the 1,024-per-request cap |
+
+### Measurement kinds
+
+| `kind` | `name` | Recorded in |
+| --- | --- | --- |
+| `stage` | A stage name from the next table | `internal/service/ride`, `internal/data/repository/ride_command.go` |
+| `postgres` | The sqlc query name, or `unnamed` when the SQL has no `-- name:` header | `PgxTracer.TraceQueryStart` |
+| `postgres_pool` | `acquire` | `poolTracer.TraceAcquireStart` |
+| `redis` | The command name, or `pipeline` | `ridePerfHook` in `internal/data/redis/rideperf_hook.go` |
+| `http` | The provider client name: `stripe`, `mapbox`, or `quo` | `measuredTransport` in `internal/utilities/otel/http.go` |
+
+SQL text, Redis keys and values, URLs, and error text never enter a summary. An `http` measurement ends when the response body is read to the end or closed, and a response status of 400 or higher counts as `error`. A Redis miss (`redis.Nil`) counts as `ok`. `counts` holds one `redis.command:<name>` entry per command, including each command inside a pipeline.
+
+### Stages
+
+Stage names are static strings. A dot marks a sub-step, and `parent_id` gives the real nesting.
+
+| Stage | Sub-stages |
+| --- | --- |
+| `prepare` | Wraps everything from `community` to `cancel_draft` |
+| `community` | None |
+| `locations` | `locations.pickup`, `locations.destination`, `locations.reverse_address` |
+| `route` | `route.distance` and `route.geometry`, run in parallel |
+| `classification` | `classification.pickup` and `classification.destination`, run in parallel |
+| `discount` | None |
+| `history` | None |
+| `stripe` | `stripe.customer` and `stripe.customer_persist` for a rider with no Stripe customer, then `stripe.ephemeral_key` and `stripe.setup_intent` in parallel |
+| `cancel_draft` | None |
+| `persist_draft` | None |
+| `rider_lock` | Recorded wherever a rider command opens its transaction |
+| `options` | `options.fleet`, `options.types`, `options.pricing_inputs`, `options.price_cache_get`, `options.zones`, `options.price_cache_set`, `options.pickup_times`, `options.drivers` |
+| Driver options | `drivers.presence`, `drivers.queue_summaries`, `drivers.profiles`, `drivers.profile_query`, `drivers.route_etas` |
+| Zones and pricing | `zones.overrides`, `zones.boundaries`, `pricing.parameters`, `pricing.jitter` |
+| `fallback.route` | Recorded only when rides are disabled for the community |
+
+### Attributes
+
+| Attribute | Value |
+| --- | --- |
+| `path` | `options`, or `fallback` when rides are disabled for the community |
+| `driver_options` | Whether the request enabled driver options |
+| `pickup_selected_id`, `destination_selected_id` | Whether the request carried a selected Mapbox ID for the stop |
+| `stripe_customer` | `existing` or `new` |
+| `price_cache_hit` | Whether the price cache answered |
+| `pricing_parameter_count`, `option_count` | Sizes of the pricing input and the returned option list |
+| `online_driver_count`, `driver_candidate_count`, `driver_eta_candidate_count` | Driver-option fan-out sizes |
+| `superseded_count` | Open requests the new draft canceled |
+
+## What the benchmark replays
+
+A manifest is a JSON file with `"environment": "e2e"` and a `cases` array. The cloud benchmark accepts 1 to 10 cases with unique names. The default is `scripts/ride-replay/manifest.benchmark.json`.
+
+| Case key | Required | Meaning |
+| --- | --- | --- |
+| `name` | Yes | Unique case name |
+| `cohort` | Yes | Free-text label that groups results |
+| `prepare`, `cleanup` | Yes | Fixture hooks, each an argv array. `prepare` reads a JSON payload (`case`, `iteration`, `run`, `fixture_config`) on stdin and prints a fixture with `token` and `body`. `cleanup` receives that fixture |
+| `before_measure` | No | Hook that runs immediately before the measured request |
+| `fixture_config` | No | Shape of the benchmark fixture. See below |
+| `features` | No | Values for the `X-Features` header. Only `driver-options` and `tips` are allowed |
+| `body`, `body_overrides` | No | A fixed request body when the fixture supplies none, and keys merged over the body |
+| `status` | No | Expected HTTP status. Default `201` |
+| `expect` | No | An object the response must contain |
+| `checks` | No | Assertions on a response path: `nonempty`, `min_items`, or `min_matching_items` with `match` |
+| `expected_attributes` | No | Summary attributes the server must report, so a case that silently measured a different workload fails |
+| `required_stages` | No | Stage names that must appear in the summary |
+
+The bundled hooks are `scripts/ride-replay/e2e_fixture.py prepare`, `prime`, and `cleanup`. `prepare` creates an `auth_existing_rider` run through `POST /internal/e2e/runs`, signs the rider in with the E2E OTP, and returns the token and a request body with addressless pickup and destination pins. `cleanup` deletes the run.
+
+`fixture_config` controls the workload:
+
+| Key | Range | Effect |
+| --- | --- | --- |
+| `fleets` | 1 to 6 | Fleets serving the run's private community. Each supports vehicle types `x` and `xl` |
+| `drivers_per_fleet` | 0 to 10 | Online drivers per fleet, alternating `x` and `xl` vehicles |
+| `pricing_tiers` | 1 to 8 | Distance tiers on each price configuration. Every fleet gets one configuration per vehicle type |
+| `varied_pricing` | Boolean | Whether the base price and per-minute price differ by fleet and vehicle type |
+| `customer` | `new`, `existing` | Whether the rider has a Stripe customer before the measured request. For `existing` with a cold cache, `prepare` sends one unmeasured request to a shifted destination |
+| `cache` | `cold`, `warm` | For `warm`, `prime` sends the exact request once before the measured one. `new` with `warm` is rejected |
+| `route` | `short`, `long` | Destination distance |
+| `seed` | Integer | Seeds the per-iteration coordinate jitter |
+
+The first four keys go to the API as the `benchmark` object on `POST /internal/e2e/runs`. Route coordinates come from `seed + iteration` only, so the baseline and candidate receive identical inputs for each iteration.
+
+Driver presence expires, so `prime` calls `POST /internal/e2e/runs/{id}/benchmark-presence` to put the fixture drivers back online right before the measured request.
+
+The default manifest has eight cases, all with `driver-options` enabled:
+
+| Case | Customer | Cache | Route | Fleets | Online drivers |
+| --- | --- | --- | --- | --- | --- |
+| `new-customer-short` | New | Cold | Short | 1 | 0 |
+| `existing-customer-cold` | Existing | Cold | Short | 1 | 0 |
+| `existing-customer-warm` | Existing | Warm | Short | 1 | 0 |
+| `tiered-mixed-long` | Existing | Cold | Long | 2 | 0 |
+| `drivers-small-warm` | Existing | Warm | Short | 2 | 4 |
+| `drivers-medium-cold` | Existing | Cold | Long | 3 | 12 |
+| `drivers-dense-cold` | Existing | Cold | Long | 6 | 36 |
+| `drivers-dense-warm` | Existing | Warm | Long | 6 | 60 |
+
+`manifest.example.json` is a one-case manifest with no `fixture_config`, for trying the replay locally.
+
+## What isolation means
+
+The benchmark never touches production, and it never changes what the E2E service serves.
+
+- **E2E service only.** `cloud.py` operates on `yelo-api-e2e` in `prod-yelo`, `us-central1`. Before it deploys, it checks that the service and the serving revision have `ENVIRONMENT=e2e`, `E2E_ENABLED=true`, `E2E_BACKGROUND_JOBS_ENABLED=false`, `E2E_DATABASE_NAME=yelo_e2e`, `REDIS_ENABLED=true`, an E2E database project ref that differs from the production ref, and `yelo-e2e-*` secret references for the DSN, JWT key, Redis URL, control key, and both Stripe keys.
+- **No traffic.** Each image deploys with `--no-traffic` and `--min-instances=0` under a revision tag. Requests reach it only through the tag URL. The revision serving 100% of E2E traffic stays in place.
+- **Same configuration on both sides.** The two revisions inherit every E2E setting. Only the image, `API_VERSION`, and the tracing variables are set, and secret references are pinned to the current version numbers. The run fails if the two revisions' configuration fingerprints differ.
+- **No migrations.** The source schema version must equal the serving E2E revision's `migration-version` label. The tool never runs migrations, so both images must work with the schema E2E already has.
+- **One mutation at a time.** The workflow holds the `e2e-api-convergence` concurrency group, the same lock as [E2E convergence](/engineering/ci/release-pipelines#e2e-convergence). `cloud.py run` refuses to start outside GitHub Actions, and it stops if the non-benchmark traffic targets change while it runs.
+- **Private fixtures.** Every case iteration creates its own fixture run with its own test community, and deletes it afterward.
+- **Images by digest.** Both images must be `@sha256:` digests in this project's Artifact Registry.
+
+## Run the benchmark
+
+The benchmark runs as the **Benchmark isolated E2E API** workflow (`.github/workflows/cloud-api-benchmark.yml`). It is manual only and runs when the `E2E_RELEASE_ENABLED` variable is `true`.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `baseline_image` | Required | Baseline image digest. It must already include the instrumentation, because the replay needs `X-Request-ID` and the completion log |
+| `candidate_image` | Required | Candidate image digest, compatible with the current E2E schema |
+| `manifest` | `scripts/ride-replay/manifest.benchmark.json` | Repository path to a manifest |
+| `iterations` | `50` | Iterations per case and revision, 1 to 200 |
+| `concurrency` | `1` | Concurrent measured requests, 1 to 20 |
+
+<Steps>
+  <Step title="Check the target">
+    ```bash
+    make cloud-api-inspect
+    ```
+
+    This prints the serving E2E revision, its image, `migration_version`, configuration fingerprint, resources, container concurrency, and timeout. It needs `gcloud` access to `prod-yelo`.
+  </Step>
+  <Step title="Dispatch the workflow">
+    ```bash
+    make cloud-api-benchmark \
+      BASELINE_IMAGE=us-central1-docker.pkg.dev/prod-yelo/<repository>/<image>@sha256:<digest> \
+      CANDIDATE_IMAGE=us-central1-docker.pkg.dev/prod-yelo/<repository>/<image>@sha256:<digest>
+    ```
+
+    The target runs `gh workflow run cloud-api-benchmark.yml`. Optional variables: `ITERATIONS`, `CONCURRENCY`, `MANIFEST`, and `BENCHMARK_REF` to run the workflow from another ref. You can also start it from **Actions → Benchmark isolated E2E API → Run workflow**.
+  </Step>
+  <Step title="Download the artifact">
+    The run uploads `cloud-api-benchmark-<run id>-<attempt>` even when it fails. GitHub keeps it for 14 days.
+  </Step>
+</Steps>
+
+The job runs on Blacksmith 2 vCPU with a 90-minute timeout. It removes expired benchmark tags, reads the control key from the `yelo-e2e-control-api-key` secret, and computes the schema version with `scripts/release/check-migrations.sh migrations`. Then it runs `cloud.py run`:
+
+1. Validates the inputs, the manifest, the E2E configuration, and the schema version. It fails if another benchmark's tags are still on the service.
+2. Writes `session.json` with the planned tag and revision names, so a canceled run can still be cleaned up.
+3. Deploys the baseline as revision `yelo-api-e2e-bench-<id>-a` and the candidate as `-b`, each under the tag `bench-<expiry>-<id>-a` or `-b`. Tags expire two hours after the session starts.
+4. Replays the manifest in batches of `concurrency` iterations. Each batch runs every case against one revision and then the other, and the order alternates from batch to batch so neither side always goes first.
+5. Reads each revision's `ride performance completed` lines from Cloud Logging, waiting up to 120 seconds for all of them.
+6. Writes the comparison and removes its own tags.
+
+The replay works in waves of at most `concurrency` requests. For each wave it prepares the fixtures, waits for every `before_measure` hook to finish, sends the measured requests together, and then cleans up. Fixture traffic never overlaps a measured request.
+
+Set the optional variable `E2E_BENCHMARK_OTLP_ENDPOINT` to a `host:port` to export traces from the benchmark revisions. When it is set, the revisions run with `OTEL_ENABLED=true` and `OTEL_OTLP_ENDPOINT` pointing at it. When it is empty, they run with `OTEL_ENABLED=false` and the comparison relies on completion logs alone. Both cases set `OTEL_TRACE_SAMPLING_RATIO=1`.
+
+### Clean up
+
+The workflow always runs `cloud.py cleanup` on `session.json`, which removes only the tags that session owns and never rewrites the traffic split. Two more paths cover a run that died before that step:
+
+```bash
+make cloud-api-cleanup SESSION=path/to/session.json   # remove one session's tags
+make cloud-api-sweep                                  # remove every expired benchmark tag
+```
+
+The sweep removes a tag only when its expiry has passed, it carries no traffic, and it points at the matching `yelo-api-e2e-bench-*` revision. Both this workflow and **Converge E2E API** run the sweep at the start of every run.
+
+### Replay locally
+
+`replay.py` runs without the cloud wrapper against an API on `localhost` that has the E2E fixture API enabled:
+
+```bash
+export RIDE_REPLAY_BASE_URL=http://localhost:8080
+export E2E_CONTROL_API_KEY=<local control key>
+python3 scripts/ride-replay/replay.py run scripts/ride-replay/manifest.example.json \
+  --base-url "$RIDE_REPLAY_BASE_URL" --run local --output records.jsonl
+python3 scripts/ride-replay/replay.py attach records.jsonl api-logs.jsonl --output baseline.jsonl
+python3 scripts/ride-replay/replay.py compare baseline.jsonl candidate.jsonl --output comparison.json
+```
+
+`attach` reads the API's JSON log lines and keeps those with a `ride_performance` field. A non-local host is refused unless you pass `--allow-isolated-host`.
+
+## Output
+
+| File | Contents |
+| --- | --- |
+| `session.json` | Session ID, tags, revision names, the original traffic signature, pinned secret versions, each revision's URL, image, fingerprint, and resources, and whether cleanup ran |
+| `baseline-client.jsonl`, `candidate-client.jsonl` | One record per measured request, appended as it completes: `case`, `cohort`, `iteration`, `workload_id`, `request_id`, `client_ms`, `status`, `valid`, `revision` |
+| `baseline-logs.jsonl`, `candidate-logs.jsonl` | The matching Cloud Logging entries, and nothing else from the service's logs |
+| `baseline.jsonl`, `candidate.jsonl` | Client records joined with the server summary (`server`) and `trace_id` |
+| `comparison.json` | The comparison |
+
+`workload_id` is a SHA-256 over the request body without `rider_id` and `community_id`, the `fixture_config`, and the features. Fixture identities differ per run, so they are left out.
+
+## Read the result
+
+`comparison.json` is an array with one entry per group. A group is a case, cohort, `path` attribute, status, and set of workload flags (`stripe_customer`, `price_cache_hit`, `driver_options`, `pickup_selected_id`, `destination_selected_id`).
+
+| Field | Meaning |
+| --- | --- |
+| `case`, `cohort`, `path`, `status`, `workload_flags` | The group |
+| `baseline`, `candidate` | Statistics for each side |
+| `server_p50_delta_ms` | Candidate `server_p50_ms` minus baseline. Negative means the candidate is faster |
+
+Each side has:
+
+| Field | Meaning |
+| --- | --- |
+| `n` | Sample count |
+| `client_p50_ms` | Median time measured by the replay client, including the network |
+| `server_p50_ms`, `server_p95_ms` | Percentiles of the summary's `duration_ms` |
+| `command_counts` | Each `counts` entry summed over the group, for example `redis.command:get` |
+| `operations` | Keyed by `<kind>:<name>`, for example `stage:route` or `http:stripe`. Each has `calls`, `p50_ms`, and `p95_ms` |
+
+Percentiles are nearest-rank over the group's samples, so with a small `iterations` value the p95 is close to the maximum.
+
+Start with `server_p50_delta_ms` per case, then compare `operations` between the two sides to see which stage or dependency moved. A change in `calls` or `command_counts` means the candidate does a different amount of work, not the same work at a different speed. Prefer server percentiles to `client_p50_ms` when you compare images, because the client figure includes the runner's network path.
+
+The run fails without a comparison when the two sides aren't comparable. `cloud.py` prints these messages itself:
+
+| Message | Cause |
+| --- | --- |
+| `response contract failed` | A response missed its `status`, `expect`, or `checks` |
+| `timed out waiting for all Cloud Logging completion records` | A request has no completion log after 120 seconds |
+| `baseline/candidate runtime configurations differ` | The two revisions' configuration fingerprints differ |
+| `candidate source schema differs from shared E2E; this tool never runs migrations` | The schema version doesn't match the serving E2E revision |
+| `another benchmark has tags; wait or sweep expired sessions` | A previous session's tags are still on the service |
+| `shared E2E traffic changed; refusing further experiment mutations` | The non-benchmark traffic targets changed during the run |
+
+The join and the comparison raise their own errors in `replay.py`, and `cloud.py` reports all of them as `invalid cloud experiment input or SDK timeout`:
+
+| `replay.py` error | Cause |
+| --- | --- |
+| `missing completion summary` | A record has no matching log entry |
+| `incomplete measurements` | A summary has `incomplete` or `dropped` above zero, or no measurements |
+| `measured workload differs from case expectations` | The summary's attributes don't contain `expected_attributes` |
+| `missing required ride stages` | A stage in `required_stages` is absent |
+| `completion status mismatch` | The logged status differs from the response status |
+| `baseline/candidate ... mismatch` | The two sides produced different groups, sample counts, or seeded workloads |
+
+To see which one fired, download the artifact and rerun the step by hand, for example `replay.py attach baseline-client.jsonl baseline-logs.jsonl --output baseline.jsonl`.
+
+## Where this lives in code
+
+| Concern | Path |
+| --- | --- |
+| Recorder | `internal/utilities/rideperf/recorder.go` |
+| Middleware, completion log, histogram | `internal/server/http/middleware_otel.go` |
+| Stage calls | `internal/service/ride/rider.go`, `driver_options.go`, `ride_locations.go`, `internal/data/repository/ride_command.go` |
+| Dependency hooks | `internal/utilities/otel/pgx_tracer.go`, `internal/utilities/otel/http.go`, `internal/data/redis/rideperf_hook.go`, `internal/data/repository/storage.go` |
+| Benchmark fixture and presence refresh | `internal/server/http/e2econtrol/benchmark_fixture.go` |
+| Replay, comparison | `scripts/ride-replay/replay.py` |
+| Cloud session | `scripts/ride-replay/cloud.py` |
+| Fixture hooks | `scripts/ride-replay/e2e_fixture.py` |
+| Manifests | `scripts/ride-replay/manifest.benchmark.json`, `manifest.example.json` |
+| Workflow | `.github/workflows/cloud-api-benchmark.yml` |
+| Make targets | `Makefile` (`cloud-api-inspect`, `cloud-api-benchmark`, `cloud-api-cleanup`, `cloud-api-sweep`) |

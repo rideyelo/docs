@@ -43,9 +43,9 @@ golangci-lint enforces structured logging. Use typed zerolog fields instead of f
 
 Instrumentation comes from four places:
 
-1. HTTP middleware wraps every request with `otelhttp` and flags requests slower than `SLOW_REQUEST_THRESHOLD_MS`. Span names and the `http.route` label use the raw URL path, and Yelo's custom request attributes never reach the server span. See [Metrics](/reference/metrics#spans).
+1. HTTP middleware wraps every request with `otelhttp` and flags requests slower than `SLOW_REQUEST_THRESHOLD_MS`. Span names and the `http.route` label use the raw URL path. Yelo's request attributes, including `http.request_id`, land on the server span. For `POST /ride/v2/` the middleware also times every stage and dependency call and logs one `ride performance completed` summary per request, independent of trace sampling. See [Metrics](/reference/metrics#spans) and [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-api-records).
 2. `PgxTracer` creates a span per query with sanitized SQL and warns about queries slower than `SLOW_QUERY_THRESHOLD_MS`. `DISABLE_SLOW_QUERY_WARNINGS` turns the warnings off.
-3. `NewInstrumentedHTTPClient` traces outbound provider calls.
+3. `NewInstrumentedHTTPClient` traces outbound Mapbox, Quo, and Stripe calls.
 4. Service methods open spans with `otel.CustomSpan(ctx, "<domain>", "<Method>")` and defer the returned function, which records the error automatically. Use the `AttrKey*` constants in `helpers.go` (`ride.id`, `community.id`, `fleet.id`, and so on) for business attributes.
 
 Sentry on the API runs with `TracesSampleRate: 0`. OpenTelemetry owns tracing.
@@ -54,8 +54,8 @@ Sentry on the API runs with `TracesSampleRate: 0`. OpenTelemetry owns tracing.
 
 When OpenTelemetry is enabled, the API registers a `MultiMetricsProvider` that fans out to two backends:
 
-- **OpenTelemetry**, exported in Prometheus format at `GET /metrics`. This covers HTTP request latency and body sizes from `otelhttp`, Yelo's HTTP error, size, slow-request, and in-flight metrics, connection pool stats, Redis operations and cache hit rate, circuit breaker state for the `google-maps` and `redis` breakers, rate limiter rejections, notification delivery, and OTP delivery status. Go runtime metrics are included. The instruments for Yelo's own request count and duration, per-query database metrics, and external call metrics are registered but never recorded. See [Metrics](/reference/metrics#metric-catalog).
-- **PostHog**, which receives only business counters. Any metric whose name starts with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, or `runtime.` is dropped. Events without an authenticated user use the distinct ID `yelo-api` and do not create a person profile.
+- **OpenTelemetry**, exported in Prometheus format at `GET /metrics`. This covers HTTP request latency and body sizes from `otelhttp`, Yelo's HTTP error, size, slow-request, and in-flight metrics, per-stage ride creation timing, connection pool stats, Redis operations and cache hit rate, circuit breaker state for the `google-maps` and `redis` breakers, rate limiter rejections, notification delivery, and OTP delivery status. Go runtime metrics are included. The instruments for Yelo's own request count and duration, per-query database metrics, and external call metrics are registered but never recorded. See [Metrics](/reference/metrics#metric-catalog).
+- **PostHog**, which receives only business counters. Any metric whose name starts with `http.`, `db.`, `external.`, `system.`, `redis.`, `circuit.`, `rate.`, `runtime.`, or `ride.operation.` is dropped. Events without an authenticated user use the distinct ID `yelo-api` and do not create a person profile.
 
 `mountObservability` (`internal/server/http/middleware_metrics_auth.go`) mounts `/metrics` only when `METRICS_AUTH_TOKEN` is set, and every request needs `Authorization: Bearer <token>`. When the token is empty, neither `/metrics` nor `/debug/pprof/` exists, and the API logs `metrics and pprof endpoints disabled: METRICS_AUTH_TOKEN is not set`. `PPROF_ENABLED` defaults to `false`. When you set it to `true`, `/debug/pprof/` is mounted behind the same token check, with `PPROF_BLOCK_RATE` and `PPROF_MUTEX_RATE` controlling profiling rates. Production reads the token from the `yelo-api-metrics-auth-token` secret.
 
