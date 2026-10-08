@@ -109,11 +109,11 @@ When a release is required on the Cloud Build backend, `resolve-release-build.sh
     Routes 100% of traffic to the candidate, verifies it, then removes the candidate tag. The log ends with `Rollback revision: <previous revision>`. If verification fails, it prints the exact `update-traffic` rollback command and exits.
   </Step>
   <Step title="Notify Slack">
-    Reads `startup_duration` from the new revision's `Server is ready` log line (up to six tries, 5 seconds apart), formats the message with `format-deploy-slack.sh`, and posts it to the webhook in the secret `yelo-api-deploy-slack-webhook`. A Slack failure doesn't fail the build.
+    Reads `startup_duration` from the new revision's `Server is ready` log line (up to six tries, 5 seconds apart), formats the message with `format-deploy-slack.sh`, and posts it to the webhook in the secret `yelo-api-deploy-slack-webhook`. A failed post doesn't fail the build, but a formatter error does. This step still passes the formatter's old inputs, so it currently fails. See [Gotchas](#gotchas-and-edge-cases).
   </Step>
 </Steps>
 
-After Cloud Build succeeds, the GitHub job confirms the 100% revision carries the release SHA and writes the revision and startup time to the job summary.
+After Cloud Build succeeds, the GitHub job confirms the 100% revision carries the release SHA and writes the revision to the job summary.
 
 ### Direct release backend
 
@@ -191,13 +191,28 @@ sequenceDiagram
     Otherwise it routes 100% of traffic to the candidate, verifies it, and removes the candidate tag. The step log ends with `Rollback revision: <previous revision>`. If verification fails, it prints the `update-traffic` rollback command and exits.
   </Step>
   <Step title="Resolve promoted revision and notify Slack">
-    The shared **Resolve promoted revision** step confirms the 100% revision carries the release SHA. It reads `startup_duration` from the `Server is ready` log line with up to two tries, 5 seconds apart.
+    The shared **Resolve promoted revision** step confirms the 100% revision carries the release SHA and writes the revision link to the job summary.
 
-    **Notify Slack on direct release success** formats the message with `format-deploy-slack.sh` and posts it to the webhook in the secret `yelo-api-deploy-slack-webhook`. A Slack failure only logs a warning.
+    **Notify Slack on direct release success** formats the message with `format-deploy-slack.sh` and posts it to the webhook in the secret `yelo-api-deploy-slack-webhook`. A Slack failure only logs a warning. The message reports two durations measured in the job:
+
+    - **build**: from **Resolve release metadata** to the end of **Record immutable images**.
+    - **deploy**: from there to the Slack step, covering migrate, deploy, verify, smoke, and promote.
+
+    ```text
+    *API deployed* · 0cj · referral: befriend invited signups
+    gcp · github · pr · build 58s · deploy 1m 6s
+    ```
   </Step>
 </Steps>
 
-If any step fails after authentication, **Notify Slack on release failure** posts a message whose second link is labeled **Blacksmith build** and points at the GitHub Actions run. The status in that message is always `failed`, because there is no Cloud Build status to read.
+If any step fails after authentication, **Notify Slack on release failure** posts a two-line message that names the first failed stage, in run order: `release order`, `prepare`, `build`, `migration build`, `migrate`, `deploy`, `verify`, `smoke`, `promote`, or `revision check`. If none of those failed, it reads `release failed`.
+
+```text
+*API release failed* · 0cj · referral: befriend invited signups
+gcp · github · pr · smoke failed
+```
+
+On the Cloud Build backend the status is `cloud build <status>`, using the lowercased Cloud Build status (for example `cloud build failure`), and a **build** link to the Cloud Build page follows **pr**. See [Deploy alerts](/engineering/ci/bots-and-automation#slack-notifications-from-ci) for every CI alert format.
 
 `scripts/release/release_pipeline_test.py` exercises the `prepare`, `migrate`, `verify`, and `promote` phases against a fake `gcloud`, and unit-tests `verify-image.py` and `revision-state.py`. It runs in `make check-migration-policy`, so the **Migration Policy** CI job covers it.
 
@@ -303,14 +318,29 @@ Web has no rollback workflow. Revert on `main`, or deploy a known-good checkout 
 
 ### Cloudflare Workers
 
-The three workers under `yelo-web/workers/` deploy only from a developer machine:
+The three workers under `yelo-web/workers/` (`og`, `experience-router`, `world-cup-router`) deploy from the **Workers** workflow (`workers.yml`) when a change merges to `main`.
+
+```mermaid
+flowchart LR
+  PR["Pull request touching workers/,<br/>package.json, or the lockfile"] --> V["Worker checks<br/>check every worker + og smoke in workerd"]
+  M["Push to main"] --> V
+  V -->|"worker directory changed"| D["Deploy changed workers<br/>wrangler deploy, one job per worker"]
+  D --> SL["Slack: Worker deployed"]
+  WD["Run workflow<br/>(pick a worker)"] --> V
+```
+
+- **Verify.** Every run, on pull requests and on `main`, runs `pnpm worker:<name>:check` for all three workers, then `scripts/og-worker-smoke.sh`. The smoke script starts `yelo-og` with `wrangler dev` in workerd, signs six invite cards, and requests them concurrently. Each response must be a PNG. The Node unit tests run satori outside the Workers runtime, so they can't catch a dependency that crashes at worker startup. The smoke test can.
+- **Deploy.** On a push to `main`, the workflow deploys each worker whose own directory under `workers/` changed, with `wrangler deploy --config workers/<dir>/wrangler.jsonc`. Each worker deploys in its own matrix job with `fail-fast: false`, then posts a **Worker deployed** Slack alert.
+- **Dependency-only changes.** A `package.json` or lockfile change is verified but doesn't deploy any worker. To ship it, open **Actions → Workers → Run workflow** and pick the worker. The workflow deploys that worker from `main`.
+
+Manual deploys from a logged-in machine still work, but they're no longer the normal path:
 
 ```bash
 pnpm worker:<name>:check    # wrangler types --check (router workers), tsc, wrangler deploy --dry-run
 pnpm worker:<name>:deploy   # wrangler deploy --config workers/<dir>/wrangler.jsonc
 ```
 
-`<name>` is `og`, `experience-router`, or `world-cup`. No workflow runs `check` or `deploy`. `pnpm test` does run each worker's tests in CI. See [Cloud infrastructure](/engineering/ci/cloud-infrastructure#cloudflare) for routes, and [Edge and routing](/engineering/web/edge-and-routing) for behavior.
+`<name>` is `og`, `experience-router`, or `world-cup`. `pnpm test` also runs each worker's tests in **CI**. See [Cloud infrastructure](/engineering/ci/cloud-infrastructure#cloudflare) for routes, and [Edge and routing](/engineering/web/edge-and-routing) for behavior.
 
 ## Mobile
 
@@ -436,7 +466,10 @@ To ship a backport, merge the rolling PR, then run **OTA Stage** with `source_re
 - **The direct backend needs exactly one revision at 100%.** `revision-state.py` fails `prepare` and `promote` when traffic is split or no revision serves 100%. The Cloud Build backend takes the first 100% entry instead.
 - **Direct release scripts come from the workflow commit.** A manual run that releases an older `sha` still uses the `scripts/release` directory of the ref you dispatched. **Check release order** is the exception: it runs `release-required.sh` from the release SHA.
 - **Migrations run before the smoke test.** If the candidate fails smoke, the schema is already migrated and the old revision keeps serving. Write migrations that the serving revision tolerates.
-- **Deploy Slack shows the Git author only.** Neither `cloudbuild.yaml` nor the direct success step sets `DEPLOY_MERGED_BY`, so the API deploy message never names the merger. The web deploy message does.
+- **Deploy alerts name the author only.** The API, web, and worker deploy alerts show the PR author (or the commit author when no merged PR is found). None of them names the merger.
+- **The Cloud Build success alert still uses the old inputs.** `format-deploy-slack.sh` now requires `DEPLOY_RUN_URL`, but the **Notify Slack** step in `cloudbuild.yaml` still passes the old revision, startup, and timestamp variables. On the Cloud Build backend the formatter exits with `missing required environment variable: DEPLOY_RUN_URL` after traffic is already promoted. The step runs under `bash -e`, so nothing is posted and the build ends as a failure. **Release API** then fails and posts `cloud build failure`, even though the new revision is serving. The direct backend passes the new inputs.
+- **Workers skip deploy on dependency-only changes.** A lockfile bump runs **Worker checks** but leaves every worker on its previous build until someone runs **Workers** manually.
+- **The `og` worker holds satori below 0.33.** `package.json` pins `satori` to `^0.32.0`, and Dependabot ignores later versions. Satori 0.33 loads harfbuzzjs, which crashes `yelo-og` at startup on Workers. The workerd smoke test is the check that fails if that regresses.
 - **Only the E2E migration job uses a dedicated identity.** The production migration job and service run as the default compute service account. `yelo-api-e2e` and its migration job run as `yelo-api-e2e@prod-yelo.iam.gserviceaccount.com`.
 - **Staging builds and OTA use production.** Every `eas.json` profile except `e2e-simulator` uses the `production` EAS environment, and staged bundles call the production API.
 - **Finalize and promote share a queue.** Both use the `ota-production` concurrency group, so a pending finalize waits for a running promote.

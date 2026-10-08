@@ -3,7 +3,7 @@ title: "Slack alerts"
 description: "Every Slack message yelo-api posts: trigger, webhook channel, exact format, dedupe, delay, test-account filtering, and how the Slack client behaves when a webhook is missing or slow."
 ---
 
-The API posts internal alerts to Slack through incoming webhooks. Users never see them. This page lists every alert the code sends today and how the Slack client behaves.
+The API posts internal alerts to Slack through incoming webhooks. Users never see them. This page lists every alert the code sends today and how the Slack client behaves. CI deploy alerts are summarized under [Deploy alerts](#deploy-alerts).
 
 ## The Slack client
 
@@ -127,6 +127,17 @@ State messages use `slack.NewStateMessage`. It adds **Status** and **Previous** 
 - Green for `READY`, `ACCEPT`, `COMPLETE`, `VALID`, and similar.
 
 App Store events are verified with the `X-Apple-Signature` HMAC before posting. Google Play monitoring is on by default only in production (`GOOGLE_PLAY_RELEASE_MONITORING_ENABLED`). On its first run it stores already-published releases without alerting.
+
+### Deploy alerts
+
+Deploy and release-failure alerts don't go through the Slack client. GitHub Actions and Cloud Build post them directly to incoming webhooks, for the API and for `yelo-web` sites and Cloudflare workers. Each alert is two lines: the bold event with the PR author and title, then links and the outcome.
+
+```text
+*API release failed* · 0cj · referral: befriend invited signups
+gcp · github · pr · smoke failed
+```
+
+A failure alert names the first stage that failed, so you can open the right step in the run. For every format and trigger, see [Slack notifications from CI](/engineering/ci/bots-and-automation#slack-notifications-from-ci).
 
 ## Defined but not sent
 

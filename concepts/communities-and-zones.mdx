@@ -22,9 +22,25 @@ The time zone is derived from the service area automatically. It isn't an admin 
 | `is_active` | **Active** | Inactive communities are skipped when Yelo matches a location to a community. |
 | `is_hidden` | **Hidden** | Users can't switch into the community by hand, unless they are test users. The community is also left out of the heatmap layer. |
 | `rides_disabled` | **Rides Disabled** | Kill switch. Ride requests return no vehicle options, so the app falls back to its off-peak and third-party states. |
+| `fare_finder_disabled` | **Fare Finder** (on means not disabled) | Kill switch for Fare Finder, the live third-party fare comparison on the ride request sheet. When `true`, the app shows static deep-link cards instead and hides the rideshare account screens. Defaults to `false`. |
 | `is_default` | None | The fallback community for users outside every service area. |
 | `is_test` | None | Test communities are excluded from location matching and school mapping. |
 | `archived_at` | None | Archived communities are excluded everywhere. Archiving retires the community's fleet services and ends its open prices. |
+
+### Fare Finder kill switch
+
+Fare Finder is on for every rider in every community. It isn't an experiment, and riders don't opt in. Use `fare_finder_disabled` to turn it off in one community, for example when a third-party provider misbehaves in that market.
+
+- Set it with the **Fare Finder** switch on the **Communities** page, or with `PATCH /dashboard/manage/{id}`.
+- The app reads the flag from `GET /community/current`. It polls that route every 60 seconds while it is in the foreground, so a flip reaches open apps within about a minute.
+- The app fails open on a missing field. If the loaded community has no `fare_finder_disabled` field, Fare Finder stays on. Only an explicit `true` turns it off. Until the community loads, the app shows the static cards.
+- Riders still accept a one-time disclosure on their device before they can sign in to a provider account.
+
+```json
+{
+  "fare_finder_disabled": true
+}
+```
 
 A reserved internal community named **Yelo** has a global bounding box for staff accounts. Yelo never places ordinary users in it by location, and it repairs ordinary accounts that end up there.
 
