@@ -175,22 +175,22 @@ Ties compare only against the current best. The comparison isn't transitive, and
 1. Loads the driver and their session. A missing session returns a `NotFound` error from `GetDriverSession`, so the `session == nil` branch never runs. The error propagates, no flag is set, and the ride is retried next tick.
 2. Calls the `assignRide` callback, wired in `internal/service/service.go` to `RideService.AutoAssignRide`. It passes an `AutoQueueDecision` with the ride's `confirm_time`, the number of scored candidates, and the winner's deadhead minutes, final score, and queue load.
 3. On error, logs "ride may have been claimed" and returns without setting the flag.
-4. On success, removes the ride from the board provider, refreshes the driver's queue summary, and sends notifications.
+4. On success, logs the assignment. The board removal, the queue summary refresh, and the pushes all belong to the `accept` ride operation that `AutoAssignRide` submitted.
 
-`RideService.AutoAssignRide` in `driver.go`:
+`RideService.AutoAssignRide` in `driver.go` calls `RideOperations.AutoAssignLegacy`, which submits an `accept` ride operation with `Automatic` set and the `AutoQueueDecision` frozen in its inputs. See [Accept and promotion](/engineering/payments/ride-operation-journal#accept-and-promotion).
 
-- Sets the request context's user to the driver, so downstream code acts as that driver.
-- Calls `Ride.AutoQueueAssign`, which is `acceptRide(..., automatic = true)` with pickup distance 0, duration 0, and an empty route. The transaction requires `accepts_auto_queue`, exactly one matching session, no live direct hold for someone else, the same fleet, and fewer than 100 rides.
-- `AssignAcceptedRideToDriver` always sets `status = 'queued'` and `auto_queued = true` for automatic assignments.
-- Records `ride_auto_queued` with `driver_id` plus the decision fields (`elapsed_since_confirm_ms`, `candidate_count`, `deadhead_minutes`, `final_score`, `queue_load`), refreshes the queue summary, and calls `RecoverIdleQueue`. If the driver has no active ride, this routes from the driver's GPS, authorizes payment, and promotes the queue head right away. See [Queue promotion and recovery](/engineering/matching/queue-promotion).
-- A `RecoverIdleQueue` failure is swallowed when the ride is still assigned to this driver. The ride stays `queued` for the 3-minute recovery loop.
+- The reservation transaction requires `accepts_auto_queue`, exactly one open session matching the session's vehicle and fleet, no live direct hold, the same fleet, and fewer than 100 rides.
+- `AssignAcceptedRideToDriver` sets `driver_en_route` when the driver has no other open ride and `queued` otherwise, with pickup distance 0, duration 0, and an empty route. `MarkRideAutomaticallyAssigned` then sets `auto_queued = true`.
+- The same transaction inserts `ride_auto_queued` with `driver_id` plus the decision fields (`elapsed_since_confirm_ms`, `candidate_count`, `deadhead_minutes`, `final_score`, `queue_load`).
+- For a ride in the active slot, the operation then authorizes payment and computes the pickup route. A queued ride defers both to its `promotion` operation. See [Queue promotion and recovery](/engineering/matching/queue-promotion).
+- If the command returns an error after the assignment committed, `AutoAssignRide` rereads the ride. When it's assigned to this driver in `queued` or `driver_en_route`, it logs "Assigned ride awaits durable preparation" and returns success, so the matcher doesn't offer the ride again. The operation's job retries the preparation.
 
-Notifications after success:
+Notifications are enqueued in the transaction that finishes the operation:
 
-| Recipient | Push | Condition |
+| Recipient | Push | Event key |
 | --- | --- | --- |
-| Driver | `ride_auto_queued`, with `data.vibration = "true"` | Candidate has a non-empty push token |
-| Rider | `NotifyRiderRideConfirmed` with the ride's current status | Rider has a push token. The status is `driver_en_route` if promotion already happened, otherwise `queued` |
+| Driver | `ride_auto_queued`, with `data.vibration = "true"` | `ride_operation:{operationId}:ride_auto_queued` |
+| Rider | `ride_confirmed` with the ride's status, `driver_en_route` or `queued` | `ride_operation:{operationId}:ride_confirmed` |
 
 ## When a ride is given up on
 
@@ -210,8 +210,8 @@ It isn't set when the pass fails on a Redis read, a settings read, a session loo
 | Pass, filtering, scoring, assignment | `yelo-api/internal/service/activation/auto_queue.go` |
 | Pass scheduling and min age | `yelo-api/internal/service/activation/activation.go` (`ProcessUnmatchedRides`, `autoQueueMinAge`) |
 | Callback wiring | `yelo-api/internal/service/service.go` |
-| Assignment and promotion | `yelo-api/internal/service/ride/driver.go` (`AutoAssignRide`, `RecoverIdleQueue`) |
-| Assignment transaction | `yelo-api/internal/data/repository/ride_matching.go` (`AutoQueueAssign`), `ride_lifecycle.go` (`acceptRide`) |
+| Assignment and promotion | `yelo-api/internal/service/ride/driver.go` (`AutoAssignRide`, `RecoverIdleQueue`), `yelo-api/internal/service/payment/ride_legacy_acceptance.go` (`AutoAssignLegacy`) |
+| Assignment transaction | `yelo-api/internal/data/repository/ride_acceptance_operation.go` (`Reserve`, `reserveAcceptanceAssignment`, `recordAcceptanceTx`) |
 | Flags and summaries | `yelo-api/internal/data/redis/queue_cache.go` |
 | Driver settings | `yelo-api/internal/service/driver/driver.go` (`SetAutoQueue`, `PauseAutoQueue`) |
 | Tests | `yelo-api/internal/service/activation/auto_queue_test.go`, `yelo-api/internal/service/ride/auto_assignment_test.go` |

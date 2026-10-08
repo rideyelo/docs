@@ -39,29 +39,30 @@ Manual accept and auto-queue admission skip `declined_drivers`. A driver who dec
 
 ## Manual accept, step by step
 
-`RideService.AcceptRide` in `internal/service/ride/driver.go` runs these checks in order. The first failure wins.
+`RideService.AcceptRide` in `internal/service/ride/driver.go` forwards to `acceptFinancialRide`, which submits an `accept` ride operation. The service no longer runs its own driver, ride, or fleet checks. Every eligibility check happens in the reservation transaction.
 
 | Order | Check | Code | Error |
 | --- | --- | --- | --- |
-| 1 | Driver has an open session | `getDriverSessionAndFleet` | 400 "No Active Session" |
-| 2 | `IsOnlineDriver` | `validateDriverAvailability` | 400 "Driver Not Online" |
-| 3 | `QueueLength` below `matching.MaxQueueLength` (100) | `validateDriverAvailability` | 400 "Driver Queue Length Exceeded" |
-| 4 | Take the ride's advisory lock, then read the ride. If the ride is already assigned to this driver in `queued` or `driver_en_route`, return success with no further work | `AcquireLock`, `rideAcceptedBy` | None. A repeat accept is idempotent |
-| 5 | Ride is `confirmed` | `validateRideRequestAcceptance` | 400 "Ride request no longer valid" |
-| 6 | No live hold for another driver | `validateRideRequestAcceptance` | 400 "Ride is awaiting the selected driver" |
-| 7 | Ride fleet is null or equals session fleet | `validateRideFleet` | 400 "This ride is for a different fleet" |
-| 8 | Pickup route | `getPickupRoute` | Mapbox error |
-| 9 | Payment authorization, when the effective price is above 0 | `processRidePayment` | Stripe error |
-| 10 | Transaction checks (below) | `Ride.Accept` | See below |
+| 1 | Take the ride's advisory lock | `acceptFinancialRide`, `AcquireLock` | None. A second accept waits |
+| 2 | The driver already has an `accept` operation for this assignment | `AcceptLegacy` | None. The operation is replayed, so a repeat accept is idempotent |
+| 3 | The ride is already assigned to this driver in `queued` or `driver_en_route`, with no operation | `AcceptLegacy` | None. Returns success with no further work |
+| 4 | Driver has an open session with a vehicle and a fleet | `AcceptLegacy`, `GetActiveDriverSession` | 500. The missing row isn't mapped to an input error |
+| 5 | Reservation checks (below) | `RideAcceptanceCommands.Reserve` | 400 "Ride Unavailable" |
+| 6 | Payment authorization, when the fare is above 0 and the ride takes the active slot | `RidePreparationPaymentExecutor.Prepare` | "Payment Failed" on a decline. A server error on a Stripe failure |
+| 7 | Pickup route | `PreparePickupRoute` | Mapbox or Google error |
 
-Inside `acceptRide` in `internal/data/repository/ride_lifecycle.go`, under participant and ride row locks:
+Steps 6 and 7 run after the assignment has committed. A failure there leaves the ride assigned to the driver with its operation `pending`, and the `ride_operation` job retries. See [Ride operation journal](/engineering/payments/ride-operation-journal#accept-and-promotion).
 
-1. `state.Status` must be `confirmed`.
-2. `validateRideAssignmentDriver` rereads `is_online_driver` and requires exactly one open `DriverSessions` row whose vehicle and fleet match the IDs read in step 1.
-3. `CanAcceptDirectRide` rechecks the 30-second hold.
-4. `validateRideAssignmentAdmission` rechecks the ride's fleet and the 100-ride cap.
+Inside `reserveAcceptanceAssignment` in `internal/data/repository/ride_acceptance_operation.go`, under participant and ride row locks:
 
-Steps 1 to 3 return a 400 conflict. Step 4 failures are wrapped with `NewServerErrorFromError`, so a fleet mismatch or a full queue detected under lock surfaces as a 500 "Something Went Wrong".
+1. `state.Status` must be `confirmed` with no driver, at the `lifecycle_revision` and `assignment_generation` the adapter read.
+2. `GetRideAcceptanceSession` must return the session start time the command carries.
+3. `validateRideAssignmentDriver` rereads `is_online_driver` and requires exactly one open `DriverSessions` row whose vehicle and fleet match the session read in step 4 above. An automatic assignment also requires `accepts_auto_queue`.
+4. `CanAcceptDirectRide` rechecks the 30-second hold.
+5. `validateRideAssignmentAdmission` rechecks the ride's fleet and the 100-ride cap (`matching.MaxQueueLength`).
+6. `ValidateRidePaymentPreparation` requires a paid ride to have a payment method, the rider's Stripe customer, consent fields, and a connected account for the driver or fleet.
+
+Steps 1 to 5 return the same 400 conflict, "Ride Unavailable". The driver can't tell a taken ride from an offline session, a full queue, a fleet mismatch, or a hold for another driver. Step 6 returns a 500.
 
 ## T0 targets in detail
 
@@ -138,7 +139,7 @@ Work through the paths in the order a ride reaches them:
 | Path | Service | SQL |
 | --- | --- | --- |
 | Board | `yelo-api/internal/service/ride/driver.go` (`GetEnrichedRideBoard`) | `queries/ride_driver.sql` (`GetEligibleEnrichedRideBoard`) |
-| Manual accept | `driver.go` (`AcceptRide`, `validateDriverAvailability`, `validateRideRequestAcceptance`, `validateRideFleet`) | `queries/ride_lifecycle.sql` (`CanAcceptDirectRide`, `GetRideAcceptingDriver`), `queries/user_driver.sql` (`GetDriverSessionOwnership`) |
+| Manual accept | `driver.go` (`AcceptRide`), `financial_commands.go` (`acceptFinancialRide`), `yelo-api/internal/service/payment/ride_legacy_acceptance.go`, `yelo-api/internal/data/repository/ride_acceptance_operation.go` | `queries/ride_lifecycle.sql` (`CanAcceptDirectRide`, `GetRideAcceptingDriver`), `queries/user_driver.sql` (`GetDriverSessionOwnership`) |
 | Admission helpers | `yelo-api/internal/data/repository/ride_command.go` (`validateRideAssignmentDriver`, `validateRideAssignmentAdmission`) | `queries/ride_command.sql` (`GetRideCommandDriverAvailability`) |
 | T0 | `yelo-api/internal/service/ride/rider.go` (`notifyDriversAboutNewRide`) | `queries/community.sql` (`ListRideT0NotificationTargets`) |
 | Activation | `yelo-api/internal/service/activation/activation.go` (`fillDriverQuota`, `getCandidatesFromInactive`, `getCandidatesFromWarmPool`) | `queries/user_driver.sql` (`ListNearbyInactiveDrivers`, `ListActiveSessionFleetIDs`) |

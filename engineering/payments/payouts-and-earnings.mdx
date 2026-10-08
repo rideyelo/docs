@@ -126,7 +126,7 @@ The estimate ignores `delay_days`, holidays, and the time of day Stripe runs pay
 - `complete_time` is on or after Monday 00:00 UTC, and
 - `driver_payout` is not null.
 
-Canceled rides have `status = complete` too. A cancellation fee ride counts once its webhook sets `driver_payout`. A $0 cancellation leaves `driver_payout` null and doesn't count.
+Canceled rides have `status = complete` too. `CancelReservedRide` sets `driver_payout` to the fee for every cancellation that ends the ride, including a fee of 0, and `CancelDeclinedRideAuthorization` sets it to 0 for a declined card. Neither clears `driver_id`. A ride canceled after a driver was assigned therefore adds to the ride count, with the fee, or $0, as its earnings. An unmatched ride that expires has no driver and doesn't count.
 
 ## Payout notifications
 
@@ -140,9 +140,9 @@ The payout writers snapshot the estimate when they write `driver_payout`:
 
 | Writer | Column | Estimated on |
 | --- | --- | --- |
-| `CompleteRideForRating`, `CompleteRideTip`, `MarkRidePaymentSucceeded` | `estimated_stripe_fee_cents` | Fare, plus the $5.00 buffer when tips are enabled (`ride_fare_fee_estimate_cents`) |
+| `CompleteRideForRating`, `CompleteRideTip`, `MarkRidePaymentSucceeded` | `estimated_stripe_fee_cents` | Fare, plus the $5.00 buffer when tips are enabled (`ride_fare_fee_estimate_cents`). The first two run inside ride operations. `MarkRidePaymentSucceeded` runs from the webhook and skips rides that have a ride operation |
 | `RecordCompletedRideTip` | `estimated_tip_stripe_fee_cents` | The dedicated tip charge alone |
-| Cancellation fee operation | `estimated_stripe_fee_cents` | The cancellation fee |
+| `CancelReservedRide`, from the `cancel` ride operation | `estimated_stripe_fee_cents` | The cancellation fee. 0 when the fee is 0 |
 
 `ride_driver_earnings_cents` prefers the actual fee, then the stored estimate, then a live estimate. The full formula is on [Driver earnings and activity](/engineering/domains/driver-earnings-and-activity#net-earnings-after-stripe-fees).
 
@@ -315,7 +315,7 @@ When `title_applied` is false, the destination payment has neither the title nor
 ## Gotchas and edge cases
 
 - **Headline versus balance.** The weekly headline counts every ride the driver drove, including rides paid to a fleet account. The balance and activity only show the driver's own account.
-- **Overwritten tips.** The headline is computed from `driver_payout`, which the fare webhook can reset after an over-buffer tip. See [Ride tip charging](/engineering/payments/ride-tips#races).
+- **Tips and the fare webhook.** The headline is computed from `driver_payout`. For a ride with a ride operation, the fare's `payment_intent.succeeded` webhook doesn't write it, so an over-buffer tip stays in the total. See [Ride tip charging](/engineering/payments/ride-tips#races).
 - **Dedicated tip charges.** Tip PaymentIntents aren't in `payment_intent_id`, so their activity rows aren't enriched. Their fees land in `tip_stripe_fee_cents`, not `stripe_fee_cents`.
 - **Pending isn't payable.** `uncaptured` is an estimate from Postgres. The next payout and instant cash-out read only Stripe's buckets.
 - **Never-resolving rides.** Rides whose hold was canceled have a `payment_intent_id` but no charge, so the fee backfill can't resolve them. They're deferred and rescanned every 24 hours indefinitely.

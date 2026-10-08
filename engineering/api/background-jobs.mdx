@@ -22,7 +22,7 @@ Both run inside the API process on Cloud Run. There is no separate worker servic
 | `Refresh` | 2 minutes | `CommunityService.RefreshFeed` | Rebuilds each community's cached feed |
 | `Notifications` | 1 minute | `DashboardService.ProcessScheduledNotifications` | Sends dashboard notifications whose scheduled time has passed |
 | `QueueRefresh` | 3 minutes | `ActivationService.RefreshQueueSummaries` | Recovers idle driver queues and rewrites queue summary caches |
-| `TipCapture` | 5 minutes | `RideService.AutoCaptureTipWindowExpired` | Captures fare and tip for up to 50 rides whose tip window closed |
+| `TipCapture` | 5 minutes | `RideService.AutoCaptureTipWindowExpired` | Submits a system `settle_tip` ride operation, which captures the fare, for up to 50 rides whose tip window closed |
 | `MapHeat` | 5 minutes, runs immediately on start | `MapLayerService.RefreshHeatmaps`, `MapLayerService.PurgeExpiredBumps` | Recomputes community heatmaps. Deletes bumps expired more than 7 days ago |
 | `Mobility` | 1 minute | `MapLayerService.RefreshMobilityFeeds` | Polls GBFS and GTFS-RT feeds into the map vehicles layer. Skipped when Redis is disabled |
 
@@ -39,7 +39,7 @@ For what the ride-related tasks do, see [Rides implementation](/engineering/api/
 - **Names.** Task names in logs come from the function name via reflection, for example `PurgeOfflineDrivers`.
 
 <Note>
-Tickers run on every instance. Tasks must be safe to run concurrently on several instances. They rely on database conditions, row locks, and idempotent writes, not on leader election. For example, `RefreshHeatmaps` does an idempotent Redis `SET`, and `CancelUnmatchedConfirmedRides` only updates rows still matching its `WHERE` clause.
+Tickers run on every instance. Tasks must be safe to run concurrently on several instances. They rely on database conditions, row locks, and idempotent writes, not on leader election. For example, `RefreshHeatmaps` does an idempotent Redis `SET`, and `CancelUnmatchedRides` and `AutoCaptureTipWindowExpired` derive one deterministic ride operation ID per ride, so every instance addresses the same command.
 </Note>
 
 ### Other goroutines
@@ -72,6 +72,7 @@ River is a Postgres-backed job queue. `notifyqueue.New` registers workers and pe
 | Calendar sync | 2 |
 | Top locations | 2 |
 | `stripe` | 2 |
+| `ride_operations` | 2. Added by `registerRideOperations` when the ride command runtime is present |
 | Quo, Quo control | 1 each |
 | `gtm` | 1 |
 | Stripe reconciliation | 1 |
@@ -100,6 +101,7 @@ All periodic jobs use `RunOnStart: true`. River's leader election ensures only o
 | `quo_sync_batch` (`backfill`) | 1 minute | Backfills Quo contacts | Always |
 | `quo_sync_batch` (`reconcile`) | 1 minute | Reconciles Quo contacts | Always |
 | `stripe_drive_fee_scan` | 10 minutes | Scans and repairs drive fee history | Always |
+| `ride_operation_recovery` | 1 minute | Re-enqueues ride operations that have no live `ride_operation` job: `pending` ones, and finished ones whose ride board and queue effects aren't acknowledged. Quarantines a `pending` operation whose job was discarded or cancelled. Up to 100 per run. See [Ride operation journal](/engineering/payments/ride-operation-journal#recovery) | Ride command runtime present |
 | `notify_receipt_check` | 5 minutes | Polls Expo receipts, finalizes deliveries, clears dead push tokens | Always |
 | `notify_recovery` | 5 minutes | Requeues deliveries stuck in `sending` longer than the 10-minute lease | Always |
 
@@ -118,6 +120,7 @@ These kinds are enqueued by application code rather than a schedule:
 | `contact_sync_user`, `contact_sync_segments` | Contact sync | Syncs one user or segment to Resend or Quo |
 | `quo_sync_user` | Quo service | Syncs one user to Quo |
 | `stripe_reconcile_account` | Reconciliation dispatch | Reconciles one Stripe connected account |
+| `ride_operation` | `RideOperationJournal.CreateTx`, in the transaction that reserves a ride financial command, and the recovery job | Resumes the command's Stripe steps if the request didn't finish them, then reconciles the ride board and driver queue summary and records the effect receipt |
 | `stripe_drive_fee_repair` | Drive fee scan | Repairs one drive fee history record |
 
 <Tip>
@@ -131,7 +134,7 @@ Time-sensitive notification codes expire after 15 minutes (`orchestrateFreshness
 | Setting | Effect |
 | --- | --- |
 | `BACKGROUND_TASKS_ENABLED=false` | Every `backgroundCleanup` loop logs that it is disabled and returns. River and the other goroutines still run |
-| `E2E_ENABLED=true` with `E2E_BACKGROUND_JOBS_ENABLED` false | Skips River workers, River UI, and `startBackgroundTasks` entirely |
+| `E2E_ENABLED=true` with `E2E_BACKGROUND_JOBS_ENABLED` false | Skips River UI and `startBackgroundTasks`. The River client still starts, with the `ride_operations` queue and the `ride_operation_recovery` periodic job only. No other queue is consumed |
 | `ACTIVATION_ENABLED=false` | `ProcessUnmatchedRides` returns immediately |
 | `STRIPE_RECONCILIATION_ENABLED=false` | Stops the reconciliation dispatch |
 

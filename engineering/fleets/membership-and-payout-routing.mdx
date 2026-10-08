@@ -108,29 +108,27 @@ Tie-breaks and failure modes:
 
 ## Every path that picks a Stripe account
 
-`selectStripeMerchantID` in `internal/service/ride/driver.go` is the only routing function:
+`GetRidePaymentPreparation` in `internal/data/repository/queries/ride_operation.sql` is the only routing rule. It runs when a ride operation freezes its payment decision:
 
-```go
-func (s *RideService) selectStripeMerchantID(driver *models.User, fleet *models.Fleet) string {
-	if fleet.HasCustomPayouts && fleet.StripeMerchantID != nil {
-		return *fleet.StripeMerchantID
-	}
-
-	return driver.StripeMerchantID
-}
+```sql
+COALESCE(CASE WHEN fleet.has_custom_payouts AND fleet.stripe_merchant_id IS NOT NULL
+       THEN fleet.stripe_merchant_id ELSE driver.stripe_merchant_id END,'')::text AS merchant_id
+FROM "Rides" r
+JOIN "Users" driver ON driver.id=r.driver_id
+LEFT JOIN "Fleets" fleet ON fleet.id=r.fleet_id
 ```
 
-The `fleet` argument is loaded by `getDriverSessionAndFleet`, which reads the open `DriverSessions` row and then `GetFleetById(session.FleetId)`. It uses the session fleet, not `Rides.fleet_id` and not `payout_fleet_id`.
+The fleet is `Rides.fleet_id`, not `payout_fleet_id`. `AssignAcceptedRideToDriver` writes it from the driver's open session in the same transaction, just before the query runs, so at acceptance it is the session fleet. `selectStripeMerchantID` in `internal/service/ride/driver.go` implements the same rule in Go and has no caller.
 
 | Path | Function | Fleet source | Account used |
 | --- | --- | --- | --- |
-| Manual accept | `AcceptRide` → `processRidePayment` | Session fleet at accept | `selectStripeMerchantID`, persisted to `Rides.stripe_merchant_id` |
-| Queue promotion or auto-queue pickup | `authorizeRidePickup` → `processRidePayment` | Session fleet at promotion | Same |
-| Rematch after driver cancel | `processRidePayment` → `reuseRideAuthorization` | Session fleet of the new driver | Reuses the intent only if the driver and account both match. Otherwise the previous hold is released and a new one is created. |
-| Completion capture | `Complete` → `confirmPaymentIntent` | Session fleet at completion, recomputed | `selectStripeMerchantID` again |
-| Cancel after a DB failure | `handleCompleteDBFailure` | Recomputed at completion | Same value as the capture |
+| Manual accept or auto-queue assignment | `reserveAcceptanceAssignment` → `freezeRidePreparation` | Session fleet at accept, through `Rides.fleet_id` | Frozen in the `accept` operation. Persisted to `Rides.stripe_merchant_id` when the hold is confirmed |
+| Queue promotion | `reserveRidePromotion` | The inputs frozen when the ride was accepted into the queue | Same account as the acceptance chose |
+| Rematch after driver cancel | A new `accept` operation | Session fleet of the new driver | The requeue voided the old hold and cleared `stripe_merchant_id`, so the new driver's account is chosen fresh |
+| Completion capture | `freezeCompletionPayment` | Not recomputed | `Rides.stripe_merchant_id` |
+| Cancellation fee or void | `freezeCancellation` | Not recomputed | `Rides.stripe_merchant_id` |
 | Tip-window capture | `tip_capture.go` | Not recomputed | `Rides.stripe_merchant_id` |
-| Tip charge on free rides | `resolveTipMerchant` in `tip_charge.go` | `Rides.fleet_id` | Stored account if present, otherwise `selectStripeMerchantID(driver, rideFleet)` |
+| Tip charge on free rides | `freezeDedicatedTip` | `Rides.fleet_id` | Stored account if present, otherwise the routing rule above |
 | QR payment links | `QrPaymentService.CreateConfig` | Config's fleet | `Fleets.stripe_merchant_id`, or an error if nil |
 | Checkout attribution | `resolveCheckoutAttribution` in `service/payment/payment.go` | Metadata `fleet_id`, otherwise the first fleet sharing the connected account | Attribution only |
 
@@ -148,15 +146,15 @@ The `fleet` argument is loaded by `getDriverSessionAndFleet`, which reads the op
 | Session commit | `RefreshDriverSession` in `yelo-api/internal/data/repository/driver_availability.go` |
 | Online and activation SQL | `SetEligibleDriverOnline`, `ActivateEligibleDriver`, `GetDriverOnlineSelection`, `GetDriverApplicationState` in `yelo-api/internal/data/repository/queries/user_driver.sql` |
 | Payout status model | `DriverApplication.EffectivePayoutStatus` in `yelo-api/internal/models/driver.go` |
-| Stripe account selection | `selectStripeMerchantID`, `processRidePayment`, `reuseRideAuthorization`, `Complete` in `yelo-api/internal/service/ride/driver.go` |
-| Tips | `yelo-api/internal/service/ride/tip_charge.go`, `tip_capture.go` |
+| Stripe account selection | `GetRidePaymentPreparation` in `yelo-api/internal/data/repository/queries/ride_operation.sql`, `freezeRidePreparation` in `ride_promotion_operation.go` |
+| Tips | `yelo-api/internal/service/ride/tip_charge.go`, `tip_capture.go`, `yelo-api/internal/data/repository/ride_dedicated_tip.go` (`freezeDedicatedTip`) |
 
 ## Gotchas and edge cases
 
 - **Routing ignores readiness.** A fleet with `has_custom_payouts = TRUE` and any non-nil `stripe_merchant_id` receives fares, even if it is an owner-operator fleet, inactive, restricted, or has an empty-string account ID. Online eligibility checks readiness, and routing doesn't.
 - **Payout fleet and routing fleet can differ.** A driver with `payout_fleet_id = NULL` goes online on personal Stripe readiness. If their session fleet has custom payouts, fares still go to the fleet's account.
-- **Capture recomputes the account.** `Complete` calls `selectStripeMerchantID` again instead of reusing `Rides.stripe_merchant_id`. If an admin unlinks Stripe or toggles `has_custom_payouts` while a ride is in progress, the capture targets a different connected account than the one that holds the authorization. Archive can't cause this, because open rides and sessions block it.
-- **Rematch across an account change fails.** `reuseRideAuthorization` treats "same driver, different account" as **ride authorization belongs to an unknown assignment**.
+- **The account is fixed at acceptance.** Capture, cancellation, and tips use `Rides.stripe_merchant_id`. If an admin unlinks Stripe or toggles `has_custom_payouts` while a ride is in progress, that ride still settles on the account that holds its authorization.
+- **A queued ride keeps the account chosen at acceptance.** Its promotion reuses the acceptance's frozen inputs, so a routing change made while the ride waits in the queue doesn't apply to it.
 - **Switch timestamps stick.** `SetDriverApplicationPayoutFleet` uses `COALESCE(payout_fleet_joined_at, NOW())`, so a switch from fleet A to fleet B keeps A's join time. The join path uses `SetDriverApplicationPayoutFleetOnJoin`, which resets it.
 - **Busy means any unfinished ride.** `has_ride` counts every ride not in `complete` or `pending_rider_rating`, including `queued` rides, so a driver with a queued ride can't switch fleets, and an admin can't transfer or edit their memberships.
 - **Admin edits skip the auth cache.** `clearFleetEditPresence` invalidates the profile cache and presence, but not the auth cache, unlike the join and switch paths.

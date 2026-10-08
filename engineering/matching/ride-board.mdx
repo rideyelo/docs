@@ -116,12 +116,8 @@ The memory board is per process. Two instances never share it.
 | --- | --- | --- | --- |
 | `addToRideBoardAndNotify` (`rider.go`) | `AddRide` | Normal confirm, direct-request fallback | Returned to `ConfirmRide` |
 | `directAssignDriver` (`rider.go`) | `AddRide` | After `OfferDirectRide` succeeds | Releases the hold and falls back with `board_unavailable` |
-| `requeueAfterDriverCancel` (`ride.go`) | `RemoveRide`, then `AddRide` with a fresh `GetByID` | Driver cancels a queued or active ride | Logged, requeue continues |
+| `ReconcileRideOperation` (`operation_effects.go`) | `AddRide` when the ride is `confirmed`, `RemoveRide` for any other status | From the `ride_operation` job, after every ride operation reaches `succeeded` or `failed`: accept, auto-assign, promotion, complete, cancel, requeue, expiry, and tips | Returned to the job, which retries. `RideOperationEffectReceipts` gets a row only after it succeeds |
 | `unqueueOfflineDriverRides` (`user/user.go`) | `AddRide` per unqueued ride | Offline grace expired | Logged |
-| `AcceptRide` (`driver.go`) | `RemoveRide` | After `Ride.Accept` commits | Returned, so the HTTP call fails even though the ride is assigned |
-| `assignWinner` (`auto_queue.go`) | `RemoveRide` | After `AutoAssignRide` succeeds | Logged |
-| `Cancel` (`ride.go`) | `RemoveRide` | Any non-requeue cancel | Returned after the cancel committed |
-| `CancelUnmatchedRides` (`ride.go`) | `RemoveRide` per expired ride | Expiry sweep | Logged |
 
 There is no remove on direct-request release or decline. The ride stays on the board the whole time and only its visibility changes.
 
@@ -137,20 +133,27 @@ There is no remove on direct-request release or decline. The ride stays on the b
 
 ## Consistency model
 
-Postgres is the source of truth. The provider is updated after the command commits, never inside the transaction, so there's always a window where the two disagree.
+Postgres is the source of truth. The provider is updated after the command commits, never inside the transaction, so there's always a window where the two disagree. For a ride operation, the update runs in the operation's `ride_operation` River job, not in the request.
 
 ```mermaid
 sequenceDiagram
   participant D as Driver A
   participant API
   participant PG as Postgres
+  participant W as ride_operation job
   participant R as Redis
   D->>API: POST /ride/i/{id}/accept
-  API->>PG: acceptRide tx (commit)
+  API->>PG: reserve accept operation (commit)
+  API->>PG: finalize accept operation (commit)
+  API-->>D: 200
   Note over PG,R: Ride assigned in PG, still in ride:details
-  API->>R: SREM, HDEL, SET refresh
+  W->>PG: read ride, status is not confirmed
+  W->>R: SREM, HDEL, SET refresh
+  W->>PG: insert RideOperationEffectReceipts row
   Note over R: Consistent again
 ```
+
+The job reconciles from the ride's current status, so a retry or a late run can't re-add a ride that has since been assigned. If the Redis write fails, the job fails and River retries it. If the job is lost, the recovery job re-enqueues it within a minute, because the operation has no effect receipt. See [Terminal effects](/engineering/payments/ride-operation-journal#terminal-effects).
 
 Because the v2 board reads Postgres, the drift only affects `GET /ride/board/{id}`. Accepts always revalidate `status = 'confirmed'` under the ride row lock, so a stale board entry can't produce a double assignment.
 
@@ -162,6 +165,7 @@ Because the v2 board reads Postgres, the drift only affects `GET /ride/board/{id
 | Board service | `yelo-api/internal/service/ride/driver.go` (`GetEnrichedRideBoard`, `activeSessionFleet`) |
 | Single-ride read | `yelo-api/internal/service/ride/ride.go` (`GetBoardRide`) |
 | Provider | `yelo-api/internal/service/ride/ride_board_redis.go`, `ride_board_memory.go` |
+| Writes after a ride operation | `yelo-api/internal/service/ride/operation_effects.go` (`ReconcileRideOperation`), `yelo-api/internal/service/payment/ride_operation_worker.go` (`finishDelivery`) |
 | Board SQL | `yelo-api/internal/data/repository/queries/ride_driver.sql` (`GetEligibleEnrichedRideBoard`), `ride_matching.sql` (`ListAvailableRideIDs`) |
 | Payload model | `yelo-api/internal/models/ride.go` (`BoardRide`, `EnrichedBoardRide`, `NewBoardRideFromRide`) |
 | App polling and filtering | `yelo-frontend/providers/DriveProvider.tsx`, `providers/driveRideSelection.ts`, `lib/notifications/pushInvalidation.ts` |
@@ -173,5 +177,5 @@ Because the v2 board reads Postgres, the drift only affects `GET /ride/board/{id
 - **`board_unavailable` is almost unreachable.** `RedisRideBoard.AddRide` never returns an error from a Redis failure. It falls back to memory and returns `nil`. Only a serialization error or a memory-board initialization failure surfaces.
 - **The refresh key is vestigial.** `rides:refresh:{communityId}` looks like a change signal but no API code or app reads it. Clients rely on the 10-second poll and pushes.
 - **Community is the driver's home community.** A driver whose `Users.community_id` differs from where they're driving sees the home community's board.
-- **The accept path fails loudly after success.** If `RemoveRide` returns an error, `AcceptRide` returns it after `Ride.Accept` has committed. The client sees an error for an accepted ride. This only happens on the in-memory provider, when lazy initialization fails.
+- **A board failure no longer fails the accept.** `RemoveRide` runs in the operation's job. An error there retries the job and never reaches the driver.
 - **Memory-board initialization is O(n) queries.** The first touch of a community loads every confirmed ride with one `GetByID` each, under a write lock that blocks every other board call in the process.

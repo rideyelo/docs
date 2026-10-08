@@ -1,9 +1,9 @@
 ---
 title: "Ride tip charging"
-description: "How captureTip chooses between an in-buffer capture and a dedicated tip PaymentIntent, the idempotency key, the confirm-tip path, the tip-window sweeper, and the races between rating, sweeping, and webhooks."
+description: "How captureTip chooses between an in-buffer settlement and a dedicated tip PaymentIntent, the commands and idempotency keys behind each, the confirm-tip path, the tip-window sweeper, and how rating, sweeping, and retries resolve against each other."
 ---
 
-In-app tips ride on the fare's PaymentIntent when they fit inside the $5.00 buffer, and on a second PaymentIntent when they don't. This page traces both paths at the Stripe-call level. For the rider-facing rules, see [Tips and earnings](/concepts/tips-and-earnings). For the fare hold itself, see [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
+In-app tips ride on the fare's PaymentIntent when they fit inside the $5.00 buffer, and on a second PaymentIntent when they don't. This page traces both paths at the Stripe-call level. Both run as ride operations: `settle_tip` for the in-buffer capture and `tip` for the dedicated charge. See [Ride operation journal](/engineering/payments/ride-operation-journal) for reservation, retries, and quarantine. For the rider-facing rules, see [Tips and earnings](/concepts/tips-and-earnings). For the fare hold itself, see [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
 
 ## Preconditions
 
@@ -12,95 +12,93 @@ A tip is only considered when all of these hold:
 - The ride row has `tips_enabled = true`. The API sets it at `CreateRide` from the `X-Features` header containing `tips` (`features.HasFeature`, case-sensitive).
 - The caller of `POST /ride/i/{id}/rate` is the rider. Driver ratings never touch payments.
 - The ride is `pending_rider_rating` or `complete`. Any other status returns "Ride is not reviewable".
-- `tip_amount` in the body is between 0 and 100.00 (`RatingRequest.Validate` against `models.MaxTip`).
+- `tip_amount` in the body is between 0 and 100.00 (`RatingRequest.Validate` against `models.MaxTip`). `financialTipCents` rejects NaN, infinity, negatives, and anything above `models.MaxTip` again with "Invalid tip", then converts with `math.Round(tip * 100)`.
 
 `GET /ride/i/{id}/tip-options` is stricter: rider only, status `pending_rider_rating`, tips enabled. It returns fixed presets `[2, 5, 10]` from `models.GetTipOptions`, which ignores the fare.
 
 ## Decision tree
 
-`RideService.captureTip` in `internal/service/ride/tip_charge.go` evaluates in this order. `pendingPaid` means status `pending_rider_rating` with both `payment_intent_id` and `stripe_merchant_id` set.
+`RideService.captureTip` in `internal/service/ride/tip_charge.go` evaluates in this order. "Has hold" means status `pending_rider_rating` with `payment_intent_id` set.
 
 ```mermaid
 flowchart TD
-    A[Rate with tip] --> B{tip at most 0?}
-    B -- Yes --> C{pendingPaid?}
-    C -- Yes --> D[captureFareOnly]
-    C -- No --> N[No-op, tip_status none]
-    B -- No --> E{tip_amount already above 0?}
-    E -- Yes --> N
-    E -- No --> F{pendingPaid and tip at most 5.00?}
-    F -- Yes --> G[captureTipWithinBuffer]
-    F -- No --> H{pendingPaid?}
-    H -- Yes --> I[captureFareOnly, then createTipCharge]
-    H -- No --> J[createTipCharge]
-    G -- CompleteTip lost race --> J
+    A[Rate with tip] --> E{tip_amount already above 0?}
+    E -- Yes --> N[No-op, tip_status none]
+    E -- No --> F{Has hold and tip at most 5.00?}
+    F -- Yes --> G[SettleTipLegacy]
+    G -- Settled --> C[captured, or none for a zero tip]
+    G -- Rejected, ride not complete --> X[Return the command error]
+    G -- Rejected, ride now complete and untipped --> H
+    F -- No --> H{tip is 0?}
+    H -- Yes --> N
+    H -- No --> J[TipLegacy]
 ```
 
-## In-buffer capture
+A rating without a tip on a ride that has a hold still runs `SettleTipLegacy` with 0 cents. That is the capture that settles the fare and completes the ride.
 
-`captureTipWithinBuffer` makes one Stripe call:
+## In-buffer settlement
+
+`SettleTipLegacy` reserves a `settle_tip` operation with the rider as actor. `freezeTipSettlement` requires status `pending_rider_rating`, `tips_enabled`, `tip_amount = 0`, no `tip_payment_intent_id`, a `payment_intent_id`, a `stripe_merchant_id`, a tip window, and a fare above 0. The tip can be at most `models.TipBuffer` ($5.00).
+
+The executor makes one Stripe call, step `capture`:
 
 ```text
-PaymentIntents.Capture(payment_intent_id, amount_to_capture = round((fare + tip) * 100))
+PaymentIntents.Capture(payment_intent_id, amount_to_capture = fare_cents + tip_cents, final_capture = true)
   Stripe-Account: Rides.stripe_merchant_id
+  Idempotency-Key: ride_operation/{operationID}/capture
 ```
 
-Then `Ride.CompleteTip(rideID, tip, fare + tip)` runs `CompleteRideTip`:
+`RideTipSettlementCommands.Finalize` then verifies the capture receipt against the frozen fare and tip and runs `CompleteRideTip`:
 
 ```sql
 UPDATE "Rides" SET tip_amount = $tip, driver_payout = $fare_plus_tip, status = 'complete'
 WHERE id = $ride AND status = 'pending_rider_rating';
 ```
 
-It records `payment_confirmed` and `tip_captured` ride events and returns `tip_status: captured`.
+The ride update, the revision bump, the operation outcome, and the `tip_captured` ride event commit in one transaction. `captureTip` returns `captured` when the settled tip is above 0 and `none` otherwise.
 
-If `CompleteRideTip` updates zero rows, the sweeper already settled the fare. In that case the capture call above hit `charge_already_captured`, which `PartiallyConfirm` swallows, so the tip wasn't collected. The code falls back to `createTipCharge`.
-
-## Fare-only capture
-
-`captureFareOnly` captures `round(fare * 100)` and then calls `CompleteTip(rideID, 0, fare)`. An input-type error from `CompleteTip`, meaning the ride is no longer pending, is ignored. This is what a rating with no tip does on a pending paid ride.
+If `SettleTipLegacy` returns an error, `settleBufferedTip` rereads the ride. A ride that isn't `complete` returns the error to the rider. A ride that is now `complete` with `tip_amount = 0` means the sweeper settled the fare between the snapshot and the reservation. A tip above 0 then falls through to a dedicated charge.
 
 ## Dedicated tip charge
 
-`createTipCharge` runs for tips above the buffer, tips on free rides, and tips on rides that are already `complete`.
+`TipLegacy` runs for tips above the buffer, tips on rides without a hold, and tips on rides that are already `complete`. It reserves a `tip` operation. `freezeDedicatedTip` requires the caller to be the rider, a driver on the ride, status `complete` or `pending_rider_rating`, `tips_enabled`, `tip_amount = 0`, no `cancel_phase`, and no `tip_payment_intent_id` other than one being adopted.
 
 <Steps>
-  <Step title="Resolve the merchant">
-    `resolveTipMerchant` returns `Rides.stripe_merchant_id` when set. For free rides it loads the driver and the ride's fleet and calls `selectStripeMerchantID`. An empty result returns "This driver can't accept tips right now."
+  <Step title="Freeze the account and funding">
+    The account is `Rides.stripe_merchant_id` when the ride has one. Otherwise `GetRidePaymentPreparation` picks the fleet account when the fleet has `has_custom_payouts` and a `stripe_merchant_id`, else the driver's account. Consent must be present: `COALESCE(payment_consent_at, confirm_time)`, `rider_ip_address`, and `rider_user_agent`. With no saved clone, the ride also needs the rider's Stripe customer and `payment_method_id`. Any gap fails the reservation.
   </Step>
-  <Step title="Resolve the payment method">
-    `resolveTipPaymentMethod` returns `cloned_payment_method_id` when set. Otherwise it clones `payment_method_id` onto the merchant now. No saved method returns "Add a payment method to leave a tip."
+  <Step title="Settle the fare first">
+    When the ride is still `pending_rider_rating`, the operation captures the fare on the ride's own intent (step `capture`, fare cents). `FinalizeFare` runs `CompleteRideTip` with a zero tip, which sets the ride to `complete`, and resolves the `settle_fare` step. The tip charge can't start until that step has a result.
   </Step>
-  <Step title="Check mandate data">
-    The ride must have `confirm_time`, `rider_ip_address`, and `rider_user_agent`. Otherwise it's a server error.
+  <Step title="Clone the payment method">
+    Step `clone_payment_method` runs only when the ride has no `cloned_payment_method_id`.
   </Step>
-  <Step title="Cancel the previous tip intent">
-    If `tip_payment_intent_id` is set, `CancelPaymentIntent` runs on it. Failures are only logged.
+  <Step title="Create the tip intent">
+    Step `create_tip` calls `CreateRideTip` with `confirm=false`. The intent ID is stored as the step result.
   </Step>
-  <Step title="Create and confirm">
-    `CreateTipPaymentIntent` creates an automatic-capture, off-session intent. See the parameters below.
+  <Step title="Confirm">
+    Step `settle_dedicated_tip` calls `ConfirmRideTip`, off-session, with the mandate data.
   </Step>
-  <Step title="Persist and record">
-    `SetRideTipPaymentIntentID` stores the new ID. If Stripe returned `succeeded`, `RecordTip` runs `RecordCompletedRideTip` and the result is `captured`. Otherwise the result is `requires_action`.
+  <Step title="Finalize">
+    A `succeeded` intent finishes the operation as `succeeded`. `RecordCompletedRideTip` writes the tip, and `SetRideTipPaymentIntentID` stores the intent ID. A `canceled` intent finishes it as `failed` and writes nothing to the ride.
   </Step>
 </Steps>
 
-`Client.CreateTipPaymentIntent` parameters:
+`Client.CreateRideTip` parameters (`internal/data/stripe/ride_tip.go`):
 
 | Parameter | Value |
 | --- | --- |
-| `amount` | `round(tip * 100)` |
+| `amount` | Frozen tip cents |
 | `currency` | `usd` |
-| `capture_method` | `automatic` |
-| `confirm`, `off_session` | `true`, `true` |
+| `capture_method`, `confirmation_method` | `automatic`, `automatic` |
+| `confirm` | `false` |
 | `payment_method` | The cloned method |
 | `automatic_payment_methods` | enabled, `allow_redirects=never` |
-| `mandate_data` | online, `accepted_at = confirm_time`, rider IP and user agent |
 | `description` | `Yelo Tip` |
-| `metadata` | `ride_id`, `type=tip` |
-| Idempotency key | `tip_{rideID}_{tipCents}` |
+| `metadata` | `type=tip`, `operation_id`, `ride_id`, `rider_id`, `driver_id` |
+| Idempotency key | `ride_operation/{operationID}/create_tip` |
 
-When Stripe answers with an `authentication_required` error that carries a PaymentIntent, the client returns that intent with no error. Its status is `requires_action`, and the rate response includes `tip_client_secret` and `tip_connected_account_id`.
+`ConfirmRideTip` sends `off_session=true` and online mandate data (`accepted_at`, rider IP, user agent) with the key `ride_operation/{operationID}/settle_dedicated_tip`. It reads the intent first and only confirms one that is still `requires_confirmation`.
 
 `RecordCompletedRideTip` is additive and single-shot:
 
@@ -109,62 +107,114 @@ UPDATE "Rides" SET tip_amount = $tip, driver_payout = COALESCE(driver_payout, 0)
 WHERE id = $ride AND status = 'complete' AND tip_amount = 0;
 ```
 
+`applyDedicatedTip` first checks that `driver_payout` still equals the base payout frozen at reservation and that the ride is still untipped. A mismatch is a command conflict.
+
+### What the rate response carries
+
+`legacyTipResult` in `financial_commands.go` maps the command's progress to `tip_status`:
+
+| Progress | `tip_status` | Extra fields |
+| --- | --- | --- |
+| Outcome `succeeded` | `captured` | — |
+| Outcome `canceled` | `none` | — |
+| No outcome, intent `requires_action` with a client secret | `requires_action` | `tip_client_secret`, `tip_connected_account_id` |
+| No outcome and the intent is `processing`, or no secret or account is available | None. Input error "Tip pending": "Your tip is still processing. Please check again shortly." | — |
+
+The client secret is a live read from Stripe. It is never stored in the journal.
+
+### Authentication window
+
+A tip can wait on the rider. The first time the executor sees `requires_action`, it writes the `authenticate_tip` step. Once 30 minutes have passed since that step's first attempt (`rideTipAuthenticationWindow`), the next attempt records `abandon_tip` and cancels the intent with `requested_by_customer`. A `requires_payment_method` status triggers the same abandonment immediately.
+
+While it waits, the `ride_operation` job snoozes for a minute at a time and a `payment_intent.*` webhook can wake it early. See [Tip snooze](/engineering/payments/ride-operation-journal#tip-snooze).
+
 ### Confirm-tip
 
 `POST /ride/i/{id}/confirm-tip` (`RideService.ConfirmTip`) finishes a `requires_action` tip:
 
-1. The caller must be the rider, and `tip_payment_intent_id` must be set.
-2. It fetches the intent from Stripe on the resolved merchant. It never trusts a client-supplied ID.
-3. Only `status=succeeded` is accepted. The recorded tip is the intent's `amount` divided by 100, not the rider's original input.
-4. `RecordTip` writes it. A second call hits `tip_amount = 0` and returns "Ride is not complete or was already tipped".
+1. The caller must be the rider. Anyone else gets "Unauthorized".
+2. `ConfirmTipLegacy` loads the rider's latest `tip` operation for the ride and resumes it with its frozen amount. It never accepts a client-supplied PaymentIntent ID and never creates a tip.
+3. The executor reads the intent from Stripe on the frozen account. A `succeeded` intent whose `amount_received` equals the frozen tip finalizes the operation.
+4. `ConfirmTip` returns success only when the outcome is `succeeded`. Anything else returns "Tip incomplete".
+5. With no `tip` operation and no legacy intent to adopt, it returns "No tip".
+
+A second call after success replays the stored outcome and returns success again.
 
 <Warning>
-The mobile app doesn't handle `requires_action`. `app/(app)/ride-complete/index.tsx` only checks `response.success` and never presents a sheet or calls `confirm-tip`. A tip that needs authentication is silently not collected, and the rider sees "Review saved".
+The mobile app doesn't handle `requires_action`. `app/(app)/ride-complete/index.tsx` only checks `response.success` and never presents a sheet or calls `confirm-tip`. A tip that needs authentication is abandoned by the server after 30 minutes, and the rider sees "Review saved".
 </Warning>
+
+### Retry identity
+
+`TipLegacy` derives the command ID from the ride, the rider, and the amount (`yelo:ride:tip:{rideID}:{riderID}:{tipCents}`), so a retry with the same amount lands on the same operation.
+
+| Situation | Result |
+| --- | --- |
+| Same amount again while the tip is unfinished | Resumes the operation and returns its current progress |
+| Same amount again after success | Replays the `succeeded` outcome. No second charge |
+| Different amount while the rider's latest tip is unfinished or succeeded | Rejected with "Ride Unavailable". The reservation compares the amount |
+| Different amount after the latest tip `failed` (intent canceled) | A new operation with the new amount |
+| Same amount again after it `failed` | Replays the canceled outcome, `tip_status: none` |
+
+### Tips started before the journal
+
+`adoptLegacyTip` handles a ride whose `tip_payment_intent_id` was written by the pre-journal tip flow and whose `tip_amount` is still 0. It reads that intent from Stripe, reserves a `tip` operation around it, and never creates a replacement. The requested amount must equal the intent's amount. See [Adopting an existing tip intent](/engineering/payments/ride-operation-journal#adopting-an-existing-tip-intent).
 
 ## Free rides
 
-A free ride goes straight to `complete` at `Complete`, so every tip on it takes the dedicated path. The payment method is cloned onto the driver's or fleet's account at rating time. The ride must still have `payment_method_id`, but `ConfirmRide` doesn't require one for free rides, so many free rides can't be tipped.
+A free ride has no hold, so every tip on it takes the dedicated path. The payment method is cloned onto the driver's or fleet's account inside the `tip` operation. The ride must have `payment_method_id`, and `ConfirmRide` doesn't require one for free rides, so many free rides can't be tipped.
+
+<Warning>
+A free ride can't be tipped while it's `pending_rider_rating`. `freezeDedicatedTip` sets `SettleFare` for every ride in that status, and `validateDedicatedTipAmounts` then requires a fare intent, a fare above 0, and a tip above the buffer ("invalid dedicated tip fare settlement"). The rating request fails with a server error before the rating is saved. A rating without a tip succeeds and moves the ride to `complete`, and a tip sent after that reserves normally.
+</Warning>
 
 ## Tip-window sweeper
 
 `RideService.AutoCaptureTipWindowExpired` in `tip_capture.go` runs from the `TipCapture` ticker every 5 minutes in `cmd/api/main.go`. It's an in-process loop, so every API instance runs it.
 
 1. `ListRidesWithExpiredTipWindows` selects up to 50 rides with status `pending_rider_rating`, `tips_enabled`, `tip_window_expires_at` in the past, and a `payment_intent_id`, ordered oldest window first.
-2. For each: `PartiallyConfirm(int(fare * 100))` on the stored merchant.
-3. `CompleteTip(ride, 0, fare)`. If it fails, the ride was rated concurrently. The sweeper returns success, because the capture already went through.
-4. Records `tip_window_expired`.
+2. For each: `SettleTipLegacy(rideID, uuid.Nil, 0, true)`. This reserves a system `settle_tip` operation with a zero tip. The reservation rechecks under lock that the window has expired.
+3. The operation captures the fare cents and completes the ride with `tip_amount = 0`. It records `tip_window_expired`.
 
-A failed ride is retried on the next tick. After an hour past its window, each failure logs "ride stuck past tip window for >1 hour, needs manual review" at error level. There's no terminal state, so a permanently uncapturable ride logs every 5 minutes forever.
+The command ID is derived from the ride alone, so every instance and every tick address the same operation. A failed ride is retried on the next tick, and its `ride_operation` job retries in between. After an hour past its window, each failure logs "ride stuck past tip window for >1 hour, needs manual review" at error level. Before that it logs "failed to auto-capture expired tip window, will retry next run" at warn level.
+
+A ride with a quarantined operation keeps failing here every 5 minutes until someone reconciles that operation.
 
 ## Races
 
+A ride has at most one unresolved operation. Every race below resolves at reservation, before any Stripe call.
+
 | Race | Outcome |
 | --- | --- |
-| Sweeper and in-buffer rating hit Stripe together | Whichever captures first wins. The loser gets `charge_already_captured`, treated as success. `CompleteRideTip`'s status guard picks one DB winner. If the sweeper won, the rating falls back to a dedicated tip charge |
-| Two instances sweep the same ride | Same as above. Both captures are fare-only, so the amounts agree |
-| Rider rates twice with the same over-buffer tip after a `requires_action` result | Second call cancels the first tip intent, then reuses the idempotency key. Stripe replays the first response, so the caller gets `requires_action` and a client secret for an intent that's now canceled. The tip can't be completed without changing the amount |
-| In-buffer capture succeeds, `CompleteRideTip` fails with a server error | The rider paid fare plus tip. The sweeper later captures fare-only, gets `charge_already_captured`, and records `tip_amount = 0` |
-| Fare capture, then tip charge, then the fare's `payment_intent.succeeded` webhook | The webhook sets `driver_payout = amount_received`, which is the fare. That overwrites the fare plus tip written by `RecordTip`. See [Stripe webhooks](/engineering/payments/webhooks) |
+| Sweeper and an in-buffer rating reserve together | One `settle_tip` wins. The other is rejected as a conflict. If the sweeper won and already finished, the rating falls through to a dedicated tip when the tip is above 0. If the sweeper's operation is still unresolved, the rating returns the error and the rider can retry |
+| Two instances sweep the same ride | Same command ID, same operation. The second caller replays the first one's steps and outcome |
+| Rider rates twice with the same over-buffer tip after a `requires_action` result | Same operation. The second call returns the current state of the same intent |
+| Capture succeeds, then finalization fails | The receipt is already in the journal. The next attempt, from the job or a retry, finalizes without another capture |
+| Fare capture, then tip charge, then the fare's `payment_intent.succeeded` webhook | The webhook skips the ride, because it has an operation row. `driver_payout` keeps the fare plus tip written by the finalizers. See [Stripe webhooks](/engineering/payments/webhooks) |
 
 ## Where this lives in code
 
 | Concern | Location |
 | --- | --- |
 | Rate entry point | `yelo-api/internal/service/ride/ride.go` (`Rate`, `GetTipOptions`) |
-| Tip routing and charges | `yelo-api/internal/service/ride/tip_charge.go` (`captureTip`, `captureTipWithinBuffer`, `captureFareOnly`, `createTipCharge`, `ConfirmTip`) |
+| Tip routing | `yelo-api/internal/service/ride/tip_charge.go` (`captureTip`, `settleBufferedTip`, `ConfirmTip`), `financial_commands.go` (`legacyTipResult`, `financialTipCents`) |
+| Adapters | `yelo-api/internal/service/payment/ride_legacy_tip_settlement.go`, `ride_legacy_dedicated_tip.go` |
+| In-buffer settlement | `yelo-api/internal/service/payment/ride_tip_settlement.go`, `yelo-api/internal/data/repository/ride_tip_settlement.go` |
+| Dedicated tip | `yelo-api/internal/service/payment/ride_dedicated_tip.go`, `ride_tip_operation.go`, `yelo-api/internal/data/repository/ride_dedicated_tip.go`, `ride_dedicated_tip_finalize.go` |
 | Sweeper | `yelo-api/internal/service/ride/tip_capture.go`, `yelo-api/cmd/api/main.go` (`TipCapture`) |
 | Constants | `yelo-api/internal/models/tip.go` (`TipBuffer`, `MaxTip`, `GetTipOptions`) |
-| Stripe tip intent | `yelo-api/internal/data/stripe/intent.go` (`CreateTipPaymentIntent`) |
-| SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`CompleteRideTip`, `RecordCompletedRideTip`, `SetRideTipPaymentIntentID`, `ListRidesWithExpiredTipWindows`) |
+| Stripe tip intent | `yelo-api/internal/data/stripe/ride_tip.go` (`CreateRideTip`, `ConfirmRideTip`, `CancelRideTip`, `InspectLegacyRideTip`) |
+| SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`CompleteRideTip`, `RecordCompletedRideTip`, `SetRideTipPaymentIntentID`, `ListRidesWithExpiredTipWindows`), `queries/ride_operation.sql` (`GetRideTipSettlementDecision`, `GetDedicatedRideTipDecision`) |
 | Feature header | `yelo-api/internal/utilities/features/features.go`, `yelo-frontend/hooks/usePreRideRequest.ts` |
 | Rider UI | `yelo-frontend/app/(app)/ride-complete/index.tsx`, `yelo-frontend/components/ride-complete/TipSelector.tsx` |
 
 ## Gotchas and edge cases
 
 - **No deadline for late tips.** `Rate` accepts `complete` rides, so the API will charge a dedicated tip on any completed tips-enabled ride with `tip_amount = 0`, at any time. Only the app's navigation limits this.
-- **Sub-minimum tips.** The mobile custom field accepts any positive amount, such as $0.10. Inside the buffer that's fine. As a dedicated charge, Stripe rejects anything under $0.50 and the rating fails with a server error.
-- **Idempotency key lifetime.** Stripe keeps keys for 24 hours. Changing the amount from A to B and back to A inside that window replays A's original response, including a canceled intent.
+- **Sub-minimum tips.** The mobile custom field accepts any positive amount, such as $0.10. Inside the buffer that's fine. As a dedicated charge, Stripe rejects anything under $0.50. That rejection isn't a conflict, so the `tip` operation stays `pending`, the rating fails with a server error, and the job retries the same request until its attempts run out and recovery quarantines the operation.
+- **One tip operation at a time.** An unfinished tip pins the amount. The rider can't switch amounts until the first intent succeeds or is canceled.
+- **A declined tip is silent.** A dedicated tip whose intent ends `canceled` returns `tip_status: none` with a successful rating.
 - **Tip charges aren't enriched.** The earnings activity feed joins on `payment_intent_id`, so a dedicated tip's charge appears as a bare Stripe row without rider name. The tip charge's fee is tracked separately in `tip_stripe_fee_cents` (actual) and `estimated_tip_stripe_fee_cents`, and both are subtracted from the driver's net earnings.
-- **Recorded tip source.** In-buffer and immediate dedicated tips record the requested amount. Confirm-tip records Stripe's `amount`. They only differ if a client sends fractional cents.
+- **`tip_payment_intent_id` is written on success only.** A tip that is waiting on authentication has no trace on the ride row. Look in `RideOperations` and `RideOperationSteps`.
+- **Recorded tip source.** Every path records the frozen tip cents. A dedicated tip must also match Stripe's `amount_received`.
 - **Presets are fixed.** `GetTipOptions` returns `[2, 5, 10]` for every fare, and the mobile screen falls back to the same presets when the endpoint fails. A $10 preset always exceeds the buffer and takes the dedicated path.

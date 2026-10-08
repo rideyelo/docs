@@ -11,6 +11,7 @@ A ride is stuck when it stays in a non-terminal status after the trip is over or
 - A rider can't book and sees **Existing ride in progress** ("Cannot create another ride while a ride is in progress").
 - A driver is forced onto the drive screens, or sees "finish the current ride before changing driver session", "go offline before changing vehicles", or **Finish Driving First** when switching fleets.
 - **Rides** → **Trips** → **Active**, or the **Rides** table on **Live**, shows a ride far older than a normal trip.
+- Every action on one ride (accept, complete, cancel, rate) fails with **Ride Unavailable** ("This ride has changed. Refresh and try again."), even after a refresh. That points at an unresolved ride operation. See step 4 below.
 
 ## Diagnose
 
@@ -62,6 +63,47 @@ A ride is stuck when it stays in a non-terminal status after the trip is over or
 
     A ride in `requested` never blocks a new booking. Any ride in `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress`, or `pending_rider_rating` does.
   </Step>
+  <Step title="Check the ride's operations">
+    Accept, promotion, complete, cancel, expiry, and tips each run as a ride operation. While one is `pending` or `quarantined`, the ride accepts no other command, the expiry sweep skips it, and admin silent cancellation is blocked. **Read-only:**
+
+    ```sql
+    BEGIN TRANSACTION READ ONLY;
+
+    -- Operations for the ride, oldest first
+    SELECT o.id, o.kind, o.state, o.actor_type, o.outcome, o.created_at, o.finished_at,
+           e.completed_at AS effects_completed_at
+    FROM "RideOperations" o
+    LEFT JOIN "RideOperationEffectReceipts" e ON e.operation_id = o.id
+    WHERE o.ride_id = '<ride-id>'
+    ORDER BY o.created_at;
+
+    -- Steps of the unresolved operation. A null result is the provider call that didn't resolve
+    SELECT name, first_attempt_at, resolved_at, result IS NULL AS unresolved
+    FROM "RideOperationSteps"
+    WHERE operation_id = '<operation-id>'
+    ORDER BY first_attempt_at;
+
+    -- The job that should be driving it
+    SELECT id, state, attempt, max_attempts, scheduled_at, errors
+    FROM river_job
+    WHERE kind = 'ride_operation' AND args->>'operation_id' = '<operation-id>'
+    ORDER BY id DESC;
+
+    ROLLBACK;
+    ```
+
+    Read the result like this:
+
+    | What you see | Meaning | Next step |
+    | --- | --- | --- |
+    | `pending`, job `running`, `available`, `retryable`, or `scheduled` | The command is still being worked. `errors` on the job shows why the last attempt failed | Fix the cause if it's on Yelo's side, such as a Stripe or maps outage. The job retries on its own |
+    | `pending`, kind `tip`, job `scheduled` about a minute out | A dedicated tip is waiting on the rider's authentication. It's abandoned 30 minutes after the first challenge | Wait |
+    | `pending`, no job row or only `completed` ones | Delivery was lost | Wait a minute. `ride_operation_recovery` re-enqueues it |
+    | `quarantined` | The provider outcome is unknown or contradicts the recorded decision, or the job ran out of attempts. `outcome.reason` says which | Escalate to an engineer. No dashboard control or endpoint resolves it. See [Quarantine](/engineering/payments/ride-operation-journal#quarantine) |
+    | `succeeded` or `failed` with no `effects_completed_at` | The ride changed, but the ride board or the driver's queue summary hasn't caught up | Usually clears within a minute. If it persists, check Redis and the job's `errors`. See [Redis outage](/runbooks/redis-outage) |
+
+    Don't edit `RideOperations` or `RideOperationSteps` by hand. Triggers reject most updates, and a wrong step result can charge or release the wrong amount.
+  </Step>
   <Step title="Check for fleet-wide anomalies">
     If several users report this, run `yelo-api/docs/ride-cardinality-preflight.sql` (read-only). It lists riders with more than one live booking, drivers with more than one active trip, requested drafts next to live bookings, active rides without a driver, and session or vehicle ownership conflicts. It never repairs anything. See `docs/ride-cardinality-preflight.md` for how to read it.
   </Step>
@@ -77,12 +119,12 @@ Match the ride's status to this table before you act.
 | Status | Ends on its own? | Who can end it |
 | --- | --- | --- |
 | `requested` | Replaced with `cancel_reason = 'superseded'` when the rider requests again | Rider |
-| `confirmed`, no driver | Yes. `CancelUnmatchedRides` ends it 10 minutes after `confirm_time` | Rider cancels |
+| `confirmed`, no driver | Yes. `CancelUnmatchedRides` ends it 10 minutes after `confirm_time`, unless the ride has an unresolved ride operation | Rider cancels |
 | `queued` | Only indirectly. If the driver has no active ride, the `QueueRefresh` loop (every 3 minutes) promotes the first queued ride through `RecoverIdleQueue`. If the driver is offline past the 5-minute grace, the ride goes back to `confirmed`, then expires | Rider cancels, or the driver cancels (requeue) |
 | `driver_en_route`, `driver_waiting` | No | Rider cancels (fees may apply), or the driver cancels, which requeues the ride to `confirmed`. An admin can silently cancel a free ride |
 | `in_progress` | No | Driver completes, or either party cancels. An admin can silently cancel a free ride |
-| `pending_rider_rating`, tips enabled | Yes. The `TipCapture` loop captures the fare after `tip_window_expires_at` (24 hours) | Rider rates |
-| `pending_rider_rating`, tips disabled | No | Rider rates |
+| `pending_rider_rating`, paid ride with tips enabled | Yes. The `TipCapture` loop captures the fare after `tip_window_expires_at` (24 hours) | Rider rates |
+| `pending_rider_rating`, tips disabled or a free ride | No. These rides have no `tip_window_expires_at` | Rider rates |
 
 A requeue resets `confirm_time`, so the 10-minute expiry clock restarts. See [Ride lifecycle](/concepts/ride-lifecycle) and [Cancellations](/concepts/cancellations).
 
@@ -102,7 +144,9 @@ A requeue resets `confirm_time`, so the 10-minute expiry clock restarts. See [Ri
 
     Rider cancellations can carry a fee, depending on status and timing. Check [Fee rules](/concepts/cancellations#fee-rules) before you advise a rider to cancel.
 
-    When the rider is stuck in `pending_rider_rating` on a ride without tips, opening the app sends them to the rating screen (`/(app)/ride-complete`). Submitting a rating ends the ride and unblocks booking.
+    When the rider is stuck in `pending_rider_rating` on a ride without tips or on a free ride, opening the app sends them to the rating screen (`/(app)/ride-complete`). Submitting a rating ends the ride and unblocks booking. On a free ride, the rating must not include a tip. See [Free rides](/engineering/payments/ride-tips#free-rides).
+
+    If the action fails with **Ride Unavailable**, an unresolved ride operation owns the ride. Go back to step 4 of **Diagnose**.
   </Accordion>
   <Accordion title="Option 2: Admin silent cancellation (free, accepted rides only)">
     Use this when neither participant can end an accepted ride, and the ride carries no payment. It needs the `admin` role. Fleet managers and interns don't see the control, and the API returns 403 for them.
@@ -163,8 +207,9 @@ Admin silent cancellation is the only operator tool that ends a ride. No dashboa
 ## Root causes seen in code
 
 - **Drivers with an active ride are forced back online.** Every 30 seconds, `SetInactiveDriversOffline` first runs `RestoreDriversWithActiveRides`, which sets `is_online_driver = TRUE` for any driver with a ride outside `complete` and `pending_rider_rating`. A ghost `driver_en_route` or `in_progress` ride keeps its driver in driving mode indefinitely.
-- **Unrated rides without tips never end.** They stay in `pending_rider_rating` until the rider rates, and that status counts as a live booking.
-- **Expiry only covers unassigned rides.** `CancelUnmatchedRides` ignores `queued` and assigned statuses. It also never calls Stripe, so an expired requeued ride can keep an authorization.
-- **Payment failure at a manual accept.** The `Payment Failed` cancel is rejected because the accepting driver isn't assigned yet. The ride stays `confirmed` on the board until it expires. See [System-initiated endings](/concepts/cancellations#system-initiated-endings).
+- **Unrated rides without a tip window never end.** Every completion moves the ride to `pending_rider_rating`. Free rides and rides with tips off have no tip window, so they stay there until the rider rates, and that status counts as a live booking.
+- **An unresolved ride operation holds its ride.** A `quarantined` operation, or a `pending` one whose job keeps failing, blocks every command on the ride with "Ride Unavailable". Nothing times it out.
+- **Expiry only covers unassigned rides.** `CancelUnmatchedRides` ignores `queued` and assigned statuses, and skips a ride with an unresolved operation. It voids any hold still attached before it completes the ride, so a ride whose void can't be verified stays `confirmed`.
+- **Payment failure at accept or promotion.** A declined card cancels the ride with `cancel_reason = 'Payment Failed'` and tells the rider. A Stripe outage at the same point leaves the ride assigned with a `pending` operation instead. See [System-initiated endings](/concepts/cancellations#system-initiated-endings).
 - **The offline grace needs Redis.** `handleQueuedDriverOfflineGrace` skips a driver when the presence lookup fails.
-- **Timeline gaps.** `RideEvents` are written asynchronously. An event is dropped when the recorder channel stays full for 100 ms. A missing event doesn't prove a transition didn't happen, so trust `Rides.status`.
+- **Timeline gaps.** Some `RideEvents` are written asynchronously, and an event is dropped when the recorder channel stays full for 100 ms. A declined authorization writes no event at all. A missing event doesn't prove a transition didn't happen, so trust `Rides.status`.

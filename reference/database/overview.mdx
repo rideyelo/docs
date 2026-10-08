@@ -69,7 +69,7 @@ Treat both `NULL` and the sentinel as "absent" when you query these columns.
 - Five columns are `timestamp` without time zone: `Rides.at_pickup_time`, `PhoneOTPs.created_at`, `Waitlist.created_at`, `Messages.timestamp`, and `EventStoryViews.viewed_at`. `MarkRideAtPickup` casts its argument to `::timestamp`.
 - Creation time is usually `created_at DEFAULT now()`. Older tables use `created_timestamp` (`Users`, `DriverAutoQueueLog`, `KpiManualLog`, `ScheduledCommunityNotifications`) or `"timestamp"`.
 - No trigger maintains `updated_at`. Queries set `updated_at = NOW()` explicitly, so a new `UPDATE` must do the same.
-- The ride operation tables default to `clock_timestamp()`, the wall-clock time of the insert, instead of `now()`, the transaction start time.
+- `RideOperations`, `RideOperationSteps`, and `RideCancellationQuotes` default to `clock_timestamp()`, the wall-clock time of the insert, instead of `now()`, the transaction start time. `RideOperationEffectReceipts.completed_at` uses `now()`.
 
 ### Soft deletes and retirement
 
@@ -143,7 +143,7 @@ While it existed, `river_job_notify()` called `pg_notify('river_insert', ...)` w
 
 ### Migrations
 
-- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 352 versions, each with both files.
+- Files are `migrations/NNNNNN_description.up.sql` and `.down.sql`, with a six-digit, gap-free version. There are 355 versions, each with both files.
 - `000001_init_db` is a `pg_dump` of the original Supabase schema, including Supabase extensions. Integration tests and the sqlc schema generator rewrite the Supabase-only statements.
 - `000242_river_v1` through `000248_river_v7` vendor River's own migrations.
 - Some migrations change data as well as schema, for example `000254_normalize_user_shape`, which backfilled missing `DriverApplications` rows.
@@ -187,8 +187,9 @@ Every table and view in the `public` schema, grouped by reference page, plus gol
 | --- | --- |
 | `Rides` | One row per ride request through completion or cancellation. |
 | `RideEvents` | Best-effort timeline of ride events. |
-| `RideOperations` | Idempotent journal of money-affecting ride commands (no production writer yet). |
+| `RideOperations` | Idempotent journal of money-affecting ride commands. |
 | `RideOperationSteps` | Provider calls inside a ride operation. |
+| `RideOperationEffectReceipts` | Acknowledgement that a finished operation's ride board and driver queue effects were applied. |
 | `RideCancellationQuotes` | Immutable short-lived cancellation fee quotes. |
 | `RideMessages` | Rider and driver chat messages. |
 | `RideMessageStreams` | Per-ride message counter and latest index. |

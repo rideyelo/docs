@@ -11,8 +11,10 @@ This page covers how the API implements rides. For the product meaning of each s
 | --- | --- |
 | `internal/server/http/ride` | Routes under `/ride`, the `RideService` interface, handlers |
 | `internal/service/ride/rider.go` | `CreateRide`, `CreateRideV2`, `ConfirmRide`, vehicle options, pricing selection, direct assignment |
-| `internal/service/ride/driver.go` | `AcceptRide`, `AutoAssignRide`, `RecoverIdleQueue`, `DeclineRide`, `AtPickup`, `Pickup`, `Complete`, payment intent creation, queue promotion |
-| `internal/service/ride/ride.go` | `Cancel`, `CancelIntent`, `Rate`, map details, `CancelUnmatchedRides`, requeue after driver cancel, `NewRideService` |
+| `internal/service/ride/driver.go` | `AcceptRide`, `AutoAssignRide`, `RecoverIdleQueue`, `DeclineRide`, `AtPickup`, `Pickup`, `Complete`. The accept, auto-assign, recovery, and complete methods forward to the ride financial runtime |
+| `internal/service/ride/ride.go` | `Cancel`, `CancelIntent`, `Rate`, map details, `CancelUnmatchedRides`, `NewRideService` |
+| `internal/service/ride/financial_commands.go` | The `RideFinancialOperations` interface and the helpers that submit accept, complete, cancel, and quote commands to `payment.RideOperations` |
+| `internal/service/ride/operation_effects.go` | `ReconcileRideOperation`: ride board, driver queue summary, and rematch alerts after a ride operation finishes |
 | `internal/service/ride/tip_capture.go`, `tip_charge.go` | Tip-window auto-capture and tip charges |
 | `internal/service/ride/driver_options.go`, `option_groups.go`, `option_presentation.go` | Per-driver options and badges for `CreateRideV2` |
 | `internal/service/ride/events.go` | `record*Event` helpers for the ride timeline |
@@ -61,8 +63,9 @@ flowchart LR
 Key implementation points:
 
 - **Confirm** (`ConfirmRide`) validates the payment method, picks the effective price and fleet, generates a four-digit confirm code when the fleet sets `RequiresConfirmationCode`, then either adds the ride to the board and notifies drivers (`addToRideBoardAndNotify`) or offers it to one driver (`directAssignDriver`). Riders with an `@rideyelo.com` email always get confirm code `1234` so Maestro E2E flows can finish the handshake.
-- **Accept** (`AcceptRide`) loads the driver's session and fleet, takes the ride's advisory lock, calculates the pickup route, creates or reuses the Stripe payment intent when the price is above zero, calls `Ride.Accept`, refreshes the driver's queue summary, removes the ride from the board, and notifies the rider. A repeat accept from the driver who already holds the ride returns success without doing any of this again. See [Concurrency and races](/engineering/matching/concurrency#race-scenarios).
-- **Complete** (`Complete`) selects the Stripe merchant (fleet or driver) and always moves the ride to `pending_rider_rating`. With tips enabled and a nonzero price, it sets a 24-hour `tip_window_expires_at` and defers capture. Otherwise it captures the fare immediately, and the ride stays in `pending_rider_rating` until the rider rates it.
+- **Accept** (`AcceptRide`) takes the ride's advisory lock and submits an `accept` ride operation. The operation assigns the ride in its reservation transaction, then creates the Stripe payment intent when the fare is above zero and the ride takes the active slot, calculates the pickup route, and notifies the rider when it finishes. Its River job removes the ride from the board and refreshes the driver's queue summary. A repeat accept from the driver who already holds the ride replays the same operation. See [Concurrency and races](/engineering/matching/concurrency#race-scenarios).
+- **Complete** (`Complete`) submits a `complete` ride operation, which uses the Stripe account stored on the ride and always moves the ride to `pending_rider_rating`. With tips enabled and a nonzero price, it sets a 24-hour `tip_window_expires_at` and defers capture. Otherwise it captures the fare first, and the ride stays in `pending_rider_rating` until the rider rates it.
+- **Money moves only through ride operations.** Accept, auto-assign, promotion, complete, cancel, expiry, and tips each reserve a row in `RideOperations` before any Stripe call and execute from it. `RideService` holds the runtime as `RideFinancialOperations` and makes no Stripe write for a ride after confirmation. See [Ride operation journal](/engineering/payments/ride-operation-journal).
 - **Direct requests** give the chosen driver a 30-second response window. `ActivationService.resumeExpiredDirectRide` returns the ride to normal matching after the window.
 
 ## Ride board
@@ -127,7 +130,7 @@ Retries from mobile clients are treated as success where safe. For example, `Dec
 
 ### Advisory lock
 
-`Ride.AcquireLock(ctx, rideID)` takes a session-level `pg_advisory_lock` keyed on the first 8 bytes of the ride UUID, on a dedicated pool connection. `prepareAndPromoteQueuedRide` uses it to serialize queue-head preparation between maintenance and driver commands. The unlock uses `context.WithoutCancel` so a cancelled request cannot leak the lock.
+`Ride.AcquireLock(ctx, rideID)` takes a session-level `pg_advisory_lock` keyed on the first 8 bytes of the ride UUID, on a dedicated pool connection. `acceptFinancialRide` takes it on a manual accept, so a duplicate accept waits for the first one instead of racing it. The unlock uses `context.WithoutCancel` so a cancelled request cannot leak the lock.
 
 ### Revision finalizer
 
@@ -193,7 +196,7 @@ Ride events are an audit trail, not a source of truth. Do not read them to make 
 
 Both are min-max normalized. The final score is 0.5 × efficiency + 0.5 × equity, and the lowest score wins. Scores within 0.05 of each other tie-break on the smaller queue. When the eligibility query returns nobody, or filtering and Mapbox leave no scored candidate, the ride is flagged in Redis (`ride:aq_attempted:{rideId}`) for 1 hour so the pass skips it. When there are no candidates at all, the fleet is also notified about the missed ride. Read errors, a missing session, and a lost assignment race don't set the flag, so the ride is retried on the next tick.
 
-The winner is assigned through the callback that `NewService` passes to the activation service, which calls `RideService.AutoAssignRide` with the scoring decision. That method runs `Ride.AutoQueueAssign` (status `queued`), records `ride_auto_queued` with the candidate count, deadhead, score, and queue load, refreshes the queue summary, and calls `RecoverIdleQueue`. If the driver has no active ride, the queue head is promoted to `driver_en_route` through `prepareAndPromoteQueuedRide`, which authorizes payment and recalculates the pickup route before `PromoteQueuedRide`.
+The winner is assigned through the callback that `NewService` passes to the activation service, which calls `RideService.AutoAssignRide` with the scoring decision. That method submits an automatic `accept` ride operation through `AutoAssignLegacy`. The reservation assigns the ride (`driver_en_route` for an idle driver, `queued` for a busy one) and records `ride_auto_queued` with the candidate count, deadhead, score, and queue load. For a ride in the active slot, the operation then authorizes payment and calculates the pickup route. Its job removes the ride from the board and refreshes the queue summary. See [Ride operation journal](/engineering/payments/ride-operation-journal).
 
 ### Queue recovery
 
@@ -201,19 +204,19 @@ The winner is assigned through the callback that `NewService` passes to the acti
 
 ## Requeue after driver cancel
 
-When a driver cancels a ride in `queued`, `driver_en_route`, or `driver_waiting`, `isReQueueEligible` returns true and `requeueAfterDriverCancel` runs:
+When a driver cancels a ride in `queued`, `driver_en_route`, or `driver_waiting`, the `cancel` ride operation is reserved with `requeue` set (`freezeCancellation`):
 
-1. `Ride.RequeueAfterCancel` resets the ride to `confirmed` in one transaction and returns any queued ride to promote.
-2. A promoted ride advances in the background through `advanceQueuedRide`.
-3. The board entry is removed and re-added with fresh state.
-4. Drivers are notified again, which restarts activation.
-5. The rider receives one "finding you a new driver" notification.
-6. An `auto_requeued` event records the reason and phase.
+1. Any payment hold is voided at Stripe.
+2. One transaction resets the ride to `confirmed` (`RequeueReservedRide`), promotes the driver's next queued ride and reserves its `promotion` operation, enqueues the rider's "finding you a new driver" notification, and records `auto_requeued` with the reason.
+3. The operation's job adds the ride back to the board, refreshes the driver's queue summary, and notifies the ride's T0 drivers again.
+4. The promoted ride's own `promotion` operation authorizes it and computes its pickup route.
 
-Rider cancellations and other phases go through the normal cancellation path, which computes the fee with `GetCancellationFee` and captures or cancels the payment intent.
+See [Requeue and expiry](/engineering/matching/requeue-and-expiry).
+
+Rider cancellations and other phases end the ride. The fee comes from the cancellation quote, priced with `GetCancellationFee`, and the same `cancel` operation captures it or cancels the payment intent.
 
 ## Expiry and offline drivers
 
-- `CancelUnmatchedRides` runs every 30 seconds and expires confirmed, unassigned rides older than `config.RideRequestExpiry` (10 minutes), removing them from the board.
+- `CancelUnmatchedRides` runs every 30 seconds and expires confirmed, unassigned rides older than `config.RideRequestExpiry` (10 minutes), up to 50 per run. Each one is a system `cancel` ride operation that voids any remaining hold, and its job removes the ride from the board.
 - `PurgeOfflineDrivers` runs on the same loop. It sets inactive drivers offline, sends renew-online reminders (at most every `DriverReminderInterval`, 30 seconds, per community), and applies the offline grace to queued rides.
-- `AutoCaptureTipWindowExpired` runs every 5 minutes and captures fare and tip for up to 50 rides whose tip window has closed. A ride stuck for more than an hour logs an error for manual review.
+- `AutoCaptureTipWindowExpired` runs every 5 minutes and submits a system `settle_tip` ride operation, which captures the fare, for up to 50 rides whose tip window has closed. A ride stuck for more than an hour logs an error for manual review.

@@ -106,7 +106,7 @@ A Mapbox 429 is a rate-limit error. It counts as a breaker failure and is retrie
 | Area | Behavior |
 | --- | --- |
 | Ride creation | Fails. `prepareCreateRide` needs the polyline from `GetRoute`, and nothing replaces it. |
-| Driver accept and pickup preparation | Fail. `pickupRoute` runs the Mapbox distance and the Google polyline in parallel, and a polyline error fails `acceptLockedRide`, `prepareRidePickup`, and `prepareActiveRide`. |
+| Driver accept and pickup preparation | The accept returns an error, but the ride is already assigned. `pickupRoute` runs the Mapbox distance and the Google polyline in parallel, and a polyline error fails `PreparePickupRoute` inside the `accept` or `promotion` ride operation. The operation stays `pending` and its `ride_operation` job retries until the route succeeds. Until then the ride accepts no other command. |
 | Communities with rides disabled | `ridesDisabledRoute` logs `Rides disabled: route lookup failed, returning no route` and returns an empty `route`. No error reaches the client. |
 | Mapbox distance fallback | Loses its Google step and goes straight to haversine. |
 | Repeated pairs | A polyline already in the route cache is served from Redis for its TTL without a provider call. |

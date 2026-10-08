@@ -151,16 +151,13 @@ Most domain errors are `InputError` (400) with a specific title. Clients show th
 | No Drivers Available | There are currently no drivers available for this ride. | `InputError` | `internal/service/ride/ride.go:438` |
 | Ride Unavailable | This ride is no longer available for this action. | `InputError` | `ride.go:440` |
 | Ride Unavailable | This ride is no longer available. Please request a new ride. | `InputError` | `internal/data/repository/ride_lifecycle.go:428` |
-| Ride Unavailable | This ride has changed. Refresh and try again. | `InputError` | `ride_command.go:113` |
-| Unavailable Ride | This ride is for a different fleet and is no longer available. | `InputError` | `internal/service/ride/driver.go:805` |
+| Ride Unavailable | This ride has changed. Refresh and try again. Returned by every ride command that loses a state, revision, or ownership check, including accept, complete, cancel, and tip commands while another ride operation is unresolved | `InputError` | `ride_command.go:113` |
 | Incorrect Confirm Code | Invalid confirm code, please ask the rider for their confirm code. | `InputError` | `driver.go:498` |
 | Pickup Outside Service Area | The pickup location is outside the service area. ... | `InputError` | `rider.go:630` |
 | Destination Outside Service Area | The destination is outside the service area. ... | `InputError` | `rider.go:634` |
 | Rides Unavailable | Rides aren't available in your area yet. We'll let you know when they go live. | `InputError` | `rider.go:742` |
 | Payment Required | Please select a payment method to confirm this ride. | `InputError` | `rider.go:362` |
-| Driver Not Online | Driver not online | `InputError` | `driver.go:679` |
-| Driver Queue Length Exceeded | Driver queue length exceeded | `InputError` | `driver.go:683` |
-| Unauthorized | User is not authorized to cancel this ride | `UnauthorizedError` (401) | `ride.go:101`, `:206` |
+| Review cancellation fee | Reopen cancellation to review the current fee before confirming. | `InputError` | `internal/service/payment/ride_legacy_cancellation.go:51` |
 | Unauthorized | User is not authorized to view this ride | `UnauthorizedError` (401) | `ride.go:581` |
 | Unauthorized | User is not authorized to rate this ride | `InputError` (400) | `ride.go:255` |
 | Ride Not Found | Ride details not found for the given ride ID | `NotFoundError` | `ride.go:675` |
@@ -183,14 +180,15 @@ Most domain errors are `InputError` (400) with a specific title. Clients show th
 
 | Title | Body | Type | Source |
 | --- | --- | --- | --- |
-| Payment Failed | Payment processing failed | `ServerError` | `internal/service/ride/driver.go:1066` |
-| Payment Failed | Payment method connection failed | `ServerError` | `driver.go:982` |
+| Payment Failed | The ride was canceled because payment authorization could not be completed. | `InputError` | `internal/service/payment/ride_operations.go:102` |
 | Payment Setup Required | Your payment account needs attention. ... | `InputError` | `internal/service/driver/driver.go:201` |
 | Payment Setup Required | Please complete your payment setup before continuing | `InputError` | `internal/service/stripeaccount/stripeaccount.go:118` |
 | Payment Setup Incomplete | Please complete your payment setup before accessing earnings | `InputError` | `stripeaccount.go:45` |
-| Tip unavailable | This driver can't accept tips right now. | `InputError` | `internal/service/ride/tip_charge.go:122` |
-| Tip unavailable | Add a payment method to leave a tip. | `InputError` | `tip_charge.go:131` |
-| Tip incomplete | The tip payment was not completed. | `InputError` | `tip_charge.go:222` |
+| Invalid tip | Choose a valid tip amount. | `InputError` | `internal/service/ride/financial_commands.go:145` |
+| Tip pending | Your tip is still processing. Please check again shortly. | `InputError` | `financial_commands.go:137` |
+| Tip incomplete | The tip payment was not completed. | `InputError` | `internal/service/ride/tip_charge.go:86` |
+| No tip | There is no tip payment to confirm. | `InputError` | `internal/service/payment/ride_legacy_dedicated_tip.go:79` |
+| Unauthorized | User is not authorized to confirm this tip | `InputError` | `tip_charge.go:77` |
 | Nothing to cash out | There are no instantly-available funds on your account right now. | `InputError` | `internal/service/earnings/earnings.go:309` |
 | Earnings unavailable | Finish setting up your driver payouts before viewing earnings. | `InputError` | `earnings.go:457` |
 | Coupon already claimed | You have already claimed this coupon | `InputError` | `internal/data/repository/coupon.go:195` |
