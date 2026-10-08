@@ -110,17 +110,17 @@ People who reach `/auth/v3` without a request secret, for example from a tip lin
 
 ## Referral invite landing
 
-Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. `invite.yelo.link/<code>` redirects here too. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
+Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on this site (see [Public sites](/engineering/web/public-sites#fleet-driver-invites-joinyelo-com-i-fleet-code)). `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect here too. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
 
 `InvitePage` (`src/sites/signup/invite/InvitePage.tsx`) loads the inviter preview with `GET /referral/invite/{code}`, which returns the inviter's first name, photo, and user ID. Without a photo, the avatar color comes from an FNV-1a hash of the user ID over a five-color palette. The app and `ogcard.DeterministicColor` in `yelo-api/internal/utilities/ogcard/color.go` implement the same function, and all three must agree. The page then branches on the device:
 
 | Device | Behavior |
 | --- | --- |
 | iPhone, iPad, iPod, or touch-capable Mac | `referralFallbackURL()` replaces the location with the App Store URL plus `&ct=<code>` on mount. iOS normally opened the app from the `join.yelo.link` universal link already, so this is a store fallback. It never probes a custom scheme, because Safari shows an invalid-address alert when the app is missing. |
-| Android | Shows a **Get it on Google Play** link whose `referrer` is `deepLink=https://join.yelo.link/<code>`. The Dub SDK reads that install referrer on first open. |
-| Anything else | Shows the App Store badge with `&ct=<code>` |
+| Android | The primary button, **Continue → Google Play**, links to Google Play with `referrer` set to `deepLink=https://join.yelo.link/<code>`. The Dub SDK reads that install referrer on first open. |
+| Anything else | The primary button, **Continue → App Store**, links to the App Store with `&ct=<code>` |
 
-On every device, **Continue → sign up** links to `/auth/v3` through `authV3EntryPath()` with the landing's allowlisted attribution parameters plus `code=<code>`, so the Dub click ID and `utm_*` parameters reach sign-up along with the code. `qr=1` is not forwarded. Store URLs live in `src/sites/signup/invite/referralHandoff.ts`.
+The page leads with the store. On every device, a secondary **Continue → web** link goes to `/auth/v3` through `authV3EntryPath()` with the landing's allowlisted attribution parameters plus `code=<code>`, so the Dub click ID and `utm_*` parameters reach sign-up along with the code. `qr=1` is not forwarded. Store URLs live in `src/sites/signup/invite/referralHandoff.ts`.
 
 ## Link landing touches
 
