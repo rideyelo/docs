@@ -59,12 +59,13 @@ Other `/driver/*` routes are documented by their owners:
 
 | Moment | Writer | Value | Fee estimate written |
 | --- | --- | --- | --- |
-| Driver completes ride | `CompleteRideForRating` via `RideService.Complete` | `GetEffectivePrice()`: `discounted_price` if set, else `price` | `estimated_stripe_fee_cents` |
-| Rider tips within the $5.00 buffer | `CompleteRideTip` via `captureTipWithinBuffer` | `fare + tip`, status `complete` | `estimated_stripe_fee_cents` (unchanged by the tip) |
-| Rider rates with no tip, or tip window expires | `CompleteRideTip` with tip 0 | `fare`, status `complete` | `estimated_stripe_fee_cents` |
-| Tip over the buffer, after the fare settled | `RecordCompletedRideTip` | `COALESCE(driver_payout, 0) + tip`, only when `tip_amount = 0` | `estimated_tip_stripe_fee_cents` on the tip alone |
-| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists | `estimated_stripe_fee_cents`, re-estimated on the fare (plus the $5.00 buffer when tips are enabled) |
-| Cancellation with a fee | Same webhook, or the cancellation operation | Captured fee amount | `estimated_stripe_fee_cents` on the fee (operation path, `stripe_fee_estimate_cents(fee_cents)`), or on the fare (webhook path) |
+| Driver completes ride | `CompleteRideForRating`, from the `complete` ride operation | `GetEffectivePrice()`: `discounted_price` if set, else `price` | `estimated_stripe_fee_cents` |
+| Rider tips within the $5.00 buffer | `CompleteRideTip`, from a rider `settle_tip` ride operation | `fare + tip`, status `complete` | `estimated_stripe_fee_cents` (unchanged by the tip) |
+| Rider rates with no tip, or tip window expires | `CompleteRideTip` with tip 0, from a rider or system `settle_tip` operation | `fare`, status `complete` | `estimated_stripe_fee_cents` |
+| Tip over the buffer, after the fare settled | `RecordCompletedRideTip`, from a `tip` ride operation | `COALESCE(driver_payout, 0) + tip`, only when `tip_amount = 0` | `estimated_tip_stripe_fee_cents` on the tip alone |
+| `payment_intent.succeeded` for `payment_intent_id` | `MarkRidePaymentSucceeded` | `amount_received / 100`, skipped when a `RideOperations` row exists. Every ride accepted through a ride operation has one, so this write only reaches older rides | `estimated_stripe_fee_cents`, re-estimated on the fare (plus the $5.00 buffer when tips are enabled) |
+| Cancellation with a fee | `CancelReservedRide`, from the `cancel` ride operation | Captured fee amount | `estimated_stripe_fee_cents` on the fee (`stripe_fee_estimate_cents(fee_cents)`) |
+| Declined authorization | `CancelDeclinedRideAuthorization`, from a failed `accept` or `promotion` operation | `0` | None |
 
 ### Worked example
 

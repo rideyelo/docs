@@ -50,9 +50,9 @@ flowchart TD
   L[Operational loop, 30 s] --> TIERS[Activation tiers]
   L --> AQ[Auto-queue pass, rides 2 min or older]
   ONLINE[Driver goes online] --> PEND[NotifyPendingRideForDriver]
-  BOARD -->|POST accept| ACC[Ride.Accept]
-  AQ -->|AutoAssignRide| AQA[Ride.AutoQueueAssign]
-  ACC --> TX[acceptRide transaction]
+  BOARD -->|POST accept| ACC[AcceptLegacy]
+  AQ -->|AutoAssignRide| AQA[AutoAssignLegacy]
+  ACC --> TX[accept ride operation, reservation transaction]
   AQA --> TX
 ```
 
@@ -63,7 +63,7 @@ flowchart TD
 | Direct request | Rider confirms with `driver_id` | No, it reserves the ride for 30 s | `RideService.directAssignDriver` in `internal/service/ride/rider.go` |
 | Activation tiers | `Operational` loop, per tier delay | No | `ActivationService.activateForConfigTier` in `internal/service/activation/activation.go` |
 | Pending-ride push | Driver's offline to online transition | No | `ActivationService.NotifyPendingRideForDriver` |
-| Auto-queue | `Operational` loop, ride age of 2 min or more | Yes, as `queued` | `ActivationService.tryAutoQueueAssign` in `internal/service/activation/auto_queue.go` |
+| Auto-queue | `Operational` loop, ride age of 2 min or more | Yes, as `driver_en_route` for an idle driver or `queued` for a busy one | `ActivationService.tryAutoQueueAssign` in `internal/service/activation/auto_queue.go` |
 | Missed-ride fleet alert | Auto-queue finds zero eligible drivers | No | `ActivationService.notifyFleetOfMissedRide` |
 
 ## Background loops that drive matching
