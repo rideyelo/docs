@@ -1,6 +1,6 @@
 ---
 title: "Concurrency and races"
-description: "How ride commands serialize: participant lock discovery and retry, row locks, the advisory lock, revision compare-and-set, the revision finalizer, and walked-through race scenarios with who wins and what the loser sees."
+description: "How ride commands serialize: participant lock discovery and retry, row locks, the advisory lock, ride operation ownership, the revision finalizer, and walked-through race scenarios with who wins and what the loser sees."
 ---
 
 Matching is contended by design. Drivers accept from the board, auto-queue assigns in the background on every instance, riders cancel, and sweeps expire. None of this is coordinated in Go. Every decision that matters is rechecked in a Postgres transaction under row locks.
@@ -13,10 +13,11 @@ This page goes deeper than [Rides implementation](/engineering/api/rides-impleme
 | --- | --- | --- | --- |
 | 1 | `SELECT ... FOR UPDATE` on `Users` rows, sorted by UUID string | Every participant of the command | Every ride command, offline purge, expiry sweep |
 | 2 | `SELECT ... FOR UPDATE` on the `Rides` row | The target ride | Every ride command with a ride ID |
-| 3 | `pg_advisory_lock(key)` on a dedicated connection | Manual accept, queue head preparation | `AcceptRide`, `prepareAndPromoteQueuedRide` |
+| 3 | `pg_advisory_lock(key)` on a dedicated connection | The ride being accepted | `acceptFinancialRide`, on manual accept |
+| 3 | A `pending` or `quarantined` row in `RideOperations` | The ride, across transactions, for as long as a financial command is unresolved | Every ride operation |
 | 4 | Redis `SET NX` | Activation cooldowns, rescue alerts | Activation loop |
 
-Levels 1 and 2 are always taken in that order. The advisory lock is taken before any row locks, outside the transaction.
+Levels 1 and 2 are always taken in that order. The advisory lock is taken before any row locks, outside the transaction. Operation ownership isn't a database lock. It's a row that every command checks after taking levels 1 and 2. See [Operation ownership](#operation-ownership).
 
 ## Participant discovery
 
@@ -57,16 +58,19 @@ That's a 400.
 
 Promoting a queued ride changes another rider's ride. The revision finalizer also bumps `ride_state_revision` on every rider in the affected drivers' queues. Locking them up front means the finalizer's `UPDATE "Users"` never waits on a lock outside the sorted order.
 
-## Compare-and-set on revisions
+## Operation ownership
 
-`Rides.lifecycle_revision` increments on every committed lifecycle command. Two places use it as an optimistic check across work done outside a transaction:
+A command that moves money can't hold row locks while it talks to Stripe or Mapbox. It reserves the ride instead. `beginOwnedRideCommand` runs `HasConflictingRideOperation` after it locks the ride, and rejects the command with "Ride Unavailable" when another operation on the ride is `pending` or `quarantined`. The unique partial index `ride_operations_one_unresolved` enforces the same rule in the database.
 
-| Caller | Reads revision | External work | Checks revision |
-| --- | --- | --- | --- |
-| `persistPaymentIntent` | `ride.LifecycleRevision` from the service's `GetByID` | Stripe clone and intent creation | `AddPaymentIntent` rejects a mismatch with a conflict and cancels the new intent |
-| `prepareRidePickup` | Same | Mapbox route, Stripe authorization | `PromoteQueuedRide` rejects a mismatch with a conflict |
+| Phase | Locks held | Revision check |
+| --- | --- | --- |
+| Reserve | Levels 1 and 2 | The ride must be at the `lifecycle_revision` and `assignment_generation` the command read. The operation row stores the pair it expects to see at finalization |
+| Execute | None. Stripe, Mapbox, and Google calls run here | — |
+| Finalize | Levels 1 and 2, then the operation row | `matchesRideCommandRevision` requires the ride to still be at the stored pair |
 
-`AddPaymentIntent` doesn't increment the revision itself, and doesn't run the revision finalizer. That's what lets `prepareRidePickup` persist its authorization and still pass the revision check in `PromoteQueuedRide`. The cost is that two writers that read the same revision can both pass.
+Between reservation and finalization, no other command can commit a change to the ride, because each one fails the ownership check. The finalizer's revision check is a second line of defense. `accept` and idle promotion change the ride during reservation, so their stored revision is the one after that change.
+
+See [Reserve, then execute](/engineering/payments/ride-operation-journal#reserve-then-execute).
 
 ## The revision finalizer
 
@@ -93,7 +97,7 @@ WHERE id=sqlc.arg(ride_id)::uuid RETURNING rider_id,driver_id;
 
 Then it collects the rider, the current driver, the previous assignee, and every rider queued behind any of those drivers. It increments each one's `Users.ride_state_revision` in sorted order. When `RIDE_STATE_SNAPSHOT_ENABLED` is true, it enqueues a `ride_state_changed` push per user with event key `ride_state:{userId}:{revision}`, in the same transaction.
 
-The finalizer also re-runs `HasConflictingRideOperation` over every changed ride. Nothing in production writes `RideOperations` yet, because `RideOperationJournal` isn't wired into service construction.
+The finalizer also re-runs `HasConflictingRideOperation` over every changed ride, excluding the operation that owns the command. A transaction that changes a second ride, such as a completion that promotes the next queued ride, fails if that second ride has an unresolved operation of its own.
 
 ## The advisory lock
 
@@ -110,52 +114,49 @@ release := func() {
 }
 ```
 
-It has two users, both keyed on the ride ID:
+It has one user. `acceptFinancialRide` takes the lock on a manual accept, before it looks up or creates the `accept` operation, and holds it until the command returns. That covers the reservation, the Stripe steps, and the pickup route. A duplicate accept from the same driver waits for the first one to finish and then replays its operation.
 
-- **Manual accept.** `AcceptRide` takes the lock after the driver availability checks and holds it for the rest of the accept, including the pickup route and Stripe authorization. A duplicate accept waits for the first one to finish instead of placing a second hold on the rider's card.
-- **Queue head preparation.** Two preparers don't both call Mapbox and Stripe for the same queue head.
+It isn't a correctness lock. Reservation rechecks everything under row locks, and operation ownership stops a second hold. Auto-queue assignment and idle recovery don't take it.
 
-It isn't a correctness lock. The transactions recheck everything under row locks, so a missing advisory lock would cost a duplicate authorization, not a double assignment.
-
-It holds a pool connection for the whole accept or preparation, including network calls to Mapbox and Stripe. `RefreshQueueSummaries` runs up to 10 recoveries at once per instance, so it can hold up to 10 connections.
+It holds a pool connection for the whole accept, including network calls to Mapbox and Stripe.
 
 ## Race scenarios
 
 <AccordionGroup>
   <Accordion title="Two drivers tap accept on the same ride">
-    Both pass the driver checks, which read without locks. Both then call `AcquireLock` on the ride's advisory lock:
+    Both call `AcquireLock` on the ride's advisory lock:
 
-    1. The first accept takes the lock, reads the ride, authorizes payment, and commits the assignment in `Ride.Accept`.
-    2. The second waits on the lock. Once it gets the lock, it reads the ride, sees `status = 'queued'` or `driver_en_route`, and fails with "Ride request no longer valid".
+    1. The first accept takes the lock, reserves the assignment, authorizes payment, and finalizes.
+    2. The second waits on the lock. Once it gets the lock, its reservation finds a ride that is no longer `confirmed` with no driver, and fails with "Ride Unavailable".
 
-    The loser gets a 400 before `processRidePayment` runs, so no second Stripe intent is created on the loser's merchant.
+    The loser is rejected at reservation, before any Stripe call, so no second intent is created on the loser's account.
   </Accordion>
   <Accordion title="Driver retries an accept">
-    A driver's app can send the same accept twice, for example after a lost response or a double tap. The second request waits on the ride's advisory lock until the first finishes. It then reads the ride. If the ride is assigned to the calling driver and its status is `queued` or `driver_en_route`, `AcceptRide` returns success without doing anything else. It doesn't create another payment intent, change the assignment, or notify the rider again.
+    A driver's app can send the same accept twice, for example after a lost response or a double tap. The second request waits on the ride's advisory lock until the first finishes. `AcceptLegacy` then finds the driver's `accept` operation for the current assignment and resubmits the same command ID with the original session, vehicle, and fleet. Reservation returns the stored row, and the executor replays the stored outcome. It doesn't create another payment intent or change the assignment. The rider's push is keyed by the operation ID, so it isn't sent again.
 
-    If `AddPaymentIntent` rejects the write because the ride's lifecycle revision moved on, `persistPaymentIntent` cancels the new Stripe intent and returns the lifecycle conflict to the driver. Before [#295](https://github.com/rideyelo/yelo-api/pull/295), this path returned a 500.
+    If the first request died after reserving, the retry continues the same operation from its last committed step.
   </Accordion>
   <Accordion title="Manual accept races auto-queue">
-    Both reach `acceptRide`. The ride row lock serializes them. The first to commit wins. If auto-queue loses, `assignWinner` logs "may have been claimed" and doesn't set the attempted flag. The ride is no longer unmatched, so it isn't retried. If the driver loses, they see "Ride request no longer valid".
+    Both reserve an `accept` operation. Auto-queue doesn't take the advisory lock, so the ride row lock serializes them. The first to commit wins. If auto-queue loses, `AutoAssignRide` returns the conflict, and `assignWinner` logs "Auto-queue assign failed, ride may have been claimed" without setting the attempted flag. The ride is no longer unmatched, so it isn't retried. If the driver loses, they see "Ride Unavailable".
   </Accordion>
   <Accordion title="Rider cancels while a driver accepts">
-    `RideService.Cancel` passes a `RideStateExpectation` with the status and driver it read. `validateRideExpectation` compares them under lock.
+    A cancellation is bound to a quote, and the quote stores the `lifecycle_revision` and `assignment_generation` it was issued at.
 
-    - Accept commits after the cancel read the ride but before it took the lock: the cancel sees a driver it didn't expect and gets "This ride has changed". The app must refetch and cancel again, this time against the assigned ride.
-    - Cancel commits first: the accept sees `status = 'complete'` and fails with "Ride request no longer valid". If the driver already authorized payment, that intent is left behind.
+    - Accept reserves first: the cancel is rejected while the `accept` operation is unresolved. After it finishes, a quote issued before the accept no longer matches the ride's revision. For a ride that now has a hold, the rider gets "Review cancellation fee" and must reopen cancellation to price it against the assigned ride.
+    - Cancel reserves first: the accept's reservation is rejected with "Ride Unavailable" while the `cancel` operation is unresolved, and afterwards because the ride is `complete`. The accept never reached Stripe, so no intent is left behind.
   </Accordion>
   <Accordion title="Accept races the expiry sweep">
-    The sweep locks riders only, then runs a conditional update that rechecks `status = 'confirmed' AND driver_id IS NULL`. Accept locks the same rider as a participant. Whichever holds the rider lock first wins. If accept wins, the sweep's update skips the ride. If the sweep wins, accept sees `complete`.
+    Expiry reserves a system `cancel` operation through `beginOwnedRideCommand`, which locks the same rider and ride that an accept locks. `ReserveExpiry` rechecks `status = 'confirmed'`, no driver, and the deadline under those locks. Whichever reserves first wins. If accept wins, the recheck fails and the sweep skips the ride. If the sweep wins, the accept's reservation is rejected.
   </Accordion>
   <Accordion title="Completion races idle recovery">
     Driver completes ride A with ride B queued. At the same moment, the 3-minute loop runs `RecoverIdleQueue` for the same driver.
 
-    - Recovery reads "no active ride" only if A is already past `in_progress`. If it is, it takes the advisory lock and preflights `PromoteAutoQueuedRide`.
-    - `Complete` runs `PromoteNextQueuedRide` in its own transaction. Both need the driver's `Users` lock.
-    - Whichever commits first moves B to `driver_en_route`. The other's `NOT EXISTS (active ride)` or `status = 'queued'` guard fails. Recovery treats that input error as success and returns quietly.
+    - The `complete` finalizer runs `PromoteNextQueuedRide` and reserves B's `promotion` operation in the transaction that ends A. There's no committed state where A is finished and B is still `queued` with a free active slot.
+    - Recovery stops when it reads an active ride, which is A before that commit and B after it.
+    - If recovery does reach `ReserveIdle` for B, it derives the same operation ID from the ride and its `assignment_generation`, finds the existing `promotion`, and continues it.
   </Accordion>
   <Accordion title="Two instances recover the same driver">
-    Both reach `prepareAndPromoteQueuedRide` for the same queue head. The advisory lock admits one. The second waits, then preflights against a ride that is no longer `queued`, gets an input error, and returns `nil`.
+    Both call `PromoteIdle` for the same queue head and derive the same operation ID. One reserves it. The other finds the row, either before or after taking the ride locks, and executes the same operation. Each step's request and receipt are in the journal, so the second executor replays what the first one finished.
   </Accordion>
   <Accordion title="Driver switches vehicle during an accept">
     The service reads the session's vehicle and fleet before locking. `validateRideAssignmentDriver` rereads under the driver's `Users` lock and requires exactly one open session matching those IDs. Session rotation takes the same driver lock, so either the rotation or the accept sees the other's result.
@@ -176,17 +177,17 @@ It holds a pool connection for the whole accept or preparation, including networ
 | Lock and discovery SQL | `yelo-api/internal/data/repository/queries/ride_command.sql` (`ListRideCommandParticipants`, `LockRideCommandParticipant`, `LockRideCommandState`) |
 | State validation | `ride_command.go` (`validateRideExpectation`, `validateRideDriverCommand`, `validateRideAssignmentDriver`, `validateRideAssignmentAdmission`) |
 | Revision finalizer | `yelo-api/internal/data/repository/ride_revision.go` |
-| Advisory lock | `yelo-api/internal/data/repository/ride.go` (`AcquireLock`), `queries/ride_driver.sql`, `internal/service/ride/driver.go` (`AcceptRide`) |
-| Revision compare-and-set | `yelo-api/internal/data/repository/ride_lifecycle.go` (`AddPaymentIntent`), `ride_matching.go` (`PromoteQueuedRide`) |
+| Advisory lock | `yelo-api/internal/data/repository/ride.go` (`AcquireLock`), `queries/ride_driver.sql`, `internal/service/ride/financial_commands.go` (`acceptFinancialRide`) |
+| Operation ownership | `ride_command.go` (`beginOwnedRideCommand`, `matchesRideCommandRevision`), `queries/ride_operation.sql` (`HasConflictingRideOperation`) |
 | Operation journal | `yelo-api/internal/data/repository/ride_operation.go` |
 | Regression tests | `yelo-api/internal/data/repository/ride_command_regression_test.go`, `ride_assignment_admission_test.go`, `ride_transition_matrix_test.go`, `idle_auto_queue_test.go` |
 
 ## Gotchas and edge cases
 
-- **Admission failures surface as 500s.** `acceptRide` wraps `validateRideAssignmentAdmission` errors with `NewServerErrorFromError`. A fleet mismatch or a full queue detected under lock returns "Something Went Wrong" instead of a 400 conflict.
-- **Service-level reads are advisory.** `AcceptRide` reads the driver and session without locks, and reads the ride under the advisory lock only. Every check is repeated in the transaction except payment, which runs between the reads and the transaction.
-- **External calls happen outside transactions.** Mapbox and Stripe calls never run while row locks are held. They do run while the advisory lock is held.
+- **Service-level reads are advisory.** `AcceptLegacy` reads the ride state and the driver's open session without locks to build the command. Reservation repeats every check under row locks.
+- **External calls happen outside transactions.** Mapbox and Stripe calls never run while row locks are held. On a manual accept they do run while the advisory lock is held.
 - **Four retries isn't much under churn.** A driver whose queue changes on every attempt, for example during a burst of auto-queue assignments, can see "This ride has changed" without any real conflict on the ride itself.
-- **Payment failure on a manual accept doesn't cancel the ride.** `clonePaymentMethodToMerchant` and `createPaymentIntent` call `RideService.Cancel` with the accepting driver as the request user. The driver isn't assigned yet, so `Cancel` returns "User is not authorized to cancel this ride" and the error is only logged. The ride stays `confirmed` on the board, despite the "ride canceled" wording in the cancel reason.
+- **A stuck operation is a stuck ride.** Ownership has no timeout. A `quarantined` operation, or a `pending` one whose job keeps failing, rejects every other command on the ride. See [Quarantine](/engineering/payments/ride-operation-journal#quarantine).
+- **A declined card on accept cancels the ride.** The assignment is committed before authorization. A declined authorization finishes the `accept` operation as `failed` and cancels the ride with `cancel_reason = 'Payment Failed'`. It doesn't go back on the board.
 - **Unlock failures leak the advisory lock.** The connection returns to the pool still holding it. See [Queue promotion and recovery](/engineering/matching/queue-promotion#idle-recovery).
-- **Redis isn't transactional with Postgres.** Board updates, notified sets, tiers, and flags are written after commit. A crash between commit and those writes leaves Redis behind. Every Redis-derived decision is revalidated in Postgres before it assigns anything.
+- **Redis isn't transactional with Postgres.** Notified sets, tiers, and flags are written after commit, and a crash between commit and those writes leaves Redis behind. Board and queue-summary writes that follow a ride operation are retried by its job until `RideOperationEffectReceipts` has a row. Every Redis-derived decision is revalidated in Postgres before it assigns anything.

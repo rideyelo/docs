@@ -1,31 +1,32 @@
 ---
 title: "Ride PaymentIntent lifecycle"
-description: "Every Stripe call Yelo makes against a ride's PaymentIntent, from SetupIntent to capture or cancel, with exact amounts, parameters, metadata, reuse rules after a requeue, and the races between them."
+description: "Every Stripe call Yelo makes against a ride's PaymentIntent, from SetupIntent to capture or cancel, with exact amounts, parameters, metadata, idempotency keys, what happens to a hold on requeue and expiry, and what each failure leaves behind."
 ---
 
 A paid ride has at most one live **ride PaymentIntent** at a time. It's created on a connected account with manual capture, and every later step captures part of it or cancels it. Tips above the buffer use a separate PaymentIntent, covered in [Ride tip charging](/engineering/payments/ride-tips).
+
+Every Stripe write on this page after ride confirmation runs as a step of a ride operation. `RideService` submits a command, the command freezes its amounts and account in `RideOperations.inputs`, and an executor performs the call. This page covers what Stripe sees. For reservation, retries, quarantine, and recovery, see [Ride operation journal](/engineering/payments/ride-operation-journal).
 
 For the product view, see [Payments and payouts](/concepts/payments-and-payouts) and [Cancellations](/concepts/cancellations). This page covers the call-level detail.
 
 ## State machine
 
-The Stripe states below are the ones Yelo drives. The ride status that triggers each transition is in the edge label.
+The Stripe states below are the ones Yelo drives. The operation kind that triggers each transition is in the edge label.
 
 ```mermaid
 stateDiagram-v2
     [*] --> NoIntent: ConfirmRide (consent only)
-    NoIntent --> RequiresCapture: accept or queue promotion, NewPaymentIntent confirm=true
+    NoIntent --> RequiresConfirmation: accept or promotion, create_authorization
     NoIntent --> [*]: free ride, or canceled before any accept
-    RequiresCapture --> RequiresCapture: requeue, hold kept
-    RequiresCapture --> Canceled: rematch to a new driver, CancelPaymentIntent
-    Canceled --> RequiresCapture: new NewPaymentIntent for the new driver
-    RequiresCapture --> Succeeded: Complete, rating, tip sweeper, or fee cancel, PartiallyConfirm
-    RequiresCapture --> Canceled: $0 cancel, persist conflict, or Complete DB failure
+    RequiresConfirmation --> RequiresCapture: confirm_authorization
+    RequiresConfirmation --> Canceled: declined, cancel_declined
+    RequiresCapture --> Succeeded: complete, settle_tip, tip, or fee cancel, capture
+    RequiresCapture --> Canceled: zero-fee cancel, requeue, or expiry, void
     Succeeded --> [*]
     Canceled --> [*]
 ```
 
-`Succeeded` here always means a **partial** capture. Stripe releases whatever wasn't captured.
+`Succeeded` means one final capture of a frozen amount. Stripe releases whatever wasn't captured.
 
 ## Step by step
 
@@ -44,139 +45,146 @@ stateDiagram-v2
     - If the request sets `save_payment_method`, `AllowPaymentMethodRedisplay` sets `allow_redisplay=always`. The mobile app doesn't send this flag.
     - The handler stores `rider_ip_address` from `X-Real-IP`, then the first `X-Forwarded-For` entry, then `RemoteAddr`, and `rider_user_agent`. `confirm_time` and `payment_consent_at` are set to now.
   </Step>
-  <Step title="Authorize: clone and create the hold">
-    `processRidePayment` in `internal/service/ride/driver.go` runs for any ride with an effective price above 0. It runs from `AcceptRide` before `Ride.Accept`, and from `authorizeRidePickup` when a queued ride is prepared for the active slot.
+  <Step title="Authorize: clone, create, confirm">
+    `RidePreparationPaymentExecutor.Prepare` in `internal/service/payment/ride_promotion_payment.go` runs inside an `accept` or `promotion` operation. It does payment work only for a ride with a fare above 0 that is taking the driver's active slot. A queued acceptance defers all of it to the later `promotion`.
 
-    1. `selectStripeMerchantID` picks the fleet account when the driver's session fleet has `has_custom_payouts` and a `stripe_merchant_id`, otherwise the driver's `Users.stripe_merchant_id`.
-    2. If the ride already has a `payment_intent_id`, `reuseRideAuthorization` decides whether to reuse, replace, or fail. See [Reuse after requeue](#reuse-after-requeue).
-    3. `ClonePaymentMethod`: `PaymentMethods.New` on the connected account with `customer` = the rider's platform customer and `payment_method` = `Rides.payment_method_id`.
-    4. `NewPaymentIntent` on the connected account. Parameters are listed in [Authorization parameters](#authorization-parameters).
-    5. `AddPaymentIntent` writes the IDs, but only if `lifecycle_revision` still matches the value read at the start. A mismatch cancels the new hold.
-    6. A `payment_intent_created` ride event records `payment_intent_id`, `amount`, `auth_amount`, and `merchant_id`.
+    1. The connected account is frozen at reservation by `GetRidePaymentPreparation`: the ride's fleet account when the fleet has `has_custom_payouts` and a `stripe_merchant_id`, otherwise the driver's `Users.stripe_merchant_id`.
+    2. If the unassigned ride still carried a hold from an earlier assignment, `release_previous_authorization` voids it first. See [Requeue and expiry](#requeue-and-expiry).
+    3. `clone_payment_method`: `PaymentMethods.New` on the connected account with `customer` = the rider's platform customer and `payment_method` = `Rides.payment_method_id`.
+    4. `create_authorization`: `PaymentIntents.New` with `confirm=false`. The intent ID is stored as the step result before any hold exists.
+    5. `confirm_authorization`: `PaymentIntents.Confirm`, off-session, with the mandate data.
+    6. The executor reads the intent back with `InspectRideAuthorization`. Finalization accepts that evidence only when it's at most 30 seconds old, then `AddRidePaymentIntent` writes `payment_intent_id`, `payment_intent_client_secret`, `pre_auth_amount`, `cloned_payment_method_id`, and `stripe_merchant_id` in the transaction that finishes the operation.
   </Step>
-  <Step title="Capture">
-    Every capture is `PartiallyConfirm`, which calls `PaymentIntents.Capture` with `amount_to_capture`. See [Capture paths](#capture-paths).
+  <Step title="Capture or void">
+    Every capture is `ExecuteRideCapture`, which calls `PaymentIntents.Capture` with `amount_to_capture` and `final_capture=true`. Every release is `ExecuteRideVoid`, which calls `PaymentIntents.Cancel`. See [Capture paths](#capture-paths).
   </Step>
 </Steps>
 
 ## Authorization parameters
 
-`Client.NewPaymentIntent` in `internal/data/stripe/intent.go` sends exactly this:
+`Client.CreateRideAuthorizationIntent` in `internal/data/stripe/ride_authorization.go` sends this:
 
 ```go
 params := &stripe.PaymentIntentParams{
-    Amount:        new(int64(request.Amount)),           // cents
-    Currency:      new("usd"),
-    CaptureMethod: stripe.String("manual"),
-    Confirm:       new(true),
-    OffSession:    new(true),
-    PaymentMethod: new(request.PaymentMethodId),        // the clone
-    Description:   new("Yelo Ride"),
+    Amount: &p.Amount, Currency: &p.Currency, PaymentMethod: &p.PaymentMethodID, // cents, "usd", the clone
+    CaptureMethod: new("manual"), Confirm: new(false), Description: new("Yelo Ride"),
     AutomaticPaymentMethods: &stripe.PaymentIntentAutomaticPaymentMethodsParams{
         Enabled: new(true), AllowRedirects: new("never"),
     },
     Metadata: map[string]string{
-        "ride_id": ..., "rider_id": ..., "driver_id": ..., "description": "Yelo Ride",
+        "operation_id": ..., "ride_id": ..., "rider_id": ..., "driver_id": ...,
     },
-    MandateData: /* type online, accepted_at = Rides.confirm_time,
-                    ip_address = rider_ip_address, user_agent = rider_user_agent */,
 }
-params.SetStripeAccount(request.MerchantId)
+params.SetStripeAccount(p.MerchantID)
+params.SetIdempotencyKey(p.IdempotencyKey) // ride_operation/{operationID}/create_authorization
 ```
 
-- **No idempotency key.** A timeout after Stripe accepted the request leaves a hold Yelo doesn't know about.
-- **Off-session.** A card that needs 3D Secure fails with `authentication_required`. Yelo has no on-session fallback for ride holds.
-- `createPaymentIntent` rejects the call before Stripe when the ride lacks `confirm_time`, IP, or user agent ("ride missing required payment metadata"), or when the request fails `PaymentIntentRequest.Validate` (amount must be above 0).
-- After Stripe returns, the service treats a nil intent, an empty ID, or an empty client secret as a payment failure and calls `Cancel` with reason `Payment Failed`.
+`ConfirmRideAuthorization` then confirms that intent:
+
+```go
+params := &stripe.PaymentIntentConfirmParams{
+    OffSession:  new(true),
+    MandateData: /* type online, accepted_at = COALESCE(payment_consent_at, confirm_time),
+                    ip_address = rider_ip_address, user_agent = rider_user_agent */,
+}
+params.SetStripeAccount(p.MerchantID)
+params.SetIdempotencyKey(p.IdempotencyKey) // ride_operation/{operationID}/confirm_authorization
+```
+
+- **Create and confirm are separate calls.** A timeout on create can't leave an unknown hold, because an unconfirmed intent holds nothing. A retry sends the same key and gets the same intent.
+- **Creation has a 23-hour window.** `CreateRideAuthorizationIntent` refuses to send once 23 hours have passed since the step's first attempt, and each call is bounded to 30 seconds. See [Creation window](/engineering/payments/ride-operation-journal#creation-window).
+- **Off-session.** Yelo has no on-session fallback for ride holds. When the confirmed intent lands in `requires_payment_method` with nothing capturable, the client cancels it with the key suffix `confirm_authorization:cancel_declined` and returns a canceled receipt.
+- **A lost confirm response is read, not resent blind.** If `Confirm` errors, the client reads the intent with `PaymentIntents.Get` and decides from its actual status.
+- **Every read re-verifies identity.** `verifyAuthorizationIdentity` checks the payment method, amount, currency, manual capture, and all four metadata values. A mismatch is a conflict, which quarantines the operation.
+- **Validation happens before Stripe.** `RideAuthorizationRequest.validate` rejects an amount at or below 0, a missing account, method, or key, missing ownership IDs, and missing consent (`mandate_accepted_at`, IP, user agent). `ValidateRidePaymentPreparation` runs the same consent checks at reservation, before the assignment commits.
 
 ## Amount math
 
+Amounts are integer cents, computed once in SQL when the command is reserved and frozen in the operation's `inputs`. Executors never recompute them.
+
 | Amount | Formula | Code |
 | --- | --- | --- |
-| Effective fare | `discounted_price` if not null, else `price` | `RideDetails.GetEffectivePrice` |
-| Authorization | `int((fare + 5.00) * 100)` with tips, `int(fare * 100)` without | `processRidePayment` |
-| Capture at `Complete` | `int(fare * 100)` | `confirmPaymentIntent` |
-| Capture at rating, no tip or tip over buffer | `math.Round(fare * 100)` | `captureFareOnly` |
-| Capture at rating, tip within buffer | `math.Round((fare + tip) * 100)` | `captureTipWithinBuffer` |
-| Capture by sweeper | `int(fare * 100)` | `autoCaptureSingleRide` |
-| Cancellation fee | `int(fee * 100)` | `applyCancellationPayment` |
+| Fare cents | `ROUND(COALESCE(discounted_price, price)::numeric * 100)` | `GetRideOperationPaymentDecision`, `GetRideCancellationBasis`, `GetRideTipSettlementDecision` in `queries/ride_operation.sql` |
+| Authorization | Fare cents, plus 500 (`models.TipBuffer`) when the fare is above 0 and tips are enabled | `freezeRidePreparation` |
+| Capture at `complete`, tips off | Fare cents | `RideCompletionExecutor` |
+| Capture at `settle_tip` | Fare cents plus tip cents. The tip is 0 for a rating without a tip and for the sweeper | `RideTipSettlementExecutor` |
+| Capture of the fare inside a `tip` operation | Fare cents | `RideDedicatedTipExecutor.prepare` |
+| Cancellation fee | `math.Round(fee * 100)` from `pricing.GetCancellationFee`, stored in the quote | `RideCancellationQuotes.Quote` |
+| `Rides.pre_auth_amount` | The authorized amount divided by 100 | `attachPromotionPayment` |
 
-`int()` truncates. `Rides.price` and `discounted_price` are `real` (float4), so a price such as $4.35 reads back as `4.349999904632568`.
+`ExecuteRideCapture` requires `amount_capturable` to cover the frozen amount before it captures, and requires `amount_received` to equal it afterwards. `ValidateRidePaymentPreparation` rejects an authorization amount that isn't exactly fare plus buffer.
 
-<Warning>
-Truncation and rounding disagree for some prices. For a $4.35 fare with tips on, the hold is `int(9.3499999 * 100)` = 934 cents, but a $5.00 tip captures `round(934.99999)` = 935 cents. Stripe rejects a capture above `amount_capturable`, so the rating fails. The same fare captures 434 cents at `Complete` and by the sweeper, one cent under the fare. Jitter pricing produces arbitrary cents, so this is reachable.
-</Warning>
+## Requeue and expiry
 
-## Reuse after requeue
+A hold never outlives the assignment it was made for.
 
-When the assigned driver cancels before pickup, `requeueAfterDriverCancel` puts the ride back to `confirmed` and appends the driver to `declined_drivers`. The ride keeps `payment_intent_id` and `stripe_merchant_id`. `RequeueRideAfterDriverCancel` also sets `confirm_time` to the requeue time and preserves the original in `payment_consent_at`.
+| Event | What happens to the hold | Code |
+| --- | --- | --- |
+| Driver cancels from `queued`, `driver_en_route`, or `driver_waiting` | The `cancel` operation voids it (`void` step), then `RequeueReservedRide` clears `payment_intent_id`, `payment_intent_client_secret`, `stripe_merchant_id`, `cloned_payment_method_id`, and `pre_auth_amount` | `ride_cancellation_operation.go` |
+| Next driver accepts | A new clone and a new intent on the new driver's account, with new metadata | `RidePreparationPaymentExecutor.Prepare` |
+| Queued ride is promoted | No intent exists yet for a ride accepted into the queue. The `promotion` creates one, reusing the inputs frozen at acceptance | `reserveRidePromotion` |
+| A queued ride that already has `payment_intent_id` set is promoted | `InspectExistingRideAuthorization` verifies the recorded intent read-only: method, amount, currency, manual capture, `ride_id`, `rider_id`, `driver_id`, `requires_capture`, and the full amount capturable. Nothing is created | `ride_existing_authorization.go` |
+| Unmatched request expires | The system `cancel` voids any remaining hold before the ride is completed | `ReserveExpiry` |
 
-When any driver next authorizes this ride, `reuseRideAuthorization` fetches the intent with `GetPaymentIntent` on the **stored** merchant and checks it:
+One compatibility case remains. A ride that was requeued before the journal took over can sit `confirmed` with a `payment_intent_id` still set. `HasRequeuedAuthorization` detects it on the next `accept`, and `release_previous_authorization` voids the old intent on its recorded account before the new hold is created. `clearReleasedAuthorization` then clears the old payment columns, and fails with "previous hold changed before assignment readiness" unless exactly one row matched. Expiry voids the same kind of hold.
 
-| Check | Failure result |
-| --- | --- |
-| Ride has a `stripe_merchant_id` | Server error "ride authorization merchant is missing" |
-| ID matches, `capture_method=manual`, `currency=usd`, `amount` equals the recomputed hold, `amount_received=0`, metadata `ride_id` and `rider_id` match | Server error "ride authorization does not match booking" |
-| Same `driver_id` in metadata and same merchant | Reuse, if `status=requires_capture` and `amount_capturable` equals the hold. Otherwise "ride authorization is not ready for this assignment" |
-| Different driver | The metadata driver must be in `declined_drivers` and must not be the new driver. Otherwise "ride authorization belongs to an unknown assignment" |
-| Previous driver's intent already `canceled` | Create a new hold. This covers a retry after a cancel whose reply was lost |
-| Previous driver's intent `requires_capture` with the full amount | `CancelPaymentIntent` on the old merchant, then create a new hold |
-
-Any server error here fails the accept, so a mismatched hold blocks the ride from being accepted until it expires.
-
-The new hold's mandate `accepted_at` is the requeue time, because `createPaymentIntent` reads `confirm_time`, not `payment_consent_at`.
+`ExecuteRideVoid` reads the intent before canceling. An already `canceled` intent with nothing capturable counts as released. A `succeeded` intent is a conflict ("intent is already captured"). It never refunds.
 
 ## Capture paths
 
-| Trigger | Condition | Call | Amount |
+| Operation | Condition | Step | Amount |
 | --- | --- | --- | --- |
-| `Complete` | Tips disabled, or effective price 0 | `PartiallyConfirm`, only if `payment_intent_id` is set | `int(fare * 100)` |
-| `Complete` | Tips enabled and price above 0 | None. Sets `pending_rider_rating` and `tip_window_expires_at = now + 24h` | — |
-| `Rate` by rider | Tips enabled, ride pending, paid | `captureFareOnly` or `captureTipWithinBuffer` | See [Ride tip charging](/engineering/payments/ride-tips) |
-| `TipCapture` sweeper | Window expired | `PartiallyConfirm` | `int(fare * 100)` |
-| `Cancel` | Fee above 0 | `PartiallyConfirm` | `int(fee * 100)` |
+| `complete` | Fare above 0 and tips off | `capture` | Fare cents |
+| `complete` | Fare above 0 and tips on | None. The ride moves to `pending_rider_rating` with `tip_window_expires_at` 24 hours after finalization | — |
+| `complete` | Fare 0 | None | — |
+| `settle_tip`, rider | Rating on a `pending_rider_rating` ride with a hold, tip at most $5.00 | `capture` | Fare cents plus tip cents |
+| `settle_tip`, system | Tip window expired | `capture` | Fare cents |
+| `tip` | Rating on a `pending_rider_rating` ride, tip above $5.00 | `capture`, then the tip steps | Fare cents |
+| `cancel` | Fee above 0 | `capture` | Fee cents |
+| `cancel` | Fee 0 and a hold exists | `void` | — |
 
-`Complete` recomputes the merchant with `selectStripeMerchantID` from the driver's **current** session fleet. It doesn't read `Rides.stripe_merchant_id`. Every other path uses the stored merchant.
+Every path captures against the `payment_intent_id` and `stripe_merchant_id` stored on the ride and frozen into the operation at reservation. No path looks up the driver's current fleet.
 
-If `Ride.Complete` fails after a capture, `handleCompleteDBFailure` runs:
+A capture is verified before the ride changes. Each finalizer re-reads the `capture` step receipt and compares it with the frozen inputs, then writes the ride and finishes the operation in one transaction. When that transaction fails, the receipt is still in the journal, and the next attempt finalizes without calling Stripe again.
 
-- Tips disabled: `CancelPaymentIntent`. On an already-captured intent this fails and is logged as "manual reconciliation required".
-- Tips enabled: nothing was captured. It logs "needs manual review" and leaves the hold.
+`driver_payout` is written by the finalizers: the fare at `complete`, fare plus tip at `settle_tip`, and the fee at a terminal `cancel`. The `payment_intent.succeeded` webhook skips any ride that has an operation row. See [Stripe webhooks](/engineering/payments/webhooks#payment_intentsucceeded).
 
 ## Cancellation
 
-`RideService.Cancel` in `internal/service/ride/ride.go` orders the work like this:
+Cancellation is two requests.
 
-1. `isReQueueEligible`: driver cancels from `queued`, `driver_en_route`, or `driver_waiting` take the requeue path. No Stripe call.
-2. `handleCancellationPayment`: no `payment_intent_id` means $0 and no call. A PaymentIntent without `stripe_merchant_id` is a server error.
-3. `pricing.GetCancellationFee`. Above 0: `PartiallyConfirm(fee)`. Exactly 0: `CancelPaymentIntent`.
-4. `Ride.Cancel` with a state expectation of the status and driver read in step 1.
+1. `RideService.CancelIntent` calls `QuoteCancellation`. A driver, or a ride without a PaymentIntent, gets a zero-fee quote. Otherwise `pricing.GetCancellationFee` prices the fee. The quote is stored in `RideCancellationQuotes` for 60 seconds. It's bound to the ride's `lifecycle_revision` and `assignment_generation`, and it records the status, PaymentIntent, and account it was priced against.
+2. `RideService.Cancel` calls `CancelLegacy`, which reserves a `cancel` operation from the actor's current quote. A rider whose ride has a PaymentIntent and who has no current quote gets "Review cancellation fee". The adapter never creates a fee-bearing quote on its own.
 
-Stripe is called **before** the database write. The fee capture lands on the connected account, and the ride's `driver_payout` is set later by the `payment_intent.succeeded` webhook to the fee amount. `Ride.Cancel` itself doesn't touch `driver_payout`.
+Execution captures the fee when it's above 0 and voids the hold when it's 0. The ride changes only after that step's receipt is verified. An unresolved `cancel` operation blocks every other command on the ride, so the driver can't advance a ride whose hold is being voided.
 
-For queued rides that are canceled terminally while being prepared for pickup, `releaseCancelledQueueAuthorization` cancels the hold if the ride ended with `cancel_phase = queued` and the intent isn't already canceled.
+A cancel that leaves the driver's active slot promotes the driver's next queued ride in the same transaction, and reserves that ride's `promotion` operation.
 
 ## Free rides
 
-A ride with an effective price of 0 never touches Stripe during the trip:
+A ride with a fare of 0 never touches Stripe during the trip:
 
 - `ConfirmRide` doesn't require a payment method, and the mobile app skips PaymentSheet confirmation.
-- `AcceptRide` and `authorizeRidePickup` skip `processRidePayment`.
-- `Complete` skips the tip window and completes directly, even with tips enabled.
-- A tip on a free ride clones the saved payment method at rating time, if the rider saved one. See [Ride tip charging](/engineering/payments/ride-tips#free-rides).
+- `accept` and `promotion` create no steps. `attachPromotionPayment` rejects payment evidence on a free ride.
+- `complete` performs no capture and sets no tip window. The ride still moves to `pending_rider_rating`.
+- `freezeCompletionPayment` rejects a free ride that has a `payment_intent_id` ("free ride has a payment authorization requiring reconciliation").
+- A tip on a free ride is a dedicated charge. See [Ride tip charging](/engineering/payments/ride-tips#free-rides).
 
 ## Failure outcomes
 
-| Failure | Where | What the driver or rider sees |
-| --- | --- | --- |
-| Clone fails | `clonePaymentMethodToMerchant` | Driver's accept returns the Stripe error as "Something Went Wrong". `Cancel` with `Payment Failed` runs as the driver, who isn't assigned yet, so it's rejected. The ride stays on the board |
-| Card declined or needs authentication | `createPaymentIntent` | Same as above. Each failed attempt counts toward the Stripe breaker |
-| Persist conflict | `persistPaymentIntent` | New hold canceled. Accept returns a server error |
-| Persist with unknown outcome | `persistPaymentIntent` | Hold kept, error returned. The ride may or may not reference it |
-| Capture fails at `Complete` | `confirmPaymentIntent` | Driver can't complete. The ride stays `in_progress` |
-| Fee capture fails | `applyCancellationPayment` | Cancel returns the error. The ride isn't canceled |
+The reservation commits before any Stripe call. A failure during execution leaves the ride assigned and the operation unresolved, and the `ride_operation` job continues the work.
 
-See [Payment failure modes and invariants](/engineering/payments/failure-modes-and-invariants) for the full matrix.
+| Failure | Operation state | What the driver or rider sees |
+| --- | --- | --- |
+| Reservation rejected: ride no longer `confirmed`, stale revision, session mismatch, driver offline, queue full, or a hold for another driver | No operation | Accept returns "Ride Unavailable". Nothing changed |
+| Missing consent, payment method, customer, or connected account | No operation | Accept returns a server error. `ValidateRidePaymentPreparation` fails inside the reservation transaction, so the assignment rolls back |
+| Stripe or network error on clone, create, or confirm | `pending` | Accept returns a server error. The ride is already assigned and `transition_pending` is `true`. The job retries the same step with the same key |
+| Card declined: intent ends `canceled` with nothing capturable | `failed` | Accept returns "Payment Failed". The ride is canceled with `cancel_reason = 'Payment Failed'`, the rider gets `ride_payment_failed`, and the driver's next queued ride is promoted |
+| Provider object contradicts the frozen request | `quarantined` | The command returns a server error. The ride keeps its assignment and accepts no other command until someone reconciles it |
+| Capture or void hits a Stripe or network error | `pending` | Complete or cancel returns a server error. The ride keeps its status. The job retries |
+| Intent already captured for a different amount, or not capturable | `quarantined` | Same as a contradiction above |
+
+See [Quarantine](/engineering/payments/ride-operation-journal#quarantine) and [Payment failure modes and invariants](/engineering/payments/failure-modes-and-invariants) for the full matrix.
 
 ## Where this lives in code
 
@@ -185,20 +193,20 @@ See [Payment failure modes and invariants](/engineering/payments/failure-modes-a
 | Customer and SetupIntent | `yelo-api/internal/service/ride/rider.go` (`ensureStripeCustomerSetup`) |
 | Confirm-time payment checks | `yelo-api/internal/service/ride/rider.go` (`validatePaymentMethod`, `processPaymentMethodParallel`, `extractPaymentBrand`) |
 | IP and user agent capture | `yelo-api/internal/server/http/ride/ride_handler.go`, `yelo-api/internal/utilities/network/ip.go` |
-| Authorization and reuse | `yelo-api/internal/service/ride/driver.go` (`processRidePayment`, `reuseRideAuthorization`, `clonePaymentMethodToMerchant`, `createPaymentIntent`, `persistPaymentIntent`) |
-| Queue promotion auth | `yelo-api/internal/service/ride/driver.go` (`prepareAndPromoteQueuedRide`, `prepareActiveRide`, `authorizeRidePickup`, `releaseCancelledQueueAuthorization`) |
-| Capture at complete | `yelo-api/internal/service/ride/driver.go` (`Complete`, `confirmPaymentIntent`, `handleCompleteDBFailure`) |
-| Cancellation charges | `yelo-api/internal/service/ride/ride.go` (`Cancel`, `handleCancellationPayment`, `applyCancellationPayment`) |
-| Stripe calls | `yelo-api/internal/data/stripe/intent.go`, `method.go` |
-| SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`AddRidePaymentIntent`, `RequeueRideAfterDriverCancel`) |
+| Command boundary | `yelo-api/internal/service/ride/financial_commands.go`, `driver.go` (`AcceptRide`, `AutoAssignRide`, `RecoverIdleQueue`, `Complete`), `ride.go` (`Cancel`, `CancelIntent`, `CancelUnmatchedRides`) |
+| Payment decision and amounts | `yelo-api/internal/data/repository/ride_promotion_operation.go` (`freezeRidePreparation`, `attachPromotionPayment`, `clearReleasedAuthorization`), `yelo-api/internal/models/ride_payment_preparation.go` |
+| Authorization steps | `yelo-api/internal/service/payment/ride_promotion_payment.go`, `ride_promotion_operation.go`, `ride_authorization_operation.go`, `ride_clone_operation.go` |
+| Capture and void steps | `yelo-api/internal/service/payment/ride_capture_operation.go`, `ride_void_operation.go`, `ride_completion_operation.go`, `ride_cancellation_operation.go` |
+| Stripe calls | `yelo-api/internal/data/stripe/ride_authorization.go`, `ride_existing_authorization.go`, `ride_clone.go`, `ride_capture.go`, `ride_void.go` |
+| SQL | `yelo-api/internal/data/repository/queries/ride_operation.sql`, `queries/ride_lifecycle.sql` (`AddRidePaymentIntent`, `CompleteRideForRating`) |
 
 ## Gotchas and edge cases
 
-- **Two drivers, two holds.** `AddPaymentIntent` checks `lifecycle_revision` but doesn't bump it, and `AcceptRide` takes no lock before authorizing. Two drivers accepting the same board ride at once can both create holds and both pass the revision check. The later write wins `payment_intent_id`, the other hold is never canceled, and `Ride.Accept` may pick the other driver.
-- **Complete uses the live merchant.** If a driver's session fleet changes between accept and complete, `Complete` captures against an account that doesn't own the hold, and Stripe returns "No such payment_intent".
-- **Cancel races.** A $0 rider cancel voids the hold before `Ride.Cancel` checks state. If the driver advances the ride in between, the cancel fails but the hold is already gone, and `Complete` can't capture later.
-- **Requeued rides that expire.** `CancelUnmatchedConfirmedRides` ends unmatched `confirmed` rides without a Stripe call. A requeued ride still holds the previous driver's authorization, which stays on the rider's card until Stripe expires it.
-- **Paid ride without a hold.** `confirmPaymentIntent` silently skips capture when `payment_intent_id` is null. A tips-enabled ride in that state never leaves `pending_rider_rating`, because the sweeper only selects rides with a PaymentIntent.
-- **Hold expiry.** Card authorizations expire after about 7 days. Queued or requeued rides don't renew them.
-- **Reuse is strict.** Any drift between the stored price and the Stripe `amount`, such as a price edit after authorization, turns every future accept into "ride authorization does not match booking".
+- **Accepting assigns before authorizing.** The assignment commits at reservation, and the hold is created afterwards. A paid ride can be `driver_en_route` with no `payment_intent_id` while its operation is `pending`. The ride accepts no other command until that operation resolves.
+- **A second accept can't create a second hold.** `acceptFinancialRide` takes the ride's advisory lock, reservation requires `confirmed` with no driver under the ride command locks, and `ride_operations_one_unresolved` allows one unresolved operation per ride. The loser gets "Ride Unavailable" before any Stripe call.
+- **The account is fixed at acceptance.** Completion, cancellation, and tips use the account frozen into the hold. A driver who changes fleets mid-ride still settles on the original account.
+- **A queued ride has no hold.** A ride accepted into a driver's queue is authorized only when it's promoted. A decline at that point cancels the ride with "Payment Failed", after the rider has been waiting.
+- **Free completions and tips-off completions wait for a rating.** `complete` always sets `pending_rider_rating`. The sweeper selects only tips-enabled rides with an expired window and a PaymentIntent, so the rider's rating is what moves those rides to `complete`.
+- **Hold expiry.** Card authorizations expire after about 7 days. Nothing renews them. A capture against an expired hold finds an intent that isn't capturable, which is a conflict, and the operation quarantines.
+- **A price edit after authorization blocks settlement.** The frozen fare must match the hold. `ExecuteRideCapture` rejects a capture above `amount_capturable`, and promotion of a ride that kept its hold rejects an amount that isn't fare plus buffer.
 - **Tips are always on from mobile.** `usePreRideRequest` always sends `X-Features: tips,driver-options`, so every mobile ride authorizes the $5.00 buffer. Rides created without that header, such as from older clients, authorize the fare only. See [Mobile PaymentSheet and wallets](/engineering/payments/mobile-payment-sheet).

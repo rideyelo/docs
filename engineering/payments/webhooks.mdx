@@ -65,7 +65,7 @@ It returns without touching the database when any of these is missing:
 - `event.account`
 - the PaymentIntent ID
 
-Ride fare intents and dedicated tip intents carry `ride_id` metadata (`internal/data/stripe/intent.go`). Platform events and intents without that metadata, such as QR Checkout charges, skip the wake-up.
+Ride fare intents and dedicated tip intents carry `ride_id` metadata (`internal/data/stripe/ride_authorization.go`, `ride_tip.go`). Platform events and intents without that metadata, such as QR Checkout charges, skip the wake-up.
 
 Otherwise it runs `WakeRidePaymentOperations` with four inputs: `ride_id` from metadata, `event.account`, the intent ID, and `metadata.operation_id`. The query sets `scheduled_at` to now on `river_job` rows that match all of these:
 
@@ -81,8 +81,10 @@ The last branch covers a creation call whose response was lost: the journal has 
 
 The query only pulls `scheduled_at` in to the current time. It doesn't change a job's state or attempt count, so a duplicate event can't revive an exhausted or canceled job. `PaymentIntentUpdated` discards the affected row count.
 
+The jobs it wakes belong to the `ride_operation` worker, which is registered with the notification River client at startup. In practice the wake-up shortens the one-minute snooze of a `tip` operation that is waiting on the rider's authentication, and the backoff of any operation whose last attempt failed. The worker then reads Stripe itself. See [Tip snooze](/engineering/payments/ride-operation-journal#tip-snooze).
+
 <Note>
-The wake-up matches zero rows in production on `main`. `RideOperations` rows and `ride_operation` jobs come from `payment.NewRideOperations`, which only tests construct. `RideOperations.RegisterWorkers` and `RideOperationRecoveryJob` have no callers either. See [Ride operation journal](/engineering/payments/ride-operation-journal#what-is-live-today). The `UPDATE` still runs for every ride and tip PaymentIntent event, so a database error there fails the webhook before the legacy handler runs.
+The `UPDATE` runs for every ride and tip PaymentIntent event, so a database error there fails the webhook before the `succeeded` or `payment_failed` handler runs.
 </Note>
 
 ### payment_intent.succeeded
@@ -102,15 +104,11 @@ WHERE ride.id = ANY($ids)
 - `driver_payout` becomes `amount_received / 100`, the amount Stripe actually captured.
 - Tip PaymentIntents, QR Checkout PaymentIntents, and Payment Link charges don't match any `payment_intent_id`, so they're no-ops.
 - `MarkRidePaymentSucceeded` also snapshots `estimated_stripe_fee_cents` in the same statement. See [Stripe fee estimates](/engineering/payments/payouts-and-earnings#stripe-fee-estimates).
-- The `RideOperations` guard fences rides owned by the durable command journal (`RideOperationJournal`, migration `000339`), which isn't wired into production. No rows exist, so the guard never blocks.
+- The `RideOperations` guard skips any ride that has a ride operation in any state. Acceptance, promotion, completion, cancellation, and tips all create one, so this write only reaches rides that were accepted before ride money moved to the journal and have had no command since. For every other ride the operation finalizers write `driver_payout`. See [Ride operation journal](/engineering/payments/ride-operation-journal#guards-and-readers).
 
-The write is unconditional. It doesn't compare with the current value or with event order.
+For a ride that passes the guard, the write is unconditional. It doesn't compare with the current value or with event order.
 
-<Warning>
-When a tip exceeds the buffer, the fare is captured first and the tip is charged on a second PaymentIntent. `RecordTip` sets `driver_payout = fare + tip`. The fare's `payment_intent.succeeded` usually arrives after that and sets `driver_payout` back to the fare. The tip stays in `tip_amount`, but the earnings week total and the activity feed's gross drop it.
-</Warning>
-
-For cancellations with a fee, this webhook is the only writer of `driver_payout`. `Ride.Cancel` doesn't set it.
+A ride with an operation row is never touched here, so the fare's `payment_intent.succeeded` can't overwrite a payout that already includes a tip. For cancellations with a fee, `CancelReservedRide` sets `driver_payout` to the fee in the transaction that finishes the `cancel` operation.
 
 ### checkout.session.completed
 
@@ -155,7 +153,7 @@ Yelo doesn't store processed event IDs, so every delivery runs its handler again
 
 | Event | Duplicate delivery | Out-of-order delivery |
 | --- | --- | --- |
-| `payment_intent.succeeded` | Same value written again | Can overwrite a newer `driver_payout`, as in the tip case above |
+| `payment_intent.succeeded` | Same value written again, or skipped for a ride with an operation row | Can overwrite a newer `driver_payout` only on a ride with no operation row |
 | Any routed `payment_intent.*` wake-up | Sets `scheduled_at` again on a job that's still waiting. No effect once the job ran | Order doesn't matter. The wake-up never applies event data |
 | `checkout.session.completed` | Ignored by the unique session ID | n/a |
 | `account.updated` | Status rewritten. Slack alert sent again for complete drivers. Fleet activation re-runs | An older event can regress `stripe_status`, for example from `complete` to `restricted`. Reconciliation corrects it within about 24 hours |
@@ -200,11 +198,11 @@ stripe listen --forward-connect-to localhost:8080/stripe-webhook \
 | Wake-up SQL | `yelo-api/internal/data/repository/queries/ride_operation.sql` (`WakeRidePaymentOperations`) |
 | Payout pushes | `yelo-api/internal/service/earnings/webhook.go` (`HandlePayoutEvent`) |
 | Webhook SQL | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` (`LockRidePaymentWebhookTargets`, `MarkRidePaymentSucceeded`), `education_commerce.sql` (`InsertQrPayment`, `UpdatePaymentIntentStatus`) |
-| Unwired journal and worker | `yelo-api/internal/data/repository/ride_operation.go`, `yelo-api/internal/service/payment/ride_operations.go`, `ride_operation_worker.go`, `ride_operation_recovery.go`, `yelo-api/migrations/000339_ride_operation_journal.up.sql` |
+| Journal and worker the wake-up targets | `yelo-api/internal/data/repository/ride_operation.go`, `yelo-api/internal/service/payment/ride_operations.go`, `ride_operation_worker.go`, `ride_operation_recovery.go`, `yelo-api/migrations/000339_ride_operation_journal.up.sql` |
 
 ## Gotchas and edge cases
 
-- **No failed-payment handling.** `payment_intent.payment_failed` runs the wake-up and then only touches the unused `PaymentIntents` table. Ride state never changes from a webhook. Failures surface only through the synchronous Stripe call that caused them.
+- **No failed-payment handling.** `payment_intent.payment_failed` runs the wake-up and then only touches the unused `PaymentIntents` table. Ride state never changes from a webhook. Failures surface through the ride operation that made the Stripe call.
 - **Cancellations write nothing.** `payment_intent.canceled` is routed, but only to the wake-up. A hold canceled in the Stripe Dashboard leaves the ride row unchanged.
 - **No refund or dispute handling.** `charge.refunded` and `charge.dispute.*` are ignored. A refund issued in the Stripe Dashboard leaves `driver_payout` and `tip_amount` unchanged.
 - **The wake-up needs a connected-account event.** `PaymentIntentUpdated` returns early when `event.account` is empty, so the same event delivered through a platform endpoint skips it.

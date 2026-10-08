@@ -44,9 +44,9 @@ flowchart LR
 | Ephemeral key | Platform | `Client.NewEphemeralKey`, on every `CreateRide`, pinned to Stripe version `2024-06-20` | Not stored. Returned as `ephemeral_key` |
 | SetupIntent | Platform | `Client.NewSetupIntent`, on every `CreateRide` | Not stored. Only the client secret is returned |
 | PaymentMethod (original) | Platform | Mobile PaymentSheet, by confirming the SetupIntent | `Rides.payment_method_id` at confirm |
-| PaymentMethod (clone) | Connected | `Client.ClonePaymentMethod` at authorization, or at tip time for free rides | `Rides.cloned_payment_method_id` |
-| Ride PaymentIntent | Connected | `Client.NewPaymentIntent` from `RideService.processRidePayment` | `Rides.payment_intent_id`, `Rides.payment_intent_client_secret`, `Rides.pre_auth_amount`, `Rides.stripe_merchant_id` |
-| Tip PaymentIntent | Connected | `Client.CreateTipPaymentIntent` from `RideService.createTipCharge` | `Rides.tip_payment_intent_id` |
+| PaymentMethod (clone) | Connected | `Client.ExecuteRideClone`, step `clone_payment_method` of an `accept`, `promotion`, or `tip` operation | `Rides.cloned_payment_method_id`, written when an authorization is attached. A clone made only for a tip stays in the step receipt |
+| Ride PaymentIntent | Connected | `Client.CreateRideAuthorizationIntent`, step `create_authorization` of an `accept` or `promotion` operation | `Rides.payment_intent_id`, `Rides.payment_intent_client_secret`, `Rides.pre_auth_amount`, `Rides.stripe_merchant_id`, written when the operation finishes |
+| Tip PaymentIntent | Connected | `Client.CreateRideTip`, step `create_tip` of a `tip` operation | `Rides.tip_payment_intent_id`, written only when the tip succeeds. Until then the ID is in the step result |
 | Express account (driver) | Platform-owned connected account | `Client.CreateExpressAccount` from `StripeAccountService.GetOnboardingLink` | `Users.stripe_merchant_id` |
 | Express account (fleet) | Platform-owned connected account | `Client.CreateFleetExpressAccount` from fleet create or unlink | `Fleets.stripe_merchant_id`, `Fleets.stripe_status`, `Fleets.stripe_onboarding_url` |
 | Account link | n/a | `Client.GetExpressAccountOnboardingLink` | `Fleets.stripe_onboarding_url` for fleets. Not stored for drivers |
@@ -98,13 +98,11 @@ Calls use one of three wrappers. They are not applied consistently, so check thi
 
 | Call | Circuit breaker | Retries | Idempotency key |
 | --- | --- | --- | --- |
-| `NewPaymentIntent` | Yes | None | None |
-| `PartiallyConfirm` (capture with amount) | No | 3 attempts, 100 ms base, 5 s max, full jitter. Skips retry on `charge_already_captured` | None |
-| `Confirm` (full capture) | No | `NewCriticalRetrier`, 3 attempts | None. No callers on `main` |
-| `CancelPaymentIntent` | No | `NewCriticalRetrier`, 3 attempts | None |
-| `GetPaymentIntent` | Yes | None | n/a |
-| `CreateTipPaymentIntent` | Yes | None | `tip_{rideID}_{cents}` |
-| `ClonePaymentMethod`, `AllowPaymentMethodRedisplay` | No | None | None |
+| `CreateRideAuthorizationIntent`, `ExecuteRideClone`, `CreateRideTip` | No | None in the client. The `ride_operation` job retries the step. Each call is bounded to 30 seconds and refused 23 hours after the step's first attempt | `ride_operation/{operationID}/{stepName}` |
+| `ConfirmRideAuthorization`, `ConfirmRideTip`, `CancelRideTip` | No | None in the client. On an error the client reads the intent and decides from its actual status | `ride_operation/{operationID}/{stepName}` |
+| `ExecuteRideCapture`, `ExecuteRideVoid` | No | None in the client. Reads the intent before writing, and again after a failed write | `ride_operation/{operationID}/{stepName}` |
+| `InspectRideAuthorization`, `InspectExistingRideAuthorization`, `InspectLegacyRideTip` | No | None | n/a, read-only |
+| `AllowPaymentMethodRedisplay` | No | None | None |
 | `NewCustomer`, `NewEphemeralKey`, `NewSetupIntent` | Yes | None | None |
 | `CreateExpressAccount`, `CreateFleetExpressAccount`, `DeleteAccount` | Yes | None | None |
 | `GetExpressAccount` | Yes. 400, 404, 429, and caller cancellation are excluded from breaker accounting | None | n/a |
@@ -119,16 +117,18 @@ Calls use one of three wrappers. They are not applied consistently, so check thi
 The breaker is a single `gobreaker` instance named `stripe`, shared by every wrapped call (`circuitbreaker.NewSettings`):
 
 - It trips after **5 consecutive failures** and stays open for **60 seconds**. Half-open allows 3 probe requests.
-- Every Stripe error counts as a failure unless excluded, including card declines on `NewPaymentIntent`.
+- Every Stripe error on a wrapped call counts as a failure unless excluded.
 - Tripping logs `CIRCUIT_BREAKER_TRIPPING` and posts a Slack alert. See [Integrations](/engineering/api/integrations).
 
 <Warning>
-Because the breaker is shared and counts declines, five declined authorizations in a row open the breaker for every wrapped Stripe call for 60 seconds. That includes SetupIntents on new ride requests, account lookups, tip charges, and earnings screens. Capture and cancel calls are not wrapped, so in-flight rides can still settle.
+The breaker is shared, so five consecutive failures on any wrapped call open it for every wrapped call for 60 seconds. That includes SetupIntents on new ride requests, account lookups, and earnings screens. The ride operation calls in the first four rows aren't wrapped, so authorizations, captures, voids, and tips neither trip the breaker nor stop when it's open.
 </Warning>
 
 ### Retry classification
 
-`NewCriticalRetrier` retries unless the error is a Yelo error of a terminal type, such as input, validation, or not found. Every Stripe error is wrapped with `errors.NewServerErrorFromError`, which has type `server`, so card errors are retried too. `PartiallyConfirm` uses its own `RetryIf` that inspects the raw `*stripe.Error` and only stops on `charge_already_captured`.
+`NewCriticalRetrier` retries unless the error is a Yelo error of a terminal type, such as input, validation, or not found. Every Stripe error is wrapped with `errors.NewServerErrorFromError`, which has type `server`, so card errors are retried too.
+
+Ride operation calls don't use a retrier. They classify errors themselves: a `*ConflictError` (`RideAuthorizationConflictError`, `RideCaptureConflictError`, `RideVoidConflictError`, `RideCloneConflictError`) means the provider object contradicts the frozen request and quarantines the operation. Any other error leaves the operation `pending` for the next job attempt. See [Quarantine](/engineering/payments/ride-operation-journal#quarantine).
 
 ## Configuration
 
@@ -150,10 +150,10 @@ The provider exposes methods with no production callers on `main`. Don't assume 
 
 - `GetCustomerByEmail`, `NewPaymentMethod`, `AttachPaymentMethod`, `GetPaymentMethods`
 - `Confirm` (uncapped full capture)
+- `NewPaymentIntent`, `PartiallyConfirm`, `CancelPaymentIntent`, `GetPaymentIntent`, `CreateTipPaymentIntent`, and `ClonePaymentMethod`. `RideService` called them before ride money moved to ride operations. The methods are still defined in `intent.go` and `method.go`
 - `CancelPayout`
 - `PaymentIntentRepository.Create` and the `PaymentIntents` table
 - `PaymentService.Attached`
-- The ride operation journal methods in `ride_authorization.go`, `ride_existing_authorization.go`, `ride_capture.go`, `ride_void.go`, `ride_clone.go`, and `ride_tip.go`. Only the unwired journal calls them. See [Ride operation journal](/engineering/payments/ride-operation-journal#what-is-live-today)
 
 ## Where this lives in code
 
@@ -161,21 +161,22 @@ The provider exposes methods with no production callers on `main`. Don't assume 
 | --- | --- |
 | Provider interface | `yelo-api/internal/data/stripe/provider.go` (`StripeProvider`) |
 | Client construction | `yelo-api/internal/data/stripe/stripe.go` (`NewStripeClient`), `yelo-api/cmd/api/main.go` |
-| PaymentIntents, SetupIntents | `yelo-api/internal/data/stripe/intent.go` |
+| SetupIntents | `yelo-api/internal/data/stripe/intent.go` |
+| Ride holds, captures, voids, clones, and tips | `yelo-api/internal/data/stripe/ride_authorization.go`, `ride_existing_authorization.go`, `ride_capture.go`, `ride_void.go`, `ride_clone.go`, `ride_tip.go` |
 | Customers, ephemeral keys | `yelo-api/internal/data/stripe/customer.go` |
-| PaymentMethod clone | `yelo-api/internal/data/stripe/method.go` (`ClonePaymentMethod`) |
+| PaymentMethod reads and redisplay | `yelo-api/internal/data/stripe/method.go` |
 | Connected accounts and links | `yelo-api/internal/data/stripe/account.go` |
 | Products, prices, links, Checkout | `yelo-api/internal/data/stripe/payment_link.go`, `checkout.go` |
 | Balance and payouts | `yelo-api/internal/data/stripe/payout.go` |
 | Transfers, platform balance, connected payment update | `yelo-api/internal/data/stripe/transfer.go` |
 | Breaker and retry | `yelo-api/internal/utilities/circuitbreaker/`, `yelo-api/internal/utilities/retry/` |
 | Config | `yelo-api/internal/utilities/config/config.go` (`Stripe` struct) |
-| Ride payment columns | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql` |
+| Ride payment columns | `yelo-api/internal/data/repository/queries/ride_lifecycle.sql`, `queries/ride_operation.sql` |
 
 ## Gotchas and edge cases
 
 - **Two customers for one rider.** `ensureStripeCustomerSetup` checks `stripe_customer_id` and then creates a customer without a lock or idempotency key. Two concurrent `CreateRide` calls for a new rider can create two customers. The last `SetStripeCustomerId` wins, and PaymentMethods saved against the other customer can't be cloned later.
 - **Orphaned SetupIntents.** Every `CreateRide`, including abandoned quotes, creates a SetupIntent and an ephemeral key. Nothing cancels unused SetupIntents.
-- **Clones are not attached.** `ClonePaymentMethod` creates a PaymentMethod on the connected account from the platform customer and payment method. It doesn't create a customer on the connected account, so the clone is single-purpose. Tips reuse `cloned_payment_method_id` rather than cloning again.
+- **Clones are not attached.** `ExecuteRideClone` creates a PaymentMethod on the connected account from the platform customer and payment method. It doesn't create a customer on the connected account, so the clone is single-purpose. Tips reuse `cloned_payment_method_id` rather than cloning again.
 - **Deleted customers.** `UserService.Delete` deletes the Stripe customer first. If Stripe fails, account deletion fails.
-- **Ten-second ceiling.** A Stripe call that takes longer than 10 seconds fails on the Yelo side even if Stripe completes it. For `NewPaymentIntent`, which has no idempotency key, that can leave an authorized hold Yelo never recorded.
+- **Ten-second ceiling.** A Stripe call that takes longer than 10 seconds fails on the Yelo side even if Stripe completes it. Ride operation calls send an idempotency key that is committed before the call, so the retry lands on the same Stripe object.
