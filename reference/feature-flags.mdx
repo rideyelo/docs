@@ -132,7 +132,7 @@ No API behavior branches on `PUT /user/app-version`, telemetry `app_version`, or
 | `design-system-lab` | `lib/experiments/index.ts:16` | off | Design System Lab screen | Admin and Self |
 
 - `rideshare-price-aggregator` is retired. It graduated to Fare Finder, which is on for all riders and controlled by `Communities.fare_finder_disabled` (see [Per-entity flags](#per-entity-flags)). Communities keep the key so older app versions still honor it. Current builds hide it from **Settings > Experiments** (`lib/experiments/index.ts:19-26`).
-- An experiment is on only when `user.active_experiments` **and** `community.active_experiments` both contain the key (`lib/experiments/index.ts:43-53`). The client evaluates this; the API only stores and returns the lists (`Users.active_experiments`, `Communities.active_experiments`, migration 000265).
+- An experiment is on only when `user.active_experiments` **and** `community.active_experiments` both contain the key (`lib/experiments/index.ts:43-52`). The client evaluates this; the API only stores and returns the lists (`Users.active_experiments`, `Communities.active_experiments`, migration 000265).
 - Admins edit the community list as free text in the community editor (`src/components/CommunityEditor.tsx:66,142,160-164`, `PATCH /dashboard/manage/{id}`).
 - Users opt in on **Settings > Experiments** (`app/(app)/profile/experiments.tsx`, `PUT /user/experiments`). The row appears only when the community has at least one experiment.
 
@@ -171,13 +171,13 @@ Column defaults come from `data/sqlc/schema.sql`.
 
 <AccordionGroup>
   <Accordion title="Communities">
-    Unless noted, Admin changes these through `PATCH /dashboard/manage/{id}` (`community_handler.go:1845`) from the community editor (`src/components/CommunityEditor.tsx:257-291`).
+    Unless noted, Admin changes these through `PATCH /dashboard/manage/{id}` (`community_handler.go:1886`) from the community editor (`src/components/CommunityEditor.tsx:257-291`).
 
     | Column | Default | What it changes | Who can change it |
     | --- | --- | --- | --- |
     | `rides_disabled` | `false`; `true` on create (`queries/community.sql:127-129`). The dashboard community editor also starts new communities with the switch on (`CommunityEditor.tsx:63`) | Ride creation returns "Rides Unavailable" (`service/ride/rider.go:795`). The app shows the inactive map state (`api/helpers/community.ts:168-171`) | Admin |
     | `fare_finder_disabled` | `false` (migration 000353) | When `true`, the app hides Fare Finder live quotes, the connect screens, and linked rideshare accounts, and shows static deep-link cards (`lib/ride/fareFinder.ts`). Fails open: a missing field reads as enabled. The app polls `GET /community/current` every 60 seconds in the foreground (`providers/QueryPollers.tsx`). The editor sends the field only when the admin flips the **Fare Finder** switch | Admin |
-| `is_active` | `false` | Users can switch only to active communities (`queries/user_profile.sql:74`). Geo lookup, heatmap, and fleet service views skip inactive ones | Admin |
+    | `is_active` | `false` | Users can switch only to active communities (`queries/user_profile.sql:74`). Geo lookup, heatmap, and fleet service views skip inactive ones | Admin |
     | `is_hidden` | `false` | Non-test users cannot join (`queries/user_profile.sql:77`). No heatmap. The app ignores it | Admin |
     | `is_test` | `false` | Hidden from non-test users. Excluded from analytics, geo lookup, and default community | SQL (migration 000230 sets it for "Yelo") |
     | `is_default` | `false` | Catch-all community: skipped in geo match, used as the repair target (`service/authv3/active_community.go:256`), top locations off by default | SQL |
