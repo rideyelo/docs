@@ -209,7 +209,8 @@ Every flow signs in through the real screens: `get-started`, `method-phone`, `ph
 A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`, and an optional `coverageCatalog`. Each test has a unique `id`, a `scenario`, and one to ten `roles`, each with `name`, `actor`, `flow`, and optional `startDelayMs` or `startAfterTransition`. Tests can also declare:
 
 - `freshDeviceState: true` to erase and reinstall the leased simulators before the fixture is created. Use it when the flow depends on OS state, such as notification permission or URL hand-off approval.
-- `rideTransitions`: an ordered list of `{role, action, afterScreenshot, notification}`. The scheduler calls the transition after the role writes `afterScreenshot`. With `notification`, it injects the payload from `e2e/notifications/*.json` into the simulator only after the transition commits.
+- `rideTransitions`: an ordered list of `{role, action, afterScreenshot, notification}`. The scheduler calls the transition after the role writes `afterScreenshot`. With `notification`, it injects the payload from `e2e/notifications/*.json` into the simulator only after the transition commits. A payload whose `body.ride_id` is the literal `${FIXTURE_RIDE_ID}` is bound first: `bindRideTransitionNotification` replaces it with the committed fixture ride's ID and adds that ride's `status`. `ride-status-changed.json` (`type: ride_status_changed`) is the only payload that uses the placeholder, so the app runs its normal push invalidation against the real ride. `ride-canceled.json` and `ride-confirmed.json` are static tap payloads.
+- `expectedRide`: `{status, cancel_phase, cancel_user}`, with exactly those three keys. After the roles finish, the scheduler reads the fixture run, writes `ride-observation.json` beside the roles' evidence, and fails the test unless the ride matches. `validateRideExpectation` in `scripts/e2e-ride-assertions.mjs` rejects outcomes the scenario can't reach when the suite loads.
 
 | Suite | Tests | Scenarios |
 | --- | --- | --- |
@@ -224,6 +225,7 @@ A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`,
 | `ride-queued-recovery.json` | Queued cache recovery on restart, legacy link warm and cold | `ride_queued_pair` |
 | `ride-driver-requeue.json` | Driver cancels before pickup | `ride_queued_pair` |
 | `ride-coordinate-stops.json` | Addressless POI ride options | `auth_existing_rider` |
+| `ride-financial-cutover.json` | Nine tests in one run, reusing the test IDs of the recovery, queued-cancellation, queue-promotion, driver-requeue, and auto-queue suites: confirmed restart and abort cancels, queued rider cancel, promotion after the driver completes or cancels, driver cancel before pickup, and the three idle auto-queue cases. Every test sets `expectedRide`. The auto-queue tests inject `ride-status-changed.json` after each transition | `ride_confirmed_rider`, `ride_queued_pair`, `auth_rider_driver_pair` |
 
 `e2e/suites/ride-notification-regressions.md` is a plan, not a runnable suite.
 
@@ -236,6 +238,10 @@ A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`,
 3. It creates the fixture, starts one `scripts/e2e-run.sh` per role with its own simulator, agent-device session, and recording, and runs the roles concurrently. Recorder startup is briefly serialized because CoreSimulator rejects bursts.
 4. It deletes the fixture, then resets each device: app reinstall, keychain reset, known location and permission grants, and XCTest cleanup.
 5. It returns the slots and writes the aggregate manifest.
+
+The scheduler repeats a control-plane request once, and only after a connection timeout (`UND_ERR_CONNECT_TIMEOUT`). That covers `GET` fixture reads and the `POST /internal/e2e/runs` create, which is safe to repeat because it carries an idempotency key. Ride transitions and fixture deletes are never repeated, and neither are device flows or whole tests.
+
+`scripts/e2e-run.sh` launches `node_modules/.bin/agent-device` from the checkout. Set `E2E_AGENT_DEVICE_BIN` to another executable when the device host supplies its own agent-device launcher. Device leases and evidence rules are the same either way.
 
 ### Legacy rigs
 
@@ -261,14 +267,16 @@ All three default `RIG` to `e2e/rigs/auth-rider-driver.json` and `PAIRS` to `1`.
 
 Each run writes `.artifacts/e2e/<run-id>/`, with roles under `scenarios/<index>-<test-id>/<role>/`. A run passes only with an MP4, at least one PNG, a non-empty timeline, JUnit XML, and a manifest. Missing evidence, a failed fixture, a failed role, or a failed cleanup fails the scenario and the aggregate.
 
-A suite with `coverageCatalog` (such as `e2e/coverage/ride-workflows.json`) also gets `workflow-coverage.json`. A case counts as verified only when its mapped test passed, every role ran exactly once with complete evidence, and the reported app and API revisions match. Local builds write `<archive>.provenance.json` with source and bundle hashes. Runs on archives without provenance can't earn coverage credit.
+A suite with `coverageCatalog` (such as `e2e/coverage/ride-workflows.json`) also gets `workflow-coverage.json`. Each mapped catalog case names one `workflow.suite` and `workflow.testId`. An optional `workflow.additionalSuites` list names other suites whose run of the same test ID also counts for the case. `ride-workflows.json` uses it to map 12 cases to `ride-financial-cutover`. `scripts/e2e-coverage.mjs` rejects a value that isn't a list of non-empty strings, and suite loading fails when a mapped suite lacks the test. A case counts as verified only when its mapped test passed, every role ran exactly once with complete evidence, and the reported app and API revisions match. Local builds write `<archive>.provenance.json` with source and bundle hashes. Runs on archives without provenance can't earn coverage credit.
 
 ## Evidence viewer
 
 The `maestro` site in `yelo-web` (`src/sites/maestro`) is the viewer, deployed to `https://yelo-maestro.web.app`. The hostname is historical: no Maestro runs anywhere.
 
-- `App.tsx` lists runs from `<ARTIFACT_ROOT>/index.json` with **all**, **failed**, and **passed** filters. Pins are stored in `localStorage` under `e2e-report:pins`.
-- `?run=<run-id>` opens `RunViewer`, which loads `<ARTIFACT_ROOT>/runs/<run-id>/` and shows each test and role's recording beside a searchable action log that seeks the video.
+- The default view is the product inventory (`ProductInventory.tsx`): app screens, states, and flows joined to captures from these runs. `?view=screens` and `?view=flows` select its two sections. The dashboard embeds the same viewer at `/inventory` for admins. See [Inventory](/dashboard/inventory) and [Public sites](/engineering/web/public-sites#maestro).
+- `?view=runs` lists runs from `<ARTIFACT_ROOT>/index.json` with **all**, **failed**, and **passed** filters. Pins are stored in `localStorage` under `e2e-report:pins`.
+- `?run=<run-id>` opens `RunViewer`, which loads `<ARTIFACT_ROOT>/runs/<run-id>/` and shows each test and role's recording beside a searchable action log that seeks the video. `&execution=<testId>:<role>` selects a role and `&t=<seconds>` seeks.
+- The inventory reads its catalog from `<ARTIFACT_ROOT>/inventory/catalog.json` and falls back to the `product-catalog.json` bundled with the viewer. No script on `yelo-frontend` `main` writes that object.
 - `WorkflowCoverage.tsx` shows mapped and verified percentages.
 - `ARTIFACT_ROOT` is `VITE_E2E_ARTIFACT_BASE_URL` when set, otherwise `<VITE_SUPABASE_URL>/storage/v1/object/public/e2e`.
 - The site also serves `/auth/v3`, a copy of the hosted Auth v3 page built against `VITE_E2E_API_URL` with the `com.rideyelo.e2e` scheme. Its `firebase.json` sets `no-store` and a strict CSP for that path. See [Sites](/engineering/web/sites#maestro).
@@ -374,7 +382,7 @@ Follow the [E2E environment reset](/runbooks/e2e-environment-reset) runbook. In 
 - Wait for the next meaningful state instead of sleeping. `startDelayMs` only staggers startup.
 - Give `BottomSheetModal` `accessible={false}` so inner `testID`s reach UI Automation. `YeloGlassView` can hide children.
 - Capture a success screenshot for every role.
-- Keep retries at zero. A flake is a failure to diagnose.
+- Keep flow retries at zero (`E2E_RETRIES` defaults to `0`). A flake is a failure to diagnose, and a test that needed more than one attempt earns no coverage credit. The scheduler's single repeat of a timed-out fixture request is separate and doesn't rerun a flow.
 
 ## Gotchas and edge cases
 
