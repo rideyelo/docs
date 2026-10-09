@@ -50,16 +50,26 @@ The dashboard API lives under `/dashboard/communities/{id}/events`. The old `/sp
 ### Events in the app and on the web
 
 - **App.** Riders see upcoming events (`GET /event/upcoming`) and event detail screens (`app/(app)/events/[eventId]`). They can mark themselves as attending with `POST /event/{id}/attend` and see who else is going.
-- **Web.** Each published event has a public page on the event site (`yelo-web/src/sites/event`), loaded from `GET /public/events/slug/{slug}`.
+- **Web.** Each published event has a landing page at `joinyelo.com/e/<slug>`, loaded from `GET /public/events/slug/{slug}`. Use it as the destination for event short links. For event short links, it replaces the older event site (`yelo-web/src/sites/event`), which embedded Posh checkout in an iframe.
 
-### Event checkout
+### Event landing
 
-Yelo doesn't sell event tickets itself. On the event web page, **Get Tickets** opens the event's ticket URL:
+The event landing at `joinyelo.com/e/<slug>` shows the event photo, name, date and time in the visitor's timezone, venue and address, tags, and description. Two buttons sit at the bottom:
 
-- If the ticket URL is a Posh (`posh.vip`) link, the page opens Posh's embedded checkout in a full-screen overlay.
-- Otherwise it opens the ticket URL directly.
+- **Get tickets** opens the event's ticket URL in a new tab. Yelo doesn't sell event tickets itself. The button only appears when the ticket URL is an `http` or `https` link.
+- **Get a ride** goes to the app landing at `joinyelo.com/get`, keeping the visit's query string, including the Dub click ID. If the link has no `utm_campaign`, the landing sets it to `event-<slug>`.
 
-**Open in Yelo** sends iOS users to the App Store and everyone else to `https://yelo.link`. It doesn't open the specific event in the app.
+For example, a visitor to `joinyelo.com/e/spring-formal?dub_id=abc` who taps **Get a ride** goes to:
+
+```text
+/get?dub_id=abc&utm_campaign=event-spring-formal
+```
+
+If the event isn't found or isn't published, the page shows "This event isn't available" with a **Get Yelo** button to the same `/get` link.
+
+The `experience-router` Worker serves the landing, so it sets the `yelo_attr` and `yelo_anon_id` attribution cookies like other link landings. See [Growth features](/concepts/growth-features#attribution-cookies).
+
+An event short link's preview card comes from Dub. The `og` Worker has an `event` card template: the event photo fills the left square, with the name, date, and venue on black beside it. Without a photo, the details fill the card. When the page URL is shared directly, crawlers see a static fallback titled "Event on Yelo".
 
 ## The Spot
 
@@ -124,6 +134,8 @@ When you create a config, Yelo:
 2. Creates a Stripe price and payment link on the fleet's connected account.
 3. Creates a Dub link at `pay.yelo.link/<slug>` that points to `https://joinyelo.com/pay/tip/<slug>`. If Dub fails, the config is still created, without a short link.
 
+The `og` Worker has a `tip` card template for tip link previews: the driver's ringed avatar, a "Tip" headline with the driver's first name, and the fleet name on the tip page's cream background. Without a driver name, the fleet stands in.
+
 Changing the price creates a new Stripe price and payment link, repoints the Dub link, and deactivates the old payment link. Deactivating a config deactivates its Stripe link.
 
 ### Payments
@@ -153,7 +165,8 @@ The API lives under `/dashboard/qr/` and only returns fleets the caller can acce
 | --- | --- |
 | Events | `yelo-api/internal/service/event/`, `internal/models/event.go` |
 | Event dashboard API | `yelo-api/internal/server/http/dashboard/event/` |
-| Public event site | `yelo-web/src/sites/event/` (`CheckoutModal.tsx`, `lib/poshCheckout.ts`) |
+| Event landing | `yelo-web/src/sites/signup/event/` |
+| Older event site | `yelo-web/src/sites/event/` (`CheckoutModal.tsx`, `lib/poshCheckout.ts`) |
 | The Spot | `yelo-api/internal/service/spot/spot.go`, `internal/models/spot.go` |
 | Community feed | `yelo-api/internal/service/community/` (`feed_logic.go`, `feed_cache_redis.go`) |
 | QR payments | `yelo-api/internal/service/qrpayment/qrpayment.go`, `internal/models/qr_payment*.go` |
