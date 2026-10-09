@@ -38,7 +38,6 @@ When `useIsCommunityInactive` is true (`rides_disabled` is set or `is_active` is
 
 - The `ContactsAccessTile` leads the row when there are no friends or `useContactsAccessAction('home')` returns a prompt.
 - `getFriendsRailLink` (`friendsRailLink.ts`) picks the link. Below `FRIENDS_SEE_ALL_THRESHOLD` (5) it returns **+ Invite** in the accent color, which opens the friends hub. From 5 up it returns **See all**, which opens `/(app)/(tabs)/map/friends`.
-- During the map tutorial's `friends` step, with contacts not yet granted, **+ Invite** and the empty slots call `tutorial.showContactsPrimer` instead of opening the hub.
 
 ### Likes rail
 
@@ -81,7 +80,7 @@ All paths are under `yelo-frontend/components/map/feed/`.
 | `MapFeedMovesCard` | `MapFeedMovesCard.tsx` | Rider first name or initials (fallback `LR`), "is heading to" the destination, time as `h:mma` | Open the destination place sheet |
 | `MapFeedCommunityMoveCard` | `MapFeedActivityCards.tsx` | "1 person" or "N people", "heading to" the place name, count badge | Open the destination place sheet |
 | `FriendAvatarSlot` | `FriendsRailSlots.tsx` | Avatar and full name | Push `/(app)/(tabs)/map/friend/[friendId]` |
-| `EmptyFriendSlot` | `FriendsRailSlots.tsx` | Dashed circle with a plus icon | Friends hub, or the tutorial contacts primer |
+| `EmptyFriendSlot` | `FriendsRailSlots.tsx` | Dashed circle with a plus icon | Friends hub |
 | `LikeCard` | `LikeCard.tsx` | Category emoji, heart badge, name, and address or the liked-by label | Push the place sheet, when the spot has a name and coordinates |
 | `AddLikePlaceholderCard` | `AddLikePlaceholderCard.tsx` | **Add a like**, "Pin a spot you love" | Push `/(app)/save-location` with `focusSearch: '1'` |
 | `MapFeedEventCard` | `MapFeedCard.tsx` | `EVENT` eyebrow, name, start time, up to 2 tags from `selectTags` | `onEventPress` |
@@ -252,7 +251,6 @@ Countdowns come from `useCountdown` and render through `formatCountdownHMS` as `
 
 `useFeaturedSpot` (`components/map/feed/useFeaturedSpot.ts`) is the single source for whether the dock shows. `visible` is true when all of these hold:
 
-- The tutorial isn't showing its `banner` surface and hasn't just completed.
 - The off-peak popup is closed.
 - No POI is open (`openPoi` is null).
 - `featuredSpot` is non-null.
@@ -262,7 +260,7 @@ Countdowns come from `useCountdown` and render through `formatCountdownHMS` as `
 
 While the state is `hidden`, the hook schedules a re-render at `starts_at` minus 24 hours, capped at `2^31 - 1` ms and re-armed after each capped fire.
 
-The map layout also reads `visible` and hides `SavedSpotsBar` while the dock shows, so the two never share the space above the sheet.
+The map layout also reads `visible` and hides `SavedSpotsBar` (the recenter and bump controls) while the dock shows, so the two never share the space above the sheet. See [Home dock controls](/engineering/mobile/rider-experience#home-dock-controls).
 
 Two per-user AsyncStorage sets back the hook, both through `usePersistedSpotIdSet` (writes debounced by 150 ms):
 
@@ -281,7 +279,6 @@ Two per-user AsyncStorage sets back the hook, both through `usePersistedSpotIdSe
 | `FeaturedSpotRoomCard` | Spot ID is in the expanded set | Frosted card with **Your Room**, the title and subtitle behind a blur, lock icon, countdown | **Your Room**, the title, **Unlock Room**, a disco-ball icon | Open the place sheet |
 
 - Swiping the card down collapses it back to the pill. The pill itself has swipe disabled.
-- While the tutorial shows its `chip` surface, `MapTutorialOverlay` renders the pill next to the progress chip, and the overlay renders nothing unless the card is expanded.
 - `resolveContent` picks the title from `spot.title`, then the event name, then the location name. The subtitle joins a date (`EEE · MMM d` from `display_start_time` or the event start) and a place name or address.
 
 Tapping the card runs `openPoi`:
@@ -294,7 +291,7 @@ Tapping the card runs `openPoi`:
 
 `FeaturedSpotAuraLayer` (`components/map/pinned/FeaturedSpotAuraLayer.tsx`) marks the featured place on the map. `MapDataLayers` mounts it once sprites are ready and no ride request route is active. See [Data layer order](/engineering/location/map-rendering#data-layer-order).
 
-It reads the raw `featuredSpot` from context, not `useFeaturedSpot`. The aura therefore stays lit while a POI is open, the tutorial banner is up, or the spot is in the dismissed set. It renders nothing when there is no spot, `resolveSpotPlace` returns null, or the lock state is `hidden`.
+It reads the raw `featuredSpot` from context, not `useFeaturedSpot`. The aura therefore stays lit while a POI is open or the spot is in the dismissed set. It renders nothing when there is no spot, `resolveSpotPlace` returns null, or the lock state is `hidden`.
 
 The glow is three static `CircleLayer`s on one `ShapeSource` (`featured-spot-src`), all with `circlePitchAlignment: 'map'`:
 
