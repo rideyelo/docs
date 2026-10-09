@@ -23,7 +23,7 @@ Both run inside the API process on Cloud Run. There is no separate worker servic
 | `Notifications` | 1 minute | `DashboardService.ProcessScheduledNotifications` | Sends dashboard notifications whose scheduled time has passed |
 | `QueueRefresh` | 3 minutes | `ActivationService.RefreshQueueSummaries` | Recovers idle driver queues and rewrites queue summary caches |
 | `TipCapture` | 5 minutes | `RideService.AutoCaptureTipWindowExpired` | Submits a system `settle_tip` ride operation, which captures the fare, for up to 50 rides whose tip window closed |
-| `MapHeat` | 5 minutes, runs immediately on start | `MapLayerService.RefreshHeatmaps`, `MapLayerService.PurgeExpiredBumps` | Recomputes community heatmaps. Deletes bumps expired more than 7 days ago |
+| `MapHeat` | 5 minutes, runs immediately on start | `MapLayerService.RefreshHeatmaps`, `MapLayerService.PurgeExpiredBumps` | Recomputes community heatmaps with the current `MapHeatSettings`. Saving heat settings also starts an out-of-band refresh. Deletes bumps expired more than 7 days ago |
 | `Mobility` | 1 minute | `MapLayerService.RefreshMobilityFeeds` | Polls GBFS and GTFS-RT feeds into the map vehicles layer. Skipped when Redis is disabled |
 
 For what the ride-related tasks do, see [Rides implementation](/engineering/api/rides-implementation#activation-and-auto-queue).
@@ -95,6 +95,7 @@ All periodic jobs use `RunOnStart: true`. River's leader election ensures only o
 | `community_geography_maintenance` | 15 seconds | Cleans expired calendar OAuth flows, reconciles community time zones, applies community cache invalidations | Always (sub-steps gated by config) |
 | `google_play_release_check` | 5 minutes | Checks Google Play tracks and posts release changes to Slack | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` |
 | `gtm_refresh` | 5 minutes | Rebuilds the cached go-to-market prospect snapshot | GTM service present |
+| `provider_quotes_sync` | 5 minutes | Copies Fare Finder competitor offers from PostHog into `ProviderQuotes` for **Pricing** > **Parity**. Reads from the watermark minus 15 minutes, or the last 90 days on the first run, up to 5,000 rows per run (5-minute timeout). See [Competitor quotes](/engineering/domains/dashboard-analytics#competitor-quotes) | Always. Does nothing without PostHog query credentials |
 | `share_link_sweep` | 1 minute | Rewrites up to 40 stale personal invite Dub links per run (50 s timeout). See [Referrals and links](/engineering/domains/referrals-and-links#self-healing-sweep) | Referral service present |
 | `stripe_reconciliation_dispatch` | 1 minute | Dispatches per-account Stripe reconciliation | `STRIPE_RECONCILIATION_ENABLED` (default true) |
 | `quo_sync_outbox` | 5 seconds | Drains the Quo contact outbox | Always |

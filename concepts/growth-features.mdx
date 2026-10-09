@@ -1,6 +1,6 @@
 ---
 title: "Growth features"
-description: "How referrals, Dub share links, attribution, the World Cup campus race, ride discounts, coupons, promo bars, and ads work in Yelo."
+description: "How referrals, Dub share links, link landings and attribution, the World Cup campus race, ride discounts, coupons, promo bars, and ads work in Yelo."
 ---
 
 Yelo grows mostly through students inviting students. This page covers the features that support that: referral codes and share links, sign-up attribution, the World Cup campus race, and the promotional surfaces (discounts, coupons, promo bars, and ads).
@@ -61,6 +61,43 @@ The dashboard doesn't have a referral rewards page. The **Drivers** page shows *
 
 Auth v3 records where each sign-up came from. Each visit to the hosted sign-in page stores an attribution touch with UTM parameters, referrer host and path, landing surface, Dub click ID, and referral code. Yelo keeps the first and last touch per user and marks three conversions: `authenticated`, `profile_completed`, and `first_ride` (`AuthV3UserAttribution` in `internal/models/authv3.go`).
 
+### Link landings on joinyelo.com
+
+Campaign and short links land on `joinyelo.com`. Three paths exist for them:
+
+| Path | What it does |
+| --- | --- |
+| `/get` | The app landing for campaign short links on flyers, posters, and bios. iPhones and iPads go straight to the App Store, with `utm_campaign` passed as the App Store campaign token. Android phones go to Google Play. Desktop visitors see **Continue → App Store**, **Continue → Google Play**, and **Continue → web**, which opens Auth v3 with the link's attribution parameters. |
+| `/drive` | An alias of `/drivers` on the home site. Short links can point at it and keep their query string. |
+| `/e/<slug>` | The event landing. See [Events and the community feed](/concepts/events-and-feed#events-in-the-app-and-on-the-web). |
+
+To point a short link at the app landing with a campaign, use a destination like this:
+
+```text
+https://joinyelo.com/get?utm_source=flyer&utm_medium=print&utm_campaign=fall-move-in
+```
+
+Link previews for `/get` use the home page card (title "Yelo | Get Out There" and `og-yelo.png`). A Dub link with its own card still shows that card instead.
+
+<Note>
+  Google Play gets no install referrer from `/get`. The app reads any Dub link key as a referral code, so passing a campaign key would redeem it as one.
+</Note>
+
+### Attribution cookies
+
+The `experience-router` Cloudflare Worker handles every request on `joinyelo.com` and `www.joinyelo.com`. When a `GET` request for an HTML page carries attribution in its query string, the Worker sets two first-party response cookies:
+
+| Cookie | Contents |
+| --- | --- |
+| `yelo_attr` | The entry click: `dub_id`, `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, `source_channel` (or `channel`), and `referral_code` (or `ref`, `code`). On `/i/<code>`, the code becomes the referral code. A Dub QR scan (`qr=1`) sets `utm_medium=qr`. |
+| `yelo_anon_id` | A random anonymous ID, set only if the visitor doesn't have one. Every attributed landing gets one, so its touch can be claimed at sign-up. |
+
+Both cookies use `Domain=.joinyelo.com`, last 90 days, and are `SameSite=Lax` and `Secure`. Safari caps cookies written by script at seven days, but not response cookies, so the entry survives a longer gap before sign-up. A landing without attribution leaves the stored entry alone. The Worker never sets these cookies on `/auth/v3`, because that page consumes attribution and its callback's `code` is an OAuth code. If setting cookies fails, the Worker serves the page anyway.
+
+At sign-up, Auth v3 fills any attribution field its own URL lacks from `yelo_attr`. Values in the sign-up URL win. Landing touches describe one landing and don't inherit from the cookie.
+
+The home site also records an attribution touch, but only when the visit carries a click ID, campaign, or referral code (`dub_id`, `utm_source`, `utm_medium`, `utm_campaign`, `ref`, `referral_code`, `code`, or `qr`), or arrives from another site. Ordinary browsing isn't logged.
+
 Separately, each user has an `acquisition_source`: `app_organic`, `app_referral`, `qr_payment`, `event_link`, `csv_import`, `guest`, `driver_guest`, or `other`. Contact sync segments can filter on it as `yelo_acquisition_source`. See [Contact sync](/administration/contact-sync).
 
 ## Dub links in use
@@ -74,6 +111,10 @@ Separately, each user has an `acquisition_source`: `app_organic`, `app_referral`
 The API also has its own path shortener at `POST /link/encode` and `GET /link/decode`, with 8-character codes. The mobile app's `/link` route (`app/(app)/link.tsx`) calls `GET /link/decode` to resolve a code. No client calls `POST /link/encode`.
 
 ## World Cup campus race
+
+<Warning>
+  The World Cup site is offline. `/world-cup`, `/world-cup/claim`, and `/world-cup/api` on `joinyelo.com` and `rideyelo.com` redirect (302) to `https://joinyelo.com/`, so old links and QR codes still land somewhere. The API routes and the app prompt below are unchanged.
+</Warning>
 
 The World Cup is a race between campuses. Students claim their `.edu` email on the World Cup site. The first 25 schools to reach 500 sign-ups unlock a Yelo pass for their campus.
 
@@ -137,7 +178,8 @@ Ads are sponsored media shown in the app.
 | Referrals and share links | `yelo-api/internal/service/referral/` (`referral.go`, `card.go`), `internal/utilities/referral/generate.go` |
 | Referral at sign-up | `yelo-api/internal/data/repository/authv3.go` (`applyAuthV3Referral`) |
 | Dub client | `yelo-api/internal/data/dub/dub.go` |
-| Attribution | `yelo-api/internal/models/authv3.go`, `yelo-web/src/sites/signup/auth-v3/attribution.ts` |
+| Attribution | `yelo-api/internal/models/authv3.go`, `yelo-web/src/sites/signup/auth-v3/attribution.ts`, `yelo-web/workers/experience-router/` |
+| App and event landings | `yelo-web/src/sites/signup/get/`, `yelo-web/src/sites/signup/event/` |
 | World Cup | `yelo-api/internal/service/worldcup/`, `internal/models/world_cup.go`, `yelo-web/src/sites/world-cup/` |
 | Discounts | `yelo-api/internal/models/discount.go`, `internal/utilities/pricing/pricing.go` |
 | Coupons | `yelo-api/internal/service/coupon/`, `internal/models/coupon.go` |
