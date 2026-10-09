@@ -104,7 +104,7 @@ Riders can add a tip after the ride is over. In the app, **Profile** → **Ride 
 
 Either button opens the **Tip your driver** screen, which uses the same presets and authentication flow as rating.
 
-`POST /ride/i/{id}/tip` submits or resumes the rider's tip. It doesn't change the review or the ride's lifecycle. The caller must be the ride's rider, and the ride must be tip-enabled, not canceled, and `pending_rider_rating` or `complete`. Otherwise the API returns "This ride is not eligible for tipping." A ride that already has a tip returns `captured` without charging again.
+`POST /ride/i/{id}/tip` submits or resumes the rider's tip. It doesn't change the review, and it doesn't change the status of a `complete` ride. On a ride that is still `pending_rider_rating`, the tip must be above $5.00, and the command captures the fare and moves the ride to `complete` before it charges the tip. The caller must be the ride's rider, and the ride must be tip-enabled, not canceled, and `pending_rider_rating` or `complete`. Otherwise the API returns "This ride is not eligible for tipping." A ride that already has a tip returns `captured` without charging again.
 
 To submit a new tip, send a positive `amount` in dollars and a client-generated `operation_id`:
 
@@ -125,7 +125,7 @@ Rules:
 
 - `amount` must be above 0 and at most $100.00. A missing `operation_id` returns "Please retry your tip."
 - Reuse the same `operation_id` and amount when retrying after an uncertain response. The same ID never creates a second charge.
-- While a tip is unfinished, its amount is frozen. A new `operation_id` resumes the unfinished tip instead of creating another one.
+- While a tip is unfinished, its amount is frozen. A new `operation_id` with the same amount resumes the unfinished tip instead of creating another one. A different amount returns "This ride has changed. Refresh and try again."
 - A new `operation_id` creates a fresh attempt only after the previous tip ends `canceled`.
 - Clients can't supply a PaymentIntent ID or change the saved funding.
 

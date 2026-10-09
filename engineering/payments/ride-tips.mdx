@@ -147,12 +147,14 @@ The body never accepts a PaymentIntent ID, and a resume can't replace the frozen
 
 | Situation | Result |
 | --- | --- |
-| `operation_id` already exists | Resumes that operation. The reservation checks the actor, ride, and frozen amount |
-| The rider has a `tip` operation for the ride that isn't `failed` | Resumes it, regardless of the new ID. Its amount can't change |
+| `operation_id` already exists | Resumes that operation. The reservation checks the actor, ride, and frozen amount. A mismatch returns "Ride Unavailable" |
+| The rider has a `tip` operation for the ride that isn't `failed` | Resumes it, regardless of the new ID. Its amount can't change: a different amount returns "Ride Unavailable" |
 | No operation, but a pre-journal tip intent exists | Adopts it |
 | The rider's previous `tip` operation `failed` | Reserves a new operation with the new ID and amount |
 
 Replaying an old ID never turns a canceled attempt into a new charge.
+
+On a `complete` ride the command doesn't change the ride's status. On a ride that is still `pending_rider_rating`, `freezeDedicatedTip` sets `SettleFare`: the tip must be above `models.TipBuffer`, and the operation captures the fare and moves the ride to `complete` before it charges the tip. A smaller tip, or any tip on a free ride in that status, fails at reservation with a server error ("invalid dedicated tip fare settlement").
 
 Rating a `complete` ride uses a review-only admission (`beginRideReviewCommand`). It ignores unfinished `tip` operations but still blocks on any other pending or quarantined operation (`HasConflictingRideReviewOperation`). On a completed ride, the review publishes participant revisions without bumping the lifecycle revision, so the pending tip's frozen revision stays valid.
 
@@ -182,7 +184,7 @@ The `tip/ride` screen rereads `tip-options` before each command. For a new tip i
 | Same amount again after success | Replays the `succeeded` outcome. No second charge |
 | Different amount while the rider's latest tip is unfinished or succeeded | Rejected with "Ride Unavailable". The reservation compares the amount |
 | Different amount after the latest tip `failed` (intent canceled) | A new operation with the new amount |
-| Same amount again after it `failed` | Replays the canceled outcome, `tip_status: none` |
+| Same amount again after it `failed` | Replays the canceled outcome, `tip_status: canceled` |
 
 ### Tips started before the journal
 
