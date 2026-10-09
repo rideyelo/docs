@@ -85,7 +85,7 @@ When `SEARCH_PROVIDER` is `google`, `MappingService` uses Google Places for sugg
 
 ### Mobility feeds
 
-`internal/data/mobility` fetches GBFS, GTFS, and GTFS-RT feeds configured on the dashboard. It includes SSRF protection (`ssrf.go`) because operators supply the feed URLs. The `Mobility` ticker polls active feeds every minute.
+`internal/data/mobility` fetches GBFS, GTFS, and GTFS-RT feeds configured on the dashboard. It includes SSRF protection (`ssrf.go`) because operators supply the feed URLs. `NewGuardedHTTPClient` exposes the same guarded client for other callers, such as the dashboard link preview check. The `Mobility` ticker polls active feeds every minute.
 
 ## Messaging
 
@@ -150,8 +150,21 @@ A `PostgresGate` per credential paces calls (at least 125 ms apart) across repli
 | | |
 | --- | --- |
 | Package | `internal/data/dub` (Dub Go SDK) |
-| Config | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET` |
-| Used for | Referral, invite, fleet-join, and QR payment short links (`CreateLink`, `UpsertLink`, `UpdateLinkDestination`), lead tracking (`TrackLead`) |
+| Config | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID`, `DUB_FLEET_FOLDER_ID`, `DUB_CAMPAIGNS_FOLDER_ID`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET` |
+| Used for | Referral, invite, fleet-join, and QR payment short links (`CreateLink`, `UpsertLink`, `UpdateLinkDestination`), lead tracking (`TrackLead`), and the dashboard **Links** page (`ListLinks`, `Folders`, `GetLink`, `CreateCampaignLink`, `UpdateLink`) |
+
+Links are filed in three Dub folders. Referral links and QR payment links (`CreateLink`) go in `DUB_SYSTEM_FOLDER_ID`. Fleet driver join links and fleet payout onboarding links go in `DUB_FLEET_FOLDER_ID`. Links created from the dashboard go in `DUB_CAMPAIGNS_FOLDER_ID` unless the admin picks the fleet folder.
+
+The dashboard listing reads (`/links`, `/links/count`, `/folders`) call Dub's REST API directly and go through a per-instance cache on the `Client`:
+
+- A saved answer is served immediately for up to 48 hours. After 30 minutes, it's also refreshed in the background, one refresh per query at a time. A failed refresh keeps the stale answer.
+- `fresh=true` on `GET /dashboard/links` skips the cache and asks Dub now.
+- Every create or update empties the cache. A generation counter stops a fetch that started before a write from saving its answer after it.
+- The cache empties itself when it reaches 500 entries. It's in memory, so each API instance has its own copy.
+
+`GetLink` and writes use the SDK and always hit Dub. A taken key (Dub conflict) returns "That short link is already in use" as an input error.
+
+The link preview check (`GET /dashboard/links/preview`) fetches a short link with `mobility.NewGuardedHTTPClient`, so every dial and redirect hop goes through the [mobility SSRF guard](#mobility-feeds). See [Dashboard short links](/engineering/domains/referrals-and-links#dashboard-short-links).
 
 Share cards are rendered by a Cloudflare Worker in `yelo-web` (`workers/og`). The API signs card URLs with `OG_SIGNING_SECRET`, which is required at startup because the worker rejects unsigned URLs.
 
