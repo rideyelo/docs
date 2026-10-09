@@ -31,7 +31,7 @@ Every claim in this section comes from tracing constructors and call sites in `y
 | Cancellation fee preview | `CancelIntent`, through `quoteFinancialCancellation` | `QuoteCancellation(rideID, actorID)`. Returns `fee_cents / 100` from the saved quote |
 | Cancel | `Cancel`, through `cancelFinancialRide` | `CancelLegacy(rideID, actorID, reason, comment)` |
 | Rider rating with tips enabled | `Rate`, through `captureTip` | `SettleTipLegacy` for a tip inside the buffer, `TipLegacy` for a dedicated tip |
-| Tip confirmation | `ConfirmTip` | `ConfirmTipLegacy(rideID, riderID)` |
+| Rider tip command | `Tip` | `TipAttempt(rideID, riderID, operationID, tipCents)` with an `amount`, `ConfirmTipLegacy(rideID, riderID)` without one |
 | Tip-window sweeper | `AutoCaptureTipWindowExpired`, through `autoCaptureSingleRide` | `SettleTipLegacy(rideID, uuid.Nil, 0, true)` |
 | Unmatched-request expiry | `CancelUnmatchedRides` | `ExpireUnmatched()` |
 
@@ -234,7 +234,7 @@ ride_operation/{operationID}/{stepName}
 | `void` | `cancel` | `PaymentIntents.Cancel` | `void` |
 | `settle_fare` | `tip` | None. Marks the fare lifecycle write | Not sent to Stripe |
 | `create_tip` | `tip` | `PaymentIntents.New`, automatic capture, `confirm=false` | `create_tip` |
-| `settle_dedicated_tip` | `tip` | `PaymentIntents.Confirm`, off-session | `settle_dedicated_tip` |
+| `settle_dedicated_tip` | `tip` | `PaymentIntents.Confirm`, on-session with `use_stripe_sdk=true` | `settle_dedicated_tip` |
 | `abandon_tip` | `tip` | `PaymentIntents.Cancel` with `requested_by_customer` | `abandon_tip` |
 | `authenticate_tip` | `tip` | None. Timestamps the first `requires_action` | Not sent to Stripe |
 

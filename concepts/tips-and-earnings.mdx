@@ -6,7 +6,7 @@ description: "How in-app ride tips are authorized and captured, how QR tip links
 Drivers earn money three ways on Yelo:
 
 - **Ride fares**, captured from the rider's payment. See [Payments and payouts](/concepts/payments-and-payouts).
-- **In-app ride tips**, left when the rider rates a completed trip.
+- **In-app ride tips**, left when the rider rates a completed trip or later from ride history.
 - **QR tip links**, paid through Stripe Checkout without a ride. Anyone can scan one, including people without a Yelo account.
 
 All three land in the same connected Stripe account: the driver's own, or their fleet's when the fleet manages payouts. The earnings API then reads that account to show balances and run payouts.
@@ -24,7 +24,7 @@ For a tip-enabled paid ride:
 
 ### Tip options
 
-`GET /ride/i/{id}/tip-options` returns the tip choices for the rider's ride while it's in `pending_rider_rating` with tips enabled:
+`GET /ride/i/{id}/tip-options` returns the tip choices for the rider's own tip-enabled ride while it's `pending_rider_rating` or `complete`. Canceled rides return "Ride is not awaiting rating".
 
 | Field | Value |
 | --- | --- |
@@ -32,12 +32,20 @@ For a tip-enabled paid ride:
 | `max_tip` | `100` dollars (`models.MaxTip`) |
 | `fare` | The ride's effective fare |
 | `currency` | `usd` |
+| `tip_amount` | The recorded tip in dollars. `0` until a tip is captured. |
+| `has_tip_payment` | `true` when the rider has a saved tip payment that can be resumed |
+| `pending_tip_amount` | The saved tip's amount in dollars, or `0` |
 
 Custom tips are accepted between $0 and $100.00 and validated server-side.
 
 ### Charging the tip
 
-The rider tips by rating: `POST /ride/i/{id}/rate` with an optional `tip_amount`. `RideService.captureTip` (`internal/service/ride/tip_charge.go`) picks the cheapest correct charge:
+Riders tip in two places:
+
+- **When rating**: `POST /ride/i/{id}/rate` with an optional `tip_amount`.
+- **Later, from ride history**: `POST /ride/i/{id}/tip`. See [Tipping from ride history](#tipping-from-ride-history).
+
+On rating, `RideService.captureTip` (`internal/service/ride/tip_charge.go`) picks the cheapest correct charge:
 
 <Steps>
   <Step title="No tip">
@@ -47,19 +55,86 @@ The rider tips by rating: `POST /ride/i/{id}/rate` with an optional `tip_amount`
     For a tip of $5.00 or less on a pending paid ride, one capture of fare + tip runs on the original PaymentIntent. The ride's `tip_amount` is set and `driver_payout` becomes fare + tip.
   </Step>
   <Step title="Tip over the buffer, or a free ride">
-    The fare is captured first, which releases the buffer. Then a separate **tip PaymentIntent** is created on the same connected account: automatic capture, off-session, using the rider's cloned payment method. For free rides, the payment method is cloned to the matched driver's or fleet's account at this point.
+    The fare is captured first, which releases the buffer. Then a separate **tip PaymentIntent** is created on the same connected account, using the rider's cloned payment method. For free rides, the payment method is cloned to the matched driver's or fleet's account at this point.
   </Step>
   <Step title="Authentication required">
-    If the card needs authentication, the rate call returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The API exposes `POST /ride/i/{id}/confirm-tip` for a client to call after authenticating the card, but the mobile app currently ignores `requires_action` and never calls it, so the tip is not recorded. When called, the API retrieves the stored tip PaymentIntent from Stripe and records the tip only if the status is `succeeded`.
+    If the card needs authentication, the response returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The mobile app authenticates the saved card through the Stripe SDK, then asks the API for the final result. See [Tip authentication](#tip-authentication).
   </Step>
 </Steps>
 
-The rate response includes `tip_status`: `none`, `captured`, or `requires_action`. See [Ride tips](/engineering/payments/ride-tips).
+Both endpoints return `tip_status`:
+
+| `tip_status` | Meaning |
+| --- | --- |
+| `none` | No tip was charged, for example a rating without a tip. |
+| `captured` | The tip is recorded on the ride. |
+| `requires_action` | The card needs authentication. The response includes `tip_client_secret` and `tip_connected_account_id`. |
+| `pending` | Stripe hasn't finished the payment. This isn't proof of capture. Resume the tip to check again. |
+| `canceled` | The tip PaymentIntent was canceled or rejected. No tip was charged, and the rider can start a new attempt. |
+
+The review is saved even while a tip waits on authentication. On a completed ride, only an unfinished tip can coexist with a review. Any other unfinished ride operation still blocks it. See [Ride tips](/engineering/payments/ride-tips).
+
+### Tip authentication
+
+Dedicated tip charges are confirmed on-session with `use_stripe_sdk`, so Stripe can ask the rider to complete 3D Secure or another card challenge.
+
+<Steps>
+  <Step title="The API returns requires_action">
+    The rate or tip response carries `tip_status: requires_action`, `tip_client_secret`, and `tip_connected_account_id`. The client secret is a live read from Stripe and is never stored.
+  </Step>
+  <Step title="The app opens the tip screen">
+    After the review is saved, the ride-complete screen hands off to the **Tip your driver** screen for that ride. The rider's review stays saved and the tip screen resumes the saved payment. It never receives secrets through the URL.
+  </Step>
+  <Step title="The rider authenticates">
+    The app retrieves the PaymentIntent on the driver's or fleet's connected account and calls Stripe's `handleNextAction` with the return URL `yelo://stripe-redirect` on iOS or `com.rideyelo://stripe-redirect` on Android.
+  </Step>
+  <Step title="The app reconciles with the API">
+    Whatever the native result, the app calls `POST /ride/i/{id}/tip` with an empty body. Only that server response proves payment. The app shows "Tip sent. Thank you!" only for `captured`.
+  </Step>
+</Steps>
+
+If the rider closes the challenge, the tip stays saved. The app shows "Payment canceled. Your tip has not been confirmed. Continue to retry." and **Continue payment** resumes the same tip and amount. The server cancels a tip that is still waiting 30 minutes after it first asked for authentication. After that, the API returns `canceled` and the app shows "Payment canceled. No tip was charged. You can try again." The rider can then choose a new amount.
+
+### Tipping from ride history
+
+Riders can add a tip after the ride is over. In the app, **Profile** → **Ride History** → a trip opens **Ride details**. When `tip-options` succeeds and `tip_amount` is `0`, the screen shows:
+
+- **Add a tip** when there's no saved tip payment.
+- **Continue tip payment** when `has_tip_payment` is `true`.
+
+Either button opens the **Tip your driver** screen, which uses the same presets and authentication flow as rating.
+
+`POST /ride/i/{id}/tip` submits or resumes the rider's tip. It doesn't change the review, and it doesn't change the status of a `complete` ride. On a ride that is still `pending_rider_rating`, the tip must be above $5.00, and the command captures the fare and moves the ride to `complete` before it charges the tip. The caller must be the ride's rider, and the ride must be tip-enabled, not canceled, and `pending_rider_rating` or `complete`. Otherwise the API returns "This ride is not eligible for tipping." A ride that already has a tip returns `captured` without charging again.
+
+To submit a new tip, send a positive `amount` in dollars and a client-generated `operation_id`:
+
+```json
+{
+  "amount": 7.5,
+  "operation_id": "6f1c2d3e-4b5a-4c7d-9e8f-0a1b2c3d4e5f"
+}
+```
+
+To resume the saved tip, send an empty body:
+
+```json
+{}
+```
+
+Rules:
+
+- `amount` must be above 0 and at most $100.00. A missing `operation_id` returns "Please retry your tip."
+- Reuse the same `operation_id` and amount when retrying after an uncertain response. The same ID never creates a second charge.
+- While a tip is unfinished, its amount is frozen. A new `operation_id` with the same amount resumes the unfinished tip instead of creating another one. A different amount returns "This ride has changed. Refresh and try again."
+- A new `operation_id` creates a fresh attempt only after the previous tip ends `canceled`.
+- Clients can't supply a PaymentIntent ID or change the saved funding.
+
+Late tips always use a dedicated tip PaymentIntent, because the fare is already captured.
 
 Safeguards:
 
 - A ride that already has a tip is never charged again.
-- Tip PaymentIntents use the idempotency key `tip_{rideId}_{cents}`. A retried request doesn't double-charge, and a changed amount creates a fresh intent after canceling the old one.
+- Every dedicated tip runs as a `tip` ride operation with step-scoped idempotency keys, so a retried request doesn't double-charge.
 - If the tip-window sweeper settles the fare at the same moment a within-buffer tip arrives, the tip falls back to a dedicated tip charge instead of being lost.
 - A driver or fleet with no connected account can't receive tips, and the rider sees "This driver can't accept tips right now."
 
@@ -147,13 +222,15 @@ Stripe `payout.paid`, `payout.failed`, and `payout.canceled` events for a connec
 
 | Concern | Location |
 | --- | --- |
-| Tip capture, dedicated tip charges, confirm-tip | `yelo-api/internal/service/ride/tip_charge.go` |
+| Tip capture and dedicated tip charges at rating | `yelo-api/internal/service/ride/tip_charge.go` |
+| Rider tip command (`POST /ride/i/{id}/tip`) | `yelo-api/internal/service/ride/tip.go` |
 | Tip-window sweeper | `yelo-api/internal/service/ride/tip_capture.go` |
 | Tip constants and options | `yelo-api/internal/models/tip.go` |
 | QR tip links | `yelo-api/internal/service/tipping/tipping.go`, `yelo-api/internal/server/http/tipping/` |
 | QR payment recording | `yelo-api/internal/service/payment/payment.go` (`CheckoutSessionCompleted`) |
 | Earnings service and payout webhook | `yelo-api/internal/service/earnings/` |
 | Stripe balance and payout calls | `yelo-api/internal/data/stripe/payout.go` |
-| Rider tip UI | `yelo-frontend/app/(app)/ride-complete/`, `yelo-frontend/app/(app)/tip/[slug].tsx` |
+| Rider tip UI | `yelo-frontend/app/(app)/ride-complete/`, `yelo-frontend/app/(app)/tip/ride.tsx`, `yelo-frontend/app/(app)/profile/ride-details.tsx`, `yelo-frontend/app/(app)/tip/[slug].tsx` |
+| Tip authentication | `yelo-frontend/lib/payments/authenticateRideTip.ts` |
 | Web tip page | `yelo-web/src/shared/signup/steps/TipStep.tsx` |
 | Driver earnings hub | `yelo-frontend/app/(app)/driver-earnings/`, `yelo-frontend/hooks/driver-earnings/` |

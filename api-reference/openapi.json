@@ -14123,6 +14123,21 @@
     ],
     "type": "object"
    },
+   "RideTipRequest": {
+    "description": "RideTipRequest schema",
+    "properties": {
+     "amount": {
+      "format": "double",
+      "nullable": true,
+      "type": "number"
+     },
+     "operation_id": {
+      "format": "uuid",
+      "type": "string"
+     }
+    },
+    "type": "object"
+   },
    "RideUser": {
     "properties": {
      "first_name": {
@@ -22423,8 +22438,19 @@
       "format": "double",
       "type": "number"
      },
+     "has_tip_payment": {
+      "type": "boolean"
+     },
      "max_tip": {
       "type": "integer"
+     },
+     "pending_tip_amount": {
+      "format": "double",
+      "type": "number"
+     },
+     "tip_amount": {
+      "format": "double",
+      "type": "number"
      },
      "tip_options": {
       "items": {
@@ -22436,7 +22462,10 @@
     "required": [
      "currency",
      "fare",
+     "has_tip_payment",
      "max_tip",
+     "pending_tip_amount",
+     "tip_amount",
      "tip_options"
     ],
     "type": "object"
@@ -51315,10 +51344,10 @@
     ]
    }
   },
-  "/ride/i/{id}/confirm-tip": {
+  "/ride/i/{id}/tip": {
    "post": {
-    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/ride.(*RideHandler).ConfirmTip`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nFinalizes a tip after the rider completed an on-session payment confirmation",
-    "operationId": "ride.ConfirmTip",
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/ride.(*RideHandler).Tip`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nA positive amount submits a tip without changing the review. Omit amount to resume the rider's saved tip command. Pending and authentication-required results are not proof of payment.",
+    "operationId": "ride.Tip",
     "parameters": [
      {
       "in": "header",
@@ -51336,16 +51365,27 @@
       }
      }
     ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RideTipRequest"
+       }
+      }
+     },
+     "description": "Request body for models.RideTipRequest",
+     "required": true
+    },
     "responses": {
      "200": {
       "content": {
        "application/json": {
         "schema": {
-         "$ref": "#/components/schemas/StandardResponse_json.SuccessResponse"
+         "$ref": "#/components/schemas/StandardResponse_models.TipResult"
         }
        }
       },
-      "description": "Tip confirmed"
+      "description": "Tip progress"
      },
      "400": {
       "content": {
@@ -51393,7 +51433,7 @@
       "JWT": []
      }
     ],
-    "summary": "Confirm tip",
+    "summary": "Submit or resume the rider's ride tip",
     "tags": [
      "Ride"
     ]

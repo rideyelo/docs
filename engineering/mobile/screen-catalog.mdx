@@ -70,7 +70,8 @@ All routes in this group render inside the map sheet.
 | `ride/4-ride` | Active trip in four stages, or **Updating your ride** recovery | `GET /ride/{id}`, `GET /ride/i/{id}/map-details` every 3 s | Status redirect to `ride-complete` |
 | `ride/pickup`, `ride/dropoff`, `ride/3-ride-matching` | Legacy screens still registered in the ride stack | Legacy draft flow via `usePreRideRequest` | Not targeted by lifecycle navigation |
 | `ride` (`index`) | Redirect only | none | `<Redirect href="/(app)/(tabs)/map" />` |
-| `ride-complete` | Rate, tip, and comment. Android back is blocked. Buttons disable after save. | `GET /ride/{id}`, `GET /ride/i/{id}/tip-options`, `POST /ride/i/{id}/rate` | Status redirect to the map on `complete` |
+| `ride-complete` | Rate, tip, and comment. Android back is blocked. Buttons disable after save. | `GET /ride/{id}`, `GET /ride/i/{id}/tip-options`, `POST /ride/i/{id}/rate` | Status redirect to the map on `complete`, or `tip/ride` when the tip needs action, is pending, or was canceled |
+| `tip/ride` | **Tip your driver** for a past ride. Presets, **Send tip** or **Continue payment**, and Stripe card authentication. Reached from ride-complete after a tip needs action, or from ride details. | `GET /ride/i/{id}/tip-options`, `POST /ride/i/{id}/tip` | **Back to ride details** |
 | `tip/[slug]` | Opens the web tip page in an in-app browser on mount. Invalid slug: **Invalid tip link**. | none | Back, or the map |
 
 ## Driver
@@ -111,7 +112,7 @@ All routes in this group render inside the map sheet.
 | `profile/settings` | ACCOUNT (Name editable, Phone and Email locked with copy), CONNECTED ACCOUNTS, PREFERENCES (Refer a friend, Notifications, Experiments, and lab rows when their experiments are on), SUPPORT (Help and feedback, Terms, Privacy, Delete account), **Sign Out**, build info | `PUT /user/name`, `PUT /user/allow-notifications` | Accounts, labs, `https://yelo.link/terms`, `https://yelo.link/privacy`, delete-account modal |
 | `profile/accounts` | LOGIN METHODS (Apple, Google), FARE FINDER, STUDENT VERIFICATION. `mode=rideshare` titles it "Fare Finder accounts". | `GET /authv3/user/identities`, `POST /authv3/user/link/authorize` | `connect-*`, `verify/1-oauth` |
 | `profile/community-switch` | **Select a community** map and list | `GET /community/`, `PUT /user/community` | Replaces to the map once the new JWT settles |
-| `profile/ride-details?id=` | Rider receipt, or "Ride not found" | `GET /user/ride-history` (cache) | Back, Get help sheet |
+| `profile/ride-details?id=` | Rider receipt, or "Ride not found". **Add a tip** or **Continue tip payment** when the ride is tippable and untipped. | `GET /user/ride-history` (cache), `GET /ride/i/{id}/tip-options` | Back, Get help sheet, `tip/ride` |
 | `profile/experiments` | Toggle experiments. The retired `rideshare-price-aggregator` key is hidden. | `PUT /user/experiments` | Back |
 | `profile/glass-lab`, `color-lab`, `design-system-lab` | Internal labs | none | `<Redirect>` to settings unless the matching experiment is on |
 | `verify/1-oauth`, `2-email`, `3-email-confirm` | **Are you a student?** StudID, Google or Microsoft school OAuth, or `.edu` email code. Accepts an `email` param from the World Cup claim. | `/authv3/user/student/studid/*`, `/authv2/email/*` | Back |
