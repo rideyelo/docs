@@ -1,7 +1,11 @@
 ---
 title: "World Cup campus race"
-description: "How the API records .edu claims, counts schools, awards the 25 winner slots, serves standings and the activity cursor, reconciles claims with email verification, and how the web site, signup flow, and app consume it."
+description: "The World Cup site is offline. How the API records .edu claims, counts schools, awards the 25 winner slots, serves standings and the activity cursor, reconciles claims with email verification, and how the web site, signup flow, and app consume it."
 ---
+
+<Warning>
+  The World Cup site is offline. The `world-cup-router` Worker now answers every `/world-cup*` path on `joinyelo.com` and `rideyelo.com`, including the race page, `/world-cup/claim`, and `/world-cup/api/*`, with a 302 to `https://joinyelo.com/`. Old links and QR codes still resolve. The API endpoints, the `world-cup` site, and the app prompt stay in place. To bring the campaign back, restore the proxy from git history.
+</Warning>
 
 The World Cup is a race between campuses. A student claims a `.edu` email, the claim counts toward that school right away, and the first 25 schools to reach 500 contributions become winners. For the product summary, see [Growth features](/concepts/growth-features#world-cup-campus-race). The browser pieces are documented in [Public sites](/engineering/web/public-sites#world-cup) (the race page) and [Signup and auth site](/engineering/web/signup-and-auth-site#world-cup-claim) (the claim form).
 
@@ -135,9 +139,9 @@ When the user proves inbox ownership through Auth v2 email verification (`intern
 
 | Client | Where | Behavior |
 | --- | --- | --- |
-| Race page | `yelo-web/src/sites/world-cup/hooks/useWorldCupStandings.ts` | Calls same-origin `/world-cup/api/standings` and `/world-cup/api/activity` every 15 seconds and on tab focus. On the first load, it drains the backlog up to 60 pages of 50. |
-| Edge proxy | `yelo-web/workers/world-cup-router/src/index.ts` | Routes `rideyelo.com/world-cup*` and `joinyelo.com/world-cup*`. `/world-cup/api/*` goes to `https://api.rideyelo.com/world-cup/*`, and everything else goes to `https://yelo-world-cup.web.app`. Only `GET` and `HEAD` are allowed. Sets `X-Yelo-Proxy`. |
-| Claim route | `yelo-web/workers/experience-router` | The more specific `joinyelo.com/world-cup/claim*` route sends the claim path to the signup site with `intent=world-cup`, which then calls `PUT /world-cup/education-claim`. |
+| Race page | `yelo-web/src/sites/world-cup/hooks/useWorldCupStandings.ts` | Offline on `joinyelo.com` and `rideyelo.com`. When served, it calls same-origin `/world-cup/api/standings` and `/world-cup/api/activity` every 15 seconds and on tab focus. On the first load, it drains the backlog up to 60 pages of 50. |
+| Edge redirect | `yelo-web/workers/world-cup-router/src/index.ts` | Routes `rideyelo.com/world-cup*` and `joinyelo.com/world-cup*`. Every World Cup path gets a 302 to `https://joinyelo.com/`. Paths that only share the prefix, such as `/world-cupcake`, pass through to the normal origin. |
+| Claim route | `yelo-web/src/sites/signup` | The signup site still has the claim flow (`intent=world-cup`), which calls `PUT /world-cup/education-claim`. The experience router no longer has a claim route, so `joinyelo.com/world-cup/claim` redirects to the home page with the rest of the World Cup paths. |
 | Race list | `yelo-web/src/sites/world-cup/lib/worldCup.ts` | 24 entries in `WORLD_CUP_CAMPUSES`, matched to API schools by email domain against `extensions`. A `baseline` is subtracted from the count shown. |
 | App prompt | `yelo-frontend/app/(app)/_layout.tsx`, `post-signup/14-student.tsx`, `api/helpers/worldCup.ts` | With a `pending` `world_cup` claim, no `prompt_dismissed_at`, and an initialized profile, the app pushes the student screen once per claim ID. **Choose verification method** opens `/(app)/verify/1-oauth` with the claim email. **Verify later** calls `PATCH .../prompt-dismissed`. |
 | Dashboard | None | No `yelo-web` code calls the unmatched or rematch endpoints. |
@@ -170,4 +174,4 @@ When the user proves inbox ownership through Auth v2 email verification (`intern
 - **The first activity page is the newest window.** Without `after`, the API returns the latest `limit` events in ascending order, not the oldest events. The race page's README describes an oldest-first drain, but in practice the drain stops after one or two calls.
 - **Displayed counts subtract a baseline, but unlocking doesn't.** `is_winner` uses the raw server count. The University of Vermont entry has `baseline: 296`, so it unlocks when the page shows 204.
 - **The README is out of date.** `src/sites/world-cup/README.md` says 23 race campuses. `WORLD_CUP_CAMPUSES` has 24.
-- **The proxy is read-only.** `world-cup-router` returns 405 for anything but `GET` and `HEAD` on `/world-cup*`. Writes work only because the claim form calls the API origin directly and the claim page is served by the experience router.
+- **Public URLs redirect.** Because `world-cup-router` redirects every `/world-cup*` path, including `/world-cup/api/*`, the race page's same-origin API calls and the claim page are unreachable through `joinyelo.com` and `rideyelo.com`. The API routes on `api.rideyelo.com` still respond.

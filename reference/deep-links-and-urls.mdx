@@ -28,11 +28,11 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | Site | Firebase site | Public domain | Evidence |
     | --- | --- | --- | --- |
     | dashboard | `yelo-dashboard-v2` | `https://dash.rideyelo.com` | API `YELO_DASHBOARD_URL` default (`config.go:261`), CORS list (`config.go:736-737`) |
-    | signup | `yelo-signup` | `https://signup.yelo.link`, and under `joinyelo.com` (including the `/i/<code>` invite landing) via the experience router | CORS list (`config.go:745-746`), `workers/experience-router/wrangler.jsonc` |
+    | signup | `yelo-signup` | `https://signup.yelo.link`, and under `joinyelo.com` (including the `/i/<code>` invite landing, the `/get` app landing, and the `/e/<slug>` event landing) via the experience router | CORS list (`config.go:745-746`), `workers/experience-router/wrangler.jsonc` |
     | home | `yelo-home` | `https://joinyelo.com` (likely also `rideyelo.com`) | `og:url` in `src/sites/home/index.html:33`, CORS list (`config.go:734-735,746-748`) |
     | event | `yelo-event` | `https://event.yelo.link` | CORS list (`config.go:742-743`) |
     | invite | `yelo-invite` | `https://invite.yelo.link`. Forwards only: `/<code>` redirects to `joinyelo.com/i/<code>`, `/fleet/<code>` to `joinyelo.com/i/fleet/<code>`, and `/` to `joinyelo.com` | CORS list (`config.go:747-748`) |
-    | world-cup | `yelo-world-cup` | `https://world-cup.yelo.link`, and under `/world-cup` via the world-cup router | CORS list (`config.go:740-741`) |
+    | world-cup | `yelo-world-cup` | `https://world-cup.yelo.link`. Offline on `joinyelo.com` and `rideyelo.com`: the world-cup router redirects `/world-cup*` to `https://joinyelo.com/` | CORS list (`config.go:740-741`) |
     | maestro | `yelo-maestro` | `https://yelo-maestro.web.app` | E2E Auth v3 origin (`cloudbuild.e2e.yaml:120`, `eas.json`) |
 
     The API's default CORS allowlist is the union of these origins and their `*.web.app` hosts (`corsTrustedOrigins`, `internal/utilities/config/config.go:728-750`).
@@ -41,8 +41,8 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | Worker | Routes | Upstream | Config |
     | --- | --- | --- | --- |
     | `yelo-og` | `rideyelo.com/og/*`, `www.rideyelo.com/og/*` | Renders signed OG PNGs | `workers/og/wrangler.jsonc` |
-    | `yelo-experience-router` | `joinyelo.com` and `www.joinyelo.com` on `/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/i/*`, `/_yelo/signup/*` | `SIGNUP_ORIGIN` (`https://yelo-signup.web.app`) | `workers/experience-router/wrangler.jsonc` |
-    | `yelo-world-cup-router` | `/world-cup*` on `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com` | `WORLD_CUP_ORIGIN`. `/world-cup/api/*` goes to `WORLD_CUP_API_ORIGIN` as `/world-cup/*` | `workers/world-cup-router/wrangler.jsonc`, `src/index.ts:1-41` |
+    | `yelo-experience-router` | `joinyelo.com/*` and `www.joinyelo.com/*` | `SIGNUP_ORIGIN` (`https://yelo-signup.web.app`) for the paths below. Every other path passes through to the home site, with attribution cookies planted on attributed landings | `workers/experience-router/wrangler.jsonc` |
+    | `yelo-world-cup-router` | `/world-cup*` on `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com` | None. Every World Cup path, including `/world-cup/claim` and `/world-cup/api/*`, gets a 302 to `https://joinyelo.com/`. Its longer pattern wins over the experience router | `workers/world-cup-router/wrangler.jsonc`, `src/index.ts` |
 
     The experience router maps public paths onto signup paths (`workers/experience-router/src/index.ts`):
 
@@ -50,9 +50,12 @@ Which Firebase site answers on which custom domain is configured in the Firebase
     | --- | --- |
     | `/auth/v3` | `/auth/v3/` |
     | `/pay/tip/<slug>` | `/tip/<slug>` |
-    | `/world-cup/claim` | `/world-cup` |
     | `/i/<code>` | `/i/<code>` (unchanged, so attribution cookies are first-party to `joinyelo.com`) |
+    | `/get` | `/get` |
+    | `/e/<slug>` | `/e/<slug>` (unchanged) |
     | `/_yelo/signup/<asset>` | `/<asset>`. HTML fallbacks become 404 so a missing asset is never cached as JS |
+
+    On HTML responses for these paths, except `/auth/v3`, the router sets the `yelo_anon_id` and `yelo_attr` cookies (`Domain=.joinyelo.com`, 90 days). On other paths, it sets them only for a `GET` whose query string carries attribution. See [Growth features](/concepts/growth-features#attribution-cookies).
   </Accordion>
   <Accordion title="Dub short-link domains">
     | Domain | Links created | Destination | Generated at |
@@ -211,14 +214,17 @@ The mobile app sets the Stripe PaymentSheet `returnURL` to the literal `com.ride
 | signup | `/i/<code>` (public `joinyelo.com/i/<code>`) | Referral invite landing. Logs a link touch, then iOS devices jump to the App Store with `ct=<code>`; Android gets a Google Play link with the install referrer. Served `no-cache, no-store, must-revalidate` | `App.tsx:272-275`, `src/sites/signup/invite/InvitePage.tsx` |
 | signup | `/i/fleet/<code>` (public `joinyelo.com/i/fleet/<code>`) | Fleet driver invite landing. Checked before `/i/<code>` | `App.tsx:267-270`, `src/sites/signup/invite/FleetInvitePage.tsx` |
 | signup | `/tip/<slug>`, `/web/tip/<slug>` | Tip flow. `?status=success` shows completion; `?auth=complete` skips the auth redirect | `App.tsx:278-302` |
-| signup | `/world-cup`, `/world-cup/claim`, `?intent=world-cup` | World Cup claim flow after Auth v3 | `App.tsx:285-308` |
+| signup | `/get` (public `joinyelo.com/get`) | App landing for campaign short links. Apple mobile devices go to the App Store with `utm_campaign` as the campaign token; Android goes to Google Play; desktop sees store buttons and **Continue → web**. Served `no-cache, no-store, must-revalidate` | `src/sites/signup/get/GetAppPage.tsx` |
+| signup | `/e/<slug>` (public `joinyelo.com/e/<slug>`) | Event landing with **Get tickets** (ticket URL, new tab) and **Get a ride** (`/get` with the query string, `utm_campaign=event-<slug>` by default). Served `no-cache, no-store, must-revalidate` | `src/sites/signup/event/EventLandingPage.tsx` |
+| signup | `/world-cup`, `/world-cup/claim`, `?intent=world-cup` | World Cup claim flow after Auth v3. Unreachable on `joinyelo.com`, where `/world-cup*` redirects to the home page | `App.tsx` |
 | signup | anything else | Redirects to Auth v3 entry | `App.tsx:320` |
 | invite | `/<code>` | Client-side redirect (`location.replace`) to `https://joinyelo.com/i/<code>`, keeping the query string | Inline script in `src/sites/invite/index.html` |
 | invite | `/fleet/<code>` | Client-side redirect (`location.replace`) to `https://joinyelo.com/i/fleet/<code>`, keeping the query string | Same inline script |
 | invite | `/`, `/index.html` | 302 to `https://joinyelo.com/` | `firebase.json:402-409` |
-| event | `/<slug>` | Public event page | `src/sites/event/App.tsx:18` |
-| home | `/partner`, `/drivers`, `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, `/terms` | Static pages | `firebase.json` home rewrites |
-| world-cup | `/` | 302 to `/world-cup` | `firebase.json:420-425` |
-| og worker | `/og/<template>`, `/og/_gallery`, `/og/_sign` | PNG cards. Gallery and signer only when `ENVIRONMENT` is not `production` | `workers/og/src/index.ts:12,76-128` |
+| event | `/<slug>` | Older public event page. New event links use `joinyelo.com/e/<slug>` | `src/sites/event/App.tsx:18` |
+| home | `/partner`, `/drivers` (and its `/drive` alias), `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, `/terms` | Static pages | `firebase.json` home rewrites |
+| world-cup | `/` | 302 to `/world-cup` | `firebase.json` |
+| world-cup router | `/world-cup*` on `joinyelo.com` and `rideyelo.com` | 302 to `https://joinyelo.com/`. The campaign is offline | `workers/world-cup-router/src/index.ts` |
+| og worker | `/og/<template>`, `/og/_gallery`, `/og/_sign` | PNG cards. Templates are `invite`, `fleet`, `fleet-payouts`, `event`, and `tip`. Gallery and signer only when `ENVIRONMENT` is not `production` | `workers/og/src/index.ts:12,76-128` |
 
 For site structure, see [Web sites](/engineering/web/sites).

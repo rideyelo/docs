@@ -15,11 +15,11 @@ There are no `pay` or `drive` sites. Both folders were removed from `yelo-web`, 
 | --- | --- | --- | --- | --- | --- | --- |
 | `dashboard` | Admins, interns, fleet managers | Clerk | Bespoke `main.tsx` | `@/generated/dashboard` | `yelo-dashboard-v2` | Live |
 | `signup` | Riders and drivers signing up, opening personal invite links, tipping, or deleting accounts | Auth v3 and phone OTP, no Clerk | `renderSite` | `@/generated/signup`, `@/generated/auth-v3` | `yelo-signup` | Live |
-| `event` | Anyone with a shared event link | Public | `renderSite` | `@/generated/event` | `yelo-event` | Live |
+| `event` | Anyone with an older shared event link | Public | `renderSite` | `@/generated/event` | `yelo-event` | Live. Event short links now use the `signup` site's `/e/<slug>` landing |
 | `home` | Marketing visitors | Public | Plain `createRoot` | None | `yelo-home` | Live |
 | `maestro` | Engineers reviewing the product inventory and E2E runs | Public viewer | `renderSite` | Supabase Storage JSON | `yelo-maestro` | Internal |
 | `invite` | Anyone opening an `invite.yelo.link` link shared before invites moved to `joinyelo.com/i` | Public | `renderSite` | None | `yelo-invite` | Live |
-| `world-cup` | Students in the World Cup campus race | Public | `renderSite` | `@/generated/dashboard` (world-cup functions) | `yelo-world-cup` | Live |
+| `world-cup` | Students in the World Cup campus race | Public | `renderSite` | `@/generated/dashboard` (world-cup functions) | `yelo-world-cup` | Offline. Its public routes redirect to `joinyelo.com` |
 
 The Hosting site IDs come from `.firebaserc`. Each Hosting target has the same name as its site.
 
@@ -45,15 +45,18 @@ The public web entry point for account creation and several one-off flows. It ha
 | --- | --- |
 | `/auth/v3`, `/auth/v3/callback` | Auth v3 sign-in page (`auth-v3/AuthV3Page`). Normally served by the dedicated entry; the main bundle lazy-loads it as a fallback. |
 | `/delete-account` | Account deletion: phone OTP, then confirmation with the word `DELETE`. |
+| `/get` | App landing for campaign short links (`get/GetAppPage`). Apple mobile devices go to the App Store with `utm_campaign` as the campaign token, and Android goes to Google Play. Desktop sees **Continue → App Store**, **Continue → Google Play**, and **Continue → web** (Auth v3 with the query string). |
+| `/e/<slug>` | Event landing (`event/EventLandingPage`). Loads the event with `usePublicEventGetBySlug` and shows **Get tickets** (the event's `http` or `https` ticket URL, in a new tab) and **Get a ride** (`/get` with the query string, and `utm_campaign=event-<slug>` if none is set). |
 | `/i/<code>` | Personal referral invite landing (`invite/InvitePage`). Apple mobile devices go to the App Store with `ct=<code>`. Everyone else sees the landing, which leads with the store for the device: **Continue → Google Play** on Android, carrying the invite as install referrer, and **Continue → App Store** elsewhere. The secondary link, **Continue → web**, goes to Auth v3 with the landing's allowlisted attribution parameters plus the code. |
 | `.../tip/<slug>` | Rider tip for a driver or fleet (`TipStep`). If the tip API returns unauthorized, it redirects to Auth v3 with `intent=tip`. `?status=success` shows the confirmation screen. |
-| `.../world-cup`, `.../world-cup/claim`, or `?intent=world-cup` | World Cup claim: Auth v3 sign-in, then `.edu` email verification (`EduClaimStep`). |
+| `.../world-cup`, `.../world-cup/claim`, or `?intent=world-cup` | World Cup claim: Auth v3 sign-in, then `.edu` email verification (`EduClaimStep`). The public `joinyelo.com/world-cup/claim` URL now redirects to the home page, so this flow is unreachable in production. |
 | Anything else | Redirects into the Auth v3 web flow. |
 
 - **Auth:** No Clerk. Auth v3 uses its own fetch client and a request secret that `captureAuthV3RequestSecret()` strips from the URL before React mounts. Older steps use the Auth v2 phone OTP endpoints.
 - **API:** `@/generated/signup` for `authv2`, `tips`, and `user`; `@/generated/auth-v3` for Auth v3; and `worldCupClaimEducationEmail` and `useReferralGetInvitePreview` from the dashboard client. Every page except `/auth/v3` logs a link touch with `POST /authv3/attribution/touch`. See [Signup and Auth v3 site](/engineering/web/signup-and-auth-site#link-landing-touches).
 - **Required build variables:** `VITE_API_URL`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID`. `VITE_APPLE_REDIRECT_URI`, `VITE_AUTH_V3_APP_SCHEME`, `VITE_APP_ENV`, `VITE_POSTHOG_KEY`, and `VITE_POSTHOG_HOST` are optional.
-- **Hosting:** Strict security headers and a Content Security Policy on `/auth/v3`, `no-store` on `/delete-account` and `/i/**`, and `.well-known` app-association files. The `experience-router` Worker proxies `joinyelo.com/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, and `/i/*` to this site so users see canonical `joinyelo.com` URLs.
+- **Hosting:** Strict security headers and a Content Security Policy on `/auth/v3`, `no-store` on `/delete-account`, `/i/**`, `/get`, and `/e/**`, and `.well-known` app-association files. The `experience-router` Worker proxies `joinyelo.com/auth/v3*`, `/pay/tip*`, `/i/*`, `/get`, and `/e/*` to this site so users see canonical `joinyelo.com` URLs.
+- **Link previews:** The build target runs `scripts/emit-signup-html.mjs`, which writes static documents with their own Open Graph tags for `/i/fleet/<code>`, `/get` (the home page card and `og-yelo.png`), and `/e/<slug>` ("Event on Yelo"). A Dub short link with its own card shows that card instead.
 
 <Tip>
 In dev, open `/?preview=all` on the signup site to see every step stacked on one page, or `/?preview=<step>` for a single step. For iPhone keyboard testing of Auth v3, run `pnpm dev:signup-device`. See [Local development](/engineering/local-development).
@@ -61,7 +64,7 @@ In dev, open `/?preview=all` on the signup site to see every step stacked on one
 
 ## event
 
-A public landing page for a single event, reached from shared links.
+A public landing page for a single event, reached from older shared links. New event short links point at the `signup` site's `joinyelo.com/e/<slug>` landing, which links out to the ticket page instead of embedding Posh checkout.
 
 - **Routes:** `/:slug` renders `EventPage`; anything else shows "Event not found".
 - **API:** `usePublicEventGetBySlug` from `@/generated/event`, a client generated only from the public events tags.
@@ -72,11 +75,11 @@ A public landing page for a single event, reached from shared links.
 
 The marketing site. It intentionally does not follow the shared conventions: it uses no Tailwind, no `renderSite`, and no router library. `main.tsx` calls `createRoot` directly and switches pages on `window.location.pathname`.
 
-- **Pages:** rider landing (`/`), `/drivers`, `/partner`, `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, and `/terms`. Each non-root page has a Hosting rewrite to its own `index.html`.
+- **Pages:** rider landing (`/`), `/drivers` (also served at the `/drive` alias, which keeps the short link's query string), `/partner`, `/fleets`, `/safety`, `/vision`, `/privacy`, `/tos`, and `/terms`. Each non-root page has a Hosting rewrite to its own `index.html`.
 - **`/farefinder`:** The ride price-comparison landing page ("Find the cheapest ride"). It works differently from the other pages. It is a self-contained static HTML, CSS, and vanilla JavaScript page in `src/sites/home/public/farefinder/`, with no React, no route in `main.tsx`, no `firebase.json` rewrite, and no build step. Vite copies `public/` into `dist/home` verbatim, and Firebase Hosting serves the real file before the `**` rewrite. Its images, video, and fonts live under `/farefinder/` so they don't collide with the site's `/img` or `/video`. Every call to action links to `https://yelo.link/aggregator`, which returns a 302 to the App Store listing so taps from this page can be attributed.
 - **Assets:** A site-local `public/`. Images in `public/img/` are generated from `assets-src/` by `tools/vite/home/gen-home-images.ts` at build start, and are not committed.
 - **Link previews:** The build target also runs `scripts/emit-partner-html.mjs`, which writes static HTML documents with page-specific Open Graph tags because link-preview crawlers do not run JavaScript.
-- **API:** None.
+- **API:** None, except that `main.tsx` lazily loads the signup site's touch logger. It records an attribution touch only when the visit carries a click ID, campaign, or referral code, or arrives from another site.
 - **Previews:** Pull requests that affect `home` get a Firebase preview channel, and CI comments the URL on the PR.
 
 Read [Home site](/engineering/web/home-site) before you change this site.
@@ -108,9 +111,13 @@ For the fleet invite flow from the operator's side, see [Driver invitations](/fl
 
 ## world-cup
 
-The campus race landing page: a live leaderboard, map, and signup ticker for 23 listed campuses.
+The campus race landing page: a live leaderboard, map, and signup ticker for the listed campuses.
 
-- **Serving:** Builds with `base: '/world-cup/'`. The `world-cup-router` Cloudflare Worker serves it at `rideyelo.com/world-cup*` and `joinyelo.com/world-cup*` and lets every other path fall through to Framer.
+<Warning>
+The World Cup site is offline. The `world-cup-router` Worker answers `/world-cup*` on `rideyelo.com` and `joinyelo.com`, including `/world-cup/claim` and `/world-cup/api`, with a 302 to `https://joinyelo.com/`. The site and its Firebase Hosting target stay in place. Only the proxy is removed, so you can restore it from git history.
+</Warning>
+
+- **Serving:** Builds with `base: '/world-cup/'`. While the campaign ran, the `world-cup-router` Cloudflare Worker served it at `rideyelo.com/world-cup*` and `joinyelo.com/world-cup*` and let every other path fall through to Framer.
 - **API:** `worldCupGetStandings` and `worldCupGetActivity` from the dashboard client, called through the same-origin `/world-cup/api` prefix. It polls activity with a cursor.
 - **Claim flow:** Claim links point at `VITE_SIGNUP_URL`, which defaults to `https://joinyelo.com/world-cup/claim` and is handled by the `signup` site.
 - **Required build variables:** None. `VITE_SIGNUP_URL` is a cache input.
@@ -123,8 +130,19 @@ Three Cloudflare Workers in `workers/` sit in front of some sites. They deploy s
 
 | Worker | Routes | Purpose |
 | --- | --- | --- |
-| `experience-router` | `joinyelo.com/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/i/*`, `/_yelo/signup/*` | Proxies to the `signup` site origin (`yelo-signup.web.app`). |
-| `world-cup-router` | `rideyelo.com/world-cup*`, `joinyelo.com/world-cup*` | Proxies to the `world-cup` site origin and API; other paths go to Framer. |
-| `og` | `rideyelo.com/og/*` | Renders signed Open Graph images for invite links. |
+| `experience-router` | `joinyelo.com/*`, `www.joinyelo.com/*` | Proxies `/auth/v3`, `/pay/tip*`, `/i/*`, `/get`, `/e/*`, and `/_yelo/signup/*` to the `signup` site origin (`yelo-signup.web.app`). Every other path passes through to the home site. Plants attribution cookies on link landings. |
+| `world-cup-router` | `rideyelo.com/world-cup*`, `joinyelo.com/world-cup*` | Redirects every World Cup path (302) to `https://joinyelo.com/`. Its longer pattern wins over the experience router. Other paths, such as `/world-cupcake`, pass through. |
+| `og` | `rideyelo.com/og/*` | Renders signed Open Graph images for invite, fleet, event, and tip links. |
+
+### Attribution at the edge
+
+The `experience-router` Worker sets two first-party cookies on attributed landings: `yelo_attr`, the entry click (Dub click ID, UTM parameters, channel, and referral code), and `yelo_anon_id`, an anonymous ID. Both use `Domain=.joinyelo.com; Path=/; Max-Age=7776000; SameSite=Lax; Secure`, so they last 90 days. Response cookies aren't subject to Safari's seven-day cap on script-written cookies.
+
+- Signup landings (`/pay/tip*`, `/i/*`, `/get`, `/e/*`) always get a `yelo_anon_id` if the visitor has none, and a `yelo_attr` entry when the URL carries attribution.
+- Other `joinyelo.com` pages, including the home page, get cookies only on a `GET` with a query string that carries attribution and an HTML response. Requests without a query string, and non-`GET` requests, pass through untouched.
+- `/auth/v3` never gets these cookies. Its callback's `code` is an OAuth code, not a referral code.
+- A failure while planting cookies serves the page anyway.
+
+At sign-up, Auth v3 fills missing attribution fields from `yelo_attr`. See [Growth features](/concepts/growth-features#attribution-cookies).
 
 Run `pnpm worker:<name>:check` before you merge a Worker change. Deployment details are in [Deployment](/engineering/deployment).
