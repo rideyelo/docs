@@ -40,6 +40,27 @@ The search bar carries a status chip from the current community:
 
 `LocationGate` covers the whole map when foreground location is missing. See [Permissions](/engineering/mobile/permissions-and-device#location).
 
+### Home dock controls
+
+`SavedSpotsBar` (`components/home/SavedSpotsBar.tsx`) is the row docked just above the home sheet. It holds two icon-only glass buttons:
+
+| Button | Position | `testID` | Action |
+| --- | --- | --- | --- |
+| Recenter | Left edge | `recenter` | `focusMap(['user'])` on the map ref |
+| Bump friends | Right edge | `bump-friends` | Pushes `map/request` with `bump: 'true'` |
+
+The bump button is `BumpFriendsButton` (`components/design-system/BumpFriendsButton.tsx`). The ride request action bar renders the same component to the left of the **Fastest** and **Cheapest** pill, so the button looks the same in both places. Its accessibility label is "Bump friends".
+
+```tsx
+import { BumpFriendsButton } from '@/components/design-system/BumpFriendsButton';
+
+<BumpFriendsButton onPress={() => router.push({ pathname: '/(app)/(tabs)/map/request', params: { bump: 'true' } })} />
+```
+
+With `bump: 'true'` and no destination yet, the request screen first opens the change-stop sheet on the destination stop. Once a destination is set, it dismisses the keyboard and presents the bump sheet. The Moves rail bump card, the friends list, and a friend's profile push the same route. See [Social and contacts](/engineering/mobile/social-and-contacts).
+
+The map layout hides this row while the featured spot dock shows, while a ride request route is active, and while the nav bar is hidden.
+
 ### Search pipeline
 
 `hooks/useSearchSuggestions.ts` drives both modes.
@@ -62,9 +83,9 @@ A failed retrieve keeps search open and shows **Couldn't load this location** / 
 | Pinned spots | AsyncStorage `spots:pinnedIds:<userId>` and `spots:unpinnedOrder:<userId>` | 2 pinned (`MAX_PINNED` in `hooks/usePinnedSpots.ts`) |
 | Hidden community POIs | AsyncStorage `community-pois:hidden:<userId>` | none in client |
 
-`useSavedLocations` (`hooks/useSavedLocations.ts`) is the single source for "saved spots". It returns the user's likes followed by community POIs. It skips a community POI that is hidden, that lacks a name or coordinates, or that `findSavedMatch` matches to an existing like. Pinned state stores IDs only, so both `SavedSpotsBar` and the save-location screen resolve those IDs against this combined list.
+`useSavedLocations` (`hooks/useSavedLocations.ts`) is the single source for "saved spots". It returns the user's likes followed by community POIs. It skips a community POI that is hidden, that lacks a name or coordinates, or that `findSavedMatch` matches to an existing like. Pinned state stores IDs only, so the save-location screen resolves those IDs against this combined list.
 
-`SavedSpotsBar` docks above the sheet. It shows the pinned spots and opens `/(app)/save-location` for management. A pinned spot pushes `map/request` with the spot as `dropoff`. An empty pin slot opens the screen with `focusSearch=1`, which focuses the search input on mount. `MapFeedLikesRail` and the first-like featured card use the same param.
+`MapFeedLikesRail` and the first-like featured card open `/(app)/save-location` with `focusSearch=1`, which focuses the search input on mount.
 
 #### Save-location screen
 
@@ -117,7 +138,7 @@ Four hooks keep per-user ID sets in AsyncStorage. Nothing in them reaches the AP
 | `usePinnedSpots` | `spots:pinnedIds:<userId>`, `spots:unpinnedOrder:<userId>` | Pinned IDs (truncated to 2 on read and write) and the **LIKED** order | Save-location screen |
 | `useHiddenCommunityPois` | `community-pois:hidden:<userId>` | Community POIs the user un-hearted | Save-location remove, and the heart in `components/map/poi/PoiHeader.tsx`, which toggles `hide` and `unhide` |
 | `useDismissedSpots` | `featured-spot:dismissed:<userId>` | Featured spots hidden from the dock. The hook has no remove | Nothing today: `useFeaturedSpot` returns `dismiss`, but no component calls it |
-| `useCollapsedSpots` | `featured-spot:collapsed:<userId>` | Featured spots the user expanded into the card | `expand` and `collapse` from `useFeaturedSpot`, called by `FeaturedSpotOverlay` and `MapTutorialOverlay` |
+| `useCollapsedSpots` | `featured-spot:collapsed:<userId>` | Featured spots the user expanded into the card | `expand` and `collapse` from `useFeaturedSpot`, called by `FeaturedSpotOverlay` |
 
 - **One store per user.** Each hook keeps a module-level store keyed by user, so every mounted instance sees the same state. `useDismissedSpots` and `useCollapsedSpots` share the implementation in `hooks/usePersistedSpotIdSet.ts`.
 - **Debounced writes.** State updates at once. The AsyncStorage write follows 150 ms later.
@@ -476,7 +497,8 @@ It shows **YOU PAID** (price plus tip), pickup and drop-off, a route map, **Base
 | Area | Path |
 | --- | --- |
 | Home feed and search | `app/(app)/(tabs)/map/index.tsx`, `components/search/`, `hooks/useSearchSuggestions.ts`, `hooks/useRecentLocations.ts` |
-| Saved places | `app/(app)/save-location/index.tsx`, `components/save-location/`, `components/home/SavedSpotsBar.tsx`, `hooks/useSavedLocations.ts`, `hooks/usePinnedSpots.ts`, `hooks/useHiddenCommunityPois.ts` |
+| Home dock controls | `components/home/SavedSpotsBar.tsx`, `components/design-system/BumpFriendsButton.tsx` |
+| Saved places | `app/(app)/save-location/index.tsx`, `components/save-location/`, `hooks/useSavedLocations.ts`, `hooks/usePinnedSpots.ts`, `hooks/useHiddenCommunityPois.ts` |
 | Featured-spot sets | `hooks/usePersistedSpotIdSet.ts`, `hooks/useDismissedSpots.ts`, `hooks/useCollapsedSpots.ts`, `components/map/feed/useFeaturedSpot.ts` |
 | Off-peak overlay | `components/map/OffPeakHoursOverlay.tsx`, `lib/map/calendarHours.ts`, `lib/map/operatingHours.ts`, `components/map/layout/MapAboveSheetOverlays.tsx` |
 | Place hours | `lib/map/poi/poiHours.ts`, `components/map/poi/usePlacePoiDetails.ts` |
