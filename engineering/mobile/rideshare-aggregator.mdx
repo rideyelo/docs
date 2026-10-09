@@ -52,11 +52,11 @@ flowchart TD
   FX["Fetch effect: focus, Fare Finder enabled, pickup, dropoff, or refresh changed"] --> CONN{"isConnected(provider)?"}
   CONN -->|no| LOGIN["needsConnect: log in card"]
   CONN -->|yes, but a stop is not a valid coordinate| WAIT["no request"]
-  CONN -->|yes| CIRCUIT{"openCircuit(provider)?"}
-  CIRCUIT -->|open| SKIP["skip: account issue or unavailable"]
-  CIRCUIT -->|closed| CACHE{"getFreshQuotes: same route under 20 s old?"}
+  CONN -->|yes| CACHE{"getFreshQuotes: same route under 20 s old?"}
   CACHE -->|yes| LIVE["live: cached options"]
-  CACHE -->|no| LOAD["loading: spinner"]
+  CACHE -->|no| CIRCUIT{"openCircuit(provider)?"}
+  CIRCUIT -->|open| SKIP["skip: account issue or unavailable"]
+  CIRCUIT -->|closed| LOAD["loading: spinner"]
   LOAD --> FETCH["getUberQuotes / getLyftQuotes / getEmpowerQuotes"]
   FETCH -->|network error, no response| RETRY["retry once"]
   RETRY --> FETCH
@@ -76,12 +76,12 @@ The effect runs only while the request screen is focused and Fare Finder is enab
 For each of `uber`, `lyft`, and `empower`, in parallel:
 
 1. **Connection check.** `isConnected` reads SecureStore. A provider with no stored session stops here and shows the log-in card. A connected provider whose route lacks a valid pickup or dropoff also stops here, with no request, and its card shows the spinner.
-2. **Circuit check.** `openCircuit` skips a provider whose circuit is open, with no request. See [Provider circuit breaker](#provider-circuit-breaker).
-3. **Cache check.** `getFreshQuotes` serves the cached options for the same route. See [Quote cache and cooldown](#quote-cache-and-cooldown).
+2. **Cache check.** `getFreshQuotes` serves the cached options for the same route. See [Quote cache and cooldown](#quote-cache-and-cooldown).
+3. **Circuit check.** `openCircuit` skips a provider whose circuit is open, with no request. See [Provider circuit breaker](#provider-circuit-breaker).
 4. **Fetch.** The provider module gets a valid access token, calls the provider, and parses the response into `RideQuoteOption[]` (`lib/ride/types.ts`). Each provider's fare request has a 10-second timeout. Empower's bootstrap lookup allows 15 seconds. If the call fails with no HTTP response at all (`error_kind: network`), the hook retries it once before reporting an error.
 5. **Filter.** `toAggregatorOptions` maps quotes to `AggregatorRideOption`. `hasUsablePrice` drops any option with no numeric fare and a blank label.
 6. **Empty result.** An empty list can mean a dead refresh cleared the tokens, so the hook calls `isConnected` again. Disconnected becomes the log-in card. Still connected becomes `unavailable`.
-7. **Error.** `classifyQuoteError` maps an `EmpowerAccountLockedError` to `account` and a thrown HTTP 401 or 403 to `auth`. Every other failure (5xx, timeout, network after the retry) is `unavailable`. Any HTTP rejection also counts toward the provider's circuit, and the failure that opens an auth circuit reports `account` instead. The hook logs `ride.quotes.error`. A successful fetch clears the provider's circuit.
+7. **Error.** `classifyQuoteError` maps an `EmpowerAccountLockedError` to `account` and a thrown HTTP 401 or 403 to `auth`. Every other failure (5xx, timeout, network after the retry) is `unavailable`. Any HTTP rejection also counts toward the provider's circuit, and the failure that opens an auth circuit sets the card's `errorKind` to `account` instead. Its `ride_aggregator_provider_result` event still carries `error_kind: auth`. The hook logs `ride.quotes.error`. A successful fetch clears the provider's circuit.
 
 `validRideCoord` validates both stops before anything leaves the device. It rejects a missing or non-finite value, a latitude outside ±90 or a longitude outside ±180, and any point within 0.01 degrees of (0, 0), which is how an unset location reads. No provider is called without two valid stops.
 
@@ -120,7 +120,7 @@ A platform without live quotes carries no prices. The static options in `RIDE_AG
 
 ## Provider sign-in
 
-Each provider has its own route under `app/(app)/`. All three render `ProviderAccountView` for the signed-out, error, and signed-in states, and read their state from `useProviderAccount`.
+Each provider has its own route under `app/(app)/`. The Uber, Lyft, and Empower screens render `ProviderAccountView` for the signed-out, error, and signed-in states, and read their state from `useProviderAccount`.
 
 | Provider | Screen | Method | Callback |
 | --- | --- | --- | --- |
@@ -410,7 +410,7 @@ The Citi Bike card is display-only. `resolveHandoffProvider` maps it to Lyft for
 
 | Writer | Writes |
 | --- | --- |
-| `useAggregatorPlatforms` | `{ loading: true }` when a fetch starts, `{ errorKind }` on a thrown error or an empty result from a connected provider, `{}` on success, cache hit, not connected, or no route |
+| `useAggregatorPlatforms` | `{ loading: true }` when a fetch starts, `{ errorKind }` on a thrown error, an open circuit, or an empty result from a connected provider, `{}` on success, cache hit, not connected, or no route |
 | `useProviderAccount.signOut` | `{}` for that provider |
 
 | Reader | Use |
