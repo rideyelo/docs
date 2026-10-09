@@ -89,7 +89,7 @@ Select **View** or **Edit** on a row to open the fleet editor. The **Vehicles** 
   </Step>
 </Steps>
 
-For a **Fleet Merchant** fleet, a **Stripe Onboarding Link** banner appears after you create the fleet. Select **Copy** or **Open** and share the link with the fleet manager. The link expires in about 24 hours. You can generate a new one later from the fleet's **Operations** tab.
+For a **Fleet Merchant** fleet, a **Stripe Onboarding Link** banner appears after you create the fleet. Select **Copy** or **Open** and share the link with the fleet manager. See [Stripe onboarding links](#stripe-onboarding-links) for how long the link works and how to replace it.
 
 ### Fleet settings
 
@@ -97,33 +97,26 @@ For a **Fleet Merchant** fleet, a **Stripe Onboarding Link** banner appears afte
 | --- | --- | --- |
 | **Name** | Yes | The fleet's display name. |
 | **Logo URL** | No | A link to the fleet's logo image. |
-| **Payment Model** | Yes | How drivers are paid. You can't change it after you create the fleet. |
-| **Supported Vehicle Types** | Yes | The vehicle types the fleet operates. Pick at least one. |
-| **Primary Vehicle Type** | Yes | The fleet's main vehicle type. It must be one of the supported types. |
-| **Custom Payouts** | No | Turns on custom payout configurations for the fleet. |
+| **Payment model** | Yes | How drivers are paid. You can't change it after you create the fleet. |
+| **Vehicle types** | Yes | The vehicle types the fleet operates. Pick at least one. |
+| **Primary vehicle type** | Yes | The fleet's main vehicle type. It must be one of the supported types. |
 | **Require rider confirmation code** | No | When off, riders skip the 4-digit PIN and drivers start the ride with a single tap. |
+| **Student riders only** | No | When on, only student riders are offered this fleet. Shown only when you edit an existing fleet. |
 
 The two payment models work like this:
 
 | Payment model | Description |
 | --- | --- |
-| **Owner Operator** | Drivers are paid directly. The fleet doesn't need Stripe setup. |
-| **Fleet Merchant** | The fleet is the merchant of record. The fleet must finish Stripe onboarding. |
+| **Owner Operator** | Rides and tips pay out to each driver's own Stripe account. The fleet doesn't need Stripe setup. |
+| **Fleet Merchant** | Rides and tips pay out to the fleet's Stripe account. The fleet must finish Stripe onboarding. |
+
+The payment model also sets payout routing. There's no separate **Custom Payouts** toggle. When you save, the dashboard turns payout routing on for **Fleet Merchant** fleets and off for **Owner Operator** fleets.
 
 For more on how each model affects driver enrollment, see [Fleet-managed payouts and owner-operator enrollment](/fleets/driver-invitations#fleet-managed-payouts-and-owner-operator-enrollment).
 
 ## Edit a fleet
 
-The fleet editor opens at `/manage/{fleet_id}` and has three tabs.
-
-### Settings
-
-Edit the [fleet settings](#fleet-settings), except **Payment Model**. Existing fleets also have two extra toggles:
-
-- **Student riders only**
-- **Owner operators**
-
-Select **Save Changes** to apply your edits, or **Discard changes** to reset the form.
+The fleet editor opens at `/manage/{fleet_id}` and has two tabs: **Operations** and **Vehicles**. Older links to `/manage/{fleet_id}?tab=settings` open **Operations**.
 
 ### Operations
 
@@ -131,15 +124,23 @@ The **Operations** tab shows the fleet's payment model, Stripe status, and activ
 
 For **Fleet Merchant** fleets, the tab also shows Stripe details:
 
-- A **Stripe Onboarding Required** or **Stripe Account Restricted** banner when Stripe needs attention. Select **Open Stripe Onboarding** to continue onboarding, or **Refresh Link** to generate a new onboarding link.
-- A **Stripe Account** card with the **Account ID**, **Payouts** and **Charges** status, any disabled reason, and **Outstanding requirements**. Select **Open Stripe dashboard** to manage the account in Stripe.
-- **Unlink Stripe Account**, which disconnects the current Stripe account and creates a new one.
+- A **Stripe Onboarding Required** or **Stripe Account Restricted** banner when Stripe needs attention. The banner shows the current onboarding link with **Copy link** and **Open** actions, and a **Refresh Link** button. See [Stripe onboarding links](#stripe-onboarding-links).
+- A **Stripe Account** card with the **Account ID**, **Payouts** and **Charges** status, any disabled reason, and **Outstanding requirements**. The **Account ID** links to the account in the Stripe Connect dashboard. Select **Open Stripe dashboard** to manage the account in Stripe.
+- **Unlink Stripe Account** in the **Stripe Account** card header. It disconnects the current Stripe account and creates a new one.
 
 <Warning>
-  Unlinking a Stripe account deactivates the fleet until the new Stripe onboarding is complete. You can't undo it.
+  Unlinking a Stripe account deactivates the fleet until the new Stripe onboarding is complete. It also revokes the onboarding link you sent before. You can't undo it.
 </Warning>
 
-The **Fleet Details** card summarizes **Vehicle Types**, **Custom Payouts**, **PIN required**, **Active Drivers**, **Vehicles**, and **Created**.
+The **Fleet Details** card summarizes **Vehicle Types**, **Payouts go to**, **PIN required**, **Student riders only**, **Active Drivers**, **Vehicles**, and **Created**. **Payouts go to** reads **Fleet Stripe account** for **Fleet Merchant** fleets and **Each driver** for **Owner Operator** fleets.
+
+If the fleet's stored payout routing doesn't match its payment model, the card shows a warning: drivers can't join the fleet until you fix it. To fix it, select **Edit settings** and save without changes.
+
+#### Edit fleet settings
+
+1. Select **Edit settings** on the **Fleet Details** card. The card switches to the settings form.
+2. Change the [fleet settings](#fleet-settings). You can't change **Payment model** on an existing fleet.
+3. Select **Save Changes**, or **Cancel** to close the form without saving.
 
 Below the card are four tabs:
 
@@ -153,6 +154,17 @@ Below the card are four tabs:
 ### Vehicles
 
 The **Vehicles** tab shows the vehicle inventory for this fleet. See [Fleet vehicles](/dashboard/fleet-vehicles).
+
+## Stripe onboarding links
+
+A **Fleet Merchant** fleet manager finishes Stripe onboarding through a link you send them. Yelo gives you a `https://yelo.link/payouts-…` short link. When shared in a message, it shows a **Set up payouts for** the fleet preview card.
+
+- The link works for 7 days. The fleet manager can open it more than once. Each visit starts a fresh Stripe onboarding session.
+- Selecting **Refresh Link** replaces the link with a new one. The link you sent before stops working.
+- Unlinking the Stripe account also revokes the link.
+- After onboarding is complete, the link sends the fleet manager to the Stripe return page instead of onboarding.
+
+If the banner says the link is a single-use Stripe link, it was created before stable links existed. Select **Refresh Link** to get a link you can send.
 
 ## Manage service communities
 

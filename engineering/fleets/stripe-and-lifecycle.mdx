@@ -51,7 +51,7 @@ The dashboard list derives its badge in `StatusBadge` (`yelo-web/src/sites/dashb
     `setupStripeForCloneOrNew`:
     - Owner-operator: `stripe_status = 'not_required'`, `is_active = TRUE`, no Stripe call.
     - Fleet-merchant cloning a source that has an account: copies `stripe_merchant_id` and `stripe_status`, sets `is_active` to whether the source is `complete`, and stores no onboarding URL.
-    - Otherwise: `CreateFleetExpressAccount` (Express, US, `card_payments` and `transfers` requested, business type `company`), then an Account Link with `collection_options.fields = eventually_due`. The refresh URL is `cfg.Stripe.ReturnUrl + "?fleet=<id>"`. The fleet starts as `pending` and inactive. If the link fails, the new account is deleted.
+    - Otherwise: `CreateFleetExpressAccount` (Express, US, `card_payments` and `transfers` requested, business type `company`), then a [stable onboarding link](#onboarding-links) stored as `stripe_onboarding_url`. The fleet starts as `pending` and inactive. If the link fails, the new account is deleted.
   </Step>
   <Step title="Insert">
     `sqlDashboardRepository.CreateFleet` locks the community (`archived_at IS NULL`), inserts the fleet, and inserts a `fleet_creation` service row for the home community in one transaction. If the insert fails, the new Stripe account is deleted.
@@ -62,6 +62,8 @@ The dashboard list derives its badge in `StatusBadge` (`yelo-web/src/sites/dashb
 </Steps>
 
 `has_owner_operators` is set to `payment_model == owner_operator`, and `requires_confirmation_code` defaults to `TRUE`.
+
+The API doesn't derive `has_custom_payouts`. The dashboard sends `has_custom_payouts = (payment_model == fleet_merchant)` on every create and update, and no longer sends `has_owner_operators`.
 
 ## Update
 
@@ -76,7 +78,9 @@ When `supported_vehicle_types` changes, `applyVehicleTypeUpdates` runs **before*
 
 Price changes only touch the home community. Prices in other service communities are left open for removed types.
 
-Effects of the toggles:
+The dashboard edits these fields from **Edit settings** on the **Fleet Details** card of the **Operations** tab. It has no `has_custom_payouts` or `has_owner_operators` controls. Saving always rewrites `has_custom_payouts` from the payment model, which repairs a fleet whose stored routing disagrees. The card and form show a warning while `has_custom_payouts != (payment_model == fleet_merchant)`.
+
+Effects of the fields:
 
 | Field | Immediate effect |
 | --- | --- |
@@ -91,7 +95,7 @@ Effects of the toggles:
 | --- | --- | --- |
 | `account.updated` webhook | `PaymentService.AccountUpdated` → `handleFleetAccountUpdated` in `internal/service/payment/payment.go` | Matches every non-archived fleet with this `stripe_merchant_id`. Past-due or currently-due requirements set `restricted`. Payouts disabled sets `pending`. Otherwise `complete`. |
 | Daily reconciliation | `reconciliation_jobs.go`, `queries/stripe_reconciliation.sql` | Discovers every non-archived fleet account and re-runs `AccountUpdated` about every 24 hours per account. Accounts Stripe rejects as invalid are rechecked weekly. |
-| Refresh link | `RefreshStripeOnboardingLink` | Mints a new Account Link and stores it, keeping the current status. Admin only. |
+| Refresh link | `RefreshStripeOnboardingLink` | Mints a new [onboarding link](#onboarding-links), stores it, and returns it, keeping the current status. Admin only. |
 | Unlink | `UnlinkStripe` | Sets `pending` with a new account. |
 
 On `complete`, `handleFleetAccountUpdated` also:
@@ -108,12 +112,57 @@ If a connected account matches any fleet, the webhook takes the fleet branch and
 
 `GetFleetStripeStatus` calls Stripe on every request. It returns `connected: false` if there is no account ID. Otherwise it returns `payouts_enabled`, `charges_enabled`, `disabled_reason`, currently due, past due, and error reasons. It mints an Express login link only when `details_submitted`, and a link failure degrades to no link.
 
+## Onboarding links
+
+Stripe Account Links are single-use and expire within minutes, and message previews can consume them. Instead of a raw Account Link, create, refresh, and unlink return and store a stable link that the fleet manager can reopen.
+
+### Stable signed link
+
+```text
+{App.Url}/community/fleet-stripe-onboarding?fleet=<fleet_id>&exp=<unix seconds>&sig=<hex>
+```
+
+`sig` is an HMAC-SHA256 over `fleet-stripe-onboarding:<fleet_id>:<stripe_merchant_id>:<exp>`, keyed with the auth JWT key. `exp` is 7 days after the link was minted.
+
+`GET /community/fleet-stripe-onboarding` is unauthenticated. The signed query string is the credential. `FleetStripeOnboardingRedirect` handles it:
+
+| Condition | Response |
+| --- | --- |
+| Fleet missing, not `fleet_merchant`, no account, or signature mismatch | 404 **onboarding link not found** |
+| `exp` in the past | 400 **this onboarding link has expired, ask Yelo for a new one** |
+| `stripe_status = 'complete'` | 303 to `cfg.Stripe.ReturnUrl` |
+| Otherwise | 303 to a fresh Stripe Account Link, with `Cache-Control: no-store` |
+
+The fresh Account Link's refresh URL is the same stable link, so an expired Account Link mints a new one instead of landing on the marketing site. Because the signature binds the Stripe account ID, unlinking revokes every link sent for the old account.
+
+### Short link
+
+`fleetStripeOnboardingShareURL` wraps the stable link in a Dub short link and returns that:
+
+| Field | Value |
+| --- | --- |
+| Domain and key | `yelo.link`, `payouts-<random 16 bytes, base64url>` |
+| External ID | `fleet-stripe-onboarding:<fleet_id>`, one link per fleet |
+| Tag and folder | `fleet-stripe-onboarding`, `cfg.Dub.FleetFolderID` |
+| Title | `Set up payouts for <fleet name>` |
+| Description | `Connect <fleet name> to Stripe so Yelo can pay the fleet for its rides.` |
+| Image | The signed `fleet-payouts` OG card, when the OG base URL and signing secret are configured |
+| Proxy | On, so Dub serves the preview tags |
+
+Each create, refresh, and unlink moves the fleet's short link to a new random key (`MoveKey`), so the previous short link stops resolving. The short link is presentation only. If Dub isn't configured or the upsert fails, the API logs a warning and returns the stable link instead.
+
+The dashboard shows the stored link in the Stripe banner with **Copy link** and **Open**. Links stored before this change are raw `https://connect.stripe.com/` Account Links, and the banner asks the admin to refresh them.
+
+### Fleet payouts card
+
+The OG worker's `fleet-payouts` template reuses the [fleet invitation card](/engineering/fleets/joins-and-invitations#link-previews) layout: the Yelo wordmark on blue, the headline **Set up payouts for &lt;fleet&gt;** (or **Set up payouts for your fleet** without a name), and a **Stripe setup** pill. Its only parameter is the fleet name, `n`.
+
 ## Unlink
 
 `POST .../stripe/unlink` is allowed for admins and the fleet's managers, for fleet-merchant fleets only. `DashboardService.UnlinkStripe`:
 
 1. `cleanupOrphanedStripeAccount`: if exactly one non-deleted fleet (this one) uses the current account, deletes the account at Stripe. A delete failure is logged and ignored. Shared accounts are never deleted.
-2. Creates a new Express account and an Account Link. If the link fails, deletes the new account.
+2. Creates a new Express account and a new [onboarding link](#onboarding-links). If the link fails, deletes the new account.
 3. `SetDashboardFleetStripeMerchantID`: new account ID, `is_active = FALSE`.
 4. `UpdateFleetStripeStatus`: `pending` with the new onboarding URL.
 
@@ -170,9 +219,12 @@ After archive:
 | Repository | `yelo-api/internal/data/repository/dashboard.go` |
 | Handlers | `yelo-api/internal/server/http/community/community_handler.go`; routes in `community_router.go` (`registerFleetRoutes`) |
 | Request validation | `yelo-api/internal/server/http/community/requests/fleet.go` |
+| Onboarding links | `yelo-api/internal/service/dashboard/fleet_stripe_link.go`; `FleetPayoutsCardURL` in `yelo-api/internal/utilities/ogcard/url.go` |
 | Stripe client | `CreateFleetExpressAccount`, `GetExpressAccountOnboardingLink` in `yelo-api/internal/data/stripe/account.go` |
 | Webhook and reconciliation | `yelo-api/internal/service/payment/payment.go`, `reconciliation_jobs.go` |
 | Dashboard status badge | `yelo-web/src/sites/dashboard/pages/ManageFleetsPage.tsx` |
+| Dashboard Operations tab and settings form | `yelo-web/src/components/FleetDetailSheet.tsx`, `FleetFormSheet.tsx` |
+| Fleet payouts card | `yelo-web/workers/og/src/templates/fleet.tsx` |
 
 ## Gotchas and edge cases
 
@@ -182,7 +234,9 @@ After archive:
 - **Creation isn't atomic.** Pricing is seeded after the fleet commits. A pricing failure returns an error, but the fleet, its service row, and possibly its Stripe account exist.
 - **Price copy and expiry only see active coverage.** `copyPricingToFleet`, `copyPricingFromSourceFleet`, and `expirePricingForFleet` read `GetAllRidePriceParameters`, which joins `ActiveFleetCommunityServices`. A source fleet that is inactive or pending Stripe contributes nothing, and removing a vehicle type from an inactive fleet doesn't end its price row.
 - **Pricing tie-breaks are alphabetical.** `copyPricingToFleet` takes the first matching row from `ListDashboardRidePriceParameters`, ordered by fleet name, then vehicle type, then newest start time. A new fleet inherits prices from the alphabetically first fleet that prices the type.
-- **Fleet-merchant fleets without custom payouts are never ready.** Creating one with `has_custom_payouts = false` still creates a Stripe account, and the webhook will activate the fleet, but it can't accept joins and its drivers can't use fleet-managed payouts.
+- **Fleet-merchant fleets without custom payouts are never ready.** A fleet with `has_custom_payouts = false`, created through the API directly or before the dashboard derived the field, still gets a Stripe account, and the webhook will activate the fleet. It can't accept joins and its drivers can't use fleet-managed payouts. Saving its settings in the dashboard fixes it.
+- **Onboarding links are bearer credentials.** Anyone with an unexpired link can open onboarding for the fleet's Stripe account. Refreshing revokes only the short link. The stable link behind it stays valid until its `exp`, so unlink to revoke a leaked stable link.
+- **The create banner understates the link's lifetime.** The **Stripe Onboarding Link** banner on the fleet list still says the link expires in about 24 hours. The stable link works for 7 days.
 - **The Deleted badge is unreachable.** `ListDashboardFleets` filters `deleted_at IS NULL`, so the list never contains an archived fleet.
 - **Archive isn't reversible through the API.** Every write query filters `deleted_at IS NULL`, and there is no restore endpoint.
 - **Managers can archive their own fleet.** `DeleteFleet` uses `assertFleetAccess`, so the blockers are the only safeguard. See [Manager authorization](/engineering/fleets/dashboard-authorization).
