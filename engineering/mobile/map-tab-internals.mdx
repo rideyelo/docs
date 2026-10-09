@@ -293,9 +293,12 @@ Placement is off by default. A screen turns it on with `display.setSmartLabelPla
 
 ### Edge pointers
 
-`components/map/edgePointers/` draws bubbles at the edge of the map that point toward off-screen community POIs. The feature is disabled. `EDGE_POINTERS_ENABLED` in `components/map/edgePointers/constants.ts` is `false`, and `_layout.tsx` mounts `EdgePoiPointersLayer` only when it is `true`. The constant is a compile-time value, not a remote flag.
+`components/map/edgePointers/` holds two generations of edge UI.
 
-When enabled, the layer works like this:
+- **Map hints (current).** `_layout.tsx` mounts `EdgeMapHints` once the map overlays are ready, and only for users in the `map-hints` experiment (`useExperimentEnabled(EXPERIMENTS.mapHints)`). It shows live friends and pinned destinations along the map's side edges. The layout turns it off while a POI is selected, a focus is active, a request route is drawn, search is focused, or the off-peak or featured overlay is visible. See [Widgets and experiments](/engineering/mobile/widgets-and-experiments).
+- **POI pointers (unmounted).** `EdgePoiPointersLayer` draws bubbles that point toward off-screen community POIs. Nothing imports it, and nothing reads `EDGE_POINTERS_ENABLED` in `constants.ts`, which is still `false`.
+
+The unmounted POI pointer layer works like this:
 
 - `buildPointerFeatures` (`features.ts`) keeps POIs that are off-screen and within 8 km of the map center (`MAX_POINTER_DISTANCE_KM`), then takes the 5 nearest (`MAX_POINTERS`). It returns nothing below zoom 11 (`POINTER_MIN_ZOOM`, an alias of `PINNED_MIN_ZOOM`).
 - Each pointer sits where the ray from the center to the POI exits an inset rectangle. The top inset clears the safe area plus `MAP_TOP_UI_HEIGHT`, and the bottom inset follows the sheet's top edge. Each adds 5% of the center-to-edge distance. The sides use 30%. No inset exceeds 85% (`MAX_INSET_FRACTION`).
@@ -353,7 +356,8 @@ When the current community ID changes to a different non-empty value, the layout
 | Proximity detection | `yelo-frontend/hooks/useMarkerCenterProximity.ts` |
 | Request sheet geometry | `yelo-frontend/components/map/request/` (`sheetGeometry.ts`, `useRequestSheetSnaps.ts`, `useSheetMorphAnimations.ts`, `useRequestMapDrawing.ts`, `RideSheetMorph.tsx`, `afterKeyboardHidden.ts`) |
 | Label placement | `yelo-frontend/components/map/labelPlacement/` (`constants.ts`, `geometry.ts`, `placement.ts`, `useMarkerLabelPlacement.ts`), `components/map/customMapView/useMapLabelPlacement.ts`, `components/map/AnnotatedMarker.tsx` |
-| Edge pointers (disabled) | `yelo-frontend/components/map/edgePointers/` (`EdgePoiPointersLayer.tsx`, `features.ts`, `geometry.ts`, `pointerAnimation.ts`, `constants.ts`) |
+| Map hints (`map-hints` experiment) | `yelo-frontend/components/map/edgePointers/` (`EdgeMapHints.tsx`, `useHintTargets.ts`, `useHintTracking.ts`, `screenSlots.ts`, `freshness.ts`) |
+| POI edge pointers (unmounted) | `yelo-frontend/components/map/edgePointers/` (`EdgePoiPointersLayer.tsx`, `features.ts`, `geometry.ts`, `pointerAnimation.ts`, `constants.ts`) |
 
 ## Gotchas and edge cases
 
@@ -373,8 +377,8 @@ When the current community ID changes to a different non-empty value, the layout
   <Accordion title="Two meters-per-pixel constants">
     `lib/map/mapPanDismiss.ts` uses 78,271.5 m per pixel at zoom 0, which matches Mapbox's 512 px tiles. `hooks/useMarkerCenterProximity.ts` uses 156,543 m per pixel, the 256 px tile value. At the same zoom, the proximity radius converts to about twice the intended meters, so the pop triggers from roughly twice as far as `PROXIMITY_RADIUS_PX` suggests.
   </Accordion>
-  <Accordion title="Edge pointers are built but switched off">
-    `EDGE_POINTERS_ENABLED` is `false`, so `EdgePoiPointersLayer` never mounts. Flip the constant in `components/map/edgePointers/constants.ts` to enable it. Nothing else gates the layer.
+  <Accordion title="POI edge pointers are built but never mounted">
+    `_layout.tsx` mounts `EdgeMapHints` behind the `map-hints` experiment, not `EdgePoiPointersLayer`. Nothing reads `EDGE_POINTERS_ENABLED` anymore, so flipping the constant in `components/map/edgePointers/constants.ts` does nothing. To bring the POI pointers back, mount the layer again.
   </Accordion>
   <Accordion title="Two copies of MAP_TOP_UI_HEIGHT">
     `components/map/layout/constants.ts` exports `MAP_TOP_UI_HEIGHT = rem(8.375)`. `components/map/request/sheetGeometry.ts` declares a private copy with the same value. Change both together, or the request sheet's top snap drifts from the top bar.

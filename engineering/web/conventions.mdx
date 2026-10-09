@@ -45,7 +45,7 @@ yelo-web/
 
 Rules of thumb:
 
-- Code under `src/sites/<site>/` belongs to that site only. Do not import one site's code from another. The two exceptions are `maestro`, which reuses the signup Auth v3 page, and the dashboard's `InventoryPage`, which embeds the `maestro` viewer.
+- Code under `src/sites/<site>/` belongs to that site only. Do not import one site's code from another. The three exceptions are `maestro`, which reuses the signup Auth v3 page, the dashboard's `InventoryPage`, which embeds the `maestro` viewer, and `home`, which lazily imports the signup `auth-v3/touch` module to record attributed visits.
 - Everything else under `src/` is a shared library, imported through the `@/` alias, for example `@/components/ui/button`. Do not put site-specific code in shared directories.
 - Dashboard-only components can live in `src/sites/dashboard/components/`. Components reused across pages or sites go in `src/components/`, grouped by domain folder such as `kpi/`, `leads/`, or `notifications/`.
 - Pages live in `src/sites/dashboard/pages/`, one component per file, as a named export that matches the file name.
@@ -78,7 +78,7 @@ Other conventions visible across the codebase:
 
 ## Lint rules
 
-`pnpm lint` runs `oxlint --deny-warnings .` and then `eslint .`. `pnpm lint:type-aware` runs oxlint with type information from `.oxlintrc.typeaware.json`.
+`pnpm lint` runs `oxlint --deny-warnings .` and then `eslint .`. `pnpm lint:type-aware` runs oxlint with type information from `.oxlintrc.typeaware.json`, then `scripts/check-api-payloads.mjs`, which fails any request body that carries a field its generated request type lacks. See [API payload check](/engineering/qa/web-tests#api-payload-check).
 
 Oxlint enables the `correctness`, `suspicious`, and `perf` categories as errors, with the `react`, `typescript`, `unicorn`, `jsx-a11y`, `import`, `promise`, and `node` plugins. Notable rules:
 

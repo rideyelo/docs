@@ -122,7 +122,7 @@ One job, **Match production**, on Blacksmith 2 vCPU with a 25-minute timeout. It
 
 ### Benchmark isolated E2E API (`cloud-api-benchmark.yml`)
 
-- **Triggers:** `workflow_dispatch` only, with inputs `baseline_image` and `candidate_image` (required image digests), `manifest` (default `scripts/ride-replay/manifest.benchmark.json`), `iterations` (default `50`, 1 to 200), and `concurrency` (default `1`, 1 to 20).
+- **Triggers:** `workflow_dispatch` only, with inputs `baseline_image` and `candidate_image` (required image digests), `manifest` (default `scripts/ride-replay/manifest.benchmark.json`), `iterations` (default `10`, 1 to 200), and `concurrency` (default `1`, 1 to 20).
 - **Gate:** the job runs only when the variable `E2E_RELEASE_ENABLED` is `true`.
 - **Concurrency:** `e2e-api-convergence`, not cancelled. It shares the lock with **Converge E2E API**, so a benchmark and a convergence never change `yelo-api-e2e` at the same time.
 - **Permissions:** `contents: read`, `id-token: write`.
@@ -303,14 +303,16 @@ One job, **Backport OTA-safe pull request**, on `ubuntu-latest`, 10-minute timeo
 | `app_source` | `local`, `eas` | `local` |
 | `app_url` | EAS iOS simulator archive URL | Blank builds the current commit |
 | `flow` | Flow file or directory | `e2e/flows` |
-| `mode` | `flow`, `schedule` | `schedule` |
-| `suite` | Suite manifest | `e2e/suites/core-smoke.json` |
+| `mode` | `flow`, `schedule`, `sweep` | `schedule` |
+| `suite` | Suite manifest, for `schedule` mode | `e2e/suites/core-smoke.json` |
+| `sweep` | Sweep manifest, for `sweep` mode | `e2e/sweeps/product-inventory.json` |
 | `max_devices` | `1` to `10` | `8` |
+| `fresh_runner` | Boolean. A self-hosted diagnostic that builds a private XCTest runner | `false` |
 
 | Job | Runner | What it does |
 | --- | --- | --- |
 | `resolve-app` | `ubuntu-latest`, only when `app_source` is `eas` | Reuses a finished `e2e-simulator` iOS build for `GITHUB_SHA`, or builds one with `eas build --wait` |
-| `ios` | Self-hosted Mac or `macos-15`, 45-minute timeout | Gets the app (EAS download, or `eas build --local` with a per-SHA archive cache), verifies the embedded API with `scripts/e2e-app-target.mjs`, prepares simulators, and runs `scripts/e2e-scheduler.mjs` or `scripts/e2e-run.sh`. Uploads `e2e-<run_id>` from `.artifacts/e2e` (14 days) |
+| `ios` | Self-hosted Mac or `macos-15`, 45-minute timeout | Gets the app (EAS download, or `eas build --local` with a per-SHA archive cache), verifies the embedded API with `scripts/e2e-app-target.mjs`, runs `make inventory-check`, prepares simulators, and runs `scripts/e2e-scheduler.mjs` (`schedule` and `sweep` modes) or `scripts/e2e-run.sh` (`flow` mode). Uploads `e2e-<run_id>` from `.artifacts/e2e` (14 days) and `e2e-startup-<run_id>-<attempt>` startup diagnostics (7 days) |
 
 The local build reuses an older archive when the only changed paths are E2E runner files, such as `e2e/*`, `scripts/e2e-*`, the workflow itself, and top-level docs. Evidence is published only when `E2E_ARTIFACT_SUPABASE_SECRET_KEY` is set. See [Testing](/engineering/testing#mobile-e2e).
 

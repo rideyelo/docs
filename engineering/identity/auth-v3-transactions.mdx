@@ -243,7 +243,7 @@ The finisher sets the span attribute `authv3.outcome` and increments the counter
 | `step`, `stage`, `operation` | The step name. All three carry the same value |
 | `outcome` | `ok`, or the result of `outcomeFor` |
 | `result` | `success` or `failure` |
-| `failure_reason` | Empty on success. The same value as `outcome` on failure |
+| `failure_reason` | Empty on success. On failure, the same value as `outcome`, or a phone validation reason: `phone_parse_failed`, `phone_impossible`, `phone_invalid`, `phone_non_us`, or `phone_code_format` |
 
 `outcomeFor` returns the error's `ErrorType` for the API's own error type and the literal `error` for anything else. Labels are limited to these closed sets. Transaction IDs, user IDs, phone numbers, provider subjects, and IPs must never become labels.
 
@@ -260,7 +260,13 @@ Steps along the lifecycle on this page:
 | `resume` | `Resume` | [Resume](#resume) |
 | `profile` | `FinishProfile` | [Finish profile](#finish-profile) |
 
-The other recorded steps are `configuration`, `authorize_link`, `status`, and `community_resolve`. `StepSessionRefresh` (`session_refresh`) is declared, but no handler records it. `RecordTouch`, `RefreshSession`, `LogoutSession`, and the connected-identity and student-verification handlers don't call `handler.step`.
+The other recorded steps are `configuration`, `authorize_link`, `status`, and `community_resolve`.
+
+Two more steps record an issued redirect. After a successful `callback`, `phone_verify`, or `resume`, the finisher emits `handoff_issued` when the validated redirect carries a handoff code, or `phone_continuation_issued` when it continues to the phone step. `recordCallbackIssued` sets the disposition and never records the code.
+
+The finisher also writes one info log line, `authv3 step completed`, with `event`, `step`, `request_id`, `event_id` (`authv3:<request_id>:<step>`), `outcome`, `result`, `failure_reason`, `duration_ms`, and the carrier properties.
+
+`StepSessionRefresh` (`session_refresh`) is declared, but no handler records it. `RecordTouch`, `RefreshSession`, `LogoutSession`, and the connected-identity and student-verification handlers don't call `handler.step`.
 
 A handler built without `WithMetrics` uses `noopFunnelMetrics` and counts nothing. `internal/server/http/router.go` passes `WithMetrics(s.service.Metrics)` to the public, onboarding, and authenticated route sets.
 
@@ -280,17 +286,20 @@ Handlers learn the transaction ID partway through a request, after the request c
 | `attempt_id` | `recordAttempt`, in both packages |
 | `provider` | `recordFunnelProvider`, in the provider start, Google and Apple callback, and phone handlers |
 | `auth_surface` | `recordTransactionContext`. `native` for an app transaction with `native_phone_step`, otherwise `hosted` |
-| `is_test`, `is_internal` | `recordUserClassification`, after resolution. `is_internal` is true for an `@rideyelo.com` email. The email itself is never recorded |
+| `is_test`, `is_internal`, `classification_state` | `recordUserClassification`, after resolution. It sets `classification_state` to `known`. `is_test` is true for a test user or a reserved `+1 555` phone. `is_internal` is true for an `@rideyelo.com` email. The email itself is never recorded |
+| `phone_country`, `failure_reason` | `resolvePhoneInput` in the phone send and verify paths. `phone_country` is the numbering-plan region or `unknown`. A reserved test phone also sets `is_test` and `classification_state` here |
 
 The transaction ID and attempt ID also go onto the span as `authv3.transaction_id` and `authv3.attempt_id`, so one ID is enough to find the server trace.
 
 ### PostHog event
 
-`PostHogMetricsProvider.enqueueCapture` in `internal/utilities/metrics/posthog.go` reads the carrier. For `authv3.step`, it adds `event_schema_version: 2`, `surface: api`, `platform: server`, `environment`, and every carrier property. It adds `transaction_id` and `request_id` when they are known.
+`PostHogMetricsProvider.enqueueCapture` in `internal/utilities/metrics/posthog.go` reads the carrier. For `authv3.step`, it adds `event_schema_version: 3`, `classification_state: unknown` (until the carrier overrides it), `surface: api`, `platform: server`, `environment`, and every carrier property. `is_test` and `is_internal` are sent as booleans. It adds `transaction_id` and `request_id` when they are known, and sets `$insert_id` to `authv3:<request_id>:<step>`.
 
-The distinct ID is the authenticated user ID when the request has one. Otherwise it is the transaction ID, and with neither it is the shared server identity. The last two set `$process_person_profile: false`, so one sign-in's steps share an ID without creating a person.
+The distinct ID is the transaction ID whenever the request has one, including authenticated requests. Without a transaction it is the authenticated user ID, and with neither it is the shared server identity. The transaction and shared-identity cases set `$process_person_profile: false`, so one sign-in's steps share an ID without creating a person.
 
-The carrier properties reach only PostHog. They never become counter labels.
+The carrier properties reach PostHog and the step log line. They never become counter labels, except a phone validation reason, which replaces `failure_reason`.
+
+Responses on `/authv3` routes also read the carrier. See [Response envelopes](/engineering/api/request-lifecycle#response-envelopes).
 
 ### Coarse location for acceptance
 

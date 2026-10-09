@@ -85,7 +85,7 @@ The heatmap fades out as you zoom in. Opacity interpolates from 0.55 at zoom 10 
 | Community zones | 5 minutes while a live map is visible | `providers/QueryPollers.tsx` |
 | Ride map details | 3 seconds for riders during an active ride | `providers/RideProvider.tsx` |
 
-Layer query keys append the community ID (and user ID for friends), so switching community never replays the previous community's cached layer. POIs, friends, and likes are also invalidated on map entry (`refreshMapContent`) and by `map_content_changed` pushes. Pollers pause in the background.
+Layer query keys append the community ID (and user ID for friends), so switching community never replays the previous community's cached layer from React Query. The app also sends `Cache-Control: no-cache` on `GET /map/community` and `GET /map/vehicles` (`MAP_LAYER_REQUEST` in `lib/map/mapLayers.ts`). The API serves both with `private, max-age` on a URL that every community shares, and iOS URL caching ignores the `Authorization` header. Without the request header, a community switch replayed the previous community's heat cells, top locations, and moves from the device HTTP cache. POIs, friends, and likes are also invalidated on map entry (`refreshMapContent`) and by `map_content_changed` pushes. Pollers pause in the background.
 
 ## Vehicle animation
 

@@ -58,11 +58,14 @@ In E2E mode the four cross-transaction maxima are multiplied by 100 (`authV3Phon
 ### Send, step by step
 
 <Steps>
-  <Step title="Normalize">
-    `NormalizeUS` in `internal/service/authv3/phone/policy.go` accepts only numbers that libphonenumber considers valid for the US and that format back to the same E.164 value. `+1 555` numbers bypass that check because they are reserved test numbers.
+  <Step title="Authenticate the request secret">
+    `resolvePhoneInput` looks up the transaction by request secret first. A bad secret fails here, before the number is looked at.
   </Step>
-  <Step title="Authenticate the transaction">
-    The request secret must be valid, the transaction unexpired, and legal acceptance current. The transaction must be phone `provider_pending`, a `verified` app Google or Apple transaction whose user still has no phone, or `pending` or `provider_pending` (which is re-pointed to phone).
+  <Step title="Normalize">
+    `NormalizeUSWithReason` in `internal/service/authv3/phone/policy.go` parses the input with region US. It rejects, in order, input that doesn't parse, impossible numbers, invalid numbers, and numbers that aren't valid for the US. It returns the E.164 form. `+1 555` numbers bypass the validity checks because they are reserved test numbers. A rejection returns 400 **invalid US phone number** and records the reason (`phone_parse_failed`, `phone_impossible`, `phone_invalid`, or `phone_non_us`) as the step's `failure_reason`.
+  </Step>
+  <Step title="Check the transaction state">
+    The transaction must be unexpired and legal acceptance current. The transaction must be phone `provider_pending`, a `verified` app Google or Apple transaction whose user still has no phone, or `pending` or `provider_pending` (which is re-pointed to phone).
   </Step>
   <Step title="Reserve atomically">
     One Postgres transaction reserves the phone and requester counters in sorted order, then upserts the `AuthPhoneAttempts` row (`ReservePhoneSend`). If any gate fails, everything rolls back, so a denied request consumes nothing.

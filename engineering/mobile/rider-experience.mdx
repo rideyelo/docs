@@ -57,7 +57,7 @@ import { BumpFriendsButton } from '@/components/design-system/BumpFriendsButton'
 <BumpFriendsButton onPress={() => router.push({ pathname: '/(app)/(tabs)/map/request', params: { bump: 'true' } })} />
 ```
 
-With `bump: 'true'` and no destination yet, the request screen first opens the change-stop sheet on the destination stop. Once a destination is set, it dismisses the keyboard and presents the bump sheet. The Moves rail bump card, the friends list, and a friend's profile push the same route. See [Social and contacts](/engineering/mobile/social-and-contacts).
+With `bump: 'true'` and no destination yet, the request screen first opens the change-stop sheet on the destination stop. Once a destination is set, it dismisses the keyboard and presents the bump sheet. If you dismiss the change-stop sheet without picking a destination, the screen goes back, or replaces to the map when there is nothing to go back to. The Moves rail bump card, the friends list, and a friend's profile push the same route. See [Social and contacts](/engineering/mobile/social-and-contacts).
 
 The map layout hides this row while the featured spot dock shows, while a ride request route is active, and while the nav bar is hidden.
 
@@ -305,13 +305,13 @@ Whenever the stop identity changes (`rideStopsKey`: coordinates plus `provider`,
 
 <Steps>
   <Step title="Validate stops">
-    Only coordinates are required. A stop without a name or address is sent as a coordinate stop. A missing pickup coordinate opens the change-stop sheet in pickup mode with "Choose where your driver should meet you." A missing dropoff coordinate opens it in destination mode with "Choose where you want to arrive."
+    Only coordinates are required. A stop without a name or address is sent as a coordinate stop. A missing pickup coordinate opens the change-stop sheet in pickup mode with "Choose where your driver should meet you." A missing dropoff coordinate opens it in destination mode with "Choose where you want to arrive." When pickup and destination have identical coordinates, the app doesn't call the API. It opens the sheet in destination mode with "Pickup and destination are the same place. Choose a different destination."
   </Step>
   <Step title="Check the app version">
     `ensureRideEntryVersion()` calls `/update-required`. See [Releases](/engineering/mobile/releases#update-required-gate).
   </Step>
   <Step title="Get distance and duration">
-    `POST /mapping/distance`. A null result fails with "Could not calculate your route. Please try again."
+    `POST /mapping/distance`. A null result, or a non-finite distance or duration, fails with "Could not calculate your route. Please try again."
   </Step>
   <Step title="Serialize and re-check status">
     Writes queue behind the previous one. A fresh `/user/status` must show no ride, or a `requested` or `complete` ride. Otherwise: "You already have a ride. Return to your current ride to continue."

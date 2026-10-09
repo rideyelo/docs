@@ -242,9 +242,9 @@ Timing averages are `null` when no row qualifies.
 | `user_signups` | Qualifying users with `COALESCE(profile_completed_at, created_timestamp)` in the window |
 | `driver_signups` | Active applications with `COALESCE(activated_at, created_timestamp)` in the window |
 | `completes`, `gmv` | Same as global KPIs, windowed on `request_time` |
-| `incompletes` | `no_drivers_available`, or canceled with no driver and not `requested`, or not in `complete`, `pending_rider_rating`, `requested` with no cancel and requested more than 1 hour before the window end |
+| `incompletes` | Confirmed (`confirm_time IS NOT NULL`) and not `superseded`, and one of: `no_drivers_available`, or canceled with no driver and not `requested`, or not in `complete`, `pending_rider_rating`, `requested` with no cancel and requested more than 1 hour before the window end |
 
-`incompletes` is looser than the market `ride_uncompletes`. It does not require `confirm_time`, does not exclude `superseded`, and its stale branch does not require `driver_id IS NULL`. A ride stuck `in_progress` with a driver for more than an hour counts on **Live** but not on **Rides** > **KPIs**.
+`incompletes` shares its base with the market `ride_uncompletes`: both require `confirm_time` and exclude `superseded`. It is still looser in one way. Its stale branch does not require `driver_id IS NULL`. A ride stuck `in_progress` with a driver for more than an hour counts on **Live** but not on **Rides** > **KPIs**.
 
 ### Competitor prices
 
@@ -526,7 +526,7 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 - **`active` and `completed` overlap.** The rides `active` filter includes `pending_rider_rating`, which `completed` also includes. `active` also includes `requested` and `no_drivers_available`.
 - **Rides search treats `%` and `_` as wildcards.** `GetDashboardRides` (`data/repository/dashboard_rides.go`) does not escape them, unlike the user directory search.
 - **`has_active` never expires.** `HasActiveDashboardRides` counts any uncanceled ride that isn't `complete`, with no time bound, so stale `no_drivers_available` or `pending_rider_rating` rows keep the Trips tab on its 10-second poll. Every `GET /dashboard/rides` call runs it, including the two **Live** ride polls.
-- **Live and Rides use different completion math.** **Live** `completion_rate` divides by every request, including unconfirmed `requested` rows. Market `completion_rate` divides by confirmed, non-superseded requests. **Live** `incompletes` is also looser than market `ride_uncompletes`.
+- **Live and Rides use different completion math.** **Live** `completion_rate` divides by every request, including unconfirmed `requested` rows. Market `completion_rate` divides by confirmed, non-superseded requests. **Live** `incompletes` requires confirmation and excludes superseded searches like market `ride_uncompletes`, but also counts stale rides that have a driver.
 - **Zero-baseline percentages disagree.** `computeKPIValue` returns 0 when the previous value is 0, while `calculateKPI` returns 100. The **Live** page hides the percentage in that case; other pages show 100%.
 - **`all_time` comparisons are empty.** `calculateTimeRanges` gives `all_time` a previous window that ends at 2020-01-01, so every non-zero KPI shows +100% on the Rides **KPIs** tab, **Community** page, and fleet overview.
 - **Three definitions of unmatched.** `unmatched_requests` on market summaries counts `confirmed` plus non-superseded `no_drivers_available` over 24 hours. Live analytics `unmatched` counts only `no_drivers_available` in the period. Presence counts only `confirmed` within the request expiry.

@@ -72,7 +72,7 @@ Production service settings that aren't in `cloudbuild.yaml` are carried over fr
 | `yelo-api-migrate` | `cloudbuild.yaml`, only when the migration version changes | `yelo-images/yelo-api/yelo-api-migrate@<digest>` | `MIGRATION_DSN` from `yelo-api-migration-dsn` |
 | `yelo-api-e2e-migrate` | `cloudbuild.e2e.yaml` | `yelo-images/yelo-api-e2e-migrate@<digest>` | `MIGRATION_DSN` from `yelo-e2e-dsn` |
 
-The project also has hand-made jobs named `yelo-e2e-1271-*` (`-migrate`, `-create`, `-redis-probe`, and variants for `integration`, `rebased`, and `snapshot`). They belong to isolated ride-recovery candidate environments described in `yelo-api/docs/E2E_CONTROL_PLANE.md`. No workflow creates or runs them.
+The project also has hand-made jobs named `yelo-e2e-1271-*` (`-migrate`, `-create`, `-redis-probe`, and variants for `integration`, `rebased`, and `snapshot`). They belong to isolated ride-recovery candidate environments. No workflow creates or runs them.
 
 ### Cloud Build triggers
 
@@ -201,9 +201,9 @@ Three Workers in `yelo-web/workers/` run on the zones `rideyelo.com` and `joinye
 
 | Worker (`name`) | Directory | Routes | Vars |
 | --- | --- | --- | --- |
-| `yelo-experience-router` | `workers/experience-router` | `joinyelo.com` and `www.joinyelo.com`: `/auth/v3*`, `/pay/tip*`, `/world-cup/claim*`, `/_yelo/signup/*` | `SIGNUP_ORIGIN=https://yelo-signup.web.app` |
+| `yelo-experience-router` | `workers/experience-router` | `joinyelo.com/*` and `www.joinyelo.com/*`. It proxies `/auth/v3`, `/pay/tip*`, `/i/*`, `/get`, `/e/*`, and `/_yelo/signup/*`, and passes every other path through to the home site | `SIGNUP_ORIGIN=https://yelo-signup.web.app` |
 | `yelo-og` | `workers/og` | `rideyelo.com/og/*`, `www.rideyelo.com/og/*` | `ENVIRONMENT=production`. CPU limit raised to 30,000 ms for PNG rendering |
-| `yelo-world-cup-router` | `workers/world-cup-router` | `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com`: `/world-cup*` | `WORLD_CUP_ORIGIN=https://yelo-world-cup.web.app`, `WORLD_CUP_API_ORIGIN=https://api.rideyelo.com` |
+| `yelo-world-cup-router` | `workers/world-cup-router` | `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com`: `/world-cup*`. The campaign is offline, so it redirects these paths to `https://joinyelo.com/` | `WORLD_CUP_ORIGIN=https://yelo-world-cup.web.app`, `WORLD_CUP_API_ORIGIN=https://api.rideyelo.com` (set but no longer read) |
 
 The `yelo-web` **Workers** workflow deploys a worker when a merge to `main` changes that worker's own directory. A change to only shared dependencies is verified but not deployed, and you ship it with **Actions → Workers → Run workflow**. `pnpm worker:<name>:deploy` still works by hand. See [GitHub Actions workflows](/engineering/ci/workflows) for the workflow and [Edge and routing](/engineering/web/edge-and-routing) for behavior and the `OG_SIGNING_SECRET` Wrangler secret.
 

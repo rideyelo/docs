@@ -87,11 +87,19 @@ Don't add scenario rows to the seed. Rows that no run owns leak across tests and
 | `GET /internal/e2e/runs/{id}` | `e2e.GetRun` | Read run state, actors, fixtures, and the owned ride |
 | `POST /internal/e2e/runs/{id}/ride-transition` | `e2e.TransitionRide` | Advance a ride fixture through a production command |
 | `POST /internal/e2e/runs/{id}/benchmark-presence` | `e2e.RefreshBenchmarkPresence` | Put a benchmark run's fixture drivers back online and return how many |
+| `POST /internal/e2e/runs/{id}/payment-fault` | `e2e.PaymentFault` | Arm or release a Stripe fault on a paid fixture. `kind` is `tip_create_loss`, `tip_confirm_loss`, or `tip_receipt_failure`, with `release` to clear it |
+| `POST /internal/e2e/runs/{id}/response-fault` | `e2e.ResponseFault` | `action` `arm`, `inspect`, or `release` for `surface` `status` or `details`. Captures a real response and replays it stale to the same rider and ride |
+| `GET /internal/e2e/runs/{id}/provider-observation` | `e2e.ObserveProvider` | Read Stripe aggregates for the run: tip intents, tip charges, tip cents, payout cents, and fare callbacks |
+| `POST /internal/e2e/runs/{id}/replay-fare-success` | `e2e.ReplayFareSuccess` | Replay the fare success callback for the run's captured fare and return the same aggregates, to prove a duplicate callback doesn't change the payout |
+| `GET /internal/e2e/runs/{id}/rider-responses` | none | For an `auth_existing_rider` run, call six production GET handlers in process as the rider (`/community/current`, `/community/feed`, `/map/community`, `/map/friends`, `/user/friends`, `/user/likes`) and return statuses, counts, and body hashes, never bodies |
+| `GET /internal/e2e/runs/{id}/signup-prerequisites` | none | The same observer for `/user/current-user`, `/community/current`, `/vehicle/`, `/user/status`, and `/vehicle-types` |
 | `DELETE /internal/e2e/runs/{id}` | `e2e.DeleteRun` | Delete everything the run owns |
 
 ### Create a run
 
 The request body is `{"scenario": "...", "idempotency_key": "..."}`. The key is required and at most 200 characters. A repeated key returns the existing run instead of creating a new one.
+
+An optional `payment_fixture` turns a `ride_confirmed_rider` run into a paid ride. Values are `cancel_hold`, `cancel_fee`, `buffered_tip`, `late_tip`, `late_tip_auth`, and `review_tip_auth`. It is rejected with any other scenario or with `benchmark`. The run gets a driver and its own Stripe test customer, connected account, saved card, and manual authorization on a $12 fare. Setup progress is stored in `E2ERuns.metadata`. The response adds `payment_ready`. While Stripe is still verifying the test account it is `false`, so repeat the same request until it is `true` before you start the device. See `internal/server/http/e2econtrol/README.md` in `yelo-api`.
 
 An optional `benchmark` object (`fleets` 1 to 6, `drivers_per_fleet` 0 to 10, `pricing_tiers` 1 to 8, `varied_pricing`) is accepted only with `auth_existing_rider`. It adds fleets, online drivers, and tiered pricing to the run's community for the [ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-benchmark-replays). Deleting the run also removes the extra fleets and drivers.
 
@@ -117,7 +125,7 @@ Phones are deterministic: `+1555` plus seven digits from an FNV-32a hash of the 
 | --- | --- | --- | --- |
 | `auth_existing_rider` | Rider | Idle | none |
 | `auth_rider_driver_pair` | Rider, driver | Both idle | `prepare_assignment`, `accept`, `prepare_idle_assignment`, `auto_assign`, `prepare_idle_queue`, `recover_idle_queue` |
-| `ride_confirmed_rider` | Rider | One free, unassigned `confirmed` ride from `E2E Pickup` to `E2E Destination`. `metadata.ride_id` records it. | none |
+| `ride_confirmed_rider` | Rider. Rider and driver with `payment_fixture` | One free, unassigned `confirmed` ride from `E2E Pickup` to `E2E Destination`. `metadata.ride_id` records it. With `payment_fixture`, the ride is paid and starts in the state that fixture needs, for example `cancel_fee` at driver waiting and `buffered_tip` at pending rider rating. | none |
 | `ride_queued_pair` | Rider, driver, plus a fixture-only `Active Rider` | The driver is online with an open `DriverSessions` row and serves a free `in_progress` ride for the active rider. The main rider's confirmed ride is `queued` to that driver with pickup PIN `1234`. No Redis queue state is written, so the app must rebuild the queue from the database. | none |
 | `ride_notification_rider` | Rider | Idle, so the app can request notification permission first | `prepare`, `expire` |
 
@@ -134,6 +142,9 @@ Phones are deterministic: `+1555` plus seven digits from an FNV-32a hash of the 
     - `prepare_assignment` creates a confirmed, unassigned ride for the rider, puts the driver online serving an in-progress ride for a new active rider, and bumps both users' revisions.
     - `prepare_idle_assignment` does the same, then completes the driver's active ride and sets `auto_queue = true`, so the driver is idle and auto-queue eligible.
     - `prepare_idle_queue` also seeds the ride as `queued` and `auto_queued` to the driver's open session, simulating a stranded idle queue.
+    - `prepare_driver_acceptance` seeds the same waiting ride as `prepare_assignment` but keeps it off the driver's fleet board, so the real driver can finish sign-in first.
+    - `publish_assignment` puts that deferred ride on the run's fleet board. It doesn't assign the driver, and it accepts only a free, confirmed, unassigned ride.
+    - `observe_accept` calls no service. It only checks that the ride is already `queued` to this driver, after the real driver accepted it in the app.
     - `accept` calls the production `RideService.AcceptRide` as the driver.
     - `auto_assign` calls `RideService.AutoAssignRide`.
     - `recover_idle_queue` calls `RideService.RecoverIdleQueue`.
@@ -144,7 +155,7 @@ Phones are deterministic: `+1555` plus seven digits from an FNV-32a hash of the 
 
 ### Cleanup
 
-`DELETE` runs one transaction and is idempotent. An already `cleaned` or `expired` run returns as is.
+`DELETE` runs one transaction and is idempotent. An already `cleaned` or `expired` run returns as is. For a run with a `payment_fixture`, cleanup first takes a session advisory lock and resolves any Stripe setup call whose result is unknown. Inside the delete it removes the run's connected account and customer and detaches the card. If a Stripe cleanup call fails, the database delete rolls back so you can retry.
 
 <Steps>
   <Step title="Lock owned rides">
@@ -209,11 +220,26 @@ Every flow signs in through the real screens: `get-started`, `method-phone`, `ph
 
 ### Suites
 
-A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`, and an optional `coverageCatalog`. Each test has a unique `id`, a `scenario`, and one to ten `roles`, each with `name`, `actor`, `flow`, and optional `startDelayMs` or `startAfterTransition`. Tests can also declare:
+A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`, an optional `coverageCatalog`, and an optional `purpose` of `e2e` (the default) or `capture-only`. A capture-only suite exists to screenshot product surfaces for the [product inventory](#product-inventory). It can't declare a `coverageCatalog`, `expectedRide`, or `rideTransitions` (`scripts/e2e-capture-purpose.mjs`).
+
+Each test has a unique `id`, a `scenario`, and one to ten `roles`. Each role has `name`, `actor`, `flow`, and these optional fields:
+
+- `startDelayMs` or `startAfterTransition` to stagger startup.
+- `startAfterCheckpoint`: `{role, screenshot}`. The role starts only after another role in the test writes that exact screenshot.
+- `locationPermission`: `always`, `foreground`, or `denied`.
+
+`loadSuiteDefinition` in `scripts/e2e-suite.mjs` validates all of this when the suite loads. Tests can also declare:
 
 - `freshDeviceState: true` to erase and reinstall the leased simulators before the fixture is created. Use it when the flow depends on OS state, such as notification permission or URL hand-off approval.
 - `rideTransitions`: an ordered list of `{role, action, afterScreenshot, notification}`. The scheduler calls the transition after the role writes `afterScreenshot`. With `notification`, it injects the payload from `e2e/notifications/*.json` into the simulator only after the transition commits. A payload whose `body.ride_id` is the literal `${FIXTURE_RIDE_ID}` is bound first: `bindRideTransitionNotification` replaces it with the committed fixture ride's ID and adds that ride's `status`. `ride-status-changed.json` (`type: ride_status_changed`) is the only payload that uses the placeholder, so the app runs its normal push invalidation against the real ride. `ride-canceled.json` and `ride-confirmed.json` are static tap payloads.
 - `expectedRide`: `{status, cancel_phase, cancel_user}`, with exactly those three keys. After the roles finish, the scheduler reads the fixture run, writes `ride-observation.json` beside the roles' evidence, and fails the test unless the ride matches. `validateRideExpectation` in `scripts/e2e-ride-assertions.mjs` rejects outcomes the scenario can't reach when the suite loads.
+- `paymentFixture`: `cancel_hold`, `cancel_fee`, `buffered_tip`, `late_tip`, `late_tip_auth`, or `review_tip_auth`. It asks the fixture for a paid ride in that state. It is valid only on `ride_confirmed_rider`, needs both `expectedRide` and `expectedFinancial`, and can't be combined with `rideTransitions`.
+- `expectedFinancial`: nonnegative integer assertions on the ride's financial journal, checked with `expectedRide`. It must include `pending_operations`, `quarantined_operations`, `undelivered_operations`, and `unresolved_steps`. It can also set `succeeded_operations`, `min_succeeded_operations`, `failed_operations`, `capture_count`, `captured_cents`, `void_count`, and `dedicated_tip_cents`.
+- `paymentFault`: `{kind, role, afterScreenshot}`, where `kind` is `tip_create_loss`, `tip_confirm_loss`, or `tip_receipt_failure`. It is valid only with `paymentFixture: late_tip`. The scheduler arms the fault on the fixture, waits for the role to write `afterScreenshot`, releases it, and writes `payment-fault.json` beside the evidence. The flow then recovers through the real button.
+- `responseFault`: `{surface, role, afterScreenshot}`, where `surface` is `status` or `details` and the role is a rider. It needs `rideTransitions`. The fixture captures a real response from before the transition, replays it afterward, and releases only once the app shows the changed state. `response-fault.json` records each step.
+- `riderResponses`: `empty-map-social` or `signup-drafts`. It makes the run observe the fixture rider's own API responses (`scripts/e2e-rider-responses.mjs`), so an empty-state capture is backed by what the API returned. It is valid only for a single-rider `auth_existing_rider` test without a `responseFault`, and `signup-drafts` also needs a capture-only suite.
+
+`rideTransitions` entries also accept `notificationRole`, which names the rider role that receives the injected payload. On `auth_rider_driver_pair`, a three-step list of `prepare_driver_acceptance`, `publish_assignment`, and `observe_accept` lets the driver accept on the real request card. `observe_accept` only checks the committed assignment.
 
 | Suite | Tests | Scenarios |
 | --- | --- | --- |
@@ -229,8 +255,36 @@ A suite is a JSON manifest with `schemaVersion: 1`, a `name`, a list of `tests`,
 | `ride-driver-requeue.json` | Driver cancels before pickup | `ride_queued_pair` |
 | `ride-coordinate-stops.json` | Addressless POI ride options | `auth_existing_rider` |
 | `ride-financial-cutover.json` | Nine tests in one run, reusing the test IDs of the recovery, queued-cancellation, queue-promotion, driver-requeue, and auto-queue suites: confirmed restart and abort cancels, queued rider cancel, promotion after the driver completes or cancels, driver cancel before pickup, and the three idle auto-queue cases. Every test sets `expectedRide`. The auto-queue tests inject `ride-status-changed.json` after each transition | `ride_confirmed_rider`, `ride_queued_pair`, `auth_rider_driver_pair` |
+| `ride-paid-financial.json` | Three paid rides: cancel and release the hold, cancel while the driver waits and capture the $9 fee, and a buffered tip captured with the fare. Every test sets `paymentFixture` and `expectedFinancial` | `ride_confirmed_rider` |
+| `ride-tip-payment.json` | Late tip, tip that needs authentication, authentication retry, and a tip from the review screen that needs authentication | `ride_confirmed_rider` |
+| `ride-payment-failure-recovery.json` | A lost tip create response, a lost tip confirm response, and a failed tip receipt write, each through `paymentFault` | `ride_confirmed_rider` |
+| `ride-notification-stale-recovery.json` | Auto-expiry with a stale status response, and queued assignment with stale ride details, each through `responseFault` | `ride_notification_rider`, `auth_rider_driver_pair` |
+| `ride-driver-acceptance-notification.json` | The driver accepts on the real request card, then the rider taps the assignment notification | `auth_rider_driver_pair` |
+| `ride-live-activity.json` | Rider and driver reach `driver_waiting` with the Live Activity showing | `ride_queued_pair` |
+
+`e2e/suites` also holds 16 `product-*.json` suites that capture screens for the [product inventory](#product-inventory). Nine of them are capture-only: `product-driver-hub-inventory`, `product-map-social-inventory`, `product-native-support-personal-inventory`, `product-next-static-inventory`, `product-route-inventory`, `product-school-entry-inventory`, `product-settings-core-inventory`, `product-signup-draft-inventory`, and `product-social-inventory`. The other seven are `product-browse-validation`, `product-capture-expansion`, `product-dense-inventory`, `product-nonride-inventory`, `product-provider-errors`, `product-ride-tools`, and `product-settings-drafts`.
 
 `e2e/suites/ride-notification-regressions.md` is a plan, not a runnable suite.
+
+### Sweeps
+
+A sweep runs several suites through one device queue. Each file in `e2e/sweeps` has `schemaVersion: 1` and a `suites` list of `{path, testIds}`, where `testIds` is optional and selects tests from that suite. `loadSweepDefinition` in `scripts/e2e-sweep.mjs` loads every member with the normal suite validation and rejects two members with the same suite name. Results keep each test's original suite name, so coverage and inventory joins still work.
+
+Set `E2E_SWEEP` to the sweep path when you start `scripts/e2e-scheduler.mjs`, or run the **Mobile E2E** workflow with `mode: sweep`. No Makefile target sets it. To run part of a single suite without a sweep, set `E2E_TEST_IDS` to a comma-separated list of test IDs. The scheduler rejects `E2E_TEST_IDS` together with `E2E_SWEEP`.
+
+`e2e/sweeps/product-inventory.json` is the workflow's default sweep. It runs `core-smoke`, `product-nonride-inventory`, and ten ride suites.
+
+### Product inventory
+
+`e2e/inventory/product.json` is the registry of product surfaces and journeys that the [evidence viewer](#evidence-viewer) joins to captures. `scripts/e2e-inventory.mjs` builds a catalog from the registry, the app's routes, and every suite:
+
+| Target | Command | Result |
+| --- | --- | --- |
+| `make inventory-check` | `node scripts/e2e-inventory.mjs check` | Validates the registry and that every app route is registered. Prints the surface, flow, and route counts. `make test` and the **Mobile E2E** workflow both run it. |
+| `make inventory-export OUTPUT=<path>` | `node scripts/e2e-inventory.mjs export <path>` | Writes the catalog to a file. The default is `.artifacts/e2e/inventory/catalog.json`. |
+| `make inventory-publish` | `node scripts/e2e-inventory.mjs publish` | Uploads the catalog to `inventory/catalog.json` in the `e2e` bucket (`E2E_ARTIFACT_BUCKET`). It needs `SUPABASE_URL` and `SUPABASE_SECRET_KEY`, and refuses to run from a checkout with uncommitted changes. |
+
+Each run manifest also gets an `inventoryEvidence` block (`buildInventoryEvidence`, called from `scripts/e2e-artifacts.mjs`), which ties the run's captures to a catalog hash.
 
 ### Scheduler
 
@@ -276,10 +330,10 @@ A suite with `coverageCatalog` (such as `e2e/coverage/ride-workflows.json`) also
 
 The `maestro` site in `yelo-web` (`src/sites/maestro`) is the viewer, deployed to `https://yelo-maestro.web.app`. The hostname is historical: no Maestro runs anywhere.
 
-- The default view is the product inventory (`ProductInventory.tsx`): app screens, states, and flows joined to captures from these runs. `?view=screens` and `?view=flows` select its two sections. The dashboard embeds the same viewer at `/inventory` for admins. See [Inventory](/dashboard/inventory) and [Public sites](/engineering/web/public-sites#maestro).
+- The default view is the product inventory (`ProductInventory.tsx`): app screens, states, and flows joined to captures from these runs. `?view=screens` and `?view=flows` select its two sections. `?view=previews` opens a gallery of the `og` Worker's link-preview cards, which doesn't use run data. The dashboard embeds the same viewer at `/inventory` for admins. See [Inventory](/dashboard/inventory) and [Public sites](/engineering/web/public-sites#maestro).
 - `?view=runs` lists runs from `<ARTIFACT_ROOT>/index.json` with **all**, **failed**, and **passed** filters. Pins are stored in `localStorage` under `e2e-report:pins`.
 - `?run=<run-id>` opens `RunViewer`, which loads `<ARTIFACT_ROOT>/runs/<run-id>/` and shows each test and role's recording beside a searchable action log that seeks the video. `&execution=<testId>:<role>` selects a role and `&t=<seconds>` seeks.
-- The inventory reads its catalog from `<ARTIFACT_ROOT>/inventory/catalog.json` and falls back to the `product-catalog.json` bundled with the viewer. No script on `yelo-frontend` `main` writes that object.
+- The inventory reads its catalog from `<ARTIFACT_ROOT>/inventory/catalog.json` and falls back to the `product-catalog.json` bundled with the viewer. `make inventory-publish` in `yelo-frontend` writes that object by hand. No workflow publishes it. See [Product inventory](#product-inventory).
 - `WorkflowCoverage.tsx` shows mapped and verified percentages.
 - `ARTIFACT_ROOT` is `VITE_E2E_ARTIFACT_BASE_URL` when set, otherwise `<VITE_SUPABASE_URL>/storage/v1/object/public/e2e`.
 - The site also serves `/auth/v3`, a copy of the hosted Auth v3 page built against `VITE_E2E_API_URL` with the `com.rideyelo.e2e` scheme. Its `firebase.json` sets `no-store` and a strict CSP for that path. See [Sites](/engineering/web/sites#maestro).
@@ -334,10 +388,12 @@ There are no persistent E2E accounts. Each test gets new actors from its fixture
     | `runner` | `self-hosted`, `github-hosted` (paid) | `self-hosted` |
     | `app_source` | `local`, `eas` | `local` |
     | `app_url` | EAS simulator archive URL | blank: build the commit |
-    | `mode` | `flow`, `schedule` | `schedule` |
+    | `mode` | `flow`, `schedule`, `sweep` | `schedule` |
     | `flow` | Flow file or directory | `e2e/flows` |
-    | `suite` | Suite path | `e2e/suites/core-smoke.json` |
+    | `suite` | Suite path, for `schedule` mode | `e2e/suites/core-smoke.json` |
+    | `sweep` | Sweep path, for `sweep` mode. See [Sweeps](#sweeps). | `e2e/sweeps/product-inventory.json` |
     | `max_devices` | 1 to 10 | 8 |
+    | `fresh_runner` | Boolean. A self-hosted diagnostic that builds a private XCTest runner. | `false` |
 
     ```bash
     gh workflow run e2e-agent-device.yml --repo rideyelo/yelo-frontend --ref main \
@@ -345,7 +401,7 @@ There are no persistent E2E accounts. Each test gets new actors from its fixture
       -f suite=e2e/suites/core-smoke.json -f max_devices=8
     ```
 
-    The self-hosted runner has labels `self-hosted`, `macOS`, `ARM64`, and `yelo-e2e`. Run one runner process only. Artifacts upload as `e2e-<github-run-id>` for 14 days.
+    The self-hosted runner has labels `self-hosted`, `macOS`, `ARM64`, and `yelo-e2e`. Run one runner process only. The job runs `make inventory-check` before it schedules anything. Artifacts upload as `e2e-<github-run-id>` for 14 days, and private startup diagnostics upload as `e2e-startup-<github-run-id>-<attempt>` for 7 days.
 
     Repository configuration: variables `E2E_API_URL`, `E2E_ARTIFACT_SUPABASE_URL`, and `E2E_VIEWER_URL`, and secrets `EXPO_TOKEN`, `E2E_CONTROL_API_KEY`, and `E2E_ARTIFACT_SUPABASE_SECRET_KEY`.
   </Tab>
@@ -364,7 +420,7 @@ There are no persistent E2E accounts. Each test gets new actors from its fixture
   </Tab>
 </Tabs>
 
-Before you hand off a runner change, run `node --test scripts/e2e-resource-queue.test.mjs` and `make check`. `make test` already runs all nine `scripts/e2e-*.test.mjs` suites.
+Before you hand off a runner change, run `node --test scripts/e2e-resource-queue.test.mjs` and `make check`. `make test` already runs `make inventory-check` and 25 of the 26 `scripts/e2e-*.test.mjs` suites. It skips `e2e-suite-lock.test.mjs`. See [Mobile tests](/engineering/qa/mobile-tests#script-tests).
 
 ## Reset
 
@@ -394,7 +450,7 @@ Follow the [E2E environment reset](/runbooks/e2e-environment-reset) runbook. In 
 - **Idempotency keys are forever.** A repeated key returns the old run, even if it's `cleaned`. Use a unique key per attempt.
 - **Assignment transitions on the wrong run return 500.** `transitionAssignment` wraps `pgx.ErrNoRows` in `fmt.Errorf` when the run isn't an active pair (`assignment_transition.go:34`). The expiry path maps the same case to 404.
 - **Fixture coordinates are fixed.** Riders are inserted at latitude and longitude 0, drivers at the fixture school (37.3349, -122.0090), and fixture rides run between `1 Test Way` and `2 Test Way` near that point.
-- **In-repo docs lag the code.** `yelo-api/docs/E2E_CONTROL_PLANE.md` and `yelo-frontend/E2E.md` list three scenarios and old migration numbers. `e2e/README.md`'s suite example uses `ride_rider_driver_pair`, which the API rejects. Trust `Handler.Create` and the constraint migrations.
+- **In-repo docs lag the code.** `yelo-api` no longer ships `docs/E2E_CONTROL_PLANE.md`; only `internal/server/http/e2econtrol/README.md` remains, and it covers paid fixtures and observers only. `yelo-frontend/E2E.md` lists three scenarios and old migration numbers. `e2e/README.md`'s suite example uses `ride_rider_driver_pair`, which the API rejects. Trust `Handler.Create` and the constraint migrations.
 
 ## Where this lives in code
 
@@ -407,7 +463,8 @@ Follow the [E2E environment reset](/runbooks/e2e-environment-reset) runbook. In 
 | Baseline seed and migration runner | `yelo-api/scripts/release/seed-e2e-baseline.sql`, `run-migrations.sh` |
 | Deploy | `yelo-api/cloudbuild.e2e.yaml`, `.github/workflows/release-e2e.yml` |
 | Background job switch | `yelo-api/cmd/api/main.go` |
-| Flows, suites, catalog | `yelo-frontend/e2e/` |
+| Flows, suites, sweeps, coverage catalog | `yelo-frontend/e2e/` (`flows/`, `suites/`, `sweeps/`, `coverage/`, `notifications/`) |
+| Product inventory | `yelo-frontend/e2e/inventory/product.json`, `scripts/e2e-inventory.mjs` |
 | Legacy rig | `yelo-frontend/e2e/rigs/auth-rider-driver.json`, `scripts/e2e-rig.mjs`, `scripts/e2e-suite.mjs` (`loadSuiteDefinition`) |
 | Runner | `yelo-frontend/scripts/e2e-*.mjs`, `e2e-run.sh`, `e2e-local.sh` |
 | Workflow | `yelo-frontend/.github/workflows/e2e-agent-device.yml` |

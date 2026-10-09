@@ -63,13 +63,13 @@ Shared test data builders live in `lib/ride/testing/`. `rideOptions.ts` exports 
 
 ## What's covered
 
-161 Jest files on `main`:
+189 Jest files on `main`:
 
 | Directory | Files | Focus |
 | --- | --- | --- |
-| `lib/` | 89 | Pure logic: map geometry and label placement (22), ride presentation, command identity, and lifecycle navigation (14), contacts (9), auth (8), messaging (7), platform, formatting, storage, query, notifications, payments, config, and the update gate |
-| `components/` | 39 | Request sheet snaps, stop seeding, ride option groups, `StripePaymentScreen`, `CurrentRideBottomSheet`, queued rider screen, fleet join, error boundaries, search, bump sheet, invite screen |
-| `hooks/` | 11 | `usePreRideRequest`, `useRideLifecycleNavigation`, driver ride details, queue details, search suggestions, countdown, identity linking |
+| `lib/` | 107 | Pure logic: map geometry and label placement (24), ride presentation, command identity, lifecycle navigation, and Fare Finder providers (23), contacts (9), auth (8), messaging (7), platform, formatting, storage, query, notifications, payments, config, and the update gate |
+| `components/` | 47 | Request sheet snaps, stop seeding, ride option groups, `StripePaymentScreen`, `CurrentRideBottomSheet`, queued rider screen, fleet join, error boundaries, search, bump sheet, invite screen |
+| `hooks/` | 14 | `usePreRideRequest`, `useRideLifecycleNavigation`, driver ride details, queue details, search suggestions, countdown, identity linking |
 | `providers/` | 11 | `SessionProvider`, `AuthV3Provider`, `AxiosProvider`, `RideProvider`, `RideMatchingProvider`, `PushNotificationProvider`, `StartupPhaseProvider`, `EasUpdateObserver`, map top bar slots, drive ride selection |
 | `api/` | 6 | Axios interceptors, the ride status protocol, and `api/helpers` for auth user, community, and bump |
 | `stores/` | 3 | Contact match, account status, and map startup stores |
@@ -81,14 +81,15 @@ Keep Jest tests deterministic and backend-free. Anything that needs a real simul
 
 ## Script tests
 
-`make test` also runs Node's built-in test runner on build and runner scripts:
+`make test` depends on `inventory-check`, so it validates the E2E product inventory before Jest starts. After Jest, it runs Node's built-in test runner on build and runner scripts:
 
 | Command | What it checks |
 | --- | --- |
+| `node scripts/e2e-inventory.mjs check` (`make inventory-check`) | The product registry in `e2e/inventory/product.json` is valid, and every app route is registered. See [E2E environment](/engineering/qa/e2e#product-inventory). |
 | `node scripts/vehicle-catalog.mjs check` | The generated vehicle image catalog matches its source. `make fix` regenerates it. |
-| `node --test scripts/vehicle-catalog.test.mjs` | Catalog validation rules |
-| `node --test scripts/e2e-resource-queue.test.mjs` and eight other `scripts/e2e-*.test.mjs` files | Scheduler admission, local CA, coverage, local wrapper, ride assertions and transitions, app target preflight, build provenance, artifacts |
-| `node --test scripts/dev.test.mjs scripts/prepare-google-services.test.mjs` | Dev runtime and Google services preparation |
+| `node --test scripts/vehicle-catalog.test.mjs scripts/uber-catalog.test.mjs` | Vehicle catalog validation rules, and the generator for the bundled Uber vehicle view names |
+| `node --test scripts/e2e-resource-queue.test.mjs` and 24 other `scripts/e2e-*.test.mjs` files | Scheduler admission and host capacity, local CA, coverage, local wrapper, ride assertions and transitions, payment fixtures, payment and response faults, rider responses, URL hand-off, flows, checkpoint and route captures, Live Activity, inventory, sweeps, thumbnails, app target preflight, API and build provenance, artifacts |
+| `node --test scripts/dev.test.mjs scripts/prepare-google-services.test.mjs scripts/fingerprint-config.test.mjs` | Dev runtime, Google services preparation, and the fingerprint config's file hashing |
 
 <Warning>
 `scripts/e2e-suite-lock.test.mjs` exists but isn't listed in the `test` target, so it never runs in CI. Add it to the `node --test` line in the `Makefile` if you change the suite lock.
