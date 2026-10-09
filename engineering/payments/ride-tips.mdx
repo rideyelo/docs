@@ -1,6 +1,6 @@
 ---
 title: "Ride tip charging"
-description: "How captureTip chooses between an in-buffer settlement and a dedicated tip PaymentIntent, the commands and idempotency keys behind each, the confirm-tip path, the tip-window sweeper, and how rating, sweeping, and retries resolve against each other."
+description: "How captureTip chooses between an in-buffer settlement and a dedicated tip PaymentIntent, the commands and idempotency keys behind each, the tip-window sweeper, and how rating, sweeping, and retries resolve against each other."
 ---
 
 In-app tips ride on the fare's PaymentIntent when they fit inside the $5.00 buffer, and on a second PaymentIntent when they don't. This page traces both paths at the Stripe-call level. Both run as ride operations: `settle_tip` for the in-buffer capture and `tip` for the dedicated charge. See [Ride operation journal](/engineering/payments/ride-operation-journal) for reservation, retries, and quarantine. For the rider-facing rules, see [Tips and earnings](/concepts/tips-and-earnings). For the fare hold itself, see [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
@@ -9,7 +9,7 @@ In-app tips ride on the fare's PaymentIntent when they fit inside the $5.00 buff
 
 A tip is only considered when all of these hold:
 
-- The ride row has `tips_enabled = true`. The API sets it at `CreateRide` from the `X-Features` header containing `tips` (`features.HasFeature`, case-sensitive).
+- The ride row has `tips_enabled = true`. The API sets it at `POST /ride/v2/` (`CreateRideV2`) from the `X-Features` header containing `tips` (`features.HasFeature`, case-sensitive).
 - The caller of `POST /ride/i/{id}/rate` is the rider. Driver ratings never touch payments.
 - The ride is `pending_rider_rating` or `complete`. Any other status returns "Ride is not reviewable".
 - `tip_amount` in the body is between 0 and 100.00 (`RatingRequest.Validate` against `models.MaxTip`). `financialTipCents` rejects NaN, infinity, negatives, and anything above `models.MaxTip` again with "Invalid tip", then converts with `math.Round(tip * 100)`.
@@ -128,21 +128,9 @@ A tip can wait on the rider. The first time the executor sees `requires_action`,
 
 While it waits, the `ride_operation` job snoozes for a minute at a time and a `payment_intent.*` webhook can wake it early. See [Tip snooze](/engineering/payments/ride-operation-journal#tip-snooze).
 
-### Confirm-tip
+### Requires-action tips
 
-`POST /ride/i/{id}/confirm-tip` (`RideService.ConfirmTip`) finishes a `requires_action` tip:
-
-1. The caller must be the rider. Anyone else gets "Unauthorized".
-2. `ConfirmTipLegacy` loads the rider's latest `tip` operation for the ride and resumes it with its frozen amount. It never accepts a client-supplied PaymentIntent ID and never creates a tip.
-3. The executor reads the intent from Stripe on the frozen account. A `succeeded` intent whose `amount_received` equals the frozen tip finalizes the operation.
-4. `ConfirmTip` returns success only when the outcome is `succeeded`. Anything else returns "Tip incomplete".
-5. With no `tip` operation and no legacy intent to adopt, it returns "No tip".
-
-A second call after success replays the stored outcome and returns success again.
-
-<Warning>
-The mobile app doesn't handle `requires_action`. `app/(app)/ride-complete/index.tsx` only checks `response.success` and never presents a sheet or calls `confirm-tip`. A tip that needs authentication is abandoned by the server after 30 minutes, and the rider sees "Review saved".
-</Warning>
+`POST /ride/i/{id}/confirm-tip` and `RideService.ConfirmTip` were removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes). No route finishes a `requires_action` tip. The server abandons a tip that still needs authentication after 30 minutes.
 
 ### Retry identity
 
@@ -197,7 +185,7 @@ A ride has at most one unresolved operation. Every race below resolves at reserv
 | Concern | Location |
 | --- | --- |
 | Rate entry point | `yelo-api/internal/service/ride/ride.go` (`Rate`, `GetTipOptions`) |
-| Tip routing | `yelo-api/internal/service/ride/tip_charge.go` (`captureTip`, `settleBufferedTip`, `ConfirmTip`), `financial_commands.go` (`legacyTipResult`, `financialTipCents`) |
+| Tip routing | `yelo-api/internal/service/ride/tip_charge.go` (`captureTip`, `settleBufferedTip`), `financial_commands.go` (`legacyTipResult`, `financialTipCents`) |
 | Adapters | `yelo-api/internal/service/payment/ride_legacy_tip_settlement.go`, `ride_legacy_dedicated_tip.go` |
 | In-buffer settlement | `yelo-api/internal/service/payment/ride_tip_settlement.go`, `yelo-api/internal/data/repository/ride_tip_settlement.go` |
 | Dedicated tip | `yelo-api/internal/service/payment/ride_dedicated_tip.go`, `ride_tip_operation.go`, `yelo-api/internal/data/repository/ride_dedicated_tip.go`, `ride_dedicated_tip_finalize.go` |

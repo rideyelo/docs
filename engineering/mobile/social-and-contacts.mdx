@@ -1,6 +1,6 @@
 ---
 title: "Social and contacts"
-description: "How the mobile app handles friends, contact sync and matching, friend bumps, invites and referral attribution, rideshare account connections, deals, events, QR scanning, and the World Cup claim."
+description: "How the mobile app handles friends, contact sync and matching, friend bumps, invites and referral attribution, rideshare account connections, events, QR scanning, and the World Cup claim."
 ---
 
 This page covers the social and growth surfaces of `yelo-frontend`. For the product rules behind them, see [Growth features](/concepts/growth-features) and [Events and feed](/concepts/events-and-feed). For the OS permission side of contacts, see [Permissions](/engineering/mobile/permissions-and-device#contacts).
@@ -145,14 +145,13 @@ These screens feed Fare Finder, the rideshare price aggregator. All three redire
 
 All three share `ProviderAccountView` for signed-out, error, and signed-in states. Tokens live in SecureStore under `ride_tokens_<provider>` (`lib/ride/tokenStore.ts`). Refreshes are single-flighted per provider because Uber and Lyft rotate refresh tokens. The **Accounts** screen (`profile/accounts?mode=rideshare`) lists connection status. For the quote pipeline, token refresh rules, and provider diagnostics, see [Rideshare aggregator](/engineering/mobile/rideshare-aggregator).
 
-## Deals and events
+## Events
 
 | Route | Data | Behavior |
 | --- | --- | --- |
-| `events/[eventId]` | `GET /event/{id}`, `GET /event/{id}/attendees` | Hero, attendee faces, venue, and a drive ETA (prompts for location). **Get tickets** opens `ticket_url` in an in-app browser. **Send** opens the bump sheet. **Get a ride** pushes the request sheet with the venue as dropoff, serialized with `serializeRideStop`. **Save** is a TODO. |
-| `deals/[dealId]` | none | Hard-coded placeholder data (see gotchas) |
+| `events/[eventId]` | `GET /event/{id}` | Hero, venue, and a drive ETA (prompts for location). **Get tickets** opens `ticket_url` in an in-app browser. **Send** opens the bump sheet. **Get a ride** pushes the request sheet with the venue as dropoff, serialized with `serializeRideStop`. **Save** is a TODO. |
 
-`routeToFeedItem` in `components/map/feed/routeToFeedItem.ts` sends any feed event tagged `deal` to the deals route and everything else to the events route. Upcoming events come from `GET /event/upcoming` and are persisted for first paint.
+`routeToFeedItem` in `components/map/feed/routeToFeedItem.ts` sends every feed event to the events route, including events tagged `deal`. Upcoming events come from `GET /event/upcoming` and are persisted for first paint. The `deals/[dealId]` screen and event attendance were retired in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
 ## QR scanning
 
@@ -181,13 +180,12 @@ The standings and activity endpoints (`/world-cup/standings`, `/world-cup/activi
 | Bumps | `components/bottom-sheets/BumpFriendsBottomSheet.tsx`, `components/bottom-sheets/bump-friends/`, `api/helpers/bump.ts`, `api/helpers/bumpPreview.ts` |
 | Invites | `app/(app)/invite/[code].tsx`, `components/ReferralCaptureObserver.tsx`, `lib/storage/referralAttribution.ts`, `hooks/useReferralLink.ts` |
 | Provider accounts | `app/(app)/connect-*.tsx`, `lib/ride/uberProvider.ts`, `lyftProvider.ts`, `empowerProvider.ts`, `tokenStore.ts`, `providerConfig.ts` |
-| Events and deals | `app/(app)/events/[eventId]/index.tsx`, `app/(app)/deals/[dealId]/index.tsx`, `components/map/feed/routeToFeedItem.ts` |
+| Events | `app/(app)/events/[eventId]/index.tsx`, `components/map/feed/routeToFeedItem.ts` |
 | QR | `app/(app)/scan-qr.tsx`, `components/bottom-sheets/QRBottomSheet.tsx`, `app/(app)/tip/[slug].tsx` |
 | World Cup | `app/(app)/post-signup/14-student.tsx`, `api/helpers/worldCup.ts` |
 
 ## Gotchas and edge cases
 
-- **Every "deal" is the same fake deal.** `deals/[dealId]/index.tsx:27` ignores `dealId` and renders a hard-coded "$5 Off Cover" at Knight Library in Kitchener with a `wygo.world` link. Any event tagged `deal` reaches it.
 - **Scanning opens any URL.** `scan-qr.tsx:27` has no allowlist. A QR for any `https://` site, `tel:`, or another app's scheme opens directly. The same applies to uploaded QR images.
 - **Third-party tokens survive sign-out.** `SessionProvider.signOut` doesn't clear `ride_tokens_<provider>`, so the next Yelo account on the device inherits connected Uber, Lyft, and Empower sessions.
 - **Empower may not return on Android.** Only `uberauth` has an Android intent filter. The `connect-uber.tsx` comment notes Custom Tabs can't intercept an unregistered scheme, and `rideyazam://` isn't registered.

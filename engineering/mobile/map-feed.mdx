@@ -16,7 +16,7 @@ For the server side (feed generation, the Spot rules, caching), see [Events and 
 | **Moves** | "See where people are moving in your city" | **See all** opens `/(app)/(tabs)/map/moves` | A bump card as the list header, then move cards. See [Moves ordering](#moves-ordering) |
 | **Friends** | "People you ride with" | **+ Invite** below 5 friends, **See all** from 5 up | Optional contacts tile, one avatar per friend, then dashed empty slots padding the row to 3 |
 | **Likes** | "Spots you love", or "Like your first spot to show it on your map" when the rail holds only placeholders | **See all** opens `/(app)/save-location` with `focusSearch: '1'` | The rider's own likes, then friend-liked spots, then one trailing placeholder |
-| **Featured** | "Get the most out of Yelo" | **See all** opens `/(app)/(tabs)/map/featured` | Event and deal cards, or four action cards |
+| **Featured** | "Get the most out of Yelo" | **See all** opens `/(app)/(tabs)/map/featured` | Event cards, or four action cards |
 
 Every **See all** handler that pushes a map route first calls `onOpenSeeAll`, which snaps the sheet to index 2.
 
@@ -55,8 +55,8 @@ With no likes from either source, the rail shows two `AddLikePlaceholderCard` it
 
 | Condition | Cards |
 | --- | --- |
-| Community is active and `eventsAndDeals` is non-empty | One card per event. An event whose `tags` include `deal` becomes a `deal` card, the rest become `event` cards |
-| Community is inactive, or `eventsAndDeals` is empty | Four action cards |
+| Community is active and `events` is non-empty | One `event` card per event |
+| Community is inactive, or `events` is empty | Four action cards |
 
 The action cards, in order:
 
@@ -91,8 +91,7 @@ Details that affect behavior:
 
 - **Move cards read from context.** `MapFeedMovesCard` looks up `rideSummaries[uuid]`. It renders an empty `View` until the summary arrives, and `null` when the summary has no destination name. It mounts no query of its own.
 - **Opening a destination.** The three move cards call `setSelectedCoordinates([longitude, latitude])` and then push `placeHref(place)`, which targets `/(app)/(tabs)/map/poi/place` with a serialized snapshot. The coordinates seed the camera fly described in [Focus and fly-to](/engineering/mobile/map-tab-internals#focus-and-fly-to).
-- **Event and deal routing.** `onEventPress` calls `routeToFeedItem`. An event tagged `deal` pushes `/(app)/deals/[dealId]` with the event ID. Anything else pushes `/(app)/events/[eventId]`.
-- **Deals reuse the event card.** `FeaturedCardRenderer` renders `deal` cards with `MapFeedEventCard`. There is no separate deal card.
+- **Event routing.** `onEventPress` calls `routeToFeedItem`, which pushes `/(app)/events/[eventId]` for every event, including one tagged `deal`. The deals screen and the `deal` featured card variant were retired in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 - **Full-width variants.** The cards accept `fullWidth` for the see-all screens. Rail cards are `rem(16)` wide.
 
 ### See-all screens
@@ -104,7 +103,7 @@ Each screen wraps its rows in `SeeAllShell`, a `BottomSheetFlatList` with a back
 | `map/moves` | **Moves** | Friend moves, then feed rides and bumps, then community moves, all full width | "Moves appear here as friends head out." |
 | `map/friends` | **Friends** | Three-column grid of avatars, padded to 3 cells, plus one trailing empty slot. Sticky **Bump** footer pushes `map/request` with `bump: 'true'` | None |
 | `map/featured` | **Featured** | The same cards as the rail, full width | None |
-| `map/drops` | **Drops** | One `MapFeedEventCard` per `eventsAndDeals` entry | "Drops appear here as deals and events go live." |
+| `map/drops` | **Drops** | One `MapFeedEventCard` per `events` entry | "Drops appear here as events go live." |
 
 No rail links to `map/drops`. `SeeAllSection` still lists `drops`, but `handleSeeAll` is only called with `moves`.
 
@@ -116,7 +115,7 @@ No rail links to `map/drops`. `SeeAllSection` still lists `drops`, but `handleSe
 
 ```mermaid
 flowchart TD
-  CL["useMapGetCommunityLayer (/map/community)"] --> EV["eventsAndDeals"]
+  CL["useMapGetCommunityLayer (/map/community)"] --> EV["events"]
   CL --> TL["topLocations, heatmap, communityMoves"]
   CL --> SP["spot"]
   SP --> DW["useSpotDisplayWindow"]
@@ -141,7 +140,7 @@ flowchart TD
 
 | Query | Key | Timing | Feeds |
 | --- | --- | --- | --- |
-| `useMapGetCommunityLayer` | `communityLayerQueryKey(communityId)` | `staleTime` and `refetchInterval` of 5 minutes (`COMMUNITY_LAYER_STALE_MS`), no background refetch, `throwOnError: false` | `eventsAndDeals`, `topLocations`, `heatmap`, `communityMoves`, and the raw spot |
+| `useMapGetCommunityLayer` | `communityLayerQueryKey(communityId)` | `staleTime` and `refetchInterval` of 5 minutes (`COMMUNITY_LAYER_STALE_MS`), no background refetch, `throwOnError: false` | `events`, `topLocations`, `heatmap`, `communityMoves`, and the raw spot |
 | `useFriendActivity` | The shared `/map/friends` layer query | Owned by `hooks/useFriendLocations.ts` | `friendMoves`, `friendLikedSpots` |
 | `useCommunityGetFeed({ page: 0 })` | `communityFeedQueryKey(communityId, 0)` | No retry on a 400, otherwise up to 3 retries | `rides`, and the inline bump summaries |
 | `useRideFeedSummaries` | `['/ride/feed-summaries', ids, communityId]` | `staleTime` 5 minutes, batches of 50 IDs, 15-second request timeout | `rideSummaries` |
@@ -167,14 +166,14 @@ The provider walks page 0 of the community feed in order:
 
 `rideSummaries` merges the fetched ride summaries with the inline bump summaries.
 
-`eventsAndDeals` is the community layer's `events` with nulls removed. When that list is empty and `EXPO_PUBLIC_ENABLE_MOCK_DATA` is `true`, it falls back to `MOCK_EVENTS`.
+The context's `events` is the community layer's `events` with nulls removed. When that list is empty and `EXPO_PUBLIC_ENABLE_MOCK_DATA` is `true`, it falls back to `MOCK_EVENTS`.
 
 ### Context value
 
 | Field | Source | Consumers |
 | --- | --- | --- |
 | `rides`, `rideSummaries` | Community feed and ride summaries | Moves rail, `map/moves` |
-| `eventsAndDeals` | Community layer | Featured rail, `map/drops`, `useVenuesWithFeedItems` |
+| `events` | Community layer | Featured rail, `map/drops`, `useVenuesWithFeedItems` |
 | `friendMoves` | `/map/friends` | Moves rail, `map/moves` |
 | `friendLikedSpots` | `/map/friends` | `PinnedMarkersLayer` |
 | `communityMoves` | Community layer | Moves rail, `map/moves`, `CommunityMovesLayer` |
@@ -193,7 +192,7 @@ When the community ID changes to a different value, the provider clears `selecte
 
 ### Venue grouping
 
-`useVenuesWithFeedItems` groups `eventsAndDeals` by venue for the pinned markers and the POI sheet.
+`useVenuesWithFeedItems` groups `events` by venue for the pinned markers and the POI sheet.
 
 - The key is `venue.id` when the venue has a non-nil ID and coordinates. Otherwise it is `inline:<lat>:<lng>` from the event's own `location_*` fields, rounded to 5 decimals. Events with neither are dropped.
 - `feedItems` are sorted with in-progress events first, then by start time.
@@ -367,9 +366,6 @@ Tapping any part does the same as the Room card: set the coordinates, fly to zoo
   </Accordion>
   <Accordion title="Exported cards that nothing renders">
     `MapFeedCard`, `MapFeedRideCard`, `MapInactiveMovesCard`, and `MapInactiveDropCard` are exported from `components/map/feed/index.ts` but no screen renders them. `MapFeedRideCard` still mounts its own per-ride summary query, which the batched `useRideFeedSummaries` replaced. `MapFeedStackParamList` also lists a `spots` route that has no screen file.
-  </Accordion>
-  <Accordion title="Deal cards route with an event ID">
-    `routeToFeedItem` sends an event tagged `deal` to `/(app)/deals/[dealId]` with the event's ID. A code comment flags this as unconfirmed: that page expects a coupon, so it can't resolve one from an event ID.
   </Accordion>
   <Accordion title="Friend bump dedupe is by timestamp">
     The provider drops a feed bump when its `created_at` equals a friend move's `createdAtMs` exactly. It doesn't compare sender or destination.

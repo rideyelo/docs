@@ -15,7 +15,7 @@ Every `/dashboard/*` request passes four layers. A request can fail at any of th
 | --- | --- | --- |
 | Clerk session | `server/http/clerk_middleware.go` (`clerkAuthMiddleware`) | Verifies the bearer token and reads `metadata.role`, `community_id`, and `fleet_assignments` from the **session token claims**. Missing claims → `401` with an empty envelope. |
 | Scope allowlist | `server/http/dashboard_scope.go` (`dashboardScopeAllows`) | Path-based allowlist for `intern` and `fleet`. Anything not listed → `401`, even if the handler would allow it. Admins pass everything. |
-| Group role gate | `server/http/router.go` `registerDashboardRoutes` | `getRequireClerkRoleMiddleware` on `/dashboard/users/*` (admin), `/dashboard/notifications/*` (admin), `/dashboard/leads/drivers/*` (admin, intern), `/dashboard/education-claims/*` (admin). Wrong role → `403`. |
+| Group role gate | `server/http/router.go` `registerDashboardRoutes` | `getRequireClerkRoleMiddleware` on `/dashboard/users/*` (admin), `/dashboard/notifications/*` (admin), `/dashboard/leads/drivers/*` (admin, intern). Wrong role → `403`. |
 | Handler check | Individual handlers | `Role != roleAdmin` checks or `ResolveDashboardCommunity` / `HasFleetAccess`. Usually returns a `403` error envelope. |
 
 The full allowlist is documented in [API authentication](/engineering/api/authentication). The UI never relies on status codes for gating; it hides controls with `useRole()`, so a mismatch shows up as an inline error or an empty table.
@@ -123,7 +123,7 @@ Queries use `useLiveData` (`components/live/useLiveData.ts`) or `hooks/useLive.t
 
 Hovering a market card prefetches its presence map and analytics. `LiveMap`, `LiveTables`, `RideFunnel`, and `LivePricing` are lazy chunks. The drivers table and map apply the same 10 km bounding-box buffer that the API uses for `drivers_online` (`liveMarkers.ts` `isNearMarket`).
 
-`NotifyMarketDialog` and `PingDialog` live in `components/live/` but only the unrouted `DriverOpsPage` imports `NotifyMarketDialog`, and nothing imports `PingDialog`. `/dashboard/live/notify`, `/ping`, `/kpis`, `/markets/{id}/rides`, `/surge-history`, `/dashboard/driver-ops`, and `/dashboard/presence/summary` and `/users` have no caller from a routed page.
+`/dashboard/driver-ops`, `/dashboard/presence/summary`, and `/dashboard/presence/users` have no caller from a routed page. The live notify, ping, KPI, market rides, and surge history routes were retired in October 2026, along with the unrouted driver ops page and its notify and ping dialogs.
 
 ## Map (`/map`)
 
@@ -149,7 +149,7 @@ Zone writes go to `POST/PATCH/DELETE /dashboard/zones`, which the intern scope d
 | `/events` · `SpotTab` (admin) | `useActiveSpot`, `useSpotHistory`, spot mutations (`hooks/useSpot.ts`) | `/dashboard/communities/{id}/spot/*` | Default. The intern scope denies `spot`. |
 | `/community` · `CommunityPage` | `useCommunityGetMarketKPIs`, `useCommunityGetCommunityDemographics`, `useSchoolGetAll` | `/dashboard/{id}/kpis`, `/dashboard/{id}/demographics`, public `GET /school/` | Default |
 | `/community` · `FeedPreview` | `useCommunityFeed`, `useDashboardGetCommunityContentMapLayer` | `.../feed`, `.../map/community` | Layer polls 60 s |
-| `/community` · feed cards | `rideGetRide`, `dashboardGetEvent`, `adGetAdById` | `GET /ride/{id}`, `.../events/{eventId}`, `GET /ad/{id}` | 5 min stale |
+| `/community` · feed cards | `rideGetRide`, `dashboardGetEvent` | `GET /ride/{id}`, `.../events/{eventId}` | 5 min stale |
 | `/community` · `OperatingHoursCard` (admin) | `useCommunityGetOperatingWindows`, upsert | `/dashboard/manage/{id}/operating-windows` | Default; admin-only handler |
 
 ## Fleet (`/fleets`)
@@ -199,9 +199,9 @@ TanStack Query's `refetchIntervalInBackground` defaults to `false`, so every pol
 
 | Endpoint | Why it is heavy | Code |
 | --- | --- | --- |
-| `GET /dashboard/kpi/global` | Four statements: `GetGlobalKPITotals` three times (all-time, this week, last week) and `ListWeeklyKPISeries`. The series aggregates the full `Users`, `DriverApplications`, `EventAttendees`, and `Rides` history by week, then keeps 12 weeks. | `data/repository/queries/analytics.sql:98`, `:173`; `service/dashboard/kpi.go:31` |
-| `GET /dashboard/{id}/kpis` | Two passes of `GetDashboardMarketMetrics` (a `COUNT FILTER` scan of the community's rides plus two user subqueries) and an hourly histogram joined on `date_trunc('hour', request_time)`. | `analytics.sql:345`, `:465` |
-| `GET /dashboard/rides` | `ListDashboardRides` and `CountDashboardRides` each join riders, drivers, fleets, and communities, `ILIKE` on concatenated names, and sort with a large `CASE` expression. With `all=true` there is no community predicate. | `analytics.sql:851`, `:935`; `data/repository/dashboard_rides.go:12` |
+| `GET /dashboard/kpi/global` | Four statements: `GetGlobalKPITotals` three times (all-time, this week, last week) and `ListWeeklyKPISeries`. The series aggregates the full `Users`, `DriverApplications`, and `Rides` history by week, then keeps 12 weeks. | `data/repository/queries/analytics.sql:98`, `:159`; `service/dashboard/kpi.go:31` |
+| `GET /dashboard/{id}/kpis` | Two passes of `GetDashboardMarketMetrics` (a `COUNT FILTER` scan of the community's rides plus two user subqueries) and an hourly histogram joined on `date_trunc('hour', request_time)`. | `analytics.sql:308`, `:428` |
+| `GET /dashboard/rides` | `ListDashboardRides` and `CountDashboardRides` each join riders, drivers, fleets, and communities, `ILIKE` on concatenated names, and sort with a large `CASE` expression. With `all=true` there is no community predicate. | `analytics.sql:814`, `:898`; `data/repository/dashboard_rides.go:12` |
 | `GET /dashboard/telemetry/summary` | Eleven sequential scans of `DeviceTelemetry` joined to `Users` (one per dimension) sharing a 15 s timeout instead of the default 5 s. | `data/repository/dashboard.go:1839` |
 | `GET /dashboard/{id}/search-insights` | Four aggregations plus a per-user name lookup for up to 100 recent searches, memoized per request. | `service/dashboard/dashboard.go:716`, `:811` |
 | `GET /dashboard/live/markets` | One `Community.GetByID` per active, ride-enabled market (six at a time), then one Redis presence-hash read per online driver for the 10 km check. Polled every 10 s by every open **Live** tab, for every market. | `service/dashboard/supply_demand.go` `GetMarketSummaries`, `populateLivePresence` |
@@ -229,8 +229,8 @@ Most repository methods wrap their context in `WithPostgresTimeout`, a 5-second 
 
 - **Role changes lag.** The API reads role and assignments from Clerk session token claims, not from the Clerk API. After someone edits a user on `/access`, that user keeps their old scope until Clerk refreshes their token, even though `DashboardSession` remounts on the new `publicMetadata`.
 - **`401` means "outside the allowlist", not "signed out".** `dashboardScopeAllows` answers `401` for interns and fleet managers who hit a route not on their list. Check `dashboard_scope.go` before debugging Clerk.
-- **Rides always poll fast.** `HasActiveDashboardRides` treats any ride that is not `complete` and not canceled as active, with no time bound (`analytics.sql:954`). Stale `no_drivers_available` or `pending_rider_rating` rows keep `has_active` true, which keeps the Trips tab on the 10-second interval. Every **Live** ride poll also pays for this `EXISTS` scan.
-- **Feed ad cards cannot load.** `FeedPreview` calls `GET /ad/{id}`, which sits in the app-JWT group (`router.go:186`). The dashboard's Clerk token fails there, so ad cards fall back to the "Ad" placeholder. `GET /ride/{id}` works because its optional-auth middleware ignores tokens it cannot parse.
+- **Rides always poll fast.** `HasActiveDashboardRides` treats any ride that is not `complete` and not canceled as active, with no time bound (`analytics.sql:917`). Stale `no_drivers_available` or `pending_rider_rating` rows keep `has_active` true, which keeps the Trips tab on the 10-second interval. Every **Live** ride poll also pays for this `EXISTS` scan.
+- **Ride cards rely on optional auth.** `FeedPreview` calls the app route `GET /ride/{id}` with the dashboard's Clerk token. It works because the route's optional-auth middleware ignores tokens it cannot parse. Feed ad cards were retired in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 - **Tabs are not all URL-backed.** `/rides`, `/drivers`, `/manage`, `/communities`, and `/notifications` persist their tab in the query string. `/fleets`, `/events`, and `/access` do not, so deep links always open their first tab. **Live** keeps its period and rides filter in local state.
 - **`/supply-demand` bookmarks break.** `/presence` and `/driver-ops` redirect to `/live`, but `/supply-demand` falls through to **Coming Soon**.
 - **Invalid `community_id` on telemetry means global.** The handler ignores an unparseable ID and returns org-wide numbers instead of an error.

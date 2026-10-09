@@ -50,7 +50,7 @@ The smallest containing box wins, so a campus box nested inside a metro box capt
 
 ## Authenticated resolution (auth v3)
 
-`ActiveCommunityService.Resolve` in `internal/service/authv3/active_community.go` serves both `POST /authv3/user/community/resolve` (full user token) and the onboarding variant. It always returns a freshly issued token, whether or not the community changed.
+`ActiveCommunityService.Resolve` in `internal/service/authv3/active_community.go` serves `POST /authv3/user/community/resolve`, which requires a full user token. It always returns a freshly issued token, whether or not the community changed.
 
 ```mermaid
 flowchart TD
@@ -75,7 +75,7 @@ flowchart TD
 2. The sign-in transaction's stored location, only if `location_source` is `ip` (`source: ip`).
 3. Nothing (`reason: no_coordinates`).
 
-A user-scope request needs either coordinates or a `transaction_id`. A transaction must belong to the user, have purpose sign-in, and be completed. For onboarding tokens, the transaction must have completed no later than one second after the token's `iat`.
+A request needs either coordinates or a `transaction_id`. A transaction must belong to the user, have purpose sign-in, and be completed. The onboarding-token variant, `POST /authv3/community/resolve`, was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 ### Entry and exit
 
@@ -89,7 +89,7 @@ A user-scope request needs either coordinates or a `transaction_id`. A transacti
 
 ### Result
 
-`ActiveCommunityResult` returns `reason` (`matched`, `already_active`, `no_coordinates`, `invalid_stored_coordinates`, `no_match`), `source` (`none`, `native`, `ip`), `community_id`, `token`, `token_scope`, `resolved`, and `updated`. Every call invalidates the user's auth and profile caches before issuing the token, including no-match calls.
+`ActiveCommunityResult` returns `reason` (`matched`, `already_active`, `no_coordinates`, `invalid_stored_coordinates`, `no_match`), `source` (`none`, `native`, `ip`), `community_id`, `token`, `token_scope` (always `user`), `resolved`, and `updated`. Every call invalidates the user's auth and profile caches before issuing the token, including no-match calls.
 
 ### Client throttling
 
@@ -107,7 +107,7 @@ When a new `user`-scope token comes back and the JWT hasn't changed meanwhile, t
 
 ## Legacy sign-up resolution (auth v2)
 
-`AuthV2Service.resolveCommunity` in `internal/service/authv2/community.go` treats `0, 0` as "location unknown" and assigns the default. Otherwise it uses `GetCommunityByCoordinates`, rejects a match named `Yelo` (case-insensitive), and falls back to the default. It has no exit buffer, because it only runs at sign-up.
+Auth v2 doesn't carry a location into account creation. When the email step creates a user in `internal/service/authv2/email.go`, a school whitelist entry assigns the school's community. Otherwise the user starts in the default community (`GetDefault`), and authenticated resolution can move them later. The coordinate-based `AuthV2Service.resolveCommunity` was removed with the auth v2 community routes in October 2026.
 
 ## Ride-time repair
 
@@ -142,10 +142,10 @@ School mapping never moves users. A user's `school_id` and `community_id` are in
 | --- | --- |
 | Resolve service | `yelo-api/internal/service/authv3/active_community.go` (`Resolve`, `communityAtLocation`, `activeCommunityCoordinates`) |
 | Yelo repair | `yelo-api/internal/service/authv3/yelo_community_repair.go` |
-| HTTP handlers | `yelo-api/internal/server/http/authv3/community_handler.go`, `routes.go`, `onboarding_routes.go` |
+| HTTP handlers | `yelo-api/internal/server/http/authv3/community_handler.go`, `routes.go` |
 | Match queries | `yelo-api/internal/data/repository/queries/community.sql` (`GetCommunityByCoordinates`, `GetDefaultCommunity`, `GetCommunitySearchBounds`) |
 | Distance to box | `yelo-api/internal/utilities/geo/bounds.go`, `haversine.go` |
-| Sign-up assignment | `yelo-api/internal/service/authv2/community.go` (`resolveCommunity`) |
+| Sign-up assignment | `yelo-api/internal/service/authv2/email.go` |
 | Ride repair | `yelo-api/internal/service/ride/rider.go` (`loadRideCommunity`, `repairRideCommunity`, `validateRideCoordinates`) |
 | School mapping | `yelo-api/migrations/000301_automatic_school_community_mapping.up.sql`, `000303_school_management_visibility.up.sql`, `queries/school_management.sql` |
 | Client trigger | `yelo-frontend/providers/LocationProvider.tsx`, `lib/map/communityResolution.ts`, `lib/ride/tripGuards.ts` |

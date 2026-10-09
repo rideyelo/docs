@@ -85,7 +85,6 @@ Values load once, and an unparseable boolean silently falls back to its default 
     | Check | Where | Effect |
     | --- | --- | --- |
     | `ENVIRONMENT == "dev"` | `main.go:108` | CORS disabled; every origin reflected |
-    | `ENVIRONMENT != "dev"` | `server/http/ride/ride_handler.go:498` | `DELETE /ride/` (drop all rides) refused outside `dev` |
     | `ENVIRONMENT == "dev"` | `service/ride/rider.go:292` | Test-account free rides are off in `dev` |
     | `ENVIRONMENT == "dev"` | `utilities/logger/logger.go:32` | Debug level and console output |
     | `ENVIRONMENT == "prod"` or an OTLP auth header | `utilities/otel/otel.go:134` | OTLP over TLS |
@@ -93,7 +92,7 @@ Values load once, and an unparseable boolean silently falls back to its default 
     | `ENVIRONMENT` is `e2e` with `E2E_ENABLED` | `config.go:405-636` | Strict E2E validation |
 
     <Warning>
-      `ENVIRONMENT` defaults to `dev`. A deployment that omits it reflects every CORS origin and lets any signed-in app user call `DELETE /ride/` to drop all rides. The OTLP TLS branch checks for `prod`, but Slack and the Google Play monitor key off `production`. A production deployment set to `production` gets TLS only because it also sets an OTLP auth header.
+      `ENVIRONMENT` defaults to `dev`. A deployment that omits it reflects every CORS origin. The OTLP TLS branch checks for `prod`, but Slack and the Google Play monitor key off `production`. A production deployment set to `production` gets TLS only because it also sets an OTLP auth header.
     </Warning>
   </Accordion>
 </AccordionGroup>
@@ -102,12 +101,12 @@ Values load once, and an unparseable boolean silently falls back to its default 
 
 | Header | Where defined | Default | What it changes | Who can change it |
 | --- | --- | --- | --- | --- |
-| `X-Features: tips` | `utilities/features/features.go:8-28`; read at `server/http/ride/ride_handler.go:67` (`POST /ride/`) and `:104` (`POST /ride/v2/`) | absent (off) | Sets `rides.tips_enabled`, overriding the body. Pre-authorizes fare plus the $5 `TipBuffer` (`models/tip.go:13`), defers capture for the 24-hour tip window, and allows tipping on rating (`service/ride/driver.go:573,853,901`, `service/ride/ride.go:264,998`) | Client. The mobile app sends it from `hooks/usePreRideRequest.ts:61` |
-| `X-Features: driver-options` | `ride_handler.go:105` (v2 only) | absent (off) | Adds up to 3 specific-driver options to the v2 vehicle options (`service/ride/rider.go:1406,1604`, `service/ride/driver_options.go:87`) | Client, same call site |
+| `X-Features: tips` | `utilities/features/features.go:8-28`; read at `server/http/ride/ride_handler.go:66` (`POST /ride/v2/`) | absent (off) | Sets `rides.tips_enabled`, overriding the body. Pre-authorizes fare plus the $5 `TipBuffer` (`models/tip.go:13`), defers capture for the 24-hour tip window, and allows tipping on rating (`service/ride/driver.go:573,853,901`, `service/ride/ride.go:264,998`) | Client. The mobile app sends it from `hooks/usePreRideRequest.ts:61` |
+| `X-Features: driver-options` | `ride_handler.go:67` | absent (off) | Adds up to 3 specific-driver options to the v2 vehicle options (`service/ride/rider.go:1406,1604`, `service/ride/driver_options.go:87`) | Client, same call site |
 | `X-Ride-State-Protocol: 1` | `server/http/user/user_handler.go:87` | absent | Opts `/user/status` into the ride state snapshot. Also needs `RIDE_STATE_SNAPSHOT_ENABLED` | Client (`api/rideStatusProtocol.ts:75`) |
 | `X-Ride-State-Minimum-Revision` | `user_handler.go:88`, `service/user/ride_snapshot.go:33` | absent | Minimum acceptable session revision. Non-digits return 400 | Client (`api/rideStatusProtocol.ts:78`) |
 | `X-Api-Version: v2` | `utilities/json/json.go:107` | absent | v2 error envelope with `request_id` and latency. Required for Auth v3 web session refresh and logout (`server/http/authv3/handler.go:249,279`) | Client (`lib/auth/client.ts:193`; web `src/sites/signup/auth-v3/authV3Fetch.ts:30`) |
-| `User-Agent` | `ride_handler.go:148` | | Stored as `rider_user_agent`. Fare and tip PaymentIntents fail without it | Client |
+| `User-Agent` | `ride_handler.go:110` | | Stored as `rider_user_agent`. Fare and tip PaymentIntents fail without it | Client |
 
 The mobile app sends `X-Features: tips,driver-options` on every ride creation. `X-Features` is not in `openapi.json`. See [State and data](/engineering/mobile/state-and-data#x-features-header).
 
@@ -158,7 +157,7 @@ No API behavior branches on `PUT /user/app-version`, telemetry `app_version`, or
     | `CommunityTopLocationSettings.enabled`, `automatic` | Migration 000345 | Column `true`; runtime fallback `NOT is_default` | Top locations display and daily refresh (`queries/places.sql:8`, `queries/top_location_profiles.sql:21`) | `PUT /dashboard/{id}/top-locations/settings`. No handler role check, so interns can change their own community |
     | `VehicleTypes` including `is_active` | Migration 000200 | Seeded `x`, `xl`, `cart`, `minibus` | Valid types, seats, artwork. Registry reloads every 5 minutes (`main.go:417`) | Admin, `/dashboard/vehicle-types` |
     | `NotificationTemplates` (`is_active`, `silent`, cooldowns, quiet hours) and variants | Migrations 000237, 000250, 000293 | Seeded insert-if-missing | Inactive templates are skipped (`notify/queue/orchestrate.go:406`). `silent` sends data-only pushes (`notify/queue/send.go:248`) | Admin, `/dashboard/notifications/templates` (`router.go:642`) |
-    | `NotificationPolicies`, `ReferralRewards`, `PromoBanners`, `PromoBars`, `RideDemandCurves` | Migrations 000250, 000142, 000085, 000144, 000129 | | Read at runtime | SQL |
+    | `NotificationPolicies`, `ReferralRewards`, `PromoBanners`, `RideDemandCurves` | Migrations 000250, 000142, 000085, 000129 | | Read at runtime | SQL |
     | `GoogleCalendarOwner` | Migration 000317 | | Operating-hours calendar source | Admin, `/dashboard/calendar-owner/*` |
 
     See [Activation](/dashboard/activation), [Operating hours](/admin/operating-hours), and [Notification templates](/dashboard/notification-templates).
@@ -217,7 +216,7 @@ Column defaults come from `data/sqlc/schema.sql`.
     | Table and column | Default | What it changes | Who can change it |
     | --- | --- | --- | --- |
     | `FleetCommunityServices.enabled` | `true` | Whether a fleet serves a community | Admin, `PUT /dashboard/fleets/services/{fleetId}/{communityId}` |
-    | `FleetDriverWhitelist.is_active` | `true` | Email-based automatic fleet assignment (`service/driver/driver.go:800`) | Admin or own fleet |
+    | `FleetDriverWhitelist.is_active` | `true` | Email-based automatic fleet assignment (`service/driver/driver.go:800`) | SQL. Archiving a fleet deactivates its entries. The dashboard whitelist routes were retired in October 2026 |
     | `DriverApplications.is_active`, `is_action_required` | `false` | Active driver: can go online and receive pings | Dashboard review and activation flow |
     | `Zones.is_active`, `show_on_map` | `true`, `true` | Map layer display (`queries/places.sql:110`) | Admin, `PATCH /dashboard/zones/{id}` |
     | `Locations.show_on_map`, `is_public` | `false`, `false` | Map display, public destination, bump metadata | Admin or own community |
@@ -225,6 +224,7 @@ Column defaults come from `data/sqlc/schema.sql`.
     | `Schools.is_synthetic` | `false` | A DB trigger skips coordinate-based community remapping (migration 000307) | SQL |
     | `Events.has_dynamic_pricing` | `false` | Stored and returned only | Event routes |
     | `PromoBanners.is_new_campus` | `false` | Never read | None |
+    | `PromoBars` (all columns) | | Nothing. The table still exists, but no code reads or writes it since October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance) | None |
   </Accordion>
   <Accordion title="Hard-coded test identities">
     These are not configurable. Values are omitted.

@@ -1,12 +1,12 @@
 ---
 title: "Operator broadcasts and scheduling"
-description: "How dashboard broadcasts, scheduled sends, market notifications, and driver and rider pings flow through the API, the SQL behind each recipient group, and the edge cases in the scheduling loop."
+description: "How dashboard broadcasts and scheduled sends flow through the API, the SQL behind each recipient group, and the edge cases in the scheduling loop."
 ---
 
-The API offers four ways to reach users: the **Send Notification** sheet, scheduled sends from the same sheet, market notifications, and single-user pings. All four become push notifications through the standard pipeline. None of them send SMS.
+The dashboard offers two ways to reach users: the **Send Notification** sheet and scheduled sends from the same sheet. Both become push notifications through the standard pipeline. Neither sends SMS.
 
 <Note>
-Only the **Send Notification** sheet is reachable in the dashboard today. The **Supply & Demand** page was replaced by **Live**, which has no notify or ping controls. `NotifyMarketDialog`, `PingDialog`, and `DriverOpsPage` still exist in `yelo-web`, but no route renders them. The market notify and ping routes below are API-only.
+`POST /dashboard/live/markets/{id}/notify`, `POST /dashboard/live/drivers/{id}/ping`, and `POST /dashboard/live/riders/{id}/ping` were removed in October 2026, along with the unrouted `NotifyMarketDialog`, `PingDialog`, and `DriverOpsPage` in `yelo-web`. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 </Note>
 
 For the admin workflow, see [Send notifications](/dashboard/notifications). For the pipeline, see [Push send pipeline](/engineering/notifications/send-pipeline).
@@ -17,9 +17,6 @@ For the admin workflow, see [Send notifications](/dashboard/notifications). For 
 | --- | --- | --- | --- | --- |
 | Send now | `POST /dashboard/notifications/send` | Handler requires Clerk role `admin` | `community_broadcast` | Community scope |
 | Schedule | Same route with `schedule_send_timestamp` | Same | Stored, later `community_broadcast` | Community scope |
-| Notify market | `POST /dashboard/live/markets/{id}/notify` | Admin only: `dashboardScopeAllows` rejects interns and fleet managers on `/dashboard/live`. Community resolved from the path | `community_broadcast` | Community scope |
-| Ping driver | `POST /dashboard/live/drivers/{id}/ping` | Admin scope plus `requireAdmin` | `dashboard_ping_driver` | One user |
-| Ping rider | `POST /dashboard/live/riders/{id}/ping` | Admin scope plus `requireAdmin` | `dashboard_ping_rider` | One user |
 
 The send and schedule route is registered by `registerNotificationRoutes` in `internal/server/http/community/community_router.go`. Its handler is `CommunityHandler.SendNotification`.
 
@@ -52,8 +49,6 @@ sequenceDiagram
 - On schedule, the timestamp must be in the future.
 
 The dashboard form limits title to 60 characters and body to 200. The API does not.
-
-`NotifyMarket` and the ping endpoints skip `ValidateCommunityNotification`. Their request structs (`MarketNotifyRequest`, `PingDriverRequest`, `PingRiderRequest` in `internal/models/supply_demand.go`) only declare `validate:"required"` on title and body or message. There is no 3,000-byte cap or NUL check, and `NotifyMarket` checks `recipient` only through the scope switch in `SendNotificationToCommunity`, which returns `400 Invalid recipient type`.
 
 ## Recipient group queries
 
@@ -106,7 +101,6 @@ Any second broadcast to the same community inside the same 5-minute bucket is dr
 
 - Sending to **Drivers Only**, then to **Riders Only**, a minute apart.
 - Two scheduled sends for the same community processed in the same minute.
-- A **Notify market** send shortly after a dashboard broadcast.
 
 The API still returns success, and the scheduled row is deleted. The only signal is the `deduped` metric and the missing `Notifications` row. Until the key includes a unique ID, space broadcasts to the same community at least 5 minutes apart, aligned to wall-clock 5-minute boundaries.
 
@@ -144,12 +138,7 @@ Timing:
 
 ## Pings
 
-`SupplyDemandService.PingDriver` and `PingRider` emit to one user with the default event key `{code}:{user}:{unix/300}`.
-
-- A second ping to the same person with different copy inside the same 5-minute bucket is deduped.
-- Both codes are time-sensitive. A ping still queued after 15 minutes is canceled.
-- The response is `{ "sent": true }` when the job is enqueued. It does not mean the push reached the device. If enqueue fails, the API returns `200` with `{ "sent": false }`, not an error.
-- Pings bypass `allow_notifications` checks at the API. The orchestrator then suppresses the delivery as `notifications_disabled` or `missing_push_token`.
+The single-user ping routes were removed in October 2026. The `dashboard_ping_driver` and `dashboard_ping_rider` template codes are still registered and seeded, but no code emits them.
 
 ## Where this lives in code
 
@@ -161,9 +150,8 @@ Timing:
 | Scope SQL | `yelo-api/internal/notify/repository/recipients.go` (`ListBroadcastTokens`) |
 | Scheduled rows SQL | `yelo-api/internal/data/repository/notification.go`, `queries/notification_log.sql` |
 | Validation | `yelo-api/internal/models/notification_validation.go` |
-| Market notify and pings | `yelo-api/internal/server/http/dashboard/supply_demand/handlers.go`, `internal/service/dashboard/supply_demand.go` |
 | Ticker | `yelo-api/cmd/api/main.go` (`startBackgroundTasks`), `cmd/api/background_cleanup.go` |
-| Dashboard UI | `yelo-web/src/sites/dashboard/pages/NotificationsPage.tsx`, `src/components/notifications/SendNotificationSheet.tsx`. Unrouted market and ping dialogs: `src/components/live/NotifyMarketDialog.tsx`, `PingDialog.tsx` |
+| Dashboard UI | `yelo-web/src/sites/dashboard/pages/NotificationsPage.tsx`, `src/components/notifications/SendNotificationSheet.tsx` |
 
 ## Gotchas and edge cases
 
@@ -173,9 +161,6 @@ Timing:
   </Accordion>
   <Accordion title="A crash between send and delete leaves a phantom row">
     If the instance dies after the emit but before `DeleteScheduledNotification`, the row keeps `is_sending = true`. The broadcast went out, but the row stays on the **Scheduled** tab as `sending`.
-  </Accordion>
-  <Accordion title="Notify market has weaker guards">
-    `notifyMarket` does not call `requireAdmin`, so any dashboard role scoped to a community can broadcast to it. It skips the size check, doesn't attribute the sender (history shows `System / API`), and always returns `{ "sent_to": 1 }` whatever the audience size.
   </Accordion>
   <Accordion title="Timezones">
     The dashboard sends the schedule timestamp in the browser's timezone. The server compares it with `NOW()` in UTC, which is correct for absolute timestamps. Community timezones only matter for quiet hours.

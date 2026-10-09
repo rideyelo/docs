@@ -51,7 +51,7 @@ All routes in this group render inside the map sheet.
 | `map` (`index`) | Feed (Moves, Friends, Likes, Featured rails) or search results. Inactive community swaps the Moves rail for a bump card and quiet-city card. | `GET /mapping/search-context`, `POST /mapping/search-suggestions`, `POST /mapping/search-result`, feed queries via `MapFeedProvider` | `poi/place` on a search pick, `moves`, `drops`, `featured`, `friends` via see-all |
 | `map/request` | Ride request sheet. See [Rider experience](/engineering/mobile/rider-experience#request-sheet). | `POST /mapping/distance`, `POST /ride/v2/`, `POST /ride/i/{id}/confirm`, aggregator quotes | Replaces to the map when there is no dropoff and `bump` isn't `true` |
 | `map/moves` | See-all list of moves. Empty: "Moves appear here as friends head out." | Feed context | Card taps |
-| `map/drops` | See-all list of drops. Empty: "Drops appear here as deals and events go live." | Feed context | Card taps |
+| `map/drops` | See-all list of drops. Empty: "Drops appear here as events go live." | Feed context | Card taps |
 | `map/featured` | See-all featured cards | `useFeaturedCards` | Event, POI, or save-location |
 | `map/friends` | Friend list | `useFriendList` | `map/friend/[friendId]` |
 | `map/friend/[friendId]` | Friend profile. "Not found" for unknown ids. Distance and walking time, or "Location unavailable". "LAST SEEN" when not live. | `GET /map/friends` (cache) | **Bump** pushes `map/request?bump=true` |
@@ -127,8 +127,7 @@ All routes in this group render inside the map sheet.
 | `link?yeloLink=` | Decodes an encoded path and navigates. "Failed to open link" / "Link appears to be invalid." on failure. | `GET /link/decode` | The decoded route, or `/` |
 | `scan-qr` | Camera scanner, permission request, or simulator placeholder | none | Opens the URL, then back |
 | `connect-uber`, `connect-lyft`, `connect-empower` | Provider sign-in states via `ProviderAccountView`. Lyft adds phone, OTP, and email phases. | Provider APIs directly | `<Redirect>` to `profile/accounts` when the community's Fare Finder kill switch is on. Shows the Fare Finder disclosure until accepted. |
-| `events/[eventId]` | Event detail, slides up from the bottom with a vertical dismiss gesture | `GET /event/{id}`, `GET /event/{id}/attendees` | Tickets, bump sheet, `map/request` |
-| `deals/[dealId]` | Hard-coded placeholder deal | none | External deal URL |
+| `events/[eventId]` | Event detail, slides up from the bottom with a vertical dismiss gesture | `GET /event/{id}` | Tickets, bump sheet, `map/request` |
 | `/fleet-join/[code]` | Fleet invite preview: invalid, preview failed, signed out (**Sign in or create account**), join, joined. Explains fleet-managed payouts or own Stripe. | `GET /fleet-join/{code}`, `GET /driver/fleet`, `POST /driver/fleet-join/{code}` | `/(auth-v3)` (code saved), `driver-signup/1-hub` if steps remain, else `drive/driver-hub/1-hub`. Auto-exits to `/` if already in the fleet. |
 | `/live-activity-preview` | Dev-only Live Activity gallery: one row per rider and driver scenario, plus `none`. Accepts `?scenario=`. See [Live Activities](/engineering/mobile/live-activities#dev-preview-route). | none | `<Redirect>` to `/` unless `__DEV__`. Outside the `(app)` group, so no session is needed. |
 | `+native-intent` | Rewrites incoming URLs. See [Navigation](/engineering/mobile/navigation#deep-links). | none | n/a |
@@ -151,7 +150,6 @@ All routes in this group render inside the map sheet.
 - **The World Cup prompt ignores ride state.** `(app)/_layout.tsx:71` skips only `/tip/` paths before pushing `post-signup/14-student`. During an assigned or matching ride, `useRideLifecycleNavigation` replaces it with the ride screen right away. For a driving user, `StatusGuard` replaces it with `/drive`. The prompt flashes and is marked as shown, so it doesn't return until the next launch. On the request sheet (`requested`), nothing bounces it.
 - **`ride/*` legacy routes are reachable by URL.** `com.rideyelo://ride/pickup` still opens the old pickup screen because `+native-intent` passes unknown paths through.
 - **The approval push targets a missing route.** The API's `driver_application_approved` push deep-links to `/driver-signup/1-application-status`. See [Driver onboarding](/concepts/driver-onboarding#admin-review).
-- **Deals ignore their id.** Any event tagged `deal` opens the same hard-coded deal page.
 - **`ride-details` depends on a cached list.** A ride outside the latest 200 history rows renders "Ride not found".
 - **`events/[eventId]` is the only `(app)` route with a vertical dismiss gesture.** Every other full-screen route either disables gestures or uses the horizontal default.
 - **Labs redirect silently.** Opening `glass-lab`, `color-lab`, or `design-system-lab` by URL without the experiment lands on settings with no message.

@@ -398,7 +398,7 @@ See [Background jobs](/engineering/api/background-jobs).
 | Community, community detail | 60 s | `data/redis/community_cache.go:14`, `community_detail_cache.go:15` |
 | Community invalidation epoch | 24 h | `data/redis/community_invalidation.go:58` |
 | School signup stats | 60 s | `data/redis/school_signup_stats_cache.go:15` |
-| Feed | 2 min, lock 30 s; 10 per page, 3 pages | `service/community/feed_cache_redis.go:21-22`, `community.go:22-23` |
+| Feed | 2 min, lock 30 s; 10 per page, 3 pages. Keys use the `feed:community:v2:` prefix | `service/community/feed_cache_redis.go:22-25`, `community.go:22-23` |
 
 ## Mobile data freshness
 
@@ -417,7 +417,7 @@ See [Background jobs](/engineering/api/background-jobs).
     | Friends convergence | 5 min, stale 60 s | `providers/FriendsProvider.tsx:20,223-224` | |
     | Friend locations stale | 15 s | `hooks/useFriendLocations.ts:71` | |
     | Vehicle locations stale | 30 s | `hooks/useVehicleLocations.ts:61` | |
-    | Feed polls | Coupons 30 s; ads, deals, events 5 min; stories, referrals 10 min; community 5 min and 60 min | `components/feed/*`, `components/modals/EventStoryModal.tsx:113`, `api/helpers/community.ts:61,191` | |
+    | Feed polls | Events 5 min; stories, referrals 10 min; community list 60 min | `components/feed/*`, `components/modals/EventStoryModal.tsx:113`, `api/helpers/community.ts:32` | |
     | Vehicle types stale | 5 min | `hooks/useVehicleSeatLimits.ts:27` | |
   </Accordion>
   <Accordion title="Updates, telemetry, prompts">
@@ -455,8 +455,8 @@ See [Background jobs](/engineering/api/background-jobs).
     | --- | --- | --- | --- |
     | Query defaults | `staleTime` 5 min, 1 retry | `src/sites/dashboard/main.tsx:104-105`, `src/shared/bootstrap/renderSite.tsx:19` | |
     | Rides tab | 10 s with active rides, else 60 s; page 50 | `src/sites/dashboard/components/RidesTab.tsx:359,445` | |
-    | Driver ops | 20 s | `src/hooks/useDriverOps.ts:4` | Only the unrouted `DriverOpsPage` polls. `SilentCancelRide` imports only `driverOpsKeys` for cache invalidation |
-    | Live operations | 10 s, stale 10 s, one retry | `src/hooks/useLive.ts:31` | |
+    | Live operations | 10 s, stale 10 s, one retry | `src/hooks/useLive.ts:19` | |
+    | Live driver sheet | Operations and notifications 15 s, user detail 30 s | `src/components/live/LiveDriverSheet.tsx:81-92` | Operations reads `GET /dashboard/driver-ops/drivers/{id}` |
     | Contact sync, marketing segments | 15 s | `src/sites/dashboard/pages/ContactSyncPage.tsx:111`, `components/MarketingSegments.tsx:155` | |
     | Fleet calendar | 15 s | `src/components/FleetCalendar.tsx:75` | |
     | Notification logs | 30 s, page 25 | `src/components/notifications/NotificationLogsTable.tsx:60,112` | |

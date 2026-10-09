@@ -73,8 +73,8 @@ After the global chain, Fuego groups add their own middleware. The group decides
 
 | Group prefix | Middleware | Credential |
 | --- | --- | --- |
-| `/user`, `/community`, `/ride`, `/referral`, `/coupon`, and most top-level domains | `getValidateJWTMiddleware` + `getRequireRoleMiddleware(["user"])` | Full app JWT |
-| `/authv2` phase 2 and 3, `/world-cup` (auth), `/tips` (auth) | `getValidatePresignupTokenMiddleware` | Presignup or full JWT |
+| `/user`, `/community`, `/ride`, `/referral`, `/event`, and most top-level domains | `getValidateJWTMiddleware` + `getRequireRoleMiddleware(["user"])` | Full app JWT |
+| `/authv2/email`, `/authv2/status`, `/world-cup` (auth), `/tips` (auth) | `getValidatePresignupTokenMiddleware` | Presignup or full JWT |
 | `/authv3` onboarding routes | `ValidateOnboardingTokenMiddleware` | Auth v3 onboarding JWT |
 | `/authv3/user` | JWT + `user` role | Full app JWT |
 | `/dashboard` | `getClerkAuthMiddleware` + `getDashboardScopeMiddleware` | Clerk session JWT |
@@ -90,27 +90,37 @@ Some ride routes use `getOptionalAuthMiddleware`: a valid token attaches the use
 Fuego handlers are typed functions. A handler receives a `fuego.ContextWithBody[T]` or `fuego.ContextNoBody` and returns `(json.StandardResponse[R], error)`.
 
 ```go
-func (h *RideHandler) CreateRide(c fuego.ContextWithBody[models.CreateRideRequest]) (json.StandardResponse[models.CreatedRide], error) {
+func (h *RideHandler) CreateRideV2(c fuego.ContextWithBody[models.CreateRideRequest]) (json.StandardResponse[models.CreatedRideV2], error) {
 	ctx := c.Context()
 
 	riderId, err := customContext.GetRequestUserID(ctx)
 	if err != nil {
-		return json.StandardResponse[models.CreatedRide]{}, err
+		return json.StandardResponse[models.CreatedRideV2]{}, err
+	}
+
+	communityId, ctxErr := customContext.GetRequestUserCommunity(ctx)
+	if ctxErr != nil {
+		return json.StandardResponse[models.CreatedRideV2]{}, ctxErr
 	}
 
 	createRideRequest, bodyErr := c.Body()
 	if bodyErr != nil {
-		return json.StandardResponse[models.CreatedRide]{}, errors.Wrap(bodyErr, "failed to read request body")
+		return json.StandardResponse[models.CreatedRideV2]{}, errors.Wrap(bodyErr, "failed to read request body")
 	}
 
 	v := validator.New()
+	createRideRequest.RiderID = riderId
+	createRideRequest.CommunityId = communityId
+	createRideRequest.TipsEnabled = features.HasFeature(c.Request(), features.FeatureTips)
+	createRideRequest.DriverOptionsEnabled = features.HasFeature(c.Request(), features.FeatureDriverOptions)
+
 	if createRideRequest.Validate(v); !v.Valid() {
-		return json.StandardResponse[models.CreatedRide]{}, v.ErrorOrNil()
+		return json.StandardResponse[models.CreatedRideV2]{}, v.ErrorOrNil()
 	}
 
-	response, err := h.rideService.CreateRide(ctx, createRideRequest)
+	response, err := h.rideService.CreateRideV2(ctx, createRideRequest)
 	if err != nil {
-		return json.StandardResponse[models.CreatedRide]{}, err
+		return json.StandardResponse[models.CreatedRideV2]{}, err
 	}
 
 	c.Response().WriteHeader(http.StatusCreated)

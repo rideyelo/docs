@@ -1,9 +1,9 @@
 ---
 title: "Growth and monetization"
-description: "Reference for referral, attribution, coupon, ad, promo, World Cup campaign, QR payment and tipping, and short-link tables."
+description: "Reference for referral, attribution, promo banner, World Cup campaign, QR payment and tipping, and short-link tables, plus the unused coupon, ad, and promo bar tables."
 ---
 
-These tables support acquisition and side revenue: referrals and their payouts, marketing attribution, partner coupons and ads, in-app promo placements, the World Cup school campaign, QR code tips paid through Stripe payment links, and short links. Ride payments and Stripe payment intents are on [Payments](/reference/database/payments).
+These tables support acquisition and side revenue: referrals and their payouts, marketing attribution, in-app promo placements, the World Cup school campaign, QR code tips paid through Stripe payment links, and short links. The coupon, ad, and promo bar tables are still in the schema but unused. Ride payments and Stripe payment intents are on [Payments](/reference/database/payments).
 
 Many of these tables are older and have no foreign keys. The per-table notes call that out.
 
@@ -166,9 +166,13 @@ One row per user summarizing attribution and funnel milestones.
 
 ## Coupons
 
+<Note>
+  Coupon listing and claims were retired in October 2026. Both tables still exist. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
+</Note>
+
 ### Coupons
 
-Partner coupons shown to a community.
+Partner coupons formerly shown to a community.
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
@@ -183,9 +187,9 @@ Partner coupons shown to a community.
 | `title`, `description` | `text` | no | | Content. |
 | `photo_url` | `text` | yes | | Image. |
 | `num_total` | `integer` | no | | Total issued. |
-| `num_available` | `integer` | no | `0` | Remaining. `DecrementCouponAvailability` only decrements while it is above 0. |
+| `num_available` | `integer` | no | `0` | Remaining. |
 
-The API has no insert path for coupons. `internal/data/repository/coupon.go` lists coupons with the caller's claim state (`ListCouponsForCommunity`) and claims inside one transaction: check, decrement, insert claim.
+No code has read or written this table since October 2026.
 
 ### CouponClaims
 
@@ -199,27 +203,31 @@ The API has no insert path for coupons. `internal/data/repository/coupon.go` lis
 | `redeemed` | `boolean` | no | `false` | Redeemed flag. |
 | `redeemed_at` | `timestamptz` | yes | | Redemption time. |
 
-Unique `(coupon_id, user_id)`: one claim per user per coupon. Index on `user_id`. No query sets `redeemed`.
+Unique `(coupon_id, user_id)`: one claim per user per coupon. Index on `user_id`. No code has read or written this table since October 2026.
 
 ## Ads
 
+<Note>
+  Ads and impression logging were retired in October 2026. Both tables still exist. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
+</Note>
+
 ### Ads
 
-In-app ad placements bought by enterprise accounts.
+In-app ad placements formerly bought by enterprise accounts.
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
 | `id` | `uuid` | no | `gen_random_uuid()` | Primary key. |
 | `enterprise_account_id` | `uuid` | no | | Advertiser. No foreign key. |
-| `community_ids` | `uuid[]` | no | | Target communities. Matched with `= ANY(community_ids)`, with no GIN index. |
+| `community_ids` | `uuid[]` | no | | Target communities. |
 | `start_time`, `end_time` | `timestamptz` | no | | Flight window. |
 | `link` | `text` | no | | Click-through URL. |
 | `media_url`, `media_type` | `text` | no | | Creative. |
-| `tier` | `integer` | no | | Priority tier. `GetRandomActiveAd` requires a minimum tier. |
-| `size`, `shape` | `text` | no | | Slot fit (`models.AdSize`, `models.AdShape`). |
+| `tier` | `integer` | no | | Priority tier. |
+| `size`, `shape` | `text` | no | | Slot fit. |
 | `height`, `width` | `integer` | no | | Creative dimensions. |
 
-`internal/service/ad` creates, updates, and serves ads. `GetRandomActiveAd` picks a random in-flight ad for the community, tier, size, and shape. `GetCommunityAds` orders by tier, then randomly.
+No code has read or written this table since October 2026. The community feed no longer includes ads.
 
 ### AdImpressions
 
@@ -234,7 +242,7 @@ In-app ad placements bought by enterprise accounts.
 | `clicks` | `integer` | no | `0` | Clicks during the impression. |
 | `impression_type` | `text` | no | `''` | Client-defined type. |
 
-Written by `AddAdImpression` through `internal/service/ad`. No query reads it.
+No code has read or written this table since October 2026.
 
 ## Promo placements
 
@@ -250,7 +258,7 @@ A text promo bar per community.
 | `url` | `text` | yes | | Tap target. |
 | `background_url`, `background_color` | `text` | yes | | Background. |
 
-Read by `internal/service/promobar` through `queries/engagement.sql`. The API never writes it.
+No code has read or written this table since October 2026, when `GET /promobar/` was removed. Promo banners below are unaffected.
 
 ### PromoBanners
 
@@ -358,4 +366,4 @@ Yelo's own short links.
 | `original_path` | `varchar(255)` | no | | Target path. |
 | `created_at` | `timestamptz` | no | `now()` | Creation time. |
 
-`internal/service/link` encodes by inserting a new random path and decodes by primary key lookup. Encoding does not reuse an existing row for the same target. Links for QR codes and marketing use Dub instead (`internal/data/dub`), stored on `"QrPaymentConfigs"`.
+`internal/service/link` decodes by primary key lookup for `GET /link/decode`. The API no longer creates rows: `POST /link/encode` was removed in October 2026. Links for QR codes and marketing use Dub instead (`internal/data/dub`), stored on `"QrPaymentConfigs"`.

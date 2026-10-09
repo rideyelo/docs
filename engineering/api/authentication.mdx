@@ -73,14 +73,16 @@ Auth v2 is the phone-first mobile sign-up flow under `/authv2`. The router regis
 | Phase | Routes | Credential |
 | --- | --- | --- |
 | 1. Phone | `POST /authv2/phone/request-otp`, `POST /authv2/phone/verify-otp` | None |
-| 2. Email and community | `/email/verify-oauth`, `/email/request-otp`, `/email/verify-otp`, `/community/verify-oauth`, `/community/request-email-otp`, `/community/verify-email-otp` | Presignup or full JWT |
-| 3. Profile | `/profile/setup`, `/profile/draft`, `/status`, `/referral-source` | Presignup or full JWT |
+| 2. Email | `/email/verify-oauth`, `/email/request-otp`, `/email/verify-otp` | Presignup or full JWT |
+| 3. Status | `GET /authv2/status` | Presignup or full JWT |
+
+The auth v2 community email and OAuth routes, `/profile/setup`, `/profile/draft`, and `/referral-source` were removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 - Verifying the phone OTP returns a full JWT for a returning user whose sign-up is complete. Otherwise it returns a **presignup token**: HS256, 1-hour lifetime, role `presignup`, with the verified phone in `app_metadata.phone` and `sub` set to the user ID or `pending`.
 - `getValidatePresignupTokenMiddleware` accepts both presignup and full tokens, stores `PresignupClaims` in context under `PresignupClaimsKey`, and masks the phone in logs. It does not check that the user exists. Handlers read `claims.UserID` themselves.
 - The OTP send route shares the Auth v3 durable rate limiter through `authv2.WithPhoneSendRateLimit` when Auth v3 is enabled.
 - Email verification refreshes the presignup token with the user and community, or returns a full JWT when it authenticates a completed account. A caller that already holds a full `user` token always gets a full JWT back, scoped to their current community.
-- Completing profile setup issues the full JWT.
+- A new user who hasn't finished sign-up gets a presignup token with status `needs_profile`. Auth v2 no longer has a profile setup route.
 
 ## Auth v3
 
@@ -97,7 +99,7 @@ Auth v3 is the primary sign-up and sign-in surface under `/authv3`, used by the 
     `FunnelContextMiddleware` runs on the whole `/authv3` group.
   </Accordion>
   <Accordion title="Onboarding routes">
-    `GET /authv3/status`, `POST /authv3/profile`, and `POST /authv3/community/resolve`. These accept only an onboarding JWT. The OpenAPI spec labels them with the `AuthV3OnboardingJWT` security scheme.
+    `GET /authv3/status` and `POST /authv3/profile`. These accept only an onboarding JWT. The OpenAPI spec labels them with the `AuthV3OnboardingJWT` security scheme. `POST /authv3/community/resolve` was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
   </Accordion>
   <Accordion title="Authenticated routes">
     Mounted under `/authv3/user` with the standard JWT and `user` role middleware: `/link/authorize`, `/identities`, `/community/resolve`, and StudID student verification (`/student/studid/start`, `/student/studid/complete`, `/student/connections`, `DELETE /student/connections/{provider}`).
@@ -165,7 +167,6 @@ Handlers still own object-level checks and mutation permissions. The gate only p
 
 | Group | Allowed roles |
 | --- | --- |
-| Education claim routes (`/dashboard/education-claims/*`) | `admin` |
 | `/dashboard/users/*` (including fleet admin routes, driver fleet memberships and transfers, and user notifications) | `admin` |
 | `/dashboard/notifications/*` | `admin` |
 | `/dashboard/leads/drivers/*` | `admin`, `intern` |

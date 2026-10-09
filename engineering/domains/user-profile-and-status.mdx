@@ -35,7 +35,6 @@ All routes are registered in `internal/server/http/user/user_routes.go` under th
 | GET | `/user/drive-history` | User JWT | `GetDriveHistory`: last 200 rides as driver |
 | PUT | `/user/name` | User JWT | `UpdateName` |
 | PUT | `/user/profile-picture` | User JWT | `UpdateProfilePicture`: multipart field `profile_picture` |
-| GET | `/user/profile-picture/thumbnail` | User JWT | `GetProfilePictureThumbnail`: generates the thumbnail lazily |
 | PUT | `/user/community` | User JWT | `UpdateActiveCommunity`: validated switch, returns a new JWT |
 | DELETE | `/user/i/{id}` | User JWT | `Delete`: deletes the caller's account |
 | PUT | `/user/app-version` | User JWT | `UpdateAppVersion`: `app_version` and `expo_update_id` |
@@ -189,7 +188,9 @@ Zero rows returns 400 **community is unavailable for this user**. On success, th
 
 A 1200 × 800 upload scales by `min(512/1200, 512/800) = 0.4267` to 512 × 341. A 400 × 300 upload is re-encoded at its original size.
 
-`GET /user/profile-picture/thumbnail` returns the stored `photo_thumbnail_url` when present. If only `photo_url` is set, it downloads the original with a plain HTTP GET (30-second client timeout), generates and uploads the thumbnail, saves it, and invalidates the profile cache. If `photo_url` is empty, the handler returns 404 **no profile picture found**. The download bypasses the storage SDK on purpose, because stored URLs point at several historical Supabase projects. When the account has no `photo_url`, the endpoint returns the driver photo thumbnail, or the driver photo when no driver thumbnail exists.
+`UserService.GetProfilePictureThumbnail` returns the stored `photo_thumbnail_url` when present. If only `photo_url` is set, it downloads the original with a plain HTTP GET (30-second client timeout), generates and uploads the thumbnail, saves it, and invalidates the profile cache. The download bypasses the storage SDK on purpose, because stored URLs point at several historical Supabase projects. When the account has no `photo_url`, it returns the driver photo thumbnail, or the driver photo when no driver thumbnail exists.
+
+The method has no HTTP route. `GET /user/profile-picture/thumbnail` was retired in October 2026, so only the ride-options self-heal below calls it. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
 ### Stale thumbnails on profile writes
 
@@ -198,7 +199,7 @@ Two other writers set `photo_url` and now clear a stale thumbnail:
 - `InitializeUserProfile` (profile init) sets `photo_thumbnail_url` to an empty string when the new `photo_url` differs from the stored one.
 - Auth v3 profile completion does the same when it receives a non-empty `photo_url` that differs from the stored one. An empty `photo_url` keeps both the stored photo and its thumbnail.
 
-The next thumbnail read or ride-options self-heal regenerates the thumbnail from the new photo.
+The next ride-options self-heal regenerates the thumbnail from the new photo.
 
 ## Avatar resolution in responses
 
@@ -209,7 +210,7 @@ Two orders apply, depending on whose photo the screen should show.
 | Order | Resolution (first non-empty wins) | Used by |
 | --- | --- | --- |
 | Driver avatar | `driver_profile_picture_thumbnail_url` → `driver_profile_picture_url` → `photo_thumbnail_url` → `photo_url` | Driver in public ride details, dashboard driver and fleet lists, driver leads, live market drivers, tip page |
-| Account avatar | `photo_thumbnail_url` → `photo_url` → `driver_profile_picture_thumbnail_url` → `driver_profile_picture_url` | Riders in ride details and the ride board, dashboard user list and user detail, presence, friends, map friends, event attendees, invite and referral previews, auth v3 user reads |
+| Account avatar | `photo_thumbnail_url` → `photo_url` → `driver_profile_picture_thumbnail_url` → `driver_profile_picture_url` | Riders in ride details and the ride board, dashboard user list and user detail, presence, friends, map friends, invite and referral previews, auth v3 user reads |
 
 The account order falls back to the driver application photo. A driver who uploaded a photo only during the driver application no longer renders blank in friend lists or rider views.
 
@@ -330,7 +331,7 @@ Database triggers finish the cleanup. `clear_recent_locations_on_user_deletion` 
 - The legacy `current_ride` picks the oldest non-complete rider ride, including `requested` and `no_drivers_available` rows. If a stale row of that kind is older than a live booking, `user_status` reports `home`. The snapshot query excludes those statuses for exactly this reason.
 - `/user/status` reports `pending_rider_rating` as `riding` in both the legacy and snapshot paths.
 - Content types are built as `"image/" + extension`, and the extension includes the dot, so originals upload as `image/.jpg`. Thumbnails correctly use `image/jpeg`.
-- The extension comes from the client filename with no allow-list. A HEIC or WebP upload succeeds, but thumbnail decoding fails. Every later `GET /user/profile-picture/thumbnail` then retries the download and fails with 500.
+- The extension comes from the client filename with no allow-list. A HEIC or WebP upload succeeds, but thumbnail decoding fails. Every later ride-options self-heal for that user then retries the download and logs the failure.
 - Uploading a new photo doesn't delete the previous original or thumbnail from storage.
 - `PUT /user/name` validates trimmed length but stores untrimmed input, so leading and trailing spaces persist.
 - `GetCurrentUser` still has a branch that tolerates `ErrorTypeMissingFields` and returns `user: null`, but nothing creates that error type anymore, so the branch is unreachable.

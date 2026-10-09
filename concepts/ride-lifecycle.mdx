@@ -62,7 +62,7 @@ stateDiagram-v2
 
 | Transition | Actor | Endpoint or job | Service method |
 | --- | --- | --- | --- |
-| → `requested` | Rider | `POST /ride/` or `POST /ride/v2/` | `RideService.CreateRide` / `CreateRideV2` |
+| → `requested` | Rider | `POST /ride/v2/` | `RideService.CreateRideV2` |
 | `requested` → `confirmed` | Rider | `POST /ride/i/{id}/confirm` | `RideService.ConfirmRide` |
 | `confirmed` → `driver_en_route` or `queued` | Driver | `POST /ride/i/{id}/accept` | `RideService.AcceptRide` |
 | `confirmed` → `queued`, or `driver_en_route` when the driver has no other ride | System | Operational loop (auto-queue pass) | `ActivationService.tryAutoQueueAssign` → `RideService.AutoAssignRide` |
@@ -83,7 +83,7 @@ Every lifecycle write runs through a locked "ride command" transaction in `inter
 
 <Steps>
   <Step title="Request">
-    The rider picks pickup and dropoff. `CreateRide` resolves the rider's community, rejects it if the community has rides disabled, and cancels any older `requested` ride for the same rider with `cancel_reason = 'superseded'`. It then stores the new ride, prices every available vehicle option, and makes sure the rider has a Stripe customer. The response includes a SetupIntent client secret and an ephemeral key. See [Pricing](/concepts/pricing).
+    The rider picks pickup and dropoff. `CreateRideV2` resolves the rider's community. If the community has rides disabled, it creates no ride and returns no vehicle options. Otherwise it cancels any older `requested` ride for the same rider with `cancel_reason = 'superseded'`. It then stores the new ride, prices every available vehicle option, and makes sure the rider has a Stripe customer. The response includes a SetupIntent client secret and an ephemeral key. See [Pricing](/concepts/pricing).
   </Step>
   <Step title="Confirm">
     The rider selects a vehicle and payment method. `ConfirmRide` recomputes the fare server-side, stores the vehicle type, fleet, price, and payment method, and generates a confirm code if the fleet requires one. It then adds the ride to the ride board and notifies drivers. If the rider picked a specific driver, the ride is offered to that driver first. No money is authorized yet.

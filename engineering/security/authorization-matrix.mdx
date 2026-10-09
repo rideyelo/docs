@@ -9,6 +9,10 @@ This page lists every route that `yelo-api` serves on `main`, grouped by area. F
 The router is the source of truth, not the OpenAPI spec. Dashboard routes carry no security scheme in `openapi.json`, `/dashboard/pricing/overview` and `/dashboard/pricing/preview` are labeled `JWT` even though they use Clerk, and hidden routes (`option.Hide()`) and raw mux mounts are absent. Everything below comes from `internal/server/http/router.go` and the handlers it registers.
 </Note>
 
+<Note>
+46 operations were retired in October 2026, including the ad, coupon, promo bar, and event attendance routes, the fleet whitelist admin routes, `/dashboard/live` pings and market notify, `POST /link/encode`, and legacy `POST /ride/` and `DELETE /ride/`. They return 404 or 405 and are not listed below. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
+</Note>
+
 ## Mechanisms
 
 | Label | Credential | Middleware or check | Rejection |
@@ -104,8 +108,6 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | POST | `/authv2/phone/request-otp` | None | Durable per-requester and global send limits when Auth v3 is enabled. Redis cooldown |
     | POST | `/authv2/phone/verify-otp` | None | 5 failed verifies delete the code |
     | POST | `/authv2/email/verify-oauth`, `/authv2/email/request-otp`, `/authv2/email/verify-otp` | Presignup or user JWT | Uses the phone and user ID from the token claims |
-    | POST | `/authv2/community/verify-oauth`, `/authv2/community/request-email-otp`, `/authv2/community/verify-email-otp` | Presignup or user JWT | Same |
-    | POST | `/authv2/profile/setup`, `/authv2/profile/draft`, `/authv2/referral-source` | Presignup or user JWT | Same |
     | GET | `/authv2/status` | Presignup or user JWT | Reports `deleted` for a deleted account instead of rejecting |
 
     Limits are detailed in [Phone OTP and abuse controls](/engineering/identity/phone-otp-and-rate-limits#auth-v2-legacy-limits).
@@ -126,7 +128,7 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | POST | `/authv3/token` | None | One-time handoff code. Durable limit `token` |
     | POST | `/authv3/session/refresh`, `/authv3/session/logout` | Refresh cookie `__Host-yelo_refresh` | Rotating session. No HTTP limit |
     | GET | `/authv3/status` | Onboarding token | Token is bound to one user and one transaction |
-    | POST | `/authv3/profile`, `/authv3/community/resolve` | Onboarding token | Same |
+    | POST | `/authv3/profile` | Onboarding token | Same |
     | POST | `/authv3/user/link/authorize` | User JWT | Durable limit `authorize`. Links to the caller only |
     | GET | `/authv3/user/identities` | User JWT | Caller's identities |
     | POST | `/authv3/user/community/resolve` | User JWT | Caller only |
@@ -144,7 +146,6 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | --- | --- | --- |
     | GET | `/user/current-user`, `/user/status`, `/user/ride-state`, `/user/ride-history`, `/user/drive-history` | Caller |
     | PUT | `/user/name`, `/user/profile-picture`, `/user/community`, `/user/app-version`, `/user/allow-notifications`, `/user/experiments`, `/user/location-sharing` | Caller. Community switch validates the target community |
-    | GET | `/user/profile-picture/thumbnail` | Caller |
     | POST | `/user/location` | Caller |
     | GET, POST | `/user/recent-locations`, `/user/recent-locations/sync` | Caller |
     | GET | `/user/friends` | Caller's friendships |
@@ -158,24 +159,16 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | Method | Path | Auth | Handler checks |
     | --- | --- | --- | --- |
     | GET | `/community/` | None | Community list |
-    | GET | `/community/current`, `/community/feed`, `/community/driver-leaderboard` | User JWT | Caller's community |
+    | GET | `/community/current`, `/community/feed` | User JWT | Caller's community |
     | GET | `/community/{id}/zones` | User JWT | Any community ID |
     | GET | `/school/` | None | School list |
     | GET | `/vehicle-types` | User JWT | Active types |
     | GET | `/event/upcoming` | User JWT | Caller's community |
-    | GET | `/event/{id}` | User JWT | Adds the caller's attendance state |
-    | GET | `/event/{id}/attendees` | User JWT | None. Returns names and photos of every attendee of any event ID |
-    | POST, DELETE | `/event/{id}/attend` | User JWT | Caller's attendance |
+    | GET | `/event/{id}` | User JWT | |
     | POST | `/event/{id}/view` | User JWT | Caller |
     | GET | `/public/events/slug/{slug}` | None | Published event by slug |
     | GET | `/referral/`, `/referral/link` | User JWT | Caller |
     | GET | `/referral/invite/{code}` | None | Returns the inviter's user ID, first name, and photo for any referral code |
-    | GET | `/coupon/`, `/coupon/i/{couponId}/available` | User JWT | |
-    | POST | `/coupon/i/{couponId}/claim` | User JWT | Claims for the caller |
-    | GET | `/promobar/` | User JWT | |
-    | GET | `/ad/`, `/ad/{id}` | User JWT | |
-    | POST | `/ad/impression` | User JWT | |
-    | POST | `/link/encode` | None | Stores any non-empty path and returns a short code |
     | GET | `/link/decode` | None | Returns the stored path for a code |
     | GET | `/world-cup/standings`, `/world-cup/activity` | None | Aggregates only |
     | PUT | `/world-cup/education-claim` | Presignup or user JWT | Caller from claims |
@@ -190,8 +183,7 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | Method | Path | Auth | Handler checks |
     | --- | --- | --- | --- |
     | GET | `/ride/{id}` | Optional JWT | Anonymous callers and board viewers get full details without the confirm code. A signed-in caller who is not the rider, the driver, or the offered driver is rejected only when a driver is assigned |
-    | POST | `/ride/`, `/ride/v2/` | User JWT | Creates a ride for the caller |
-    | DELETE | `/ride/` | User JWT | Handler returns 401 unless `ENVIRONMENT=dev`. Repository refuses when `RIDE_STATE_SNAPSHOT_ENABLED` is true |
+    | POST | `/ride/v2/` | User JWT | Creates a ride for the caller |
     | GET | `/ride/v2/board` | User JWT | Board for the fleet of the caller's active driver session. Empty without one |
     | GET | `/ride/board/{id}` | User JWT | Any confirmed ride. No fleet or driver check |
     | POST | `/ride/feed-summaries` | User JWT | |
@@ -203,12 +195,11 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | POST | `/ride/i/{id}/cancel`, `/ride/i/{id}/cancel-intent` | User JWT | Caller must be the rider or the driver |
     | POST | `/ride/i/{id}/rate` | User JWT | Caller must be the rider or the driver |
     | GET | `/ride/i/{id}/tip-options` | User JWT | Caller must be the rider |
-    | POST | `/ride/i/{id}/confirm-tip` | User JWT | Caller must be the rider |
     | GET | `/ride/i/{id}/map-details` | User JWT | None. Returns driver position, heading, speed, and route for any ride ID |
     | GET | `/ride/i/{id}/ping` | User JWT | None. Returns status and driver position for any ride ID |
     | GET, POST | `/ride/i/{id}/messages`, `/messages/new`, `/messages/v2` | User JWT | `requireRideParticipant`: rider or driver |
     | GET | `/ride/i/{id}/messages/delta`, `/messages/history` | User JWT | Repository `requireMessageParticipant` |
-    | POST | `/ride/i/{id}/messages/read`, `/ride/messages/inbox` | User JWT | Caller's read state and rides |
+    | POST | `/ride/messages/inbox` | User JWT | Caller's rides |
     | GET | `/ride/operations/{id}` | User JWT | Looked up by operation ID and the caller as actor |
   </Accordion>
 
@@ -221,7 +212,6 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | POST | `/driver/refresh-online`, `/driver/cancel-online`, `/driver/active-fleet`, `/driver/auto-queue/pause` | Caller |
     | PUT | `/driver/auto-queue` | Caller |
     | POST | `/driver/profile-photo`, `/driver/license-photos` | Caller |
-    | GET | `/driver/profile-photo/thumbnail` | Caller |
     | GET, POST | `/vehicle/` | Caller's vehicles |
     | PUT | `/vehicle/{id}` | Personal vehicle must belong to the caller. A fleet vehicle can only be selected, not edited |
     | POST | `/driver/fleet-join/{code}` | Redeems a join code for the caller |
@@ -272,11 +262,11 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | GET | `/dashboard/notifications`, `/history`, `/detail/{id}`, `/analytics/types`, `/analytics/variants` | `admin` role gate | |
     | POST | `/dashboard/notifications/send` | `admin` role gate | |
     | DELETE | `/dashboard/notifications/scheduled/{schedule_id}` | `admin` role gate | |
-    | GET, PATCH | `/dashboard/notifications/templates/*`, `/dashboard/notifications/variants/{id}` | `admin` role gate | |
+    | GET | `/dashboard/notifications/templates` | `admin` role gate | |
+    | PATCH | `/dashboard/notifications/templates/{code}/{locale}`, `/dashboard/notifications/variants/{id}` | `admin` role gate | |
     | POST | `/dashboard/notifications/templates/{code}/{locale}/preview`, `/test-send`, `/variants` | `admin` role gate | |
     | GET | `/dashboard/{id}/notifications/history`, `/dashboard/{id}/notifications/scheduled` | Admin | |
     | GET, POST, PUT, DELETE | `/dashboard/contact-sync`, `/dashboard/contact-sync/segments*` | Admin | |
-    | GET, POST | `/dashboard/education-claims/unmatched`, `/rematch` | `admin` role gate | |
   </Accordion>
 
   <Accordion title="Dashboard: communities, markets, and places">
@@ -285,7 +275,6 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | POST | `/dashboard/manage`, `/dashboard/manage/timezone-preview` | Admin | |
     | PATCH, DELETE | `/dashboard/manage/{id}` | Admin | |
     | GET, PUT, POST | `/dashboard/manage/{id}/activation-config*`, `/operating-windows` | Admin | |
-    | POST, DELETE | `/dashboard/manage/{id}/schools/{school_id}` | Admin | |
     | POST | `/dashboard/zones` | Admin | |
     | PATCH, DELETE | `/dashboard/zones/{id}` | Admin | |
     | PUT, DELETE | `/dashboard/zone-pricing` | Admin | |
@@ -295,7 +284,7 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | GET | `/dashboard/communities/{id}/feed` | Admin, intern | |
     | GET, POST, PUT | `/dashboard/communities/{id}/events*` | Admin, intern | `requireEventInCommunity` on by-ID routes |
     | GET, POST, PUT, DELETE | `/dashboard/communities/{id}/locations*` | Admin, intern | `requireLocationInCommunity`. `user-coords` and `ride-destinations` are admin-only in the handler |
-    | GET, POST, PUT, DELETE | `/dashboard/communities/{id}/spot*` | Admin | |
+    | GET, POST, PUT | `/dashboard/communities/{id}/spot*` | Admin | |
     | GET, POST, PATCH, DELETE | `/dashboard/communities/{id}/mobility-feeds*`, `/mobility-feed-suggestions` | Admin | |
     | GET, POST, PATCH, DELETE | `/dashboard/{id}/top-locations*` | Admin, intern | `assertTopLocationInCommunity` on by-ID routes |
     | GET | `/dashboard/{id}/kpis`, `/drivers`, `/demographics`, `/search-insights`, `/search-map-data` | Admin, intern | Intern forced to own community |
@@ -317,10 +306,8 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | POST | `/dashboard/communities/{id}/fleets` | Admin | `assertAdmin` |
     | GET, PATCH, DELETE | `/dashboard/communities/{id}/fleets/{fleet_id}` | Admin, fleet | `assertFleetAccess`. Path community must be the fleet's home community |
     | GET, POST | `/dashboard/communities/{id}/fleets/{fleet_id}/stripe/*` | Admin, fleet | `refresh-link` admin-only. `unlink` and `status` allow the fleet's manager |
-    | GET, POST, PATCH | `/dashboard/communities/{id}/fleets/{fleet_id}/whitelist*` | Admin, fleet | `assertFleetInCommunity`, `assertWhitelistEntryInFleet` |
     | GET | `/dashboard/fleet/{fleet_id}/kpis`, `/histogram` | Admin, fleet | `HasFleetAccess` |
     | GET | `/dashboard/fleet/{fleet_id}/drivers` | Admin, fleet | Manager needs an exact fleet and `community_id` assignment |
-    | POST | `/dashboard/fleet/{fleet_id}/drivers` | Admin | Handler and service both require admin |
     | GET, DELETE, POST | `/dashboard/fleets/driver-join-link/{fleet_id}*` | Admin, fleet | `authorizeFleet` |
     | GET, PUT | `/dashboard/fleets/services/*` | Admin | |
     | GET | `/dashboard/fleets/{fleet_id}/communities/{community_id}/calendar` | Admin, fleet | `CalendarAccess` |
@@ -329,7 +316,7 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | GET, POST, PUT, DELETE | `/dashboard/vehicles*` | Admin | |
     | GET | `/dashboard/drivers/global/*`, `/dashboard/drivers/{user_id}/application` | Admin | |
     | POST | `/dashboard/drivers/review` | Admin | |
-    | GET, POST, PATCH | `/dashboard/leads/drivers*` | `admin`, `intern` role gate | Create, import, referrer, tags, disqualify, and activate are admin-only. Interns see and annotate leads in their community |
+    | GET, POST, PATCH | `/dashboard/leads/drivers*` | `admin`, `intern` role gate | Import, referrer, tags, disqualify, and activate are admin-only. Interns see and annotate leads in their community |
     | GET | `/dashboard/qr/qr-configs`, `/dashboard/qr/qr-payments` | Admin, fleet | `FleetScope` limits managers to assigned fleets |
     | POST | `/dashboard/qr/qr-configs` | Admin | |
     | PATCH | `/dashboard/qr/qr-configs/{id}/deactivate`, `/pricing` | Admin, fleet | Loads the config and 404s outside the manager's fleets |
@@ -337,8 +324,8 @@ An intern's community is always forced to the claim: `ResolveDashboardCommunity`
     | GET | `/dashboard/rides/{id}/events`, `/route` | Admin | |
     | GET, POST | `/dashboard/rides/{id}/silent-cancellation`, `/silent-cancel` | Admin | Handler also requires admin |
     | GET | `/dashboard/presence/*`, `/dashboard/telemetry/summary`, `/dashboard/driver-ops` | Admin | |
-    | GET, POST | `/dashboard/live/*` | Admin | Includes driver and rider pings, market notify, and surge |
-    | GET, POST | `/dashboard/kpi/*` | Admin | |
+    | GET, POST | `/dashboard/live/*` | Admin | Includes the market surge override |
+    | GET | `/dashboard/kpi/*` | Admin | |
   </Accordion>
 </AccordionGroup>
 
@@ -352,12 +339,10 @@ These routes pass their gate as designed, but the gate is looser than the data t
 | `POST /ride/i/{id}/confirm` | Confirming another user's requested ride with the caller's payment method | `prepareConfirmRide` loads the ride by ID and checks only `status = requested`. `ConfirmRequestedRide` matches on ride ID and status |
 | `GET /ride/i/{id}/map-details`, `GET /ride/i/{id}/ping` | Live driver position, heading, and speed | No participant check in `GetMapDetails` or `PingRide` |
 | `GET /ride/board/{id}` | Board details of any confirmed ride | No fleet session check, unlike `/ride/v2/board` |
-| `GET /event/{id}/attendees` | Names and photos of every attendee | No community check |
 | `GET /referral/invite/{code}` | Inviter's user ID, first name, and photo | Unauthenticated, keyed by referral code |
 | `POST /issue/` | Issue records and Slack alerts against any ride ID | No participant check |
 | `GET /stripe-reauth/onboarding` | A fresh Stripe onboarding link for the token's user | JWT travels in the URL query string, so it lands in request logs. No deleted or banned check |
-| Presignup-or-user routes (`/authv2/*` phases 2 and 3, `/tips/{slug}/checkout`, `/tips/{slug}/visit`, `/world-cup/education-claim*`) | Actions by banned or deleted users | The presignup middleware skips `AuthCache` |
-| `POST /link/encode` | Unbounded rows in `ShortenedLinks` | Unauthenticated write with no length or content validation |
+| Presignup-or-user routes (`/authv2/email/*`, `/authv2/status`, `/tips/{slug}/checkout`, `/tips/{slug}/visit`, `/world-cup/education-claim*`) | Actions by banned or deleted users | The presignup middleware skips `AuthCache` |
 | `GET /healthcheck/deep` | Database round trip and internal stats | Unauthenticated, and each call pings Postgres |
 
 ## Where this lives in code

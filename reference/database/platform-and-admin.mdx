@@ -104,7 +104,7 @@ Primary key `(provider, account_key)`. `internal/data/resend/gate.go` admits a c
 
 ## KpiManualLog
 
-Hand-entered KPI values that the database cannot compute.
+Hand-entered KPI values that the database cannot compute. The table still exists, but it has been unused since October 2026, when the manual KPI log routes (`GET` and `POST /dashboard/kpi/manual`) were removed. No code reads or writes it. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
@@ -115,10 +115,10 @@ Hand-entered KPI values that the database cannot compute.
 | `created_by` | `text` | no | | Dashboard (Clerk) user. |
 | `created_timestamp` | `timestamptz` | no | `now()` | Entry time. |
 
-Index on `(metric, period_start DESC)`. Append-only: `ListKPIManualEntries` and `CreateKPIManualEntry` in `analytics.sql`, through `internal/data/repository/kpi.go` and `internal/service/dashboard/kpi.go`.
+Index on `(metric, period_start DESC)`. Rows written before October 2026 remain.
 
 <Note>
-There is no KPI snapshot table. `KpiService` computes dashboard KPIs (global totals, weekly series with week-over-week deltas on ISO week boundaries, and the acquisition breakdown) on every request from live tables through `analytics.sql`. Only these manual entries are stored.
+There is no KPI snapshot table. `KpiService` computes dashboard KPIs (global totals, weekly series with week-over-week deltas on ISO week boundaries, and the acquisition breakdown) on every request from live tables through `analytics.sql`. `KpiManualLog` is the only KPI table, and nothing writes to it anymore.
 </Note>
 
 ## GooglePlayReleaseStates

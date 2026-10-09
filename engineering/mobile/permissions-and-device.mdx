@@ -11,7 +11,7 @@ For how location feeds heartbeats and the driver background task, see [Rider and
 
 | Permission | Requested where | Copy the user sees first | Denied fallback |
 | --- | --- | --- | --- |
-| Location (when in use) | Auth v3 **permissions** screen, then `LocationGate` on the map, the **Where to?** control, save-location, event and deal detail | "Location — To show your driver where you are." | Full-screen **Turn on location** blocker on the map. The first tap re-prompts, later taps open Settings. |
+| Location (when in use) | Auth v3 **permissions** screen, then `LocationGate` on the map, the **Where to?** control, save-location, event detail | "Location — To show your driver where you are." | Full-screen **Turn on location** blocker on the map. The first tap re-prompts, later taps open Settings. |
 | Location (always) | Never requested in code. Checked only when a driver taps **Go online**. | "Keep your driver location updated" sheet | Driver can't go online. The sheet deep-links to Settings. |
 | Notifications | Auth v3 **permissions** screen, `post-signup/10-marketing` | "Notifications — To get friend alerts." | Nothing blocks. Push token is never registered. |
 | Contacts | Auth v3 **permissions** screen, friends hub, bump sheet, profile contacts sheet | "Contacts — To securely match phone numbers with friends on Yelo." | Friends hub and bump sheet show contact-access rows. Sync clears the server snapshot. |
@@ -63,7 +63,7 @@ The UI surfaces for a missing grant:
 | Map blocker | `components/map/LocationGate.tsx` | Absolute overlay at `zIndex: 1000`: **Turn on location**, "Yelo is built around where you are — rides, friends, and spots near you. Enable location to use the map." Button reads **Enable location**, then **Open Settings** after one failed request. Hidden while the request sheet is active. |
 | Onboarding | `app/(auth-v3)/permissions.tsx` | Inline "Location access is required…" with **Open Settings**. |
 | Legacy search pill | `components/home/WhereTo.tsx` | Native alert **Location Required** with **Not Now** and **Open Settings**. The component is exported but no screen renders it. |
-| Save location, events, deals | `save-location/index.tsx`, `events/[eventId]`, `deals/[dealId]` | Call `requestForegroundPermissionsAsync()` directly for a best-effort ETA and silently skip on denial. |
+| Save location, events | `save-location/index.tsx`, `events/[eventId]` | Call `requestForegroundPermissionsAsync()` directly for a best-effort ETA and silently skip on denial. |
 
 The app never distinguishes precise from approximate location. It does not read `accuracy` authorization on iOS 14+ or `ACCESS_COARSE_LOCATION`-only grants on Android. A coarse grant counts as `granted`.
 
@@ -233,5 +233,5 @@ For client toggles and experiment gates that sit next to these prompts, see [Wid
 - **Notification channels exist only after registration.** They are created inside `registerForPushNotificationsAsync`. A push that arrives before that uses the OS default channel.
 - **Ride alerts are foreground-only.** `playRideAlert` returns early unless the app is active, and `expo-audio` has background playback disabled. A backgrounded driver relies on the push sound.
 - **Coarse location counts as granted.** A user who picks approximate location passes every gate, but pickup accuracy suffers.
-- **Deals and events prompt out of context.** Opening an event or deal detail calls `requestForegroundPermissionsAsync()` just to show an ETA.
+- **Events prompt out of context.** Opening an event detail calls `requestForegroundPermissionsAsync()` just to show an ETA.
 - **`userInterfaceStyle` is `light`** in `app.json` from 5.8.0, and `lib/theme/appearanceLock.ts` calls `Appearance.setColorScheme('light')` at startup. Binaries before 5.8.0 shipped `automatic`, so on those only the JavaScript lock keeps native materials light under system Dark Mode.

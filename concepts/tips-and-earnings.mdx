@@ -50,7 +50,7 @@ The rider tips by rating: `POST /ride/i/{id}/rate` with an optional `tip_amount`
     The fare is captured first, which releases the buffer. Then a separate **tip PaymentIntent** is created on the same connected account: automatic capture, off-session, using the rider's cloned payment method. For free rides, the payment method is cloned to the matched driver's or fleet's account at this point.
   </Step>
   <Step title="Authentication required">
-    If the card needs authentication, the rate call returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The API exposes `POST /ride/i/{id}/confirm-tip` for a client to call after authenticating the card, but the mobile app currently ignores `requires_action` and never calls it, so the tip is not recorded. When called, the API retrieves the stored tip PaymentIntent from Stripe and records the tip only if the status is `succeeded`.
+    If the card needs authentication, the rate call returns `tip_status: requires_action` with `tip_client_secret` and `tip_connected_account_id`. The API no longer exposes a confirm-tip route: `POST /ride/i/{id}/confirm-tip` was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
   </Step>
 </Steps>
 
@@ -147,7 +147,7 @@ Stripe `payout.paid`, `payout.failed`, and `payout.canceled` events for a connec
 
 | Concern | Location |
 | --- | --- |
-| Tip capture, dedicated tip charges, confirm-tip | `yelo-api/internal/service/ride/tip_charge.go` |
+| Tip capture, dedicated tip charges | `yelo-api/internal/service/ride/tip_charge.go` |
 | Tip-window sweeper | `yelo-api/internal/service/ride/tip_capture.go` |
 | Tip constants and options | `yelo-api/internal/models/tip.go` |
 | QR tip links | `yelo-api/internal/service/tipping/tipping.go`, `yelo-api/internal/server/http/tipping/` |
