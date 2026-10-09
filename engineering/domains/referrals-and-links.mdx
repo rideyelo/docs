@@ -5,7 +5,7 @@ description: "How the API generates referral codes, publishes Dub share links an
 
 Referrals connect three systems: a code on `Users.referral_code`, a Dub short link on `join.yelo.link`, and a `Referrals` row written at sign-up. Rewards are computed at read time from `ReferralRewards` and `ReferralPayouts`. Nothing is paid out automatically.
 
-This page covers the API side. For the product view, see [Growth features](/concepts/growth-features). For how a code is bound to an Auth v3 sign-in, see [Auth v3 transactions](/engineering/identity/auth-v3-transactions). Fleet join links also use Dub; see [Joins and invitations](/engineering/fleets/joins-and-invitations).
+This page covers the API side. For the product view, see [Growth features](/concepts/growth-features). For how a code is bound to an Auth v3 sign-in, see [Auth v3 transactions](/engineering/identity/auth-v3-transactions). Fleet join and payout onboarding links also use Dub and are filed in the fleet folder (`DUB_FLEET_FOLDER_ID`); see [Joins and invitations](/engineering/fleets/joins-and-invitations).
 
 ## Data touched
 
@@ -24,6 +24,7 @@ This page covers the API side. For the product view, see [Growth features](/conc
 | Postgres | `ShortenedLinks` (`encoded_path` PK, `original_path` `VARCHAR(255)`) | Legacy in-house path shortener |
 | Postgres | `ReferralLookup` | Table exists (migration 000146). No Go code reads or writes it. |
 | Dub | Links on `join.yelo.link` | Referral share links, keyed by referral code |
+| Dub | Links on `yelo.link`, `pay.yelo.link`, `event.yelo.link` | Hand-made campaign links and API-created fleet links, listed and edited on the dashboard **Links** page |
 | Cloudflare Worker | `yelo-og` at `OG_IMAGE_BASE_URL/og/invite` | Signed share-card image |
 
 For column types, see [Users and identity](/reference/database/users-and-identity).
@@ -40,6 +41,11 @@ For column types, see [Users and identity](/reference/database/users-and-identit
 | `POST` | `/link/encode` | Public | `LinkHandler.Encode`. Body `path`; returns an 8-character `encoded_path`. |
 | `GET` | `/link/decode` | Public | `LinkHandler.Decode`. Query `encoded_path`; returns `path`. |
 | `GET` | `/redirect` | Public | `redirect` in `router.go`. HTML page that opens the app, then falls back to the App Store. |
+| `GET` | `/dashboard/links` | Platform admin | `links.Handler.List`. One page of short links with click and sign-up counts, the total, and the folder tabs. See [Dashboard short links](#dashboard-short-links). |
+| `GET` | `/dashboard/links/{id}/latest` | Platform admin | `links.Handler.Get`. One link read from Dub now, past the cache. |
+| `POST` | `/dashboard/links` | Platform admin | `links.Handler.Create`. Creates a tracked link. |
+| `PATCH` | `/dashboard/links/{id}` | Platform admin | `links.Handler.Update`. Edits a hand-made link. |
+| `GET` | `/dashboard/links/preview` | Platform admin | `links.Handler.Preview`. Fetches a short link as a crawler and returns its preview tags. |
 
 Routes are registered in `internal/server/http/router.go`: `/referral` on `baseGroup` with an authenticated subgroup, `/link` and `/redirect` on `baseGroup` with no middleware. The service methods `GetReferrers`, `UpdateReferralReward`, `AddPayout`, `UpdatePayout`, and `GetInviterName` have no route.
 
@@ -263,6 +269,74 @@ Personal invite links land on `joinyelo.com/i/<code>`, served by the signup site
 
 Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on the same site. `invite.yelo.link` only forwards links shared before the move: `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect to the matching `https://joinyelo.com/i/...` path with the query string preserved, and the root `invite.yelo.link/` returns a 302 to `https://joinyelo.com/`.
 
+## Dashboard short links
+
+The `/dashboard/links` endpoints back the dashboard [**Links** page](/dashboard/links). They're registered by `links.RegisterRoutes` and every handler requires a Clerk user with role `admin`. Other callers get 403 "Platform admin required".
+
+Validation errors (bad key, non-https destination, unknown folder, taken key) return 400 with a message the dashboard shows as written.
+
+### List links
+
+`GET /dashboard/links` takes these query parameters:
+
+| Parameter | Values |
+| --- | --- |
+| `folder` | A Dub folder ID, `root` for links in no folder, or `all` to search every folder. Omit it to get only the folder list. |
+| `search` | Matches key and destination. At most 100 characters. Required for `folder=all`, which returns no links without it. |
+| `sort` | `clicks` (default), `last_clicked`, or `created_at`. Always descending, because Dub ignores sort order. |
+| `page`, `page_size` | 1-based page. `page_size` is 1 to 100 and defaults to 100. |
+| `archived` | `true` includes archived links. |
+| `fresh` | `true` skips the per-instance cache and asks Dub now. |
+
+The response carries `links`, `total` (across all pages), `page`, `page_size`, and `folders`. Each folder has `id`, `name`, and `count`. The system folder (`DUB_SYSTEM_FOLDER_ID`) is left out because it holds one referral link per user. Links in no folder appear last as `unsorted` with ID `root`. The list and the count run concurrently.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "$API_BASE_URL/dashboard/links?folder=all&search=ndflyer&sort=clicks"
+```
+
+Each link has `id`, `domain`, `key`, `short_link`, `url`, `folder` (`campaigns`, `fleet`, `system`, or empty), `created_at`, `last_clicked`, `tags`, `clicks`, `leads`, `track_conversion`, `archived`, and `managed`.
+
+`managed` is `true`, making the link read-only, when any of these holds:
+
+- The link has a Dub external ID, so the API owns it. This covers referral, fleet join, and fleet payout onboarding links.
+- The key is `_root`, the domain root.
+- The domain isn't `yelo.link`, `pay.yelo.link`, or `event.yelo.link`. This covers referral links on `join.yelo.link`.
+
+### Create and edit links
+
+`POST /dashboard/links` creates a link with `TrackConversion` on.
+
+```json
+{
+  "domain": "yelo.link",
+  "key": "fall-flyer",
+  "url": "https://joinyelo.com/get",
+  "folder": "campaigns"
+}
+```
+
+- `domain` defaults to `yelo.link`. It must be `yelo.link`, `pay.yelo.link`, or `event.yelo.link`.
+- `key` must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
+- `url` must be an `https` address.
+- `folder` is `campaigns` (default) or `fleet`. It maps to `DUB_CAMPAIGNS_FOLDER_ID` or `DUB_FLEET_FOLDER_ID`. When the mapped ID is empty, the link is created in no folder.
+
+`PATCH /dashboard/links/{id}` takes any of `key`, `url`, `folder`, and `archived`. The API reads the link from Dub first and returns 403 "This link is managed by the API and cannot be edited here" for a managed link. A link can move between `campaigns` and `fleet` but not back to the root.
+
+Writes empty the Dub listing cache on the instance that handled them. See [Dub](/engineering/api/integrations#dub) for how the cache works.
+
+### Preview check
+
+`GET /dashboard/links/preview?url=<short link>` fetches the short link the way a link-preview crawler does and returns the card it would build.
+
+- The URL must be `https`, on `yelo.link`, `pay.yelo.link`, `event.yelo.link`, or `join.yelo.link` (`dub.ShortDomains`), with no user info. Otherwise the API returns 400 "url must be an https short link on a Yelo short domain". Editing stays limited to the first three domains.
+- The fetch uses `mobility.NewGuardedHTTPClient`, so every dial and redirect hop goes through the SSRF guard. The destination is whatever an admin typed into Dub.
+- The request sends the user agent `facebookexternalhit/1.1 (compatible; YeloLinkPreview/1.0)`, because Dub only serves a link's own card to crawlers.
+- It times out after 8 seconds, follows at most 5 redirects, stops at any non-`https` redirect, and reads at most 512 KB of HTML.
+- A fetch failure returns 400 "Could not load the link: " followed by the fetch error. The dashboard shows this message.
+
+The response has `url`, `final_url`, `served_by`, `title`, `description`, `image`, and `site_name`. Tags are read in order: Open Graph, then Twitter, then the plain `<title>` and `description`. `served_by` is `dub` when the crawler ended on a Yelo short domain, and `destination` when it was redirected to the landing page.
+
 ## Path shortener
 
 `LinkService.Encode` stores `NewShortenedPathRecord(path)`: an 8-character code from `math/rand` over `[a-zA-Z0-9]` (62^8 possible values). `Decode` reads it back. There is no TTL and no ownership.
@@ -295,6 +369,8 @@ The mobile app decodes these in `app/(app)/link.tsx`. It handles `com.rideyelo:/
 | Friend connect | `internal/service/user/friends.go` | `ConnectFriend` |
 | Path shortener | `internal/service/link/link.go`, `internal/models/link.go`, `data/repository/link.go` | `Encode`, `Decode`, `NewShortenedPathRecord` |
 | Redirect page | `internal/server/http/router.go` | `redirect`, `redirectTemplate` |
+| Dashboard links HTTP | `internal/server/http/dashboard/links/routes.go`, `preview.go` | `RegisterRoutes`, `Handler`, `FetchPreview`, `parsePreview` |
+| Dashboard links Dub access and cache | `internal/data/dub/links.go` | `ListLinks`, `Folders`, `GetLink`, `CreateCampaignLink`, `UpdateLink`, `ManagedDomains`, `ShortDomains` |
 
 `internal/models/invite.go` isn't part of referrals. It defines `InviteUserRequest` for dashboard staff invites (roles `intern`, `fleet`, `admin`).
 

@@ -42,7 +42,7 @@ Both POI routes render the same `PoiSheet`. They differ only in how they resolve
 | --- | --- | --- |
 | `room: '1'` | `FeaturedSpotOverlay`, `FeaturedSpotAuraLayer` | Shows the **Unlock** button next to **Ride** and treats the place as auto-liked |
 | `releaseAt` | Same callers, as epoch milliseconds | Drives the locked countdown on the **Unlock** button |
-| `animateIn: '1'` | `BumpAutoOpen` (tutorial) | Fades the sheet content in over 260 ms |
+| `animateIn: '1'` | No caller sets it today | Fades the sheet content in over 260 ms |
 
 `parsePlaceSnapshot` reads the params back:
 
@@ -105,7 +105,6 @@ Every caller except the bump sheet's fallback goes through `placeHref`. Most als
 | Likes rail | `components/map/feed/MapFeedLikesRail.tsx` | Own likes, plus friend-liked spots with `id` set to `friend-liked-{id}` |
 | Moves and activity cards | `MapFeedMovesCard.tsx`, `MapFeedActivityCards.tsx` | The ride destination or the place on the card |
 | Featured spot banner and marker | `FeaturedSpotOverlay.tsx`, `FeaturedSpotAuraLayer.tsx` | Adds `room` and `releaseAt` |
-| Tutorial auto-open | `components/map/tutorial/BumpAutoOpen.tsx` | Fills address, `mapbox_id`, and categories from the matching like or community POI. Adds `animateIn` |
 | Bump sheet spot | `components/bottom-sheets/BumpFriendsBottomSheet.tsx` | With coordinates: `placeHref`, with `mapbox_id` set to the bump's `poiId`. Without coordinates: `map/poi/[poiId]` |
 
 ### Basemap tap lookup
@@ -275,8 +274,6 @@ The unlocked button's `onPress` is an empty function in `PoiSheet`. The unlock f
 
 The send button opens `BumpFriendsBottomSheet` with a custom location built from the POI. The location's `poiId` is `yelo:{yelo_place_id}` when the place has a catalog ID, else `mapbox_id`, else the POI's `id`. See [Friend bumps](/engineering/mobile/social-and-contacts#friend-bumps).
 
-During the map tutorial's like step, the button shows a nudge toward the heart instead of opening the sheet.
-
 ## Hours
 
 `computeOpenStatus` in `lib/map/poi/poiHours.ts` works out open or closed at render time from Google's opening-hours periods. The server caches place details for days, so a cached `open_now` flag goes stale.
@@ -322,7 +319,7 @@ A success invalidates the likes query. The like request carries the categories s
 
 ### Reported state
 
-`PoiHeader` reports the result through `setSelectedPoiSaved` and resets it to `false` on unmount. The open-POI marker and the map tutorial read it.
+`PoiHeader` reports the result through `setSelectedPoiSaved` and resets it to `false` on unmount. The open-POI marker reads it to decide whether to draw the heart.
 
 ## Friend activity
 
