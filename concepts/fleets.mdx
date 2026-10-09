@@ -16,12 +16,12 @@ A fleet row (`Fleet` in `internal/models/fleet.go`) holds:
 | `name`, `logo_url` | How riders and drivers see the fleet. |
 | `community_id` | The fleet's home community. Drivers who switch to the fleet move to this community. |
 | `payment_model` | `fleet_merchant` or `owner_operator`. See [Payment models](#payment-models). |
-| `has_custom_payouts` | When `true` and the fleet has a Stripe account, fares go to the fleet's Stripe account. |
+| `has_custom_payouts` | Payout routing. When `true` and the fleet has a Stripe account, fares go to the fleet's Stripe account. The dashboard derives it from `payment_model`: `true` for `fleet_merchant`, `false` for `owner_operator`. |
 | `stripe_merchant_id`, `stripe_status` | The fleet's Stripe connected account and its onboarding status. |
 | `primary_vehicle_type`, `supported_vehicle_types` | The vehicle types the fleet runs. |
 | `requires_confirmation_code` | Whether drivers must enter the rider's confirm code at pickup. |
 | `is_student_only` | Hides the fleet's ride types from riders without a verified student account, and gives its options the verified-student badge. |
-| `has_owner_operators` | Marks the fleet as having owner-operator drivers. |
+| `has_owner_operators` | Legacy flag set at creation from `payment_model`. The dashboard no longer sends it. |
 | `is_active`, `deleted_at` | Inactive or archived fleets can't accept joins and don't serve communities. `deleted_at` marks an archived fleet. |
 
 ### Service communities
@@ -56,6 +56,10 @@ Each fleet has one of two payment models. The model decides who receives the far
 | Can accept joins when | Fleet is payout-ready | Fleet is active and `has_custom_payouts` is `false` |
 
 A fleet is **payout-ready** (`Fleet.IsDriverPayoutReady()`) when it is active and not deleted, uses `fleet_merchant`, has `has_custom_payouts = true`, has a Stripe account ID, and its `stripe_status` is `complete`.
+
+The dashboard has no separate custom payouts toggle. Creating or saving a fleet in the dashboard sets `has_custom_payouts` to match the payment model. If a stored value disagrees with the payment model, the fleet can't accept joins, and the **Fleet Details** card shows a warning until an admin saves the fleet settings. See [Edit a fleet](/dashboard/fleets#edit-a-fleet).
+
+A fleet-merchant fleet's manager finishes Stripe onboarding through a `https://yelo.link/payouts-…` short link. The link works for 7 days and can be reopened, and refreshing or unlinking revokes it. See [Stripe onboarding links](/dashboard/fleets#stripe-onboarding-links).
 
 ### How payouts route
 
@@ -147,7 +151,7 @@ Removing a fleet archives it. Yelo keeps the fleet row, ride and payment history
 | Page | Path | Who | What |
 | --- | --- | --- | --- |
 | **Fleet** | `/fleets` | Admins, fleet managers | Fleet KPIs, driver directory, invitations, **Operating hours**, and **Payments** (QR payment configs). |
-| **Fleets** (Configuration) | `/manage`, `/manage/{fleet_id}` | Admins | Fleet editor: settings, pricing, service communities, operating hours, join links, Stripe, vehicles. |
+| **Fleets** (Configuration) | `/manage`, `/manage/{fleet_id}` | Admins | Fleet editor with **Operations** (settings, pricing, service communities, operating hours, join links, Stripe) and **Vehicles** tabs. |
 | **Drivers** | `/drivers` | Admins, interns, fleet managers | Driver leads and applications. Fleet managers see only their fleets. |
 
 Fleet managers are scoped by their `fleet_assignments`. See [Dashboard roles and access](/administration/dashboard-roles). Operating hours come from a Google Calendar per fleet and community. See [Fleet operating hours](/admin/operating-hours).

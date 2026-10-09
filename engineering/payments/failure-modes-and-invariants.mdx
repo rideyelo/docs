@@ -40,12 +40,12 @@ See [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents).
 
 | Failure | Detection | Result |
 | --- | --- | --- |
-| Tip needs authentication | Rate returns `tip_status: requires_action` | Mobile ignores it. The server abandons and cancels the intent 30 minutes after the first `requires_action` observation |
-| Tip intent declined | `tip` operation `failed` | Rate returns `tip_status: none`. Rating saved. No charge |
-| Tip still processing at Stripe | "Tip pending" | Rating fails. The job keeps polling |
+| Tip needs authentication | Rate or tip returns `tip_status: requires_action` | Rating saved. Mobile authenticates through the Stripe SDK, then resumes with `POST /ride/i/{id}/tip`. If the rider never finishes, the server abandons and cancels the intent 30 minutes after the first `requires_action` observation |
+| Tip intent declined, canceled, or rejected at creation | `tip` operation `failed` | `tip_status: canceled`. Rating saved. No charge. The rider can retry with a new `operation_id` |
+| Tip still processing at Stripe | `tip_status: pending` | Rating saved. The job keeps polling. The rider resumes to check again |
 | Driver or fleet has no connected account, or the rider has no saved method | Server error at reservation | Rating fails. The mobile screen shows "Could not confirm your review" |
 | Tip on a free ride that is still `pending_rider_rating` | Server error at reservation ("invalid dedicated tip fare settlement") | Rating fails. See [Free rides](/engineering/payments/ride-tips#free-rides) |
-| Tip under $0.50 as a dedicated charge | Stripe `amount_too_small` on `create_tip` | Rating fails. The `tip` operation stays `pending` until its job is exhausted, then quarantines |
+| Tip under $0.50 as a dedicated charge | Stripe rejects `create_tip` with `amount_too_small`, a typed `invalid_request_error` | `tip` operation `failed` with outcome `rejected`. `tip_status: canceled`. Rating saved. No charge |
 | Different tip amount while one is unfinished | "Ride Unavailable" | Rating fails |
 
 See [Ride tip charging](/engineering/payments/ride-tips).

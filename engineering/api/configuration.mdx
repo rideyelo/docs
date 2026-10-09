@@ -36,6 +36,7 @@ A few values bypass the struct and read the environment directly: `PORT` (in `ma
     - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`
     - `OG_SIGNING_SECRET`
     - `GOOGLE_PLAY_PACKAGE_NAME` and `GOOGLE_PLAY_TRACKS` when Google Play release monitoring is enabled
+    - `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, and `APNS_HOST` when `APNS_PRIVATE_KEY` is set. The key must be a PEM-encoded PKCS #8 EC key. Otherwise the service fails to start.
 
     When `AUTH_V3_ENABLED` is true, the required Auth v3 origins, legal versions, Google and Apple provider settings, and keys must also be present and parse correctly.
   </Tab>
@@ -48,7 +49,7 @@ A few values bypass the struct and read the environment directly: `PORT` (in `ma
     - Redis enabled on a nonzero logical database.
     - `E2E_BACKGROUND_JOBS_ENABLED` false and `E2E_FIXTURE_TTL` between 0 and 24 hours.
     - Stripe test keys (`sk_test_`, `pk_test_`).
-    - Messaging, Quo, Dub, Slack, Photon, Resend, and Auth v3 provider secrets unset, so E2E can never contact real people.
+    - Messaging, Quo, Dub, Slack, Photon, Resend, Auth v3 provider, and `APNS_PRIVATE_KEY` secrets unset, so E2E can never contact real people.
   </Tab>
 </Tabs>
 
@@ -162,7 +163,10 @@ Calendar settings are validated separately when the calendar services are built.
   <Accordion title="Links and storage">
     | Variable | Default | Purpose |
     | --- | --- | --- |
-    | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID` | none | Dub |
+    | `DUB_API_KEY`, `DUB_WORKSPACE_ID` | none | Dub |
+    | `DUB_SYSTEM_FOLDER_ID` | none | Dub folder for referral links and QR payment links. Hidden from the dashboard **Links** tabs |
+    | `DUB_FLEET_FOLDER_ID` | `DUB_SYSTEM_FOLDER_ID` | Dub folder for fleet driver join links and fleet payout onboarding links |
+    | `DUB_CAMPAIGNS_FOLDER_ID` | none | Dub folder for links created from the dashboard **Links** page. When unset, new links are created in no folder |
     | `INVITE_LANDING_BASE_URL` | `https://joinyelo.com/i` | Destination base for invite Dub links: `<base>/<code>` for personal invites and `<base>/fleet/<code>` for fleet driver invites. Keep it on `joinyelo.com` so click cookies are first-party to sign-up. Changing it makes the `share_link_sweep` job rewrite every existing personal link |
     | `OG_IMAGE_BASE_URL` | `https://rideyelo.com` | OG card worker base |
     | `OG_SIGNING_SECRET` | none | Signs OG card URLs (required) |
@@ -178,6 +182,22 @@ Calendar settings are validated separately when the calendar services are built.
     | `GOOGLE_CALENDAR_TOKEN_KEYS` | none | Base64 32-byte token encryption keys |
     | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` | `true` only in `production` | Enables the release check job |
     | `GOOGLE_PLAY_PACKAGE_NAME`, `GOOGLE_PLAY_TRACKS`, `GOOGLE_PLAY_CONSOLE_URL` | `com.rideyelo`, `production`, console URL | Release monitoring targets |
+  </Accordion>
+  <Accordion title="APNs (Live Activity pushes)">
+    Token-based (`.p8`) credential the API uses to send [Live Activity updates](/engineering/mobile/live-activities#background-updates-over-apns) directly to APNs. Leave `APNS_PRIVATE_KEY` empty to keep pushes off. The API still stores activity push tokens, and the `live_activity_refresh` job does nothing.
+
+    | Variable | Default | Purpose |
+    | --- | --- | --- |
+    | `APNS_PRIVATE_KEY` | none | PEM contents of the `.p8` key. Literal `\n` sequences become newlines. Empty disables Live Activity pushes |
+    | `APNS_KEY_ID`, `APNS_TEAM_ID` | none | Key ID and Apple team ID for the ES256 provider token. Required with `APNS_PRIVATE_KEY` |
+    | `APNS_BUNDLE_ID` | `io.flutterflow.ridedesi.desirider` | App bundle ID. The API sends to the topic `<bundle>.push-type.liveactivity` |
+    | `APNS_HOST` | `https://api.push.apple.com` | APNs host. Point it at `https://api.sandbox.push.apple.com` for development builds |
+
+    ```bash
+    APNS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIGT...\n-----END PRIVATE KEY-----"
+    APNS_KEY_ID=ABC123DEFG
+    APNS_TEAM_ID=TEAM123456
+    ```
   </Accordion>
   <Accordion title="Telemetry">
     | Variable | Default | Purpose |

@@ -1,6 +1,6 @@
 ---
 title: "Migrations log"
-description: "Every yelo-api SQL migration from 000001 to 000355, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
+description: "Every yelo-api SQL migration from 000001 to 000359, grouped by era, with dates, pull requests, and flags for backfills and destructive changes."
 ---
 
 This page indexes every file in `yelo-api/migrations/`. Use it to find when a table or column appeared, which pull request shipped it, and which migrations rewrote or removed data. For the current shape of each table, see the [database reference](/reference/database/overview). For how migrations run in production, see [Deployment](/engineering/deployment) and [Failed migration](/runbooks/failed-migration).
@@ -25,7 +25,7 @@ This page indexes every file in `yelo-api/migrations/`. Use it to find when a ta
 | [Zones, social, and durable notifications](#zones-social-and-durable-notifications-summer-2026) | 000216 to 000253 | 2026-06 to 2026-07 | Zones and zone pricing, friendships and contacts, notification templates and deliveries, River. |
 | [Auth v3 and hardening](#auth-v3-and-hardening-august-2026) | 000254 to 000299 | 2026-08 to 2026-09 | Auth v3 storage and sessions, phone normalization, bumps and SMS consent, map layers, education verification, history indexes, Quo outbox, E2E runs. |
 | [Durable domain systems](#durable-domain-systems-september-2026) | 000300 to 000347 | 2026-09 | Durable messaging, school mapping, Stripe reconciliation, driver leads, recents, calendars, contact sync, place identity, fleet-owned vehicles, ride state protocol, canonical top locations. |
-| [Driver net earnings](#driver-net-earnings-october-2026) | 000348 to 000355 | 2026-10 | Stripe fee estimates and net driver earnings, dedicated tip charge fees, share link state, Fare Finder kill switch and parity window, ride operation effect receipts. |
+| [Driver net earnings](#driver-net-earnings-october-2026) | 000348 to 000359 | 2026-10 | Stripe fee estimates and net driver earnings, dedicated tip charge fees, share link state, Fare Finder kill switch and parity window, ride operation effect receipts, synced competitor quotes, Live Activity push tokens. |
 
 ## Migrations by domain
 
@@ -42,7 +42,7 @@ Use this map to jump to the migrations that shaped a domain.
 | Communities, zones, and schools | 002, 032, 131, 136 to 140, 154, 155, 185, 216, 223, 230, 234, 281, 301 to 303, 307, 314, 315 |
 | Calendars | 317 to 320 |
 | Places and locations | 022, 046, 051, 058, 084, 095, 171, 172, 174, 181, 182, 213, 217, 218, 227, 259, 260, 270, 271, 274, 309, 326 to 328, 331, 345, 347 |
-| Notifications and messaging | 029, 047, 125, 167, 175, 176, 180, 195, 197, 237 to 241, 249, 250, 264, 268, 269, 286, 293, 300, 329, 330 |
+| Notifications and messaging | 029, 047, 125, 167, 175, 176, 180, 195, 197, 237 to 241, 249, 250, 264, 268, 269, 286, 293, 300, 329, 330, 359 |
 | Growth, social, and events | 020, 041 to 045, 079, 085, 113, 141 to 146, 149 to 153, 164, 178, 201, 220, 228, 229, 235, 252, 255, 265, 272, 273, 275 to 277, 283, 312, 313, 351 |
 | CRM and contact sync | 188, 190, 292, 305, 306, 308, 322, 323, 332 |
 | Platform and tooling | 104, 123, 179, 221, 242 to 248, 253, 279, 295, 296, 310, 336, 337, 341, 342 |
@@ -507,6 +507,8 @@ Driver-facing earnings become net of Stripe processing fees, with stored estimat
 | `000353_add_fare_finder_disabled_to_communities` | 2026-10-07 | [#312](https://github.com/rideyelo/yelo-api/pull/312) | Adds `Communities.fare_finder_disabled`, default `false`. |  |
 | `000354_add_parity_window_to_communities` | 2026-10-08 | [#318](https://github.com/rideyelo/yelo-api/pull/318) | Adds `Communities.parity_ratio_min` (default `0.80`) and `parity_ratio_max` (default `0.95`). |  |
 | `000355_ride_operation_effects` | 2026-10-08 | [#315](https://github.com/rideyelo/yelo-api/pull/315) | Creates `RideOperationEffectReceipts` (`operation_id` primary key referencing `RideOperations`, `completed_at`). No backfill: terminal operations without a receipt are reconciled by the recovery worker. |  |
+| `000356_provider_quotes` | 2026-10-08 | [#327](https://github.com/rideyelo/yelo-api/pull/327) | Creates `ProviderQuotes` (one row per Fare Finder offer, primary key `event_id`, `offer_index`, with `is_test` and `is_internal` flags, indexed on `community_id`, `observed_at DESC`) and the single-row `ProviderQuoteSync` watermark. The `provider_quotes_sync` job fills both from PostHog. |  |
+| `000359_live_activity_tokens` | 2026-10-09 | [#320](https://github.com/rideyelo/yelo-api/pull/320) | Creates `LiveActivityTokens` (`user_id` and `kind` primary key, `kind` CHECK `rider` or `driver`, nullable `ride_id`, `token`, `updated_at`) for [iOS Live Activity pushes](/engineering/mobile/live-activities#background-updates-over-apns). Cascades from `Users` and `Rides`. No backfill: tokens exist only once a client uploads them. |  |
 
 ## Related pages
 

@@ -48,7 +48,7 @@ All three call `authorizeFleet` in `internal/server/http/fleetjoin/handler.go`: 
     `GetFleetJoinCode` (filters deleted fleets).
   </Step>
   <Step title="Publish to Dub first">
-    Calls `dub.UpsertLink` with key `fleet-<new code>`, `ExternalID` `fleet-driver-join:<fleet_id>`, the `fleet-driver` tag, `cfg.Dub.SystemFolderID`, and a title and description that depend on the payment model.
+    Calls `dub.UpsertLink` with key `fleet-<new code>`, `ExternalID` `fleet-driver-join:<fleet_id>`, the `fleet-driver` tag, `cfg.Dub.FleetFolderID` (`DUB_FLEET_FOLDER_ID`, falling back to `DUB_SYSTEM_FOLDER_ID`), `TrackConversion: true` so Dub forwards its click ID to the landing page, the title `Join <fleet name> on Yelo`, a description that depends on the payment model, the signed fleet invitation card as the image, and `Proxy` on. See [Link previews](#link-previews).
   </Step>
   <Step title="Compare and set">
     `SetFleetJoinCode` updates only if `driver_join_code IS NOT DISTINCT FROM` the old code. Zero rows means another instance rotated first, and the call fails with `ErrorTypeFleetJoinBusy` (409, **Invitation Changed**).
@@ -61,6 +61,20 @@ All three call `authorizeFleet` in `internal/server/http/fleetjoin/handler.go`: 
 <Note>
   `DisableLink` only clears the database column. It doesn't touch Dub, so the short link still resolves to the landing page. The preview then returns 404 because no fleet has that code.
 </Note>
+
+## Link previews
+
+When a join link is shared in a message, crawlers see a fleet invitation preview instead of the generic signup page.
+
+| Layer | Behavior |
+| --- | --- |
+| Dub short link | `RotateLink` sets the image to the OG worker's `/og/fleet` card, signed with the fleet name (`ogcard.FleetCardURL`), and turns on Dub proxy so Dub serves the link's own title, description, and image. |
+| OG card | The `fleet` template renders the Yelo wordmark in yellow on blue, the headline **Join &lt;fleet&gt; as a Yelo driver** (or **Join a fleet as a Yelo driver** without a name), and a **Fleet invitation** pill. Its only parameter is the fleet name, `n`. Long names shrink, then wrap to two lines. |
+| Landing page | The signup site rewrites `/i/fleet/**` to a static document titled **Fleet invitation \| Yelo** with the description "You've been invited to drive with a fleet on Yelo. Open the link to join." Every fleet gets the same card at this layer. |
+
+The fleet name is frozen into the signed card URL. Links published before the card shipped, and fleets renamed since their last rotation, keep their old preview until the link is rotated.
+
+The fleet Stripe onboarding short link uses the same card layout through the `fleet-payouts` template. See [Onboarding links](/engineering/fleets/stripe-and-lifecycle#onboarding-links).
 
 ## Preview
 
@@ -171,6 +185,7 @@ The `FleetDriverWhitelist` table still exists. Nothing creates entries or enroll
 | Concern | Path |
 | --- | --- |
 | Join service | `yelo-api/internal/service/fleetjoin/fleet_join.go` |
+| Invitation card | `FleetCardURL` in `yelo-api/internal/utilities/ogcard/url.go`; `yelo-web/workers/og/src/templates/fleet.tsx` |
 | Enrollment transaction | `EnrollDriver` in `yelo-api/internal/data/repository/fleet_join.go` |
 | Join SQL | `yelo-api/internal/data/repository/queries/fleet_join.sql` |
 | Routes and handlers | `yelo-api/internal/server/http/fleetjoin/routes.go`, `handler.go`; registration in `internal/server/http/router.go` |
@@ -186,5 +201,5 @@ The `FleetDriverWhitelist` table still exists. Nothing creates entries or enroll
 - **The rotation mutex is per instance.** Cross-instance races rely on the compare-and-set and surface as 409 **Invitation Changed**. The losing request has already upserted a Dub link for its own code, and reconciliation repoints it only if the database read succeeds.
 - **Disabling doesn't unpublish.** Neither disable nor archive touches Dub. Old short links keep resolving until Dub is cleaned up by hand. They preview as 404 in the app.
 - **The error title is always about payouts.** Both unavailable paths use `ErrorTypeFleetPayoutUnavailable` titled **Fleet Payouts Unavailable**, even for an inactive owner-operator fleet.
-- **Owner-operator fleets with custom payouts are never joinable.** `CanAcceptDriverJoins` requires `has_custom_payouts = FALSE` for owner-operator fleets. Turning on custom payouts for an owner-operator fleet disables its invitations, admin assignment, and selection in the membership editor.
+- **Owner-operator fleets with custom payouts are never joinable.** `CanAcceptDriverJoins` requires `has_custom_payouts = FALSE` for owner-operator fleets. The dashboard no longer has a custom payouts toggle and derives the field from the payment model, but a fleet with a mismatched stored value stays unjoinable until its settings are saved. The **Fleet Details** card warns about the mismatch.
 - **Admin paths keep the community; joins move it.** Redeem and `PUT .../fleet` move the driver to the fleet's home community. `fleet-transfer`, the membership editor, and legacy add by email leave `Users.community_id` unchanged.

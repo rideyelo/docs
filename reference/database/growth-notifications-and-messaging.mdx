@@ -1,6 +1,6 @@
 ---
 title: "Notifications and messaging"
-description: "Reference for the push notification pipeline tables (templates, variants, versions, policies, notifications, cohorts, deliveries), scheduled community broadcasts, legacy driver ping logs, SMS text messages, the Quo contact sync outbox, and marketing segments."
+description: "Reference for the push notification pipeline tables (templates, variants, versions, policies, notifications, cohorts, deliveries), scheduled community broadcasts, legacy driver ping logs, SMS text messages, Live Activity push tokens, the Quo contact sync outbox, and marketing segments."
 ---
 
 Push notifications go through one pipeline in `internal/notify`. `notify.Emit` enqueues a River job inside the caller's transaction. The orchestrator job writes one `"Notifications"` row and one `"NotificationDeliveries"` row per recipient, then the send worker delivers to Expo. Templates and their A/B variants are editable from the dashboard. Ride-specific push logs (`"RideNotifications"`) are on the [Rides](/reference/database/rides) page.
@@ -272,6 +272,23 @@ Outbound SMS log. Today the only writer is the friend-bump SMS flow.
 - `ClaimTextMessage` (`queries/engagement.sql`) takes an advisory lock per recipient, then inserts a `sending` claim unless another friend bump to that recipient is inside its cooldown or has a live lease. A `failed` row, or a `sending` row with an expired lease, can be reclaimed. `CompleteTextMessage` finalizes it. `CountRecentBumpsBySender` rate-limits senders.
 - Workers: `internal/notify/queue/bump_sms.go` and `internal/notify/bump_sms.go`.
 - `AddTextMessage` (`internal/data/repository/text_messages.go`) is a legacy dashboard insert with no callers.
+
+## LiveActivityTokens
+
+ActivityKit push tokens for iOS Live Activities. Created in `000359_live_activity_tokens`. The app uploads the token of the activity it started through `PUT /live-activity/token`. Ride transitions then update that activity through APNs while the app is backgrounded. See [Background updates over APNs](/engineering/mobile/live-activities#background-updates-over-apns).
+
+| Column | Type | Null | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `user_id` | `uuid` | no | | FK to `"Users"` `ON DELETE CASCADE`. Primary key with `kind`. |
+| `kind` | `text` | no | | `rider` or `driver` (CHECK). |
+| `ride_id` | `uuid` | yes | | FK to `"Rides"` `ON DELETE CASCADE`. The ride a rider activity follows. `NULL` for the driver activity. |
+| `token` | `text` | no | | Hex ActivityKit push token. |
+| `updated_at` | `timestamptz` | no | `now()` | Last upload. |
+
+- One row per user and kind. A newer activity's upload replaces the older token, like the single `Users.push_notification_token`.
+- The `live_activity_refresh` job deletes a rider row when it sends an `end` event, or when APNs answers `410` or reports the token `Unregistered`, `BadDeviceToken`, `DeviceTokenNotForTopic`, or `ExpiredToken`.
+- `driver` rows are stored but never pushed to.
+- No backfill. Rows exist only once a client that uploads tokens is running.
 
 ## Quo contact sync
 

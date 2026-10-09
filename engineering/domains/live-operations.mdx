@@ -208,14 +208,14 @@ On the web, `rideJourneyLayout` (`src/components/live/rideJourneyLayout.ts`) kee
 
 ## Competitor quotes
 
-Two endpoints read Fare Finder quotes from PostHog. Both live in `internal/service/dashboard/live.go` and delegate to `liveQuoteClient` (`internal/service/dashboard/live_pricing.go`).
+Two endpoints return Fare Finder quotes. Both live in `internal/service/dashboard/live.go`. `competitor-prices` queries PostHog at request time through `liveQuoteClient` (`internal/service/dashboard/live_pricing.go`). `competitor-quotes` reads the `ProviderQuotes` table in Postgres, which the `provider_quotes_sync` River job fills from PostHog every 5 minutes. It never calls PostHog during the request.
 
 | Endpoint | Returns | Used by |
 | --- | --- | --- |
 | `GET /dashboard/live/competitor-prices` (`GetLiveCompetitorPrices`) | One averaged UberX row and one averaged Lyft Standard row | The **Pricing** card on Live |
 | `GET /dashboard/live/competitor-quotes` (`GetLiveCompetitorQuotes`) | One row per priced Fare Finder offer: provider, product, trip miles and minutes, surge, fare, `at_minimum`, and Lyft's `rate_card` | **Pricing** > **Parity** |
 
-Both parse `period` with `livePeriod`, which is wider than the analytics endpoint's fixed list. It accepts `<n>h` or `<n>d` with `n` from 1 to 999, or `all`. Empty means `24h`, and anything else returns 400. For the per-offer query, response shape, and row filters of `competitor-quotes`, see [Competitor quotes](/engineering/domains/dashboard-analytics#competitor-quotes) in Dashboard analytics.
+Both parse `period` with `livePeriod`, which is wider than the analytics endpoint's fixed list. It accepts `<n>h` or `<n>d` with `n` from 1 to 999, or `all`. Empty means `24h`, and anything else returns 400. For the sync job, response shape, and row filters of `competitor-quotes`, see [Competitor quotes](/engineering/domains/dashboard-analytics#competitor-quotes) in Dashboard analytics.
 
 The rest of this section covers `competitor-prices`. The client sends a HogQL query to `POST {POSTHOG_QUERY_HOST}/api/projects/{POSTHOG_PROJECT_ID}/query/` with a bearer `POSTHOG_PERSONAL_API_KEY`.
 
@@ -227,7 +227,7 @@ The query reads `ride_aggregator_prices_loaded` events in the window, scoped by 
 | `unavailable` | Network error, non-200, undecodable body, or a row without four columns | No |
 | `ready` | Parsed | 5 minutes, keyed by scope and window length in hours. The cache clears when it reaches 512 entries. |
 
-The HTTP client times out after 12 seconds and the response body is capped at 1 MiB. Both endpoints always return 200 for a valid period, and `competitor-quotes` uses the same three `status` values with its own cache.
+The HTTP client times out after 25 seconds, which stays under the server's 30-second write timeout. The response body is capped at 8 MiB. A failed query logs a `posthog query failed` warning with the error and elapsed time. `competitor-prices` always returns 200 for a valid period. `competitor-quotes` returns only `not_configured` or `ready` and has no in-process cache.
 
 ## Drivers table and map
 
@@ -408,7 +408,7 @@ Other client behavior:
 
 | Variable | Where | Default | Purpose |
 | --- | --- | --- | --- |
-| `POSTHOG_PERSONAL_API_KEY` | API only | empty | Query API bearer for competitor quotes. Grant project query read only. Never put it in a `VITE_*` variable. |
+| `POSTHOG_PERSONAL_API_KEY` | API only | empty | Query API bearer for `competitor-prices` and the `provider_quotes_sync` job. Grant project query read only. Never put it in a `VITE_*` variable. |
 | `POSTHOG_PROJECT_ID` | API only | empty | Numeric PostHog project ID |
 | `POSTHOG_QUERY_HOST` | API only | `https://us.posthog.com` | Must be `https` |
 | `DASHBOARD_PREVIEW` | API only | `false` | See [Local preview mode](#local-preview-mode) |
@@ -422,6 +422,7 @@ The web app has no Live-specific environment variables. The map needs the dashbo
 | Routes | `yelo-api` | `internal/server/http/dashboard/supply_demand/router.go`, `handlers.go` | `RegisterRoutes`, `resolveCommunityScope`, `resolveCommunityID` |
 | Mount and scope gate | `yelo-api` | `internal/server/http/router.go`, `dashboard_scope.go` | `registerDashboardRoutes`, `dashboardScopeAllows` |
 | Service | `yelo-api` | `internal/service/dashboard/supply_demand.go`, `live.go`, `live_pricing.go` | `GetMarketSummaries`, `populateLivePresence`, `GetMarketDrivers`, `SetSurge`, `GetLiveAnalytics`, `GetLiveCompetitorPrices`, `GetLiveCompetitorQuotes`, `livePeriod`, `liveQuoteClient` |
+| Competitor quote sync | `yelo-api` | `internal/service/providerquotes/service.go`, `internal/notify/queue/provider_quotes.go`, `internal/data/repository/provider_quotes.go`, `internal/data/posthogquery/client.go` | `Service.Sync`, `Query`, `providerQuoteSyncPeriodic`, `ListProviderQuotes`, `NormalizeLegacy` |
 | Repository and SQL | `yelo-api` | `internal/data/repository/supply_demand.go`, `live.go`, `queries/supply_demand.sql` | `ListMarketSummaries`, `ListMarketDrivers`, `GetLiveRideCohorts`, `aggregateLiveCohorts`, `SetCommunitySurge`, `surge_history` queries |
 | Models | `yelo-api` | `internal/models/live.go`, `supply_demand.go` | `LiveAnalytics`, `MarketSummary`, `MarketDriver`, `SetSurgeRequest` |
 | Ride list filters | `yelo-api` | `internal/data/repository/queries/analytics.sql`, `internal/server/http/dashboard/rides/` | `ListDashboardRides` `live` and `recent_only` |
@@ -440,7 +441,7 @@ The web app has no Live-specific environment variables. The map needs the dashbo
 - **Request completion includes drafts.** `requests` counts every ride row, including `requested` quotes the rider never confirmed. It's lower than the confirmed-request completion rate on **Rides** > **KPIs**.
 - **`activity_score` uses the SQL session count.** It's computed from open `DriverSessions` before presence replaces `drivers_online`, so it can disagree with the card.
 - **One Redis error blanks presence for a market.** `populateLivePresence` returns early on any failed `HMGET`, leaving `presence_available: false` even when most reads succeeded.
-- **Quote fetches serialize.** `liveQuoteClient.prices` holds its mutex across the PostHog call, so concurrent cache misses wait up to 12 seconds each. Failures aren't cached, so an outage retries on every poll.
+- **Concurrent quote misses duplicate work.** `liveQuoteClient.prices` releases its mutex before the PostHog call, so a slow market doesn't block other dashboards. Two concurrent cache misses for the same scope both run the query. Failures aren't cached, so an outage retries on every poll.
 - **Quote HogQL is built by string formatting.** The community ID is a parsed UUID and times are formatted server-side, so there's no user-controlled input today. Keep it that way if you add filters.
 - **The warm-pool read prunes.** `GetWarmPoolDrivers` trims old members on every call, so the 10-second driver and map polls also maintain the warm pool.
 - **History writes are best effort.** A failed `CloseActiveSurgeHistory` or `InsertSurgeHistory` doesn't fail the request, so `surge_history` can miss changes that did apply.

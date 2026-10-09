@@ -2746,6 +2746,28 @@
     },
     "type": "object"
    },
+   "CreateLinkRequest": {
+    "description": "CreateLinkRequest schema",
+    "properties": {
+     "domain": {
+      "description": "yelo.link (default), pay.yelo.link or event.yelo.link",
+      "type": "string"
+     },
+     "folder": {
+      "description": "campaigns (default) or fleet",
+      "type": "string"
+     },
+     "key": {
+      "description": "Path of the short link: letters, digits, - and _",
+      "type": "string"
+     },
+     "url": {
+      "description": "https destination",
+      "type": "string"
+     }
+    },
+    "type": "object"
+   },
    "CreateLocationRequest": {
     "description": "CreateLocationRequest schema",
     "properties": {
@@ -6585,6 +6607,27 @@
     ],
     "type": "object"
    },
+   "Folder": {
+    "description": "Folders to offer as tabs; the system folder is left out",
+    "properties": {
+     "count": {
+      "format": "int64",
+      "type": "integer"
+     },
+     "id": {
+      "type": "string"
+     },
+     "name": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "count",
+     "id",
+     "name"
+    ],
+    "type": "object"
+   },
    "Friend": {
     "properties": {
      "created_at": {
@@ -7563,6 +7606,76 @@
     ],
     "type": "object"
    },
+   "Link": {
+    "properties": {
+     "archived": {
+      "type": "boolean"
+     },
+     "clicks": {
+      "format": "int64",
+      "type": "integer"
+     },
+     "created_at": {
+      "type": "string"
+     },
+     "domain": {
+      "type": "string"
+     },
+     "folder": {
+      "description": "campaigns, fleet, system, or empty for the root folder",
+      "type": "string"
+     },
+     "id": {
+      "type": "string"
+     },
+     "key": {
+      "type": "string"
+     },
+     "last_clicked": {
+      "type": "string"
+     },
+     "leads": {
+      "description": "Sign-ups attributed to this link",
+      "format": "int64",
+      "type": "integer"
+     },
+     "managed": {
+      "description": "Created and rewritten by the API; read-only in the dashboard",
+      "type": "boolean"
+     },
+     "short_link": {
+      "type": "string"
+     },
+     "tags": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     "track_conversion": {
+      "type": "boolean"
+     },
+     "url": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "archived",
+     "clicks",
+     "created_at",
+     "domain",
+     "folder",
+     "id",
+     "key",
+     "leads",
+     "managed",
+     "short_link",
+     "tags",
+     "track_conversion",
+     "url"
+    ],
+    "type": "object"
+   },
    "LinkedProvider": {
     "properties": {
      "linked_at": {
@@ -7579,6 +7692,42 @@
     ],
     "type": "object"
    },
+   "ListLinksResponse": {
+    "properties": {
+     "folders": {
+      "description": "Folders to offer as tabs; the system folder is left out",
+      "items": {
+       "$ref": "#/components/schemas/Folder"
+      },
+      "type": "array"
+     },
+     "links": {
+      "items": {
+       "$ref": "#/components/schemas/Link"
+      },
+      "type": "array"
+     },
+     "page": {
+      "type": "integer"
+     },
+     "page_size": {
+      "type": "integer"
+     },
+     "total": {
+      "description": "Links matching the query across all pages",
+      "format": "int64",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "folders",
+     "links",
+     "page",
+     "page_size",
+     "total"
+    ],
+    "type": "object"
+   },
    "ListResponse": {
     "properties": {
      "leads": {
@@ -7591,6 +7740,27 @@
     "required": [
      "leads"
     ],
+    "type": "object"
+   },
+   "LiveActivityTokenRequest": {
+    "description": "LiveActivityTokenRequest schema",
+    "properties": {
+     "kind": {
+      "description": "Which activity the token belongs to: rider or driver",
+      "example": "rider",
+      "type": "string"
+     },
+     "ride_id": {
+      "description": "Ride the activity follows; required for the rider activity",
+      "format": "uuid",
+      "nullable": true,
+      "type": "string"
+     },
+     "token": {
+      "description": "Hex ActivityKit push token of the running Live Activity",
+      "type": "string"
+     }
+    },
     "type": "object"
    },
    "LiveAnalytics": {
@@ -8423,6 +8593,152 @@
      "latitude",
      "longitude",
      "photo_url"
+    ],
+    "type": "object"
+   },
+   "MapHeatPreview": {
+    "properties": {
+     "cells": {
+      "description": "Cells the previewed values produce for the requested community",
+      "items": {
+       "$ref": "#/components/schemas/HeatCell"
+      },
+      "type": "array"
+     },
+     "communities": {
+      "description": "Every active, visible community",
+      "items": {
+       "$ref": "#/components/schemas/MapHeatPreviewCommunity"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "cells",
+     "communities"
+    ],
+    "type": "object"
+   },
+   "MapHeatPreviewCommunity": {
+    "description": "Every active, visible community",
+    "properties": {
+     "community_id": {
+      "type": "string"
+     },
+     "eligible_users": {
+      "description": "People with a shared position inside the previewed age window",
+      "type": "integer"
+     },
+     "live_cells": {
+      "description": "Cells the app is showing now",
+      "type": "integer"
+     },
+     "sweep_cells": {
+      "description": "Cell count at each requested sweep cell size, in request order",
+      "items": {
+       "description": "Cell count at each requested sweep cell size, in request order",
+       "type": "integer"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "community_id",
+     "eligible_users",
+     "live_cells",
+     "sweep_cells"
+    ],
+    "type": "object"
+   },
+   "MapHeatPreviewRequest": {
+    "description": "MapHeatPreviewRequest schema",
+    "properties": {
+     "community_id": {
+      "description": "Community whose cells are returned",
+      "type": "string"
+     },
+     "settings": {
+      "$ref": "#/components/schemas/MapHeatValues"
+     },
+     "sweep_cell_degrees": {
+      "description": "Cell sizes to count cells at, for every community",
+      "items": {
+       "description": "Cell sizes to count cells at, for every community",
+       "format": "double",
+       "type": "number"
+      },
+      "type": [
+       "array",
+       "null"
+      ]
+     }
+    },
+    "type": "object"
+   },
+   "MapHeatSettings": {
+    "properties": {
+     "cell_degrees": {
+      "description": "Grid cell size in degrees (0.0005 is about 50 m)",
+      "format": "double",
+      "type": "number"
+     },
+     "communities": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/MapHeatValues"
+      },
+      "description": "Values used instead of the platform-wide ones, keyed by community id",
+      "type": [
+       "object",
+       "null"
+      ]
+     },
+     "max_cells": {
+      "description": "Cells kept per community, heaviest first",
+      "type": "integer"
+     },
+     "min_users": {
+      "description": "Cells holding fewer people are dropped (minimum 3)",
+      "type": "integer"
+     },
+     "position_max_age_days": {
+      "description": "Ignore last-known positions older than this many days",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "cell_degrees",
+     "max_cells",
+     "min_users",
+     "position_max_age_days"
+    ],
+    "type": "object"
+   },
+   "MapHeatValues": {
+    "description": "Values used instead of the platform-wide ones, keyed by community id",
+    "properties": {
+     "cell_degrees": {
+      "description": "Grid cell size in degrees (0.0005 is about 50 m)",
+      "format": "double",
+      "type": "number"
+     },
+     "max_cells": {
+      "description": "Cells kept per community, heaviest first",
+      "type": "integer"
+     },
+     "min_users": {
+      "description": "Cells holding fewer people are dropped (minimum 3)",
+      "type": "integer"
+     },
+     "position_max_age_days": {
+      "description": "Ignore last-known positions older than this many days",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "cell_degrees",
+     "max_cells",
+     "min_users",
+     "position_max_age_days"
     ],
     "type": "object"
    },
@@ -9347,6 +9663,15 @@
    "Metadata": {
     "nullable": true,
     "properties": {
+     "analytics_excluded": {
+      "type": "boolean"
+     },
+     "attempt_id": {
+      "type": "string"
+     },
+     "failure_reason": {
+      "type": "string"
+     },
      "latency_ms": {
       "format": "int64",
       "type": "integer"
@@ -9361,6 +9686,9 @@
       "type": "string"
      },
      "trace_id": {
+      "type": "string"
+     },
+     "transaction_id": {
       "type": "string"
      }
     },
@@ -11171,6 +11499,43 @@
     "required": [
      "total",
      "users"
+    ],
+    "type": "object"
+   },
+   "Preview": {
+    "properties": {
+     "description": {
+      "type": "string"
+     },
+     "final_url": {
+      "description": "Where the crawler ended up after redirects",
+      "type": "string"
+     },
+     "image": {
+      "type": "string"
+     },
+     "served_by": {
+      "description": "dub when Dub answers with the link's own card, destination when the crawler is redirected to the landing page",
+      "type": "string"
+     },
+     "site_name": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "url": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "description",
+     "final_url",
+     "image",
+     "served_by",
+     "site_name",
+     "title",
+     "url"
     ],
     "type": "object"
    },
@@ -13126,6 +13491,21 @@
     ],
     "type": "object"
    },
+   "RideTipRequest": {
+    "description": "RideTipRequest schema",
+    "properties": {
+     "amount": {
+      "format": "double",
+      "nullable": true,
+      "type": "number"
+     },
+     "operation_id": {
+      "format": "uuid",
+      "type": "string"
+     }
+    },
+    "type": "object"
+   },
    "RideUser": {
     "properties": {
      "first_name": {
@@ -14302,6 +14682,32 @@
       "description": "Personal max queue depth in minutes (null for community default)",
       "nullable": true,
       "type": "integer"
+     }
+    },
+    "type": "object"
+   },
+   "SetCommunitiesExperimentRequest": {
+    "description": "SetCommunitiesExperimentRequest schema",
+    "properties": {
+     "community_ids": {
+      "description": "Communities to change",
+      "items": {
+       "description": "Communities to change",
+       "format": "uuid",
+       "type": "string"
+      },
+      "type": [
+       "array",
+       "null"
+      ]
+     },
+     "enabled": {
+      "description": "true grants the key, false revokes it; other keys are untouched",
+      "type": "boolean"
+     },
+     "key": {
+      "description": "Experiment key (lowercase letters, digits, - and _)",
+      "type": "string"
      }
     },
     "type": "object"
@@ -16604,6 +17010,29 @@
     ],
     "type": "object"
    },
+   "StandardResponse_dub.Link": {
+    "description": "StandardResponse_dub.Link schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/Link"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
    "StandardResponse_event.CheckSlugResponse": {
     "description": "StandardResponse_event.CheckSlugResponse schema",
     "properties": {
@@ -17033,6 +17462,52 @@
     "properties": {
      "data": {
       "$ref": "#/components/schemas/DecodedLink"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
+   "StandardResponse_links.ListLinksResponse": {
+    "description": "StandardResponse_links.ListLinksResponse schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/ListLinksResponse"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
+   "StandardResponse_links.Preview": {
+    "description": "StandardResponse_links.Preview schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/Preview"
      },
      "error": {
       "$ref": "#/components/schemas/ErrorInfo"
@@ -18344,6 +18819,52 @@
     "properties": {
      "data": {
       "$ref": "#/components/schemas/MapDetails"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
+   "StandardResponse_models.MapHeatPreview": {
+    "description": "StandardResponse_models.MapHeatPreview schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/MapHeatPreview"
+     },
+     "error": {
+      "$ref": "#/components/schemas/ErrorInfo"
+     },
+     "metadata": {
+      "$ref": "#/components/schemas/Metadata"
+     },
+     "success": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "data",
+     "metadata",
+     "success"
+    ],
+    "type": "object"
+   },
+   "StandardResponse_models.MapHeatSettings": {
+    "description": "StandardResponse_models.MapHeatSettings schema",
+    "properties": {
+     "data": {
+      "$ref": "#/components/schemas/MapHeatSettings"
      },
      "error": {
       "$ref": "#/components/schemas/ErrorInfo"
@@ -20774,8 +21295,19 @@
       "format": "double",
       "type": "number"
      },
+     "has_tip_payment": {
+      "type": "boolean"
+     },
      "max_tip": {
       "type": "integer"
+     },
+     "pending_tip_amount": {
+      "format": "double",
+      "type": "number"
+     },
+     "tip_amount": {
+      "format": "double",
+      "type": "number"
      },
      "tip_options": {
       "items": {
@@ -20787,7 +21319,10 @@
     "required": [
      "currency",
      "fare",
+     "has_tip_payment",
      "max_tip",
+     "pending_tip_amount",
+     "tip_amount",
      "tip_options"
     ],
     "type": "object"
@@ -21255,6 +21790,29 @@
        "type": "string"
       },
       "type": "array"
+     }
+    },
+    "type": "object"
+   },
+   "UpdateLinkRequest": {
+    "description": "UpdateLinkRequest schema",
+    "properties": {
+     "archived": {
+      "nullable": true,
+      "type": "boolean"
+     },
+     "folder": {
+      "description": "campaigns or fleet",
+      "nullable": true,
+      "type": "string"
+     },
+     "key": {
+      "nullable": true,
+      "type": "string"
+     },
+     "url": {
+      "nullable": true,
+      "type": "string"
      }
     },
     "type": "object"
@@ -27626,6 +28184,104 @@
     ]
    }
   },
+  "/community/fleet-stripe-onboarding": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/community.(*CommunityHandler).FleetStripeOnboardingRedirect`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n\n---\n\nValidates a signed fleet onboarding link and redirects to a fresh Stripe Connect onboarding URL",
+    "operationId": "community.FleetStripeOnboardingRedirect",
+    "parameters": [
+     {
+      "description": "Fleet ID",
+      "in": "query",
+      "name": "fleet",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "description": "Link expiry as a Unix timestamp",
+      "in": "query",
+      "name": "exp",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "description": "Link signature",
+      "in": "query",
+      "name": "sig",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_json.NoContent"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "303": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/NoContent"
+        }
+       }
+      },
+      "description": "Redirect to Stripe onboarding"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "404": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Onboarding link not found"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Open fleet Stripe onboarding",
+    "tags": [
+     "Community"
+    ]
+   }
+  },
   "/community/{id}/zones": {
    "get": {
     "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/community.(*CommunityHandler).GetCommunityZones`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nReturns the polygon zones defined for a community, for map rendering.",
@@ -32810,6 +33466,88 @@
     ]
    }
   },
+  "/dashboard/experiments": {
+   "put": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/experiments.Handler.Set`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "community.SetCommunitiesExperiment",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "*/*": {
+       "schema": {
+        "$ref": "#/components/schemas/SetCommunitiesExperimentRequest"
+       }
+      }
+     },
+     "description": "Request body for experiments.SetCommunitiesExperimentRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_json.SuccessResponse"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Grant or revoke one experiment across communities",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
   "/dashboard/fleet/{fleet_id}/drivers": {
    "get": {
     "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/community.(*CommunityHandler).GetFleetDrivers`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nRetrieves a list of all drivers in a specific fleet along with their fleet-specific statistics and earnings",
@@ -34611,6 +35349,481 @@
     ]
    }
   },
+  "/dashboard/links": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/links.Handler.List`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.ListLinks",
+    "parameters": [
+     {
+      "description": "Dub folder id, root for links in no folder, or all to search every folder (needs search)",
+      "in": "query",
+      "name": "folder",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "description": "Matches the key and destination",
+      "in": "query",
+      "name": "search",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "description": "clicks (default), last_clicked or created_at; always descending",
+      "in": "query",
+      "name": "sort",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "description": "1-based page",
+      "in": "query",
+      "name": "page",
+      "schema": {
+       "type": "integer"
+      }
+     },
+     {
+      "description": "1-100, default 100",
+      "in": "query",
+      "name": "page_size",
+      "schema": {
+       "type": "integer"
+      }
+     },
+     {
+      "description": "Include archived links",
+      "in": "query",
+      "name": "archived",
+      "schema": {
+       "type": "boolean"
+      }
+     },
+     {
+      "description": "Skip the saved answer and ask Dub now",
+      "in": "query",
+      "name": "fresh",
+      "schema": {
+       "type": "boolean"
+      }
+     },
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_links.ListLinksResponse"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "One page of short links with click and sign-up counts",
+    "tags": [
+     "Dashboard"
+    ]
+   },
+   "post": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/links.Handler.Create`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.CreateLink",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "*/*": {
+       "schema": {
+        "$ref": "#/components/schemas/CreateLinkRequest"
+       }
+      }
+     },
+     "description": "Request body for links.CreateLinkRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_dub.Link"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Create a tracked short link",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
+  "/dashboard/links/preview": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/links.Handler.Preview`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.PreviewLink",
+    "parameters": [
+     {
+      "description": "https short link on a Yelo domain",
+      "in": "query",
+      "name": "url",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_links.Preview"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Preview tags a crawler reads from a short link",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
+  "/dashboard/links/{id}": {
+   "patch": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/links.Handler.Update`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.UpdateLink",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "id",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "*/*": {
+       "schema": {
+        "$ref": "#/components/schemas/UpdateLinkRequest"
+       }
+      }
+     },
+     "description": "Request body for links.UpdateLinkRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_dub.Link"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "404": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Not Found"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Edit a hand-made short link",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
+  "/dashboard/links/{id}/latest": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/links.Handler.Get`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.GetLink",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "id",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_dub.Link"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Bad Request _(validation or deserialization error)_"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "404": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Not Found"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "One short link, read from Dub now",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
   "/dashboard/live/analytics": {
    "get": {
     "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/supply_demand.(*SupplyDemandHandler).getAnalytics`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
@@ -34747,7 +35960,7 @@
   },
   "/dashboard/live/competitor-quotes": {
    "get": {
-    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/supply_demand.(*SupplyDemandHandler).getCompetitorQuotes`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nOne row per priced Fare Finder tier riders saw in the market, with trip distance, duration, surge and the provider rate card when published. Test devices are excluded.",
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/supply_demand.(*SupplyDemandHandler).getCompetitorQuotes`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nOne row per priced Fare Finder tier riders saw in the market, with trip distance, duration, surge and the provider rate card when published, synced from PostHog every five minutes. Internal and test devices are included.",
     "operationId": "dashboard.GetLiveCompetitorQuotes",
     "parameters": [
      {
@@ -35699,6 +36912,239 @@
      }
     },
     "summary": "Set community operating windows",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
+  "/dashboard/map/heat-settings": {
+   "get": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/mapheat.Handler.Get`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.GetMapHeatSettings",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_models.MapHeatSettings"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPError"
+        }
+       }
+      },
+      "description": "Bad Request _(validation or deserialization error)_"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Presence heatmap binning settings for all communities",
+    "tags": [
+     "Dashboard"
+    ]
+   },
+   "put": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/mapheat.Handler.Set`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.SetMapHeatSettings",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "*/*": {
+       "schema": {
+        "$ref": "#/components/schemas/MapHeatSettings"
+       }
+      }
+     },
+     "description": "Request body for models.MapHeatSettings",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_models.MapHeatSettings"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Replace platform-wide presence heatmap binning settings",
+    "tags": [
+     "Dashboard"
+    ]
+   }
+  },
+  "/dashboard/map/heat-settings/preview": {
+   "post": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/dashboard/mapheat.Handler.Preview`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\n",
+    "operationId": "dashboard.PreviewMapHeatSettings",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "*/*": {
+       "schema": {
+        "$ref": "#/components/schemas/MapHeatPreviewRequest"
+       }
+      }
+     },
+     "description": "Request body for models.MapHeatPreviewRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_models.MapHeatPreview"
+        }
+       }
+      },
+      "description": "OK"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "summary": "Heat cells unsaved binning settings would produce",
     "tags": [
      "Dashboard"
     ]
@@ -44044,6 +45490,93 @@
     ]
    }
   },
+  "/live-activity/token": {
+   "put": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/liveactivity.RegisterRoutes.func1`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nStores the ActivityKit push token of the iOS Live Activity the app started, replacing any earlier token of the same kind, so ride changes can update it while the app is backgrounded",
+    "operationId": "liveActivity.SetToken",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/LiveActivityTokenRequest"
+       }
+      }
+     },
+     "description": "Request body for liveactivity.LiveActivityTokenRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_json.SuccessResponse"
+        }
+       }
+      },
+      "description": "Token stored"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "403": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Forbidden"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "security": [
+     {
+      "JWT": []
+     }
+    ],
+    "summary": "Register a Live Activity push token",
+    "tags": [
+     "Live Activity"
+    ]
+   }
+  },
   "/location/pois": {
    "get": {
     "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/location.(*LocationHandler).GetPOIs`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nRetrieves the curated points of interest for the authenticated user's community (locations flagged show_on_map)",
@@ -47311,6 +48844,101 @@
      }
     ],
     "summary": "Rate ride",
+    "tags": [
+     "Ride"
+    ]
+   }
+  },
+  "/ride/i/{id}/tip": {
+   "post": {
+    "description": "#### Controller: \n\n`api.rideyelo.com/internal/server/http/ride.(*RideHandler).Tip`\n\n#### Middlewares:\n\n- `github.com/go-fuego/fuego.defaultLogger.middleware`\n- `github.com/go-chi/chi/v5/middleware.Recoverer`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetRequestInfo`\n- `api.rideyelo.com/internal/server/http.(*Server).otelInstrumentation`\n- `api.rideyelo.com/internal/server/http.(*Server).contextSetLogger`\n- `api.rideyelo.com/internal/server/http.(*Server).rateLimit`\n- more middleware\u2026\n\n---\n\nA positive amount submits a tip without changing the review. Omit amount to resume the rider's saved tip command. Pending and authentication-required results are not proof of payment.",
+    "operationId": "ride.Tip",
+    "parameters": [
+     {
+      "in": "header",
+      "name": "Accept",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "id",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RideTipRequest"
+       }
+      }
+     },
+     "description": "Request body for models.RideTipRequest",
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StandardResponse_models.TipResult"
+        }
+       }
+      },
+      "description": "Tip progress"
+     },
+     "400": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Bad Request"
+     },
+     "401": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Unauthorized"
+     },
+     "404": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Ride not found"
+     },
+     "500": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "Internal Server Error"
+     }
+    },
+    "security": [
+     {
+      "JWT": []
+     }
+    ],
+    "summary": "Submit or resume the rider's ride tip",
     "tags": [
      "Ride"
     ]

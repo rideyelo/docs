@@ -3,7 +3,7 @@ title: "Dashboard analytics internals"
 description: "Exact SQL definitions, time windows, delta math, Redis reads, and background refresh behind the dashboard's KPI, live operations, driver ops, presence, telemetry, rides, search, and notification analytics endpoints."
 ---
 
-The dashboard's reporting surfaces are computed on request from Postgres and Redis. Nothing is pre-aggregated except the GTM prospect snapshot and the five-minute competitor quote cache. This page documents what each number means in SQL, which window it covers, and how deltas are calculated. For which screen calls which endpoint and how often, see [Dashboard data map](/engineering/web/dashboard-data-map). For the product definitions, see [Ride metrics](/dashboard/ride-metrics). For the user directory, access management, and role scoping, see [Dashboard directory and scope](/engineering/domains/dashboard-directory-and-scope).
+The dashboard's reporting surfaces are computed on request from Postgres and Redis. Nothing is pre-aggregated except the GTM prospect snapshot, the `ProviderQuotes` table synced from PostHog every five minutes, and the five-minute competitor price cache. This page documents what each number means in SQL, which window it covers, and how deltas are calculated. For which screen calls which endpoint and how often, see [Dashboard data map](/engineering/web/dashboard-data-map). For the product definitions, see [Ride metrics](/dashboard/ride-metrics). For the user directory, access management, and role scoping, see [Dashboard directory and scope](/engineering/domains/dashboard-directory-and-scope).
 
 Paths are relative to `yelo-api/`.
 
@@ -25,7 +25,7 @@ Paths are relative to `yelo-api/`.
 | Mapbox | `ReverseGeocodeCity` | GTM refresh and approvals city labels |
 | Clerk | `user.Get` | Surge audit name and email |
 | PostHog Query API | `ride_aggregator_prices_loaded` events | Observed competitor quotes on **Live** |
-| PostHog Query API | `ride_provider_request_completed` events, `trip.offers[]` | Per-offer competitor quotes on **Pricing** > **Parity** |
+| Postgres | `ProviderQuotes`, `ProviderQuoteSync`, synced from PostHog `ride_provider_request_completed` events, `trip.offers[]` | Per-offer competitor quotes on **Pricing** > **Parity** |
 | Postgres | `Communities.parity_ratio_min`, `parity_ratio_max` | Target parity window on **Pricing** > **Parity** |
 
 Presence and warm-pool mechanics are owned by [Heartbeat and presence](/engineering/location/heartbeat-and-presence) and [Activation tiers](/engineering/matching/activation-tiers). This page only covers how the dashboard aggregates them.
@@ -256,7 +256,7 @@ Timing averages are `null` when no row qualifies.
 | `unavailable` | The request fails, returns non-200, or has an unexpected row shape |
 | `ready` | Results parsed. Cached in memory for 5 minutes per scope and window length, up to 512 entries. |
 
-The HTTP client times out after 12 seconds. Any valid `period` returns 200, whatever the status.
+The HTTP client times out after 25 seconds, under the server's 30-second write timeout. A failed query logs a `posthog query failed` warning with the reason and elapsed time. Any valid `period` returns 200, whatever the status.
 
 `period` for both competitor endpoints is parsed by `livePeriod` (`service/dashboard/live.go`). It accepts `<n>h` or `<n>d` with `n` from 1 to 999 (for example `6h`, `3d`, `30d`), or `all` (from 2020-01-01). Empty means `24h`. Anything else, including `0h`, returns 400. The window always ends now. This is wider than `GetLiveAnalytics`, which still accepts only `24h`, `7d`, `30d`, or `all`.
 
@@ -264,7 +264,7 @@ The HTTP client times out after 12 seconds. Any valid `period` returns 200, what
 
 `GetLiveCompetitorQuotes` returns the raw Fare Finder offers behind the **Pricing** > **Parity** tab. The API does no band or ratio math. The dashboard computes bands, rate card fits, and suggestions client-side against the community's pricing configs and `parity_ratio_min` / `parity_ratio_max`.
 
-The PostHog query flattens `properties.trip.offers[]` on `ride_provider_request_completed` events where `operation = 'quotes'` and `outcome = 'success'`, scoped by `properties.community_id`. It excludes `properties.is_test` but includes internal devices, because a provider's quote is the same whoever asks. It drops offers with an empty `product` or a non-positive `fare`, `trip_miles`, or `trip_minutes`, which skips rows from app versions before 5.7.5. The app attaches `trip` only while the rider's provider diagnostics consent is current, so riders without it contribute no rows (see [Rideshare aggregator](/engineering/mobile/rideshare-aggregator)). Results are ordered newest first and capped at 5,000 offers, so a long period on a busy market loses its oldest quotes.
+`GetLiveCompetitorQuotes` reads Postgres only. It selects `ProviderQuotes` rows whose `observed_at` falls in the period, scoped by `community_id`, newest first and capped at 5,000 offers. A long period on a busy market loses its oldest quotes. The response comes back in milliseconds, instead of the 10 to 20 seconds a month of PostHog rows took at request time.
 
 ```bash
 curl "$API_URL/dashboard/live/competitor-quotes?community_id=$COMMUNITY_ID&period=30d" \
@@ -302,9 +302,27 @@ Example `data` payload:
 | `fare` | The displayed fare. Divide by `surge` for the base rate. |
 | `surge` | The provider's multiplier. The API returns values below 1, including a missing value, as 1. |
 | `at_minimum` | The provider priced the trip at its minimum fare. Only Lyft offers report it, so it is always `false` for Uber. |
-| `rate_card` | Published `base`, `minimum`, `per_mile`, `per_minute`. Only present for Lyft, and omitted when `per_mile` is not above 0. |
+| `rate_card` | Published `base`, `minimum`, `per_mile`, `per_minute` in dollars. Only present for Lyft, and omitted when `per_mile` is not above 0. App builds before the Lyft money fix stored cards 10,000 times too large (17200 per mile for $1.72). The API divides every field by 10,000 when `per_mile` is 100 or more, on read, so older synced rows also come back in dollars. |
 
-`status` follows the same `not_configured`, `unavailable`, `ready` rules as competitor prices. A single row with an unexpected shape makes the whole response `unavailable`. Ready results are cached in a separate in-process map for 5 minutes per scope and window length in hours, cleared at 512 entries. There is no `include_internal` parameter.
+| `status` | When |
+| --- | --- |
+| `not_configured` | The sync job hasn't completed a run yet, so `ProviderQuoteSync` has no row. `updated_at` is `null`. |
+| `ready` | The watermark exists. `updated_at` is the last sync time, not the request time. |
+
+A stale `updated_at` means the sync job is behind or failing. Any valid `period` returns 200 unless the Postgres read fails. There is no in-process cache and no `include_internal` or `include_test` parameter.
+
+#### Sync job
+
+The `provider_quotes_sync` River job fills `ProviderQuotes` from PostHog. It runs every 5 minutes on the `default` queue, on start, one run at a time, with a 5-minute job timeout. Each run:
+
+1. Reads the `ProviderQuoteSync` watermark. On the first run there is none, so it reads the last 90 days.
+2. Queries PostHog from the watermark minus 15 minutes, so events PostHog ingested late are picked up on the next run. The query uses a 2-minute HTTP timeout and returns at most 5,000 rows, oldest first.
+3. Inserts each offer keyed by PostHog event UUID and offer index, with `ON CONFLICT DO NOTHING`, so the overlap never duplicates rows.
+4. Advances the watermark to now. When the page is full, it stops the watermark at the last row read, so a backfill catches up over several runs.
+
+When `POSTHOG_PERSONAL_API_KEY`, `POSTHOG_PROJECT_ID`, or `POSTHOG_QUERY_HOST` isn't valid, the job does nothing and the table stays empty.
+
+The query flattens `properties.trip.offers[]` on `ride_provider_request_completed` events where `operation = 'quotes'` and `outcome = 'success'`. It keeps test and internal devices and stores their `is_test` and `is_internal` flags, because a provider's quote is the same whoever asks. The endpoint returns quotes from every device and doesn't expose the flags. It drops offers with an empty `product` or a non-positive `fare`, `trip_miles`, or `trip_minutes`, which skips rows from app versions before 5.7.5. The app attaches `trip` only while the rider's provider diagnostics consent is current, so riders without it contribute no rows (see [Rideshare aggregator](/engineering/mobile/rideshare-aggregator)).
 
 ### Market summaries
 
@@ -476,7 +494,8 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 | --- | --- |
 | KPI, market, fleet, cancellation, search, telemetry, rides | None. Every request queries Postgres with a 5-second `WithPostgresTimeout`, except telemetry at 15 seconds. |
 | Presence, market online counts, market driver status, AQ flag | Live Redis reads, no memoization |
-| Competitor prices and competitor quotes | Two in-process maps, 5 minutes per scope and window length, each cleared at 512 entries |
+| Competitor prices | In-process map, 5 minutes per scope and window length, cleared at 512 entries |
+| Competitor quotes | `ProviderQuotes` table, synced from PostHog every 5 minutes by `provider_quotes_sync` |
 | GTM | Redis snapshot and geocode cache, 24-hour TTL, refreshed every 5 minutes |
 | Surge | Writes invalidate the community price cache asynchronously |
 | User detail edits | Invalidate the user profile cache (best effort) |
@@ -498,6 +517,7 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 | Rides | `internal/service/dashboard/rides.go`, `data/repository/dashboard_rides.go` | `BuildDashboardRidesParams`, `GetDashboardRides`, `GetRideEvents` |
 | Notification analytics | `internal/data/repository/notification.go`, `queries/notification_log.sql` | `GetNotificationVariantAnalytics`, `GetNotificationTypeAnalytics` |
 | GTM | `internal/service/dashboard/gtm.go`, `internal/notify/queue/gtm.go`, `queue.go` | `Refresh`, `gtmRefreshWorker`, `gtmRefreshOptions` |
+| Competitor quote sync | `internal/service/providerquotes/service.go`, `internal/notify/queue/provider_quotes.go`, `internal/data/repository/provider_quotes.go` | `Service.Sync`, `Query`, `providerQuoteSyncPeriodic`, `ListProviderQuotes`, `LiveProviderRateCard.NormalizeLegacy` |
 | Zone pricing backtest | `internal/service/dashboard/zone_pricing.go`, `models/backtest.go` | `SimulateZonePricing` (limit default 100, max 500), `ZonePricingBacktestRow` |
 
 ## Gotchas and edge cases
@@ -511,7 +531,6 @@ See [Background jobs](/engineering/api/background-jobs) for the full periodic jo
 - **`all_time` comparisons are empty.** `calculateTimeRanges` gives `all_time` a previous window that ends at 2020-01-01, so every non-zero KPI shows +100% on the Rides **KPIs** tab, **Community** page, and fleet overview.
 - **Three definitions of unmatched.** `unmatched_requests` on market summaries counts `confirmed` plus non-superseded `no_drivers_available` over 24 hours. Live analytics `unmatched` counts only `no_drivers_available` in the period. Presence counts only `confirmed` within the request expiry.
 - **`active_rides` has no time bound.** A ride stuck in `confirmed` or `in_progress` counts on its market card indefinitely, while the **Live** rides list drops unconfirmed requests after 5 minutes.
-- **Competitor quotes serialize.** `liveQuoteClient.prices` and `quoteRows` hold the same mutex across the PostHog request, so concurrent cache misses wait on each other for up to 12 seconds each.
 - **`last_request` is empty after an hour.** The driver ops snapshot calls `GetMarketRides` without `older`, so only rides from the last hour qualify.
 - **`no_activity_7d` rarely fires.** `ListMarketDrivers` already drops drivers inactive for 7 days, so the flag is true only when every listed driver has an open session and no valid heartbeat.
 - **Warm pool totals double count.** `countWarmPoolDrivers` does not remove online drivers, while `/presence/users` does.

@@ -44,6 +44,8 @@ All rider routes are mounted in `internal/server/http/router.go` on `authenticat
 | `GET` | `/dashboard/communities/{id}/map/community` | Clerk, admin or intern for own community | `GetDashboardCommunityLayer` |
 | `GET` | `/dashboard/communities/{id}/map/ride-routes?days=` | Clerk, admin or intern for own community | `GetDashboardHistoricalRideRoutes` |
 | `GET` | `/dashboard/communities/{id}/mobility-feed-suggestions` | Clerk, admin only in practice | `DiscoverDashboardMobilityFeeds` |
+| `GET`, `PUT` | `/dashboard/map/heat-settings` | Clerk, platform admin | Read or replace heat binning settings. See [Heat settings](/engineering/location/map-layers-and-mobility#heat-settings). |
+| `POST` | `/dashboard/map/heat-settings/preview` | Clerk, platform admin | Bin live positions with unsaved values. Publishes nothing. |
 
 User-side routes that trigger map change pushes:
 
@@ -142,7 +144,7 @@ The response is `{ routes, days, total, truncated }`, where `total` is the numbe
 | Friends, moves | Ride moves need `is_public_destination`, status `confirmed`, `complete`, or `pending_rider_rating`, and `confirm_time` within 24 hours. Limit 200 rows. | `queries/ride_history.sql` |
 | Friends, moves | A bump is hidden once the sender has a matching public ride (same trimmed name, or within 0.0015 degrees on both axes, confirmed from 3 hours before the bump until it expires). Limit 100 rows. | `GetActiveBumpsForRecipient` (`queries/engagement.sql`) |
 | Friends, liked spots | Only likes from ghost-filtered friends. At most 500 rows read and 100 places returned. | `collectLikedSpots` |
-| Community, heatmap | Postgres positions only, opted-in users only, 60-day freshness, cells of fewer than 3 users dropped | `heatmap.go` |
+| Community, heatmap | Postgres positions only, opted-in users only, freshness and minimum from `MapHeatSettings` (defaults 60 days and 3 users). The minimum never drops below 3, including in previews. | `heatmap.go`, `MapHeatMinUsersFloor` |
 | Community, moves | Distinct movers of at least 2 per source, applied in SQL. No user IDs. | `communityMovesMinCount`, `ListPublicDestinationCounts`, `GetCommunityBumpDestinationCounts` |
 | Community, events | Built with `uuid.Nil` so one user's viewed state never enters the shared cache | `buildCommunityLayer` |
 
@@ -209,7 +211,7 @@ The `FriendshipRepository` interface has no remove method, so no unfriend push p
 
 | Event | Server cache dropped | Client push |
 | --- | --- | --- |
-| Heatmap refresh (every 5 minutes) | Community layer, per active non-hidden community | None |
+| Heatmap refresh (every 5 minutes, and after each heat settings save) | Community layer, per active non-hidden community | None |
 | Mobility feed refresh with vehicles | Vehicles layer | None |
 | Top-location slot, settings, or refresh | Community layer | `community_pois` |
 | Location CRUD or import | None | `community_pois` |
