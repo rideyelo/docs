@@ -1,14 +1,14 @@
 ---
 title: "Growth features"
-description: "How referrals, Dub share links, link landings and attribution, the World Cup campus race, ride discounts, coupons, promo bars, and ads work in Yelo."
+description: "How referrals, Dub share links, link landings and attribution, the World Cup campus race, ride discounts, and promo banners work in Yelo."
 ---
 
-Yelo grows mostly through students inviting students. This page covers the features that support that: referral codes and share links, sign-up attribution, the World Cup campus race, and the promotional surfaces (discounts, coupons, promo bars, and ads).
+Yelo grows mostly through students inviting students. This page covers the features that support that: referral codes and share links, sign-up attribution, the World Cup campus race, and the promotional surfaces (ride discounts and promo banners).
 
 For events, The Spot, the community feed, and QR payments, see [Events and the community feed](/concepts/events-and-feed).
 
 <Note>
-  Several of these features have no dashboard editor today. Coupons, promo bars, ads, discounts, and referral rewards can only be changed in the database. The sections below call this out.
+  Several of these features have no dashboard editor today. Discounts, promo banners, and referral rewards can only be changed in the database. The sections below call this out.
 </Note>
 
 ## Referrals
@@ -108,7 +108,7 @@ Separately, each user has an `acquisition_source`: `app_organic`, `app_referral`
 | `yelo.link` | Fleet driver join links (`yelo.link/fleet-<code>`) | `internal/service/fleetjoin` |
 | `pay.yelo.link` | QR payment links | `internal/service/qrpayment` |
 
-The API also has its own path shortener at `POST /link/encode` and `GET /link/decode`, with 8-character codes. The mobile app's `/link` route (`app/(app)/link.tsx`) calls `GET /link/decode` to resolve a code. No client calls `POST /link/encode`.
+The API also resolves its own 8-character short codes at `GET /link/decode`. The mobile app's `/link` route (`app/(app)/link.tsx`) calls it to resolve a code. The matching `POST /link/encode` route was removed in October 2026, so the API no longer creates new codes.
 
 ## World Cup campus race
 
@@ -129,10 +129,10 @@ How it works:
 
 1. A student submits a `.edu` email on the World Cup site (`yelo-web/src/sites/world-cup`). Yelo matches the school by email domain and stores a claim with status `pending`. Claims can also be `verified` or `superseded`.
 2. A school's count is its pending and verified claims since the start date, plus verified `.edu` users at the school who have no claim.
-3. When a school reaches 500 and fewer than 25 winners exist, it becomes a winner. The check only runs when a claim for that school is written, verified, or rematched. A school that crosses 500 through sign-ups alone isn't marked a winner until the next claim.
+3. When a school reaches 500 and fewer than 25 winners exist, it becomes a winner. The check only runs when a claim for that school is written or verified. A school that crosses 500 through sign-ups alone isn't marked a winner until the next claim.
 4. The next time the student opens the app, it prompts them to verify the email. That proves inbox ownership and makes them a student account. They can choose **Verify later**.
 
-The public routes are `GET /world-cup/standings` and `GET /world-cup/activity`. Claim routes accept a pre-signup or full token. Admins can list and rematch unmatched claims at `/dashboard/education-claims/unmatched` and `/dashboard/education-claims/rematch`.
+The public routes are `GET /world-cup/standings` and `GET /world-cup/activity`. Claim routes accept a pre-signup or full token. The admin routes for listing and rematching unmatched claims were removed in October 2026.
 
 ## Ride discounts
 
@@ -144,32 +144,13 @@ Ride discounts lower the fare for rides to a specific destination. They apply au
 
 Discounts have no dashboard editor. For the rest of the fare math, see [Pricing](/concepts/pricing).
 
-## Coupons
+## Promo banners
 
-Coupons are limited-quantity deals from local venues, not ride discounts. A coupon has a title, description, photo, venue, community, total and available counts, and preview, release, and expiry times.
+Promo banners are image banners for a community, each with a link and an optional pinned flag. The API returns them inside the community payload as `promo_banners`. They have no dashboard editor.
 
-- Users claim a coupon with `POST /coupon/i/{couponId}/claim`. Each claim gets a unique code.
-- A user can claim a coupon once. Claims stop when the coupon is out of stock.
-- The API doesn't check the release or expiry times, and has no redeem endpoint.
+## Retired: coupons, ads, and promo bars
 
-The app has no coupon UI. No screen or component calls the coupon endpoints. Coupons have no dashboard editor.
-
-## Promo bars
-
-A promo bar is a banner for a community with optional text, text color, link, background image, and background color. `GET /promobar/` returns every promo bar for the caller's community. There is no schedule or active flag, no dashboard editor, and the current app doesn't call the endpoint.
-
-## Ads
-
-Ads are sponsored media shown in the app.
-
-- An ad has a media type (`image`, `video`, or `lottie`), size (`small`, `medium`, or `large`), shape (`horizontal_rectangle`, `vertical_rectangle`, or `square`), tier, target communities, and start and end times.
-- `GET /ad/` returns one random active ad for the caller's community that matches the requested size and shape and meets the tier.
-- The app reports views and clicks with `POST /ad/impression`.
-- The community feed places one ad after each group of rides and bumps. See [Events and the community feed](/concepts/events-and-feed#community-feed).
-
-<Warning>
-  The ride-matching screen requests ads with shape `rectangle`, which isn't a valid shape, so it likely never gets an ad. Ads also have no dashboard editor.
-</Warning>
+Venue coupons, sponsored ads with impression tracking, and the `GET /promobar/` endpoint were retired in October 2026. The app no longer has a deals screen, and the community feed no longer includes ads. The `Coupons`, `CouponClaims`, `Ads`, `AdImpressions`, and `PromoBars` tables still exist, but no code reads or writes them. Ride discounts and promo banners are unaffected. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
 ## Where this lives in code
 
@@ -182,8 +163,6 @@ Ads are sponsored media shown in the app.
 | App and event landings | `yelo-web/src/sites/signup/get/`, `yelo-web/src/sites/signup/event/` |
 | World Cup | `yelo-api/internal/service/worldcup/`, `internal/models/world_cup.go`, `yelo-web/src/sites/world-cup/` |
 | Discounts | `yelo-api/internal/models/discount.go`, `internal/utilities/pricing/pricing.go` |
-| Coupons | `yelo-api/internal/service/coupon/`, `internal/models/coupon.go` |
-| Promo bars | `yelo-api/internal/service/promobar/` |
-| Ads | `yelo-api/internal/service/ad/`, `internal/models/ad.go`, `yelo-frontend/components/feed/Ad.tsx` |
+| Promo banners | `yelo-api/internal/data/repository/community.go` (`ListCommunityPromoBanners`) |
 | Invite landing page | `yelo-web/src/sites/signup/invite/`. `yelo-web/src/sites/invite/` only forwards old `invite.yelo.link` links |
 | Mobile referral hub | `yelo-frontend/components/ReferralHub.tsx`, `hooks/useReferralLink.ts` |

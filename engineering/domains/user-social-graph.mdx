@@ -122,7 +122,6 @@ Example: a user submits three strings with no region. Two are different formats 
 A referred signup also befriends the inviter, with source `referral`:
 
 - **Auth v3**: when `CompleteAuthV3Profile` applies a referral code (presented or ambient), `applyAuthV3Referral` writes the `Referrals` row and then calls the `AddMutualFriendship` query with the new user and the referrer, in the same transaction. If the friendship insert fails, the whole profile transaction fails, so a signup can't record who invited whom without connecting them. Because the insert uses `ON CONFLICT DO NOTHING`, an existing friendship keeps its original source. There was no backfill: users referred through Auth v3 before [yelo-api#309](https://github.com/rideyelo/yelo-api/pull/309) have a `Referrals` row but no `Friendships` row.
-- **Auth v2**: `AuthV2Service.applyReferralCode` adds the friendship after the referral, and failures are logged and ignored.
 
 See [Applying a referral](/engineering/domains/referrals-and-links#applying-a-referral).
 
@@ -134,7 +133,7 @@ See [Applying a referral](/engineering/domains/referrals-and-links#applying-a-re
 
 ### New friend push
 
-Every service writes friendships through `mapchanges.Service.WrapFriendships`, which wraps the shared `Friendship` repository. That covers contact matching (`UserService.linkMutualContacts`), Auth v2 signup referrals (`AuthV2Service.applyReferralCode`), and invite links (`UserService.ConnectFriend`). The Auth v3 referral friendship is written by a query inside the signup transaction, not through the wrapper, so it sends no new friend push and no `friends` map change. The first user passed to `AddMutual` or `AddMutualBatch` is the joiner: the user who uploaded contacts, signed up, or tapped the invite. Referral and invite call sites pass the acting user first (the new signup, or the existing user who tapped the invite), so the referrer or inviter receives the push.
+Every service writes friendships through `mapchanges.Service.WrapFriendships`, which wraps the shared `Friendship` repository. That covers contact matching (`UserService.linkMutualContacts`) and invite links (`UserService.ConnectFriend`). The Auth v3 referral friendship is written by a query inside the signup transaction, not through the wrapper, so it sends no new friend push and no `friends` map change. The first user passed to `AddMutual` or `AddMutualBatch` is the joiner: the user who uploaded contacts, signed up, or tapped the invite. Referral and invite call sites pass the acting user first (the new signup, or the existing user who tapped the invite), so the referrer or inviter receives the push.
 
 Before the write, the wrapper reads the existing edges with `FriendsAmong`. After the write, it keeps only edges that did not exist before. If that read fails, it logs `map.change.friendship_lookup_failed` and treats every edge as new. When there is at least one, it:
 

@@ -125,9 +125,9 @@ The view `ActiveFleetCommunityServices` returns rows where the service is enable
 
 ## `FleetDriverWhitelist`
 
-Created in `000168`. `email` is globally `UNIQUE`, so an email can be whitelisted for only one fleet. `UpsertFleetDriverWhitelist` moves an existing email to the new fleet and reactivates it. `added_by` became nullable in `000170`, and the dashboard handler always passes `nil`. Archive sets `is_active = FALSE` on the fleet's entries.
+Created in `000168`. `email` is globally `UNIQUE`, so an email can be whitelisted for only one fleet. `added_by` became nullable in `000170`. The whitelist routes were removed in October 2026, so nothing creates or updates entries. Archive sets `is_active = FALSE` on the fleet's entries.
 
-No runtime path reads the whitelist to enroll drivers. `reconcileFleetAssignmentForUser` doesn't consult it, and `FleetDriverWhitelistRepository.GetByEmail` has no callers.
+No runtime path reads the whitelist to enroll drivers. `reconcileFleetAssignmentForUser` doesn't consult it. The only reader is `GetWhitelistSchoolMatch`, which places a whitelisted email in a community at school matching.
 
 ## Calendar tables
 
@@ -175,7 +175,7 @@ Historical rows stay editable as long as the fleet reference doesn't change. The
 | Concern | Path |
 | --- | --- |
 | Schema | `yelo-api/internal/data/sqlc/schema.sql`, `yelo-api/migrations/000157_*` through `000346_*` |
-| Go models | `yelo-api/internal/models/fleet.go`, `fleet_community_service.go`, `fleet_vehicle.go`, `fleet_driver_whitelist.go`, `driver.go` |
+| Go models | `yelo-api/internal/models/fleet.go`, `fleet_community_service.go`, `fleet_vehicle.go`, `driver.go` |
 | Fleet CRUD queries | `yelo-api/internal/data/repository/queries/driver_fleet_primitives.sql` |
 | Join and switch queries | `yelo-api/internal/data/repository/queries/fleet_join.sql` |
 | Service queries | `yelo-api/internal/data/repository/queries/fleet_community_services.sql` |
@@ -186,6 +186,5 @@ Historical rows stay editable as long as the fleet reference doesn't change. The
 - **Archive keeps history, not operations.** `DeleteFleet` refuses while the fleet still has operational references (see [Archive](/engineering/fleets/stripe-and-lifecycle#archive)). Once archived, inactive `FleetDrivers` rows, `FleetVehicles` rows for archived vehicles, historical rides, and the Stripe reference remain.
 - **Fleets deleted before `000346` may still have active references.** The migration performs no backfill. A fleet soft-deleted under the old single-statement delete can still have active memberships, payout assignments, open prices, and enabled services. `ActiveFleetId` can point at such a fleet, because the profile query doesn't join `Fleets`, and `reconcileFleetAssignmentForUser` returns early whenever `ActiveFleetId` is set.
 - **The active-fleet index is enforced per row.** `SetDriverActiveFleet` flips every membership in one `UPDATE` (`SET is_active = (fleet_id = $1)`). A non-deferrable unique index is checked as each row changes, so whether this statement conflicts depends on the order in which PostgreSQL visits the rows. The join and admin membership paths avoid the problem by deactivating other rows in a separate statement first.
-- **Whitelist emails are global.** Whitelisting an email for fleet B silently moves it off fleet A.
 - **`has_owner_operators` is cosmetic.** It is editable but doesn't affect routing, join rules, or onboarding. `payment_model` controls those.
 - **`000334_breeze_shared_cart` is data, not schema.** It seeds one shared cart for one hard-coded fleet ID. Other environments are unchanged.

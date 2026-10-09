@@ -1,6 +1,6 @@
 ---
 title: "Fleet joins and invitation links"
-description: "How fleet join codes are generated, published through Dub, rotated under concurrency, previewed, and redeemed, plus admin assignment, admin membership edits, legacy add-by-email, and the email whitelist."
+description: "How fleet join codes are generated, published through Dub, rotated under concurrency, previewed, and redeemed, plus admin assignment and admin membership edits."
 ---
 
 Drivers enter a fleet through six paths. All but automatic enrollment go through the fleet join repository and its locked enrollment transaction. This page covers all six. For the user-facing flow, see [Fleet driver invitations](/fleets/driver-invitations). For what the active fleet and payout fleet mean afterwards, see [Membership and payout routing](/engineering/fleets/membership-and-payout-routing).
@@ -11,10 +11,9 @@ Drivers enter a fleet through six paths. All but automatic enrollment go through
 | Admin assign | `PUT /dashboard/users/detail/{id}/fleet` | `admin` | `fleetjoin.Service.Assign` → `EnrollDriver` |
 | Admin transfer | `PUT /dashboard/users/detail/{id}/fleet-transfer` | `admin` | `DashboardService.TransferUserFleet` → `TransferDriver` |
 | Admin membership edit | `PUT /dashboard/users/detail/{id}/fleets` | `admin` | `DashboardService.UpdateUserFleetMemberships` → `UpdateDriverMemberships` |
-| Legacy add by email | `POST /dashboard/fleet/{fleet_id}/drivers` | `admin` | `DashboardService.AddDriverToFleet` → `TransferUserFleet` |
 | Default enrollment | None, automatic | Not applicable | `reconcileFleetAssignmentForUser` → `AddDriverToDefaultFleet` |
 
-The email whitelist (`POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist`) still stores entries, but no path enrolls drivers from it. See [Email whitelist](#email-whitelist).
+The add-by-email route and the email whitelist routes were removed in October 2026. See [Retired add-by-email and email whitelist](#retired-add-by-email-and-email-whitelist).
 
 ## Join codes
 
@@ -175,23 +174,11 @@ The dashboard surface is the **Fleet membership** section of the admin user shee
 | De-duplication | `markFleetJoinCodeHandled`, `hasHandledFleetJoinCode` | Keeps the last 20 handled codes under `@yelo/fleet_join_handled_codes_v1`. A handled pending code is cleared without navigating. |
 | Screen | `app/fleet-join/[code].tsx` | Preview, join, then driver setup or the driver hub. |
 
-## Legacy add by email
+## Retired add-by-email and email whitelist
 
-`POST /dashboard/fleet/{fleet_id}/drivers` is admin only. The handler rejects other roles with 403 **Only admins can enroll drivers directly. Share the fleet join link instead.**, and `DashboardService.AddDriverToFleet` checks `fleetServiceAdmin` again. It looks up the user by email and calls `TransferUserFleet`, so it has the same guarantees as [Admin transfer](#admin-transfer).
+`POST /dashboard/fleet/{fleet_id}/drivers`, which added a driver to a fleet by email, and the fleet whitelist routes (`GET` and `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist`, `PATCH .../whitelist/{entry_id}`) were removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
-## Email whitelist
-
-The whitelist stores emails pre-approved for a fleet. `CreateFleetWhitelistEntry`:
-
-- Lowercases the email and checks a minimal shape (`isValidEmail`: one `@` and a dot in the domain).
-- Rejects emails ending in `.edu`.
-- Rejects emails that already belong to any user (`GetCountByEmail`).
-- Runs `assertFleetInCommunity` in the handler, which requires the fleet to appear in `GetCommunityFleets` for the path community. That list comes from `ActiveFleetCommunityServices`, so the fleet must be active and actively serve that community.
-- Upserts on the globally unique `email`, which moves an existing entry to the new fleet and reactivates it.
-
-`PUT .../whitelist/{entry_id}` toggles `is_active` after `assertWhitelistEntryInFleet`. Archiving the fleet deactivates its entries.
-
-No code path reads the whitelist to enroll a driver. `reconcileFleetAssignmentForUser` doesn't consult it, so a whitelisted email has no effect on the driver's fleet.
+The `FleetDriverWhitelist` table still exists. Nothing creates entries or enrolls drivers from it. Archiving a fleet still deactivates its entries (`DisableArchivedFleetWhitelist`).
 
 ## Where this lives in code
 
@@ -203,8 +190,7 @@ No code path reads the whitelist to enroll a driver. `reconcileFleetAssignmentFo
 | Join SQL | `yelo-api/internal/data/repository/queries/fleet_join.sql` |
 | Routes and handlers | `yelo-api/internal/server/http/fleetjoin/routes.go`, `handler.go`; registration in `internal/server/http/router.go` |
 | Admin transfer and membership edits | `TransferDriver` in `yelo-api/internal/data/repository/fleet_join.go`; `UpdateDriverMemberships` in `driver_fleet_memberships.go`; `TransferUserFleet`, `UpdateUserFleetMemberships` in `internal/service/dashboard/fleet_transfer.go`; routes in `internal/server/http/dashboard/users/routes.go` |
-| Legacy add and whitelist handlers | `AddDriverToFleet`, `CreateFleetWhitelistEntry`, `UpdateFleetWhitelistEntry` in `yelo-api/internal/server/http/community/community_handler.go` |
-| Whitelist service | `CreateFleetWhitelistEntry` in `yelo-api/internal/service/dashboard/dashboard.go` |
+| Whitelist deactivation on archive | `DisableArchivedFleetWhitelist` in `yelo-api/internal/data/repository/queries/fleet_archive.sql` |
 | Error types | `ErrorTypeFleetJoinBusy`, `ErrorTypeFleetPayoutUnavailable` in `yelo-api/internal/utilities/errors/error.go`, both mapped to 409 in `internal/server/http/httperrors/errors.go` |
 | Mobile | `yelo-frontend/app/fleet-join/[code].tsx`, `lib/storage/fleetJoinIntent.ts`, `components/FleetJoinIntentObserver.tsx`, `app/+native-intent.tsx` |
 | Design notes | `yelo-api/docs/owner-operator-fleet-joins.md`, `docs/admin-fleet-transfers.md` |
@@ -217,4 +203,3 @@ No code path reads the whitelist to enroll a driver. `reconcileFleetAssignmentFo
 - **The error title is always about payouts.** Both unavailable paths use `ErrorTypeFleetPayoutUnavailable` titled **Fleet Payouts Unavailable**, even for an inactive owner-operator fleet.
 - **Owner-operator fleets with custom payouts are never joinable.** `CanAcceptDriverJoins` requires `has_custom_payouts = FALSE` for owner-operator fleets. The dashboard no longer has a custom payouts toggle and derives the field from the payment model, but a fleet with a mismatched stored value stays unjoinable until its settings are saved. The **Fleet Details** card warns about the mismatch.
 - **Admin paths keep the community; joins move it.** Redeem and `PUT .../fleet` move the driver to the fleet's home community. `fleet-transfer`, the membership editor, and legacy add by email leave `Users.community_id` unchanged.
-- **The whitelist is inert.** Entries can still be created and toggled, but nothing enrolls drivers from them.

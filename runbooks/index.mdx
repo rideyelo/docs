@@ -70,7 +70,8 @@ This is every operational tool in `yelo-api`, `yelo-web`, and `yelo-frontend` on
 | `GET /internal/context/user?phone=` or `?user_id=` | `X-Internal-Key` header, matched against `INTERNAL_API_KEY` | Onboarding, community, driver, and Quo context for one user. Returns `found: false` when there's no match. Built for n8n SMS automation. | No |
 | `/riverui/` and `POST /riverui/session` | Clerk `admin` | Embedded River UI. Use it through the dashboard **Jobs** page. | Yes, through River UI actions |
 | `POST /internal/e2e/runs`, `GET` and `DELETE /internal/e2e/runs/{id}`, `POST /internal/e2e/runs/{id}/ride-transition` | `X-E2e-Key` header | E2E fixtures. Registered only on the isolated E2E service. | Yes, E2E database only |
-| `DELETE /ride/` | App JWT | Drops all rides. Refused unless `ENVIRONMENT=dev`. | Yes, local only |
+
+`DELETE /ride/`, the local-only route that dropped all rides, was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 The `/internal/context/user` endpoint is the fastest read-only support lookup. It reports `phone_verified`, `profile_completed`, `is_banned`, `is_deleted`, `is_test`, the community's `market_status` and `rides_disabled`, and the driver's status, steps, and `is_online`.
 
@@ -97,12 +98,9 @@ The `/internal/context/user` endpoint is the fastest read-only support lookup. I
 | **Send test** | **Notifications** → **Templates** | `POST /dashboard/notifications/templates/{code}/{locale}/test-send` | admin |
 | Retry, cancel, delete jobs | **Jobs** (River UI) | `/riverui/` | admin |
 
-Several dashboard endpoints have no dashboard control. You can only call them with a dashboard Clerk session token:
+`PUT /dashboard/users/detail/{id}/fleet-transfer` has no dashboard control. It selects a driver's active fleet without revoking other memberships. It's admin-only, and you can only call it with a dashboard Clerk session token.
 
-- `POST /dashboard/live/markets/{id}/notify` sends a push to users in a market. `POST /dashboard/live/drivers/{id}/ping` and `POST /dashboard/live/riders/{id}/ping` push one user. All three are admin-only. The **Live** page has no notify or ping control. Use **Send Notification** on **Notifications** for market-wide messages.
-- `PUT /dashboard/users/detail/{id}/fleet-transfer` selects a driver's active fleet without revoking other memberships. It's admin-only.
-- `POST /dashboard/fleet/{fleet_id}/drivers` enrolls a driver by email. It's admin-only. Fleet managers get a 403 and must share a join link.
-- `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist` adds an email to `FleetDriverWhitelist`. Automatic fleet assignment no longer reads the whitelist, so an entry doesn't enroll the driver. It's still used to place a whitelisted user in a community at school matching.
+The market notify route, the driver and rider ping routes, `POST /dashboard/fleet/{fleet_id}/drivers`, and the fleet whitelist routes were removed in October 2026. Use **Send Notification** on **Notifications** for market-wide messages. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 ### Command-line tools in `yelo-api/cmd`
 
@@ -120,7 +118,7 @@ Each tool reads `DSN` and provider keys from `.env` in the working directory, th
 
 | Script | Type | Purpose |
 | --- | --- | --- |
-| `yelo-api/docs/ride-cardinality-preflight.sql` | Read-only | Lists duplicate live bookings, duplicate active trips, requested drafts next to live bookings, and session or vehicle ownership conflicts. |
+| `yelo-api/scripts/ride-cardinality-preflight.sql` | Read-only | Lists duplicate live bookings, duplicate active trips, requested drafts next to live bookings, and session or vehicle ownership conflicts. |
 | `yelo-api/scripts/auth-v3-user-preflight.sql` | Read-only | Auth v3 compatibility counts, including duplicate phone groups. Emits user IDs only. |
 | `yelo-api/scripts/fix_driver_fleet_status.sql` | Diagnostics, then writes | Four diagnostics for activated drivers without a usable fleet or with incomplete steps. **FIX 1 is not commented out**, so running the whole file inserts `FleetDrivers` rows. FIX 2 is commented out. |
 | `yelo-api/scripts/backfill-yelo-community.sql` | Write, ends in `ROLLBACK` | One-time repair that moves ordinary users out of the reserved Yelo community. You preview by running it as-is, then change `ROLLBACK` to `COMMIT`. |
@@ -174,7 +172,7 @@ No supported tool exists for these operations:
 | Complete or reassign a ride | No tool. |
 | Refund, capture, or cancel a PaymentIntent, including the hold left on an expired requeued ride | No tool. Done on the connected account in Stripe. See [Payment failures and holds](/runbooks/payment-issues). |
 | Retry a failed payout | No tool. |
-| Ping one user or notify a market from the dashboard | API only: `POST /dashboard/live/drivers/{id}/ping`, `/riders/{id}/ping`, and `/markets/{id}/notify`. |
+| Ping one user from the dashboard | No tool. The ping routes were removed in October 2026. To notify a market, use **Send Notification** on **Notifications**. |
 | Edit quiet hours (`NotificationPolicies`) | No dashboard page edits the quiet-hours window. Each template's quiet-hours behavior is editable under [Template settings](/dashboard/notification-templates#limits-and-quiet-hours). |
 | Reset `AuthRateLimitCounters` or merge two accounts | No tool. |
 | Force a production migration version | No tool. See [Failed migration](/runbooks/failed-migration). |

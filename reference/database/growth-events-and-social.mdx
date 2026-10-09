@@ -1,6 +1,6 @@
 ---
 title: "Events, spots, and social graph"
-description: "Reference for event, attendance, ticket, poll, and community spot tables, the friendship and contact-matching graph, and the generic contact sync tables that project users into Quo and Resend. Also covers where the community feed comes from."
+description: "Reference for event, ticket, poll, and community spot tables, the friendship and contact-matching graph, and the generic contact sync tables that project users into Quo and Resend. Also covers where the community feed comes from."
 ---
 
 This page covers community content (events, the featured spot, polls), the friend graph built from referrals and address-book matching, and the generic contact sync engine that mirrors users into external contact providers. Venues are on [Locations and places](/reference/database/markets-locations-and-places#venues). Bumps (friend ride intents) are on [Rides](/reference/database/rides).
@@ -9,7 +9,7 @@ For repository conventions, see [Data layer](/engineering/api/data-layer).
 
 ```mermaid
 erDiagram
-    Events ||--o{ EventAttendees : "going"
+    Events ||--o{ EventAttendees : "going (unused)"
     Events ||--o{ EventShares : "shared"
     Events ||--o{ TicketPurchases : "tickets"
     Events ||--o{ EventStoryViews : "viewed (no FK)"
@@ -49,7 +49,7 @@ erDiagram
 
 ## Community feed
 
-There is no feed table. `generateCommunityFeed` in `internal/service/community/feed_logic.go` builds a randomized, paginated feed from ads (`"Ads"`), recent public rides, and friend bumps, and caches it in Redis with an in-memory fallback (`feed_cache_redis.go`, `feed_cache_memory.go`). `cmd/api/main.go` refreshes every community's feed every 2 minutes. Event items are currently disabled: the event query is commented out, and the feed passes an empty event list.
+There is no feed table. `generateCommunityFeed` in `internal/service/community/feed_logic.go` builds a randomized, paginated feed from recent public rides and friend bumps, and caches it in Redis under the `feed:community:v2:` key prefix with an in-memory fallback (`feed_cache_redis.go`, `feed_cache_memory.go`). Ads were removed from the feed in October 2026. `cmd/api/main.go` refreshes every community's feed every 2 minutes. Event items are currently disabled: the event query is commented out, and the feed passes an empty event list.
 
 ## Events
 
@@ -89,16 +89,16 @@ Community events created from the dashboard.
 
 ### EventAttendees
 
-RSVPs.
+RSVPs. Event attendance was retired in October 2026. The table still exists, but no code has read or written it since then. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
 | Column | Type | Null | Default | Meaning |
 | --- | --- | --- | --- | --- |
 | `event_id` | `uuid` | no | | FK to `"Events"`. No cascade. |
 | `user_id` | `uuid` | no | | Attendee. No foreign key. |
-| `status` | `text` | no | `'going'` | Always `going`. `AddEventAttendee` inserts it, and leaving deletes the row. |
+| `status` | `text` | no | `'going'` | Always `going` in existing rows. |
 | `created_at` | `timestamptz` | no | `now()` | RSVP time. |
 
-Primary key `(event_id, user_id)`. Index on `user_id`. `internal/data/repository/event_attendee.go`.
+Primary key `(event_id, user_id)`. Index on `user_id`.
 
 ### EventShares
 
@@ -183,7 +183,7 @@ Undirected friend edges.
 
 - CHECK `user_low < user_high` and unique `(user_low, user_high)` make each pair one row. Inserts order the pair with `LEAST` and `GREATEST`, and the first source wins on conflict.
 - Index on `user_high` covers lookups from the other side.
-- Written by `internal/data/repository/friendship.go` from `internal/service/authv2/profile.go` (the referrer and new user become friends) and `internal/service/user/contacts.go` (mutual contact matches). Read for the friends list, map friends, bump recipients, and place-change fan-out.
+- Written by `internal/data/repository/friendship.go` from `internal/service/user/friends.go` (invite links), `internal/service/user/contacts.go` (mutual contact matches), and `internal/service/notifications/bump.go` (bumps). Auth v3 signup referrals insert the friendship inside the profile transaction. Read for the friends list, map friends, bump recipients, and place-change fan-out.
 
 ### UserContacts
 

@@ -27,7 +27,7 @@ This page lists what is still in the codebase for compatibility or by accident, 
 | Item | Replaced by | Current callers | Safe to remove? |
 | --- | --- | --- | --- |
 | [Auth v1 no-op hook](#auth-v1) | Auth v2 and v3 | `router.go:134` only | Yes |
-| [Auth v2 routes](#auth-v2) | Auth v3 | Mobile and web, for 6 of 12 routes | No; 6 unused routes need log evidence |
+| [Auth v2 routes](#auth-v2) | Auth v3 | Mobile and web, for all 6 remaining routes | No |
 | [`EmailOTP` and `PhoneOTP` repositories](#retired-otp-tables-and-repositories) | Redis (v2) and `AuthPhoneAttempts` (v3) | None | Code yes; tables after export |
 | [v1 error envelope](#v1-error-envelope) | v2 envelope via `X-API-Version: v2` | Every client without the header | No |
 | [Legacy App Engine host](#legacy-app-engine-host) | `api.rideyelo.com` | App builds 4.x and older | Only after log evidence that no 4.x build calls it |
@@ -42,10 +42,10 @@ This page lists what is still in the codebase for compatibility or by accident, 
 | [Legacy Quo writer](#legacy-quo-writer) | Contact sync engine | Active while provider mode is `legacy` | After cutover to `generic` |
 | [`TextMessageRepository.AddText`](#dead-api-code) | Bump SMS pipeline | None | Yes |
 | [ClickHouse setup script](#dead-api-code) | Postgres analytics tables | None | Yes |
-| [`/fleet-transfer` route](#fleet-transfer-and-whitelist-management-routes) | `PUT /dashboard/users/detail/{id}/fleets` | No dashboard caller | After log check |
-| [Fleet whitelist management routes](#fleet-transfer-and-whitelist-management-routes) | Fleet join links | No dashboard caller | Routes after log check; table no |
-| [`GuestSignup` component](#dead-web-code) | Auth v3 signup flow | Type import only | Yes |
+| [`/fleet-transfer` route](#fleet-transfer-route) | `PUT /dashboard/users/detail/{id}/fleets` | No dashboard caller | After log check |
 | [Dashboard redirect routes](#dashboard-redirect-routes) | Consolidated pages | Old bookmarks | Keep; trim prefetch entries |
+| [Ads, coupons, promo bar, and event attendance](#retired-ads-coupons-and-event-attendance) | None | None | Removed in October 2026; tables remain |
+| [Other retired routes](#other-retired-routes) | Various | None | Removed in October 2026 |
 
 ## Authentication
 
@@ -57,7 +57,7 @@ One empty hook remains. `user.RegisterUnauthenticatedRoutes` in `internal/server
 
 ### Auth v2
 
-Auth v2 routes are registered in `internal/server/http/router.go:201-220` under `/authv2`, with handlers in `internal/server/http/authv2` and logic in `internal/service/authv2`. Auth v3 (`/authv3/*`) replaced it for sign-in and signup, but auth v2 still serves status, school email verification, and the web delete-account flow.
+Auth v2 routes are registered in `internal/server/http/router.go:208-226` under `/authv2`, with handlers in `internal/server/http/authv2` and logic in `internal/service/authv2`. Auth v3 (`/authv3/*`) replaced it for sign-in and signup, but auth v2 still serves status, school email verification, and the web delete-account flow.
 
 | Route | Operation | Current callers | Removal |
 | --- | --- | --- | --- |
@@ -67,18 +67,10 @@ Auth v2 routes are registered in `internal/server/http/router.go:201-220` under 
 | `POST /authv2/email/verify-otp` | `authv2.VerifyEmailOtp` | Mobile `verify/3-email-confirm.tsx`, `driver-signup/verify/3-email-confirm.tsx` | No |
 | `POST /authv2/phone/request-otp` | `authv2.RequestPhoneOtp` | Web `src/sites/signup/delete-account/DeleteAccountPage.tsx` | No |
 | `POST /authv2/phone/verify-otp` | `authv2.VerifyPhoneOtp` | Web `DeleteAccountPage.tsx` | No |
-| `POST /authv2/community/verify-oauth` | `authv2.VerifyCommunityOauth` | Only the dead web `GuestSignup` component | After log check |
-| `POST /authv2/community/request-email-otp` | `authv2.RequestCommunityEmailOtp` | None | After log check |
-| `POST /authv2/community/verify-email-otp` | `authv2.VerifyCommunityEmailOtp` | None | After log check |
-| `POST /authv2/profile/setup` | `authv2.SetupProfile` | None | After log check |
-| `POST /authv2/profile/draft` | `authv2.SaveProfileDraft` | None | After log check |
-| `POST /authv2/referral-source` | `authv2.SaveReferralSource` | None | After log check |
 
-<Warning>
-In August 2026, production Apple sign-ins still reached `VerifyCommunityOauth` ([#45](https://github.com/rideyelo/yelo-api/pull/45)). Current source no longer calls it, but confirm zero traffic before you delete it.
-</Warning>
+The six unused auth v2 routes (`/authv2/community/verify-oauth`, `/authv2/community/request-email-otp`, `/authv2/community/verify-email-otp`, `/authv2/profile/setup`, `/authv2/profile/draft`, and `/authv2/referral-source`) were removed in [#322](https://github.com/rideyelo/yelo-api/pull/322). See [Other retired routes](#other-retired-routes).
 
-The presignup token middleware (`getValidatePresignupTokenMiddleware`) also guards `/world-cup` and `/tips` routes (`router.go:286-296`), so it outlives auth v2. See [Identity overview](/engineering/identity/overview) for how the three generations fit together.
+The presignup token middleware (`getValidatePresignupTokenMiddleware`) also guards `/world-cup` and `/tips` routes (`router.go:292-302`), so it outlives auth v2. See [Identity overview](/engineering/identity/overview) for how the three generations fit together.
 
 ### Retired OTP tables and repositories
 
@@ -171,12 +163,11 @@ The Quo outbox (`QuoSyncOutbox`, `QuoSyncRequests`, and `internal/service/quo`) 
 
 ## Fleets
 
-### Fleet transfer and whitelist management routes
+### Fleet transfer route
 
-- `PUT /dashboard/users/detail/{id}/fleet-transfer` (`internal/server/http/dashboard/users/routes.go:20`) selects an active fleet without revoking memberships. The dashboard now uses `GET` and `PUT /dashboard/users/detail/{id}/fleets`, and no yelo-web source outside the generated client calls `TransferUserFleet`.
-- `GET` and `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist` and `PATCH .../whitelist/{entry_id}` (`internal/server/http/community/community_router.go:424-443`) manage the fleet email whitelist. [web #100](https://github.com/rideyelo/yelo-web/pull/100) replaced the dashboard whitelist UI with join links on 2026-09-04.
+`PUT /dashboard/users/detail/{id}/fleet-transfer` (`internal/server/http/dashboard/users/routes.go:20`) selects an active fleet without revoking memberships. The dashboard now uses `GET` and `PUT /dashboard/users/detail/{id}/fleets`, and no yelo-web source outside the generated client calls `TransferUserFleet`. The route can go after a log check.
 
-Both sets of routes can go after a log check. Keep the `FleetDriverWhitelist` table: `queries/education_commerce.sql` still reads it during email verification, and fleet archive disables its entries. See [Joins and invitations](/engineering/fleets/joins-and-invitations).
+The fleet whitelist management routes were removed in [#322](https://github.com/rideyelo/yelo-api/pull/322). Keep the `FleetDriverWhitelist` table: `queries/education_commerce.sql` still reads it during email verification, and fleet archive disables its entries. See [Joins and invitations](/engineering/fleets/joins-and-invitations).
 
 ### Vehicle icon alias
 
@@ -187,10 +178,6 @@ Migration `000200` seeded the `cart` vehicle type with icon `golf_cart`. The mob
 ### Removed sites
 
 The `pay` and `drive` sites from the initial multisite commit were stubs. [web #93](https://github.com/rideyelo/yelo-web/pull/93) removed "the unused `drive` and `pay` stubs" on 2026-09-03. See [Sites](/engineering/web/sites).
-
-### Dead web code
-
-`GuestSignup` in `src/shared/signup/GuestSignup.tsx:28` is the pre-auth-v3 guest signup form. It calls auth v2 phone OTP and community OAuth. Nothing renders it. `src/shared/signup/steps/Handoff.tsx:3` imports only its `SignupIntent` type. Move that type and delete the component.
 
 ### Dashboard redirect routes
 
@@ -211,6 +198,43 @@ The `pay` and `drive` sites from the initial multisite commit were stubs. [web #
 | `/vehicles` | `/manage?tab=vehicles` |
 
 Keep the redirects for bookmarks. `src/sites/dashboard/routeModules.ts:13`, `:23`, and `:24` still register prefetch importers for `/schools`, `/vehicles`, and `/activation`, which only redirect. Those three entries are safe to remove. The pages themselves are still rendered as tabs inside `CommunitiesPage`, `ManageFleetsPage`, and `NotificationsPage`.
+
+## Retired in October 2026
+
+[yelo-api #322](https://github.com/rideyelo/yelo-api/pull/322) removed 46 operations from the API (394 to 348 in `openapi.json`). [yelo-frontend #685](https://github.com/rideyelo/yelo-frontend/pull/685) and [yelo-web #185](https://github.com/rideyelo/yelo-web/pull/185) removed the clients that called them. A client that still calls a removed route gets `404` or `405`. The release had no migrations, schema drops, or backfills.
+
+### Retired ads, coupons, and event attendance
+
+| Feature | Removed operations | What else changed |
+| --- | --- | --- |
+| Ads | `GET /ad/`, `GET /ad/{id}`, `POST /ad/impression` | The community feed no longer contains `ad` items. The feed cache key prefix moved from `feed:community:` to `feed:community:v2:`, so cached pages that held ads are never read. Old keys expire with the 2-minute feed TTL. |
+| Coupons (mobile "deals") | `GET /coupon/`, `GET /coupon/i/{couponId}/available`, `POST /coupon/i/{couponId}/claim` | The mobile `deals/[dealId]` screen and deal cards are gone. |
+| Promo bar | `GET /promobar/` | Promo banners in the community payload (`promo_banners`) are unchanged. |
+| Event attendance | `POST /event/{id}/attend`, `DELETE /event/{id}/attend`, `GET /event/{id}/attendees` | The event response no longer has `attendees` or `is_attending`. The dashboard events table lost its attendees column. Mobile no longer sends event or ad impressions. |
+| Attendance and manual KPIs | `GET /dashboard/kpi/manual`, `POST /dashboard/kpi/manual` | `GET /dashboard/kpi/global` no longer returns `total_attenders` or the `attenders` series. The dashboard **Attenders** card and chart series are gone. |
+
+Ride discounts, promo banners, and ordinary events are not affected. See [Ride discounts and promo surfaces](/engineering/domains/coupons-ads-and-promo-bars) and [Events and the community feed](/engineering/domains/events-and-feed).
+
+The backing tables still exist, but no code reads or writes them: `Ads`, `AdImpressions`, `Coupons`, `CouponClaims`, `PromoBars`, `EventAttendees`, and `KpiManualLog`. Export their rows before you drop them in a later migration.
+
+### Other retired routes
+
+The same release removed these unused routes:
+
+| Area | Removed operations |
+| --- | --- |
+| Auth v2 | `POST /authv2/community/request-email-otp`, `POST /authv2/community/verify-email-otp`, `POST /authv2/community/verify-oauth`, `POST /authv2/profile/draft`, `POST /authv2/profile/setup`, `POST /authv2/referral-source` |
+| Auth v3 | `POST /authv3/community/resolve` |
+| Community | `GET /community/driver-leaderboard` |
+| Dashboard fleets | `GET` and `POST /dashboard/communities/{id}/fleets/{fleet_id}/whitelist`, `PATCH .../whitelist/{entry_id}`, `POST /dashboard/fleet/{fleet_id}/drivers` |
+| Dashboard places | `GET /dashboard/communities/{id}/locations/{location_id}`, `DELETE /dashboard/communities/{id}/spot/{spot_id}` |
+| Dashboard schools and education | `POST` and `DELETE /dashboard/manage/{id}/schools/{school_id}`, `POST /dashboard/education-claims/rematch`, `GET /dashboard/education-claims/unmatched` |
+| Dashboard live | `POST /dashboard/live/drivers/{id}/ping`, `POST /dashboard/live/riders/{id}/ping`, `GET /dashboard/live/kpis`, `POST /dashboard/live/markets/{id}/notify`, `GET /dashboard/live/markets/{id}/rides`, `GET /dashboard/live/markets/{id}/surge-history` |
+| Dashboard other | `POST /dashboard/leads/drivers`, `GET /dashboard/notifications/templates/{code}/{locale}` |
+| Rides | `POST /ride/`, `DELETE /ride/`, `POST /ride/i/{id}/confirm-tip`, `GET /ride/i/{id}/messages`, `POST /ride/i/{id}/messages/read` |
+| Media and links | `GET /driver/profile-photo/thumbnail`, `GET /user/profile-picture/thumbnail`, `POST /link/encode` |
+
+On the web, the unrouted driver ops page, the ping and notify-market dialogs, and the `GuestSignup` component were removed with their hooks. The mobile driver leaderboard modal was removed.
 
 ## Related pages
 

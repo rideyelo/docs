@@ -1,6 +1,6 @@
 ---
 title: "Live operations internals"
-description: "How the dashboard Live page works end to end: every /dashboard/live endpoint, the queries and Redis reads behind each card, table, and map layer, surge, notify and ping, web polling, and gotchas."
+description: "How the dashboard Live page works end to end: every /dashboard/live endpoint, the queries and Redis reads behind each card, table, and map layer, surge, web polling, and gotchas."
 ---
 
 **Live** is the admin dashboard's real-time market view. It replaced the separate Supply & Demand, Presence, and Driver Ops pages. The API routes live under `/dashboard/live`, and the web page is `LivePage` at `/live` in `yelo-web`. For what operators see, read [Live operations](/dashboard/live).
@@ -71,9 +71,8 @@ The handlers still carry their own scoping, written before the middleware existe
 
 | Helper | Used by | Admin behavior | Non-admin behavior (unreachable today) |
 | --- | --- | --- | --- |
-| `resolveCommunityScope` | `analytics`, `competitor-prices`, `competitor-quotes`, `kpis`, `markets` | `community_id` query param, or `nil` (all communities) when it's empty | Pinned to the claim's `CommunityID`, 403 if missing |
+| `resolveCommunityScope` | `analytics`, `competitor-prices`, `competitor-quotes`, `markets` | `community_id` query param, or `nil` (all communities) when it's empty | Pinned to the claim's `CommunityID`, 403 if missing |
 | `resolveCommunityID` | Every `/markets/{id}/...` route | Path `{id}`, 400 if empty | Ignores the path and uses the claim's `CommunityID` |
-| `requireAdmin` | `/drivers/{id}/ping`, `/riders/{id}/ping` | Passes | 403 **Admin role required** |
 
 The Live web route is also admin-only: `App.tsx` registers `/live` with `allowedRoles` of `admin`, and `RootRoute` sends admins to `/live`. See [Dashboard roles and access](/administration/dashboard-roles).
 
@@ -86,15 +85,11 @@ All responses use the standard envelope, `{"success": true, "data": ...}`. Paths
 | GET | `/analytics` | `dashboard.GetLiveAnalytics` | `community_id`, `period` = `24h` (default), `7d`, `30d`, `all` | `LiveAnalytics` | `useLiveData('analytics')` |
 | GET | `/competitor-prices` | `dashboard.GetLiveCompetitorPrices` | `community_id`, `period` = `<n>h`, `<n>d`, or `all` (default `24h`) | `LiveCompetitorPrices` | `LivePricing` |
 | GET | `/competitor-quotes` | `dashboard.GetLiveCompetitorQuotes` | `community_id`, `period` = `<n>h`, `<n>d`, or `all` (default `24h`) | `LiveProviderQuotes` | `useParity` on **Pricing** > **Parity**, not the Live page |
-| GET | `/kpis` | `dashboard.GetSupplyDemandKPIs` | `community_id` | `SupplyDemandKPIs` (24 h vs. prior 24 h) | None |
 | GET | `/markets` | `dashboard.GetMarketSummaries` | `community_id` (optional) | `{ markets: MarketSummary[] }` | `useLiveMarkets` |
 | GET | `/markets/{id}/drivers` | `dashboard.GetMarketDrivers` | none | `{ drivers: MarketDriver[] }` | `useLiveDrivers` |
-| GET | `/markets/{id}/rides` | `dashboard.GetMarketRides` | `older=true` | `{ rides: MarketRide[], has_older }` | None |
 | POST | `/markets/{id}/surge` | `dashboard.SetSurge` | Body `SetSurgeRequest` | `SetSurgeResponse` | `useSetSurge` |
-| GET | `/markets/{id}/surge-history` | `dashboard.GetSurgeHistory` | `limit` (1 to 100, default 20), `offset` | `{ items, total, has_more }` | None (`useSurgeHistory` exists but no component calls it) |
-| POST | `/markets/{id}/notify` | `dashboard.NotifyMarket` | Body `MarketNotifyRequest` | `{ sent_to: 1 }` | None routed |
-| POST | `/drivers/{id}/ping` | `dashboard.PingDriver` | Body `{ title, message }` | `{ sent }` | None routed |
-| POST | `/riders/{id}/ping` | `dashboard.PingRider` | Body `{ title, message }` | `{ sent }` | None routed |
+
+`GET /kpis`, `GET /markets/{id}/rides`, `GET /markets/{id}/surge-history`, `POST /markets/{id}/notify`, `POST /drivers/{id}/ping`, and `POST /riders/{id}/ping` were removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 The page also reads these endpoints outside `/dashboard/live`:
 
@@ -329,7 +324,7 @@ Auto-fit stops once the user moves, zooms, or rotates the map. `LiveMap` sets a 
 
 **Live / active** uses the 10-second `status=live` query and then filters client-side to uncanceled `requested`, `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, and `in_progress`. The API's `live` filter (`ListDashboardRides` in `internal/data/repository/queries/analytics.sql`) already limits `requested` rows to the last 5 minutes. The other views use `recent_only=true` with `completed`, `canceled`, or `all`, at 50 rows per page.
 
-`GET /dashboard/live/markets/{id}/rides` still exists and returns non-`requested` rides from the last hour, or the last 24 hours with `older=true`. The page doesn't call it.
+`GET /dashboard/live/markets/{id}/rides` was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 ## Surge
 
@@ -364,19 +359,11 @@ Only step 4 can fail the request. History failures are logged and ignored.
 
 Riders pay surge only while it's active. `RideService.getActiveSurgeMultiplier` (`internal/service/ride/rider.go`) applies `surge_multiplier` only when it's above 1.0 and `surge_expires_at` is in the future. Nothing resets the column when surge expires. See [Pricing engine](/engineering/domains/pricing-engine).
 
-`GET /markets/{id}/surge-history` orders by `created_at DESC`. `deriveSurgeStatus` reports `clear_action` for 1.0 rows, then the stored `end_reason`, then `active` or `expired`.
+Nothing reads `surge_history` back. `GET /markets/{id}/surge-history` was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 ## Notify and ping
 
-These endpoints predate Live and have no caller on a routed page. `NotifyMarketDialog` and `PingDialog` in `src/components/live/` are only imported by the unrouted `DriverOpsPage`, or not at all.
-
-| Endpoint | Body | Validation | Delivery |
-| --- | --- | --- | --- |
-| `POST /markets/{id}/notify` | `recipient`, `title`, `body` | `title` and `body` required. `recipient` must be `ALL`, `DRIVERS`, `RIDERS`, `ONLINE_DRIVERS`, or `RECENTLY_ONLINE_DRIVERS`, else 400. | `SendNotificationToCommunity` emits `CodeCommunityBroadcast` with a community broadcast scope |
-| `POST /drivers/{id}/ping` | `title`, `message` | Both required | `NotifyDashboardPingDriver` emits `CodeDashboardPingDriver` to the user |
-| `POST /riders/{id}/ping` | `title`, `message` | Both required | `NotifyDashboardPingRider` emits `CodeDashboardPingRider` to the user |
-
-`notify` always returns `sent_to: 1` because the broadcast is queued, not counted. A ping send failure returns HTTP 200 with `sent: false`. Pings don't check that the target user belongs to any particular community. See [Broadcasts and scheduling](/engineering/notifications/broadcasts-and-scheduling) and [Send pipeline](/engineering/notifications/send-pipeline).
+The market notify and driver or rider ping routes were removed in October 2026, along with the unrouted `NotifyMarketDialog`, `PingDialog`, and `DriverOpsPage` in `yelo-web`. To message a market, use **Send Notification** on **Notifications**. See [Broadcasts and scheduling](/engineering/notifications/broadcasts-and-scheduling) and [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 ## Web polling and caching
 
@@ -432,7 +419,7 @@ The web app has no Live-specific environment variables. The map needs the dashbo
 
 | Concern | Repo | Path | Key symbols |
 | --- | --- | --- | --- |
-| Routes | `yelo-api` | `internal/server/http/dashboard/supply_demand/router.go`, `handlers.go` | `RegisterRoutes`, `resolveCommunityScope`, `resolveCommunityID`, `requireAdmin` |
+| Routes | `yelo-api` | `internal/server/http/dashboard/supply_demand/router.go`, `handlers.go` | `RegisterRoutes`, `resolveCommunityScope`, `resolveCommunityID` |
 | Mount and scope gate | `yelo-api` | `internal/server/http/router.go`, `dashboard_scope.go` | `registerDashboardRoutes`, `dashboardScopeAllows` |
 | Service | `yelo-api` | `internal/service/dashboard/supply_demand.go`, `live.go`, `live_pricing.go` | `GetMarketSummaries`, `populateLivePresence`, `GetMarketDrivers`, `SetSurge`, `GetLiveAnalytics`, `GetLiveCompetitorPrices`, `GetLiveCompetitorQuotes`, `livePeriod`, `liveQuoteClient` |
 | Competitor quote sync | `yelo-api` | `internal/service/providerquotes/service.go`, `internal/notify/queue/provider_quotes.go`, `internal/data/repository/provider_quotes.go`, `internal/data/posthogquery/client.go` | `Service.Sync`, `Query`, `providerQuoteSyncPeriodic`, `ListProviderQuotes`, `NormalizeLegacy` |
@@ -457,6 +444,5 @@ The web app has no Live-specific environment variables. The map needs the dashbo
 - **Concurrent quote misses duplicate work.** `liveQuoteClient.prices` releases its mutex before the PostHog call, so a slow market doesn't block other dashboards. Two concurrent cache misses for the same scope both run the query. Failures aren't cached, so an outage retries on every poll.
 - **Quote HogQL is built by string formatting.** The community ID is a parsed UUID and times are formatted server-side, so there's no user-controlled input today. Keep it that way if you add filters.
 - **The warm-pool read prunes.** `GetWarmPoolDrivers` trims old members on every call, so the 10-second driver and map polls also maintain the warm pool.
-- **`notify` has no admin check of its own.** It relies on the scope middleware. `sent_to` is always 1.
 - **History writes are best effort.** A failed `CloseActiveSurgeHistory` or `InsertSurgeHistory` doesn't fail the request, so `surge_history` can miss changes that did apply.
-- **Surge history isn't shown.** The endpoint and `useSurgeHistory` exist, but no Live component renders history.
+- **Surge history is write-only.** `SetSurge` writes `surge_history` rows, but no route or Live component reads them.

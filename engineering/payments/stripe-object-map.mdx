@@ -40,9 +40,9 @@ flowchart LR
 
 | Stripe object | Account | Created by | Yelo storage |
 | --- | --- | --- | --- |
-| Customer | Platform | `RideService.ensureStripeCustomerSetup` on `CreateRide`, only when `Users.stripe_customer_id` is empty | `Users.stripe_customer_id` |
-| Ephemeral key | Platform | `Client.NewEphemeralKey`, on every `CreateRide`, pinned to Stripe version `2024-06-20` | Not stored. Returned as `ephemeral_key` |
-| SetupIntent | Platform | `Client.NewSetupIntent`, on every `CreateRide` | Not stored. Only the client secret is returned |
+| Customer | Platform | `RideService.ensureStripeCustomerSetup` on `CreateRideV2`, only when `Users.stripe_customer_id` is empty | `Users.stripe_customer_id` |
+| Ephemeral key | Platform | `Client.NewEphemeralKey`, on every `CreateRideV2`, pinned to Stripe version `2024-06-20` | Not stored. Returned as `ephemeral_key` |
+| SetupIntent | Platform | `Client.NewSetupIntent`, on every `CreateRideV2` | Not stored. Only the client secret is returned |
 | PaymentMethod (original) | Platform | Mobile PaymentSheet, by confirming the SetupIntent | `Rides.payment_method_id` at confirm |
 | PaymentMethod (clone) | Connected | `Client.ExecuteRideClone`, step `clone_payment_method` of an `accept`, `promotion`, or `tip` operation | `Rides.cloned_payment_method_id`, written when an authorization is attached. A clone made only for a tip stays in the step receipt |
 | Ride PaymentIntent | Connected | `Client.CreateRideAuthorizationIntent`, step `create_authorization` of an `accept` or `promotion` operation | `Rides.payment_intent_id`, `Rides.payment_intent_client_secret`, `Rides.pre_auth_amount`, `Rides.stripe_merchant_id`, written when the operation finishes |
@@ -175,8 +175,8 @@ The provider exposes methods with no production callers on `main`. Don't assume 
 
 ## Gotchas and edge cases
 
-- **Two customers for one rider.** `ensureStripeCustomerSetup` checks `stripe_customer_id` and then creates a customer without a lock or idempotency key. Two concurrent `CreateRide` calls for a new rider can create two customers. The last `SetStripeCustomerId` wins, and PaymentMethods saved against the other customer can't be cloned later.
-- **Orphaned SetupIntents.** Every `CreateRide`, including abandoned quotes, creates a SetupIntent and an ephemeral key. Nothing cancels unused SetupIntents.
+- **Two customers for one rider.** `ensureStripeCustomerSetup` checks `stripe_customer_id` and then creates a customer without a lock or idempotency key. Two concurrent `CreateRideV2` calls for a new rider can create two customers. The last `SetStripeCustomerId` wins, and PaymentMethods saved against the other customer can't be cloned later.
+- **Orphaned SetupIntents.** Every `CreateRideV2`, including abandoned quotes, creates a SetupIntent and an ephemeral key. Nothing cancels unused SetupIntents.
 - **Clones are not attached.** `ExecuteRideClone` creates a PaymentMethod on the connected account from the platform customer and payment method. It doesn't create a customer on the connected account, so the clone is single-purpose. Tips reuse `cloned_payment_method_id` rather than cloning again.
 - **Deleted customers.** `UserService.Delete` deletes the Stripe customer first. If Stripe fails, account deletion fails.
 - **Ten-second ceiling.** A Stripe call that takes longer than 10 seconds fails on the Yelo side even if Stripe completes it. Ride operation calls send an idempotency key that is committed before the call, so the retry lands on the same Stripe object.

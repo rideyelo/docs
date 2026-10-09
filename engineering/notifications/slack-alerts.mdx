@@ -43,7 +43,7 @@ There are no retries, no rate limiting, and no dedupe in the client. Each alert 
 - `SchoolName` is `Yelo University`, or `SchoolID` is `c9817564-6850-4497-a248-67ea43e32d78`.
 - The email, lowercased, starts with `test`.
 
-Only alerts that pass a user through this helper are filtered: signup, driver application, and issue alerts. Guest signups, breaker alerts, and ops alerts are not.
+Only alerts that pass a user through this helper are filtered: signup, driver application, and issue alerts. Breaker alerts and ops alerts are not.
 
 ## Alert catalog
 
@@ -51,8 +51,9 @@ Only alerts that pass a user through this helper are filtered: signup, driver ap
 
 | Alert | Trigger | Channel | Format |
 | --- | --- | --- | --- |
-| Signup | Auth v3: `NotificationService.NotifyAuthV3Signup` from `authv3` resolver. Auth v2: `NotifyUserSignedUpDetailed` from `AuthV2Service` profile completion. | User updates | One line of text, see below |
-| Web guest signup | `AuthV2Service.notifyGuestSignup` for web guest accounts | User updates | `🌐 Web guest signup: {First Last} — {email} ({community})` |
+| Signup | `NotificationService.NotifyAuthV3Signup` from the `authv3` resolver | User updates | One line of text, see below |
+
+The Auth v2 signup alert (`NotifyUserSignedUpDetailed`) has had no caller since the Auth v2 profile setup route was removed in October 2026. The web guest signup alert (`notifyGuestSignup`) was removed with the Auth v2 community routes. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
 
 #### Signup alert
 
@@ -61,7 +62,7 @@ Signup alerts are River jobs, not direct posts:
 - `notify.EnqueueSignupAlert` inserts `signup_slack_alert` with `ScheduledAt = now + 90s`, `MaxAttempts: 3`, and uniqueness on `user_id` only. A second enqueue for the same user is ignored while the first job exists.
 - The 90-second delay lets the account transaction commit and lets onboarding set the community and location.
 - `signupAlertWorker` has a 30-second timeout. `SendSignupAlert` reloads the user with a join to `AuthTransactions`, `Communities`, `Schools`, and the latest `AttributionTouches` row. If the user was deleted during the delay, the job succeeds silently.
-- The test filter runs at enqueue time for Auth v2 and again at send time for both paths.
+- The test filter runs at send time.
 - If the user has coordinates, `enrichSignupCity` reverse-geocodes a city and caches it in Redis under `signup:city:{lat}:{lng}`, rounded to 2 decimals, for 24 hours.
 
 `buildSignupAlertMessage` joins `key=value` pairs with ` • `. Each value is cleaned: control characters become spaces, whitespace collapses, `&`, `<`, and `>` are escaped, and values are cut to 160 characters.
@@ -149,7 +150,6 @@ A failure alert names the first stage that failed, so you can open the right ste
 | --- | --- |
 | Client, channels, Block Kit types | `yelo-api/internal/utilities/slack/slack.go`, `state_message.go` |
 | Signup | `yelo-api/internal/service/notifications/signup_alert.go`, `internal/notify/signup_alert.go`, `internal/notify/queue/signup_alert.go` |
-| Guest signup | `yelo-api/internal/service/authv2/community.go` (`notifyGuestSignup`) |
 | Driver application | `yelo-api/internal/service/notifications/driver_application_alert.go`, callers in `internal/service/driver/driver.go`, `internal/service/vehicle/vehicle.go`, `internal/service/payment/payment.go` |
 | Issues and test filter | `yelo-api/internal/service/notifications/notification.go` (`NotifyIssueCreated`, `shouldSkipSlackForUser`), `internal/service/issue/issue.go` |
 | Rescue | `yelo-api/internal/service/activation/activation.go` (`checkRescue`) |

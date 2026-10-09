@@ -110,7 +110,7 @@ The only discount in the ride pricing pipeline is a **destination discount** fro
 - The discounted fare is then finalized like any fare. It's rounded up to a whole dollar in `rounded` mode and truncated to cents otherwise.
 - The ride stores `discount_id` and sets `is_discounted = true`.
 
-Coupons (`internal/service/coupon`) and referrals don't change ride fares.
+Referrals don't change ride fares. Venue coupons never did, and they were retired in October 2026.
 
 ## Fallback pricing
 
@@ -118,7 +118,7 @@ When a community has no live per-ride configs, or none match the ride types curr
 
 ## Quote caching and confirm-time pricing
 
-- **Quote cache**: `buildVehicleOptions` caches the pre-discount prices in Redis under `price:` plus the community and rounded pickup and dropoff coordinates, for 5 minutes (`internal/data/redis/price_cache.go`). A repeat quote for the same trip within that window reuses the cached fares, including the same jitter draw.
+- **Quote cache**: `buildVehicleOptionsV2` caches the pre-discount prices in Redis under `price:` plus the community and rounded pickup and dropoff coordinates, for 5 minutes (`internal/data/redis/price_cache.go`). A repeat quote for the same trip within that window reuses the cached fares, including the same jitter draw.
 - **Confirm**: `ConfirmRide` doesn't read the quote cache and doesn't accept a price from the client. `determineRidePriceAndFleet` reruns `GetRidePrice` against the current config, surge, zones, and discount. It then selects the price matching the requested vehicle type **and** fleet. If the requested fleet has no live config for that vehicle type, it takes the first price for the vehicle type from any fleet, and the ride stores that fleet. See [Pricing engine internals](/engineering/domains/pricing-engine#repricing-on-confirm).
 
 <Note>
@@ -144,7 +144,7 @@ The dashboard's pricing overview and editor use `GET /dashboard/pricing/overview
 | Pricing engine | `yelo-api/internal/utilities/pricing/pricing.go` |
 | Tiers, zones, fare adjustment, jitter | `yelo-api/internal/utilities/pricing/tiers.go`, `zoned.go`, `adjustment.go`, `jitter.go` |
 | Dashboard preview helpers | `yelo-api/internal/utilities/pricing/preview.go`, `presets.go` |
-| Quote and confirm pricing | `yelo-api/internal/service/ride/rider.go` (`buildVehicleOptions`, `determineRidePriceAndFleet`) |
+| Quote and confirm pricing | `yelo-api/internal/service/ride/rider.go` (`buildVehicleOptionsV2`, `determineRidePriceAndFleet`) |
 | Pricing and zone models | `yelo-api/internal/models/community.go`, `pricing_adjustment.go`, `zone.go`, `zone_pricing.go` |
 | Global jitter store | `yelo-api/internal/data/repository/pricing_jitter.go` |
 | Surge | `yelo-api/internal/service/dashboard/supply_demand.go` |

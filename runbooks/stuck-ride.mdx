@@ -105,7 +105,7 @@ A ride is stuck when it stays in a non-terminal status after the trip is over or
     Don't edit `RideOperations` or `RideOperationSteps` by hand. Triggers reject most updates, and a wrong step result can charge or release the wrong amount.
   </Step>
   <Step title="Check for fleet-wide anomalies">
-    If several users report this, run `yelo-api/docs/ride-cardinality-preflight.sql` (read-only). It lists riders with more than one live booking, drivers with more than one active trip, requested drafts next to live bookings, active rides without a driver, and session or vehicle ownership conflicts. It never repairs anything. See `docs/ride-cardinality-preflight.md` for how to read it.
+    If several users report this, run `yelo-api/scripts/ride-cardinality-preflight.sql` (read-only). It lists riders with more than one live booking, drivers with more than one active trip, requested drafts next to live bookings, active rides without a driver, and session or vehicle ownership conflicts. It never repairs anything.
   </Step>
   <Step title="Confirm the sweepers are running">
     Expiry and offline cleanup run in the `Operational` background loop every 30 seconds. Search Cloud Logging for errors that mention `CancelUnmatchedRides` or `PurgeOfflineDrivers`. If an instance has `BACKGROUND_TASKS_ENABLED=false`, nothing expires. See [Background jobs](/engineering/api/background-jobs#in-process-ticker-loops).
@@ -194,7 +194,7 @@ A requeue resets `confirm_time`, so the 10-minute expiry clock restarts. See [Ri
 </AccordionGroup>
 
 <Warning>
-Admin silent cancellation is the only operator tool that ends a ride. No dashboard control, endpoint, or script cancels a paid ride, a `confirmed` or `queued` ride, or a ride in `pending_rider_rating`, and none completes or reassigns a ride. For those, a participant must act or a sweeper must run. Don't `UPDATE "Rides"` by hand. Ride commands also advance `Users.ride_state_revision`, remove the ride from the board, release or capture the Stripe hold, send notifications, record `RideEvents`, and promote the driver's queue. A raw update skips all of that. `DELETE /ride/` only works when `ENVIRONMENT=dev`.
+Admin silent cancellation is the only operator tool that ends a ride. No dashboard control, endpoint, or script cancels a paid ride, a `confirmed` or `queued` ride, or a ride in `pending_rider_rating`, and none completes or reassigns a ride. For those, a participant must act or a sweeper must run. Don't `UPDATE "Rides"` by hand. Ride commands also advance `Users.ride_state_revision`, remove the ride from the board, release or capture the Stripe hold, send notifications, record `RideEvents`, and promote the driver's queue. A raw update skips all of that.
 </Warning>
 
 ## Verify

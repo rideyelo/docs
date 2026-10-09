@@ -16,9 +16,9 @@ Every place in `yelo-api` that signs an app token:
 | `ExchangeToken`, profile incomplete | Onboarding | 15 minutes (app), web access TTL (web) | User's `community_id` |
 | `FinishProfile` (`onboarding.go`) | Native user | 6,360 hours, for both channels | User's `community_id` |
 | `RefreshWebSession` (`web_session.go`) | Web user | Web access TTL | User's `community_id` |
-| `ActiveCommunityService.resultWithToken` (`active_community.go`) | Native user or onboarding, matching the caller's scope | 6,360 hours or onboarding TTL | Resolved community |
+| `ActiveCommunityService.resultWithToken` (`active_community.go`) | Native user | 6,360 hours | Resolved community |
 | `UserHandler.UpdateActiveCommunity` (`internal/server/http/user/user_handler.go`) | Native user | 6,360 hours | Requested community |
-| Auth v2 phone verify, email verify, profile setup (`internal/service/authv2/`) | Native user or presignup | 6,360 hours or 1 hour | User's community or `*` |
+| Auth v2 phone verify and email verify (`internal/service/authv2/`) | Native user or presignup | 6,360 hours or 1 hour | User's community or `*` |
 | `StripeAccountService.GetOnboardingLink` (`internal/service/stripeaccount/stripeaccount.go`) | Native user shape | 24 hours | User's `community_id` |
 
 All user and presignup tokens are HS256 with `iss` and `aud` set to `api.rideyelo.com`, `sub` set to the user UUID (or `pending` for a presignup token with no user), and `app_metadata.authorization.roles` plus `app_metadata.community` (a UUID or `*`). Presignup tokens add `app_metadata.phone`. Onboarding tokens add a top-level `auth_transaction_id`.
@@ -77,7 +77,7 @@ There is no API or dashboard action that bans or unbans a user. The only API wri
   </Tab>
   <Tab title="Onboarding token">
     - Returned by `POST /token` with status `needs_profile`.
-    - Valid only on `GET /authv3/status`, `POST /authv3/profile`, and `POST /authv3/community/resolve`.
+    - Valid only on `GET /authv3/status` and `POST /authv3/profile`. `POST /authv3/community/resolve` was removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes).
     - Tied to one transaction. `onboardingState` requires that transaction to be `completed`, `signin`, and owned by the token's user.
     - Expires after 15 minutes on app, or the web access TTL on web. Mobile checks `exp` before saving it to the draft and fails with `transaction_expired` if it's already past.
   </Tab>

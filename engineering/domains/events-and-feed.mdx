@@ -15,15 +15,15 @@ Two neighbors own the deeper internals of shared pieces:
 | Store | Object | Written by | Read by |
 | --- | --- | --- | --- |
 | Postgres | `"Events"` | Dashboard event CRUD, `ArchivePastEvents` | App, public event site, community layer, Spot hydration |
-| Postgres | `"EventAttendees"` | `POST` and `DELETE /event/{id}/attend` | Event detail, attendee list, dashboard counts |
+| Postgres | `"EventAttendees"` | Nothing since October 2026 | Nothing. The table still exists, but no code reads or writes it. |
 | Postgres | `"EventStoryViews"` | `POST /event/{id}/view` (upsert) | `viewed` flag on app event reads |
 | Postgres | `"EventShares"`, `"TicketPurchases"` | Not written by this domain | `metrics.shares`, `metrics.tickets_sold` |
 | Postgres | `"Venues"`, `"EnterpriseAccounts"`, `"Discounts"` | Joined only | Venue block, account block, `is_discounted` |
 | Postgres | `"CommunitySpots"` | Dashboard Spot CRUD | Feed page 0, community map layer |
-| Postgres | `"Ads"`, `"Bumps"`, `"Rides"` | Other domains | Feed generation |
+| Postgres | `"Bumps"`, `"Rides"` | Other domains | Feed generation |
 | Postgres | `"CommunityTopLocations"`, `"CommunityTopLocationSettings"`, `"PlaceProfiles"` | Top-location service | Search context, community layer |
 | Postgres | `"MobilityFeeds"` | Dashboard mobility CRUD, poller health columns | Mobility poller |
-| Redis | `feed:community:{communityID}` (hash, field per page) | `refreshFeedInRedis` | `RedisFeedCache.GetFeed` |
+| Redis | `feed:community:v2:{communityID}` (hash, field per page) | `refreshFeedInRedis` | `RedisFeedCache.GetFeed` |
 | Redis | `feed:refresh:lock:{communityID}` | `SetNX` in `initCommunityFeed` and `RefreshFeed` | Same |
 | Process memory | `FeedCache.communityFeedPages` | `FeedCache.RefreshFeed` | Fallback when Redis fails |
 | Supabase Storage | `event_photos/{eventID}/{uuid}{ext}`, `spot_photos/{spotID}/{uuid}{ext}` (public bucket) | Photo upload endpoints | `photo_url`, `image_url` |
@@ -37,13 +37,12 @@ Table definitions live in the [database reference](/reference/database/overview)
 | Method | Path | Auth | Handler and purpose |
 | --- | --- | --- | --- |
 | `GET` | `/event/upcoming?limit=` | JWT, role `user` | `GetUpcoming`. Published events in the caller's community where `release_time` is before now and `close_time` is after now, ordered by `start_time`. `limit` defaults to 20, max 100. |
-| `GET` | `/event/{id}` | JWT, role `user` | `GetEventByID`. Published event plus metrics, attendee count, a 5-person preview, and `is_attending`. |
+| `GET` | `/event/{id}` | JWT, role `user` | `GetEventByID`. Published event plus metrics. |
 | `POST` | `/event/{id}/view` | JWT, role `user` | `ViewEvent`. Upserts `"EventStoryViews"` with `viewed_at = now`. |
-| `POST` | `/event/{id}/attend` | JWT, role `user` | `Attend`. Inserts status `going`, `ON CONFLICT DO NOTHING`. |
-| `DELETE` | `/event/{id}/attend` | JWT, role `user` | `Leave`. Deletes the attendee row. |
-| `GET` | `/event/{id}/attendees` | JWT, role `user` | `GetAttendees`. Every attendee, oldest first, plus a count. |
 | `GET` | `/public/events/slug/{slug}` | Public | `GetPublicEventBySlug`. Case-insensitive slug match on published events, trimmed to `PublicEvent`. |
 | `GET` | `/community/feed?page=` | JWT, role `user` | `CommunityHandler.GetFeed`. Cached feed page for the caller's community. `page` must be 0 or more. |
+
+The event attendance routes (`POST` and `DELETE /event/{id}/attend`, `GET /event/{id}/attendees`) were retired in October 2026 and now return 404 or 405. Event responses no longer include `attendees` or `is_attending`. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
 ### Dashboard
 
@@ -63,7 +62,6 @@ Every route below sits under `/dashboard`, behind `getClerkAuthMiddleware` and `
 | `POST` | `/communities/{id}/spot` | Denied | `CreateSpot` |
 | `PUT` | `/communities/{id}/spot/{spot_id}` | Denied | `UpdateSpot`. Partial update. |
 | `POST` | `/communities/{id}/spot/{spot_id}/photo` | Denied | `UploadSpotPhoto` |
-| `DELETE` | `/communities/{id}/spot/{spot_id}` | Denied | `DeleteSpot`. Hard delete. |
 | `GET` | `/communities/{id}/feed?page=` | Own community, `GET` only | `dashboard/feed.GetFeed`. Same `CommunityService.GetFeed` as the app. |
 | `GET` | `/communities/{id}/mobility-feeds` | Denied | `ListMobilityFeeds`. Every feed on the community, active or not, newest first. |
 | `POST` | `/communities/{id}/mobility-feeds` | Denied | `CreateMobilityFeed`. Body is `source`, `name`, `feed_url`, and `vehicle_type`. |
@@ -115,8 +113,8 @@ Any other pair returns 400 `cannot transition from 'X' to 'Y'`.
 | --- | --- | --- |
 | App detail | `GetPublishedEventByID` | Published only. `is_discounted` is true when a `"Discounts"` row targets the venue address and spans `start_time`. |
 | App upcoming | `ListUpcomingEvents` | `slug` is cleared in the response. |
-| Public slug | `GetPublishedEventBySlug` | Response drops attendees, metrics, status, creator, and community. Location falls back from venue to the event's own `location_*` fields and is omitted when all four are empty. |
-| Dashboard list | `ListEventsByStatus` + `CountEventsByStatus` | Attendee count per row, empty preview array. |
+| Public slug | `GetPublishedEventBySlug` | Response drops metrics, status, creator, and community. Location falls back from venue to the event's own `location_*` fields and is omitted when all four are empty. |
+| Dashboard list | `ListEventsByStatus` + `CountEventsByStatus` | One page of events plus the total count. |
 | Community layer | `GetUpcoming(uuid.Nil, community, 25)` | Cached for 300 seconds per community. |
 
 `getEventMetrics` issues two `COUNT` queries per event (`"TicketPurchases"` and `"EventShares"`). `GetUpcoming` calls it once per returned event, so 20 events cost 40 extra queries.
@@ -131,7 +129,7 @@ A Spot row references exactly one event or one location. The table enforces this
 - `CreateSpot` runs `DeactivateSpotsByCommunity` and then inserts. This happens even when the new Spot has `is_active: false`.
 - `UpdateSpot` deactivates the community's Spots only when the body sets `is_active: true`. `UpdateSpotFields` uses `COALESCE` for every column, so an update can't clear a field back to null.
 - `spot_type`, `event_id`, and `location_id` are accepted on update only so the strict decoder doesn't reject them. They are ignored.
-- `requireSpotInCommunity` guards update, photo, and delete. A foreign Spot returns 404.
+- `requireSpotInCommunity` guards update and photo upload. A foreign Spot returns 404. There is no delete route; `DELETE /dashboard/communities/{id}/spot/{spot_id}` was retired in October 2026.
 
 ### Liveness
 
@@ -154,32 +152,22 @@ The server ignores `display_start_time` and `display_end_time`. The app filters 
 | Source | Query | Filter and order |
 | --- | --- | --- |
 | Events | Commented out | `events` is always an empty slice. `ListFeedEventIDs` exists but is unused. |
-| Ads | `GetCommunityAds` | Every ad whose `community_ids` contains the community, ordered by `tier DESC, RANDOM()`. The 30-row limit is ignored. |
 | Rides | `ListPublicFeedRideIDs` | Status `complete`, `confirmed`, or `pending_rider_rating`, with `confirm_time` set and `is_public_destination = TRUE`. A public pickup alone doesn't qualify, because the ride summary redacts a private destination. Newest `confirm_time` first, 30 rows. |
 | Bumps | `GetFeedBumps` | Unexpired bumps with coordinates, excluding bumps already fulfilled by a matching public ride. Newest first, 30 rows. |
 
-For the ad model itself, see [Coupons, ads, and promo bars](/engineering/domains/coupons-ads-and-promo-bars).
+Feed ads, and the `ad` feed item type, were retired in October 2026. Generation no longer queries `"Ads"`. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
 
-`buildMoveFeedItems` concatenates all bumps first, then all rides. The loop then repeats until moves run out:
-
-<Steps>
-  <Step title="Take a group of moves">
-    Append `rand.Intn(3)+1` moves, so 1 to 3, capped by what is left.
-  </Step>
-  <Step title="Add one ad">
-    Append the next ad if any remain.
-  </Step>
-</Steps>
+`buildMoveFeedItems` concatenates all bumps first, then all rides. The loop then appends groups of `rand.Intn(3)+1` moves, so 1 to 3, capped by what is left, until moves run out. Because events are empty, the result is the move list in order.
 
 The flat list is then cut into pages of 10. There is no cap at 3 pages.
 
-**Worked example.** A community has 3 bumps, 12 rides, 4 ads, and a live Spot. Suppose the random group sizes are 2, 3, 1, 2, and so on:
+**Worked example.** A community has 3 bumps, 12 rides, and a live Spot:
 
 | Position | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Page 0 | bump | bump | ad | bump | ride | ride | ad | ride | ad | ride |
+| Page 0 | bump | bump | bump | ride | ride | ride | ride | ride | ride | ride |
 
-After four groups, the ads run out, and the last 7 rides follow with no ads. That makes 15 moves plus 4 ads, or 19 items: page 0 has 10 and page 1 has 9. `CommunityService.GetFeed` prepends the Spot on page 0 only, so page 0 returns 11 items.
+That makes 15 moves: page 0 has 10 and page 1 has 5. `CommunityService.GetFeed` prepends the Spot on page 0 only, so page 0 returns 11 items.
 
 ### Cache and invalidation
 
@@ -187,7 +175,7 @@ After four groups, the ads run out, and the last 7 rides follow with no ads. Tha
 
 | Mode | When | Read path | Write path |
 | --- | --- | --- | --- |
-| Redis | `RedisClient` exists and is enabled | `HGET feed:community:{id} {page}` | Regenerate, `DEL`, `HSET` each page, `EXPIRE` 2 minutes |
+| Redis | `RedisClient` exists and is enabled | `HGET feed:community:v2:{id} {page}` | Regenerate, `DEL`, `HSET` each page, `EXPIRE` 2 minutes |
 | Memory | Redis missing or disabled | Map lookup | `FeedCache.RefreshFeed` replaces the community's pages |
 
 Timings and keys:
@@ -196,12 +184,15 @@ Timings and keys:
 | --- | --- | --- |
 | `feedTTL` | 2 minutes | `feed_cache_redis.go` |
 | `feedLockTTL` | 30 seconds | Same |
+| `feedCommunityKeyPrefix` | `feed:community:v2:` | Same |
 | Contended cold read wait | 100 ms, then read whatever exists | `initCommunityFeed` |
 | `Refresh` loop | Every 2 minutes, first tick after 2 minutes | `cmd/api/main.go` |
 
+The `v2` prefix was added in October 2026 when feed ads were retired, so no reader picks up an older `feed:community:{id}` page that still holds `ad` items. Those v1 keys expire on their own through the 2-minute TTL.
+
 The read path in Redis mode:
 
-1. `EXISTS feed:community:{id}`. On a Redis error, fall back to memory.
+1. `EXISTS feed:community:v2:{id}`. On a Redis error, fall back to memory.
 2. If the key is missing, take `feed:refresh:lock:{id}` with `SETNX` and regenerate. If another caller holds the lock, sleep 100 ms and continue.
 3. `HGET` the page. A missing field returns an empty page, not an error.
 4. Deserialize. A decode error falls back to memory.
@@ -210,7 +201,7 @@ In Redis mode, `NewRedisFeedCache` warms every community's key in the background
 
 `CommunityService.RefreshFeed` walks every community from `GetAllLight`. In Redis mode, an instance that loses the lock skips that community and leaves its own memory copy untouched. The winner writes Redis and its memory copy.
 
-Nothing invalidates the feed on write. A new ride, bump, or ad shows up on the next refresh tick or after the key expires. The Spot is the exception, because `GetFeed` reads it live on every page-0 request.
+Nothing invalidates the feed on write. A new ride or bump shows up on the next refresh tick or after the key expires. The Spot is the exception, because `GetFeed` reads it live on every page-0 request.
 
 ### Consumers
 
@@ -270,7 +261,7 @@ Changes reach the rider map on the next `Mobility` tick, about one minute later.
 | --- | --- | --- |
 | Event model and transitions | `internal/models/event.go` | `Event`, `NewEvent`, `ValidEventStatusTransitions` |
 | Event service | `internal/service/event/event.go` | `EventService`, `UpdateEventStatus`, `requireEventInCommunity` |
-| Event queries | `internal/data/repository/queries/engagement.sql`, `repository/event.go`, `event_attendee.go` | `ArchivePastEvents`, `ListUpcomingEvents`, `eventCreateParams` |
+| Event queries | `internal/data/repository/queries/engagement.sql`, `repository/event.go` | `ArchivePastEvents`, `ListUpcomingEvents`, `eventCreateParams` |
 | App and public handlers | `internal/server/http/event/` | `EventHandler`, `toPublicEvent`, `RegisterPublicRoutes` |
 | Dashboard event handlers | `internal/server/http/dashboard/event/` | `buildNewEvent`, `validateSlug`, `CheckSlug` |
 | Spot | `internal/service/spot/spot.go`, `internal/models/spot.go`, `repository/spot.go`, `queries/places.sql` | `validateSpotTypeRef`, `spotFromSQLC` |
@@ -298,11 +289,9 @@ Changes reach the rider map on the next `Mobility` tick, about one minute later.
 - **Unknown IDs return 500, not 404.** `GetByID` and `GetDashboardEvent` wrap `pgx.ErrNoRows` as a server error (`repository/event.go:37`, `:470`). The nil check in `requireEventInCommunity` is unreachable. A foreign event returns 404, but a nonexistent one returns 500.
 - **Interns can publish.** `UpdateEventStatus` has no role check, and the scope middleware allows every method on `/communities/{own}/events`. Only the UI limits interns to **Submit for Review**.
 - **Updates wipe hidden fields.** `CreateEventRequest` has no `posh_event_id` or `has_dynamic_pricing`, and `UpdateEvent` writes every column. Any dashboard save sets both to null or false.
-- **Attendance has no gates.** `Attend`, `Leave`, and `GetAttendees` don't check status or community. Any signed-in user can list names and photos for any event ID.
 - **Uploaded photos get a malformed content type.** The handler keeps the dot in the extension, and storage builds `"image/" + photo.Extension`, which gives `image/.png` (`storage.go:180`, `:206`). There is no file-type check, and the size limit is `MaxMultipartFormSize`, 100 MiB.
-- **Expired ads stay in the feed.** `GetCommunityAds` doesn't filter on `start_time` or `end_time`, and the repository ignores its `limit`.
-- **Bumps crowd out rides.** Moves are all bumps, then all rides. With 10 or more live bumps, page 0 holds no rides. With ads interleaved, as few as 7 bumps can fill it (groups of 3, 3, and 1 plus 3 ads). The app then shows bumps but no ride activity, because it reads only page 0.
-- **The page count is unbounded.** Up to 60 moves and one ad per group can produce more than 3 pages. Docs that say "up to 3 pages" describe the query limit, not the output.
+- **Bumps crowd out rides.** Moves are all bumps, then all rides. With 10 or more live bumps, page 0 holds no rides. The app then shows bumps but no ride activity, because it reads only page 0.
+- **The page count isn't capped at 3.** Up to 30 bumps and 30 rides give 60 moves, or 6 pages. Docs that say "up to 3 pages" describe the per-source query limit, not the output.
 - **The memory fallback starts empty in Redis mode.** Startup warming writes only Redis. Until the first refresh tick, two minutes after boot, any Redis read error falls back to an empty map and returns 400 **Invalid Community ID**. The app does not retry 400s.
 - **Cold reads can return an empty feed.** The key's 2-minute TTL equals the refresh interval, so it can expire just before a tick. A reader that loses the `SETNX` race sleeps 100 ms and then reads a missing hash, getting an empty page. A community with zero items never gets a key, so every read regenerates it.
 - **Deactivating on create is unconditional.** Saving an inactive draft Spot turns off the live one (`spot.go:62`). Deactivate and insert aren't in one transaction, so two concurrent creates can hit the unique index and return 500.

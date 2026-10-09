@@ -46,8 +46,6 @@ Dashboard paths are mounted directly on `/dashboard` (`community.RegisterDashboa
 | `POST` | `/dashboard/manage` | Admin | `CreateCommunityAdmin` |
 | `PATCH` | `/dashboard/manage/{id}` | Admin | `UpdateCommunityAdmin`. Partial update |
 | `DELETE` | `/dashboard/manage/{id}` | Admin | `DeleteCommunityAdmin`. Archives |
-| `POST` | `/dashboard/manage/{id}/schools/{school_id}` | Admin (inline) | `AddSchoolToCommunity` |
-| `DELETE` | `/dashboard/manage/{id}/schools/{school_id}` | Admin (inline) | `RemoveSchoolFromCommunity` |
 | `GET`, `PUT` | `/dashboard/manage/{id}/operating-windows` | Admin (inline) | `GetOperatingWindows`, `UpsertOperatingWindows` |
 | `POST` | `/dashboard/schools/mapping-preview` | Admin | `PreviewSchoolMapping` |
 | `GET` | `/dashboard/schools` | Admin via scope middleware. No handler gate | `GetSchools` |
@@ -76,7 +74,7 @@ Two layers decide who can edit which community.
 | --- | --- |
 | `assertAdmin` | `role == "admin"`, else 403 **Forbidden: Admins only** |
 | `resolveCommunityID` | Admin: parse the path ID. Anyone else: `ClerkUserContext.ResolveDashboardCommunity`, which pins them to the community in their claim regardless of the path |
-| Inline checks | `AddSchoolToCommunity`, `RemoveSchoolFromCommunity`, operating windows, `ReviewDriverApplication`, and the global driver lists repeat the admin comparison inline |
+| Inline checks | Operating windows, `ReviewDriverApplication`, and the global driver lists repeat the admin comparison inline |
 
 In practice, every community, school, and zone mutation is admin-only. No role can edit "its own" community. Interns can only read.
 
@@ -228,9 +226,7 @@ The `school_management(school_id)` SQL function builds the `management` object o
 
 ### Manual assignment
 
-`AddSchoolToCommunity` runs `MoveSchoolToCommunity`, and `RemoveSchoolFromCommunity` runs `MoveSchoolToDefaultCommunity`. Both update `community_id`, which fires the `BEFORE` trigger. For a school with a usable point, the trigger immediately recomputes the community, so the call succeeds but changes nothing. Manual assignment only sticks for schools without usable coordinates and for synthetic schools.
-
-`AddCommunitySchool` always returns a nil user list. School moves never touch users.
+No API route assigns a school to a community by hand. The triggers above decide the mapping. `POST` and `DELETE /dashboard/manage/{id}/schools/{school_id}` were removed in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#other-retired-routes). School moves never touch users.
 
 ### Create and update
 
@@ -507,8 +503,6 @@ A dry run returns the report with the issues listed. An apply fails with `prefli
 - **Auto-queue limits have no writer.** `CommunityUpdate` and the SQL support `auto_queue_max_minutes` and `auto_queue_default_minutes`, but `AdminUpdateCommunityRequest` has no such fields. No API route sets them.
 - **Deactivating skips the timezone gate.** `validateCommunityGeographyUpdate` only runs when the box changes, `is_active` becomes true, or `rides_disabled` becomes false. You can hide or disable an unresolved community freely.
 - **Activation doesn't need a revision.** Only `bounding_box` requires `expected_geography_revision`. Two admins can toggle flags concurrently with last write wins.
-- **Manual school assignment is usually a no-op.** See [Manual assignment](#manual-assignment). The route still returns success.
-- **`RemoveSchoolFromCommunity` ignores the community in the path.** `MoveSchoolToDefaultCommunity` is keyed by school ID only.
 - **School writes don't invalidate community caches.** `school_ids`, `school_names`, and `extensions` on cached communities can lag by up to 60 seconds after a school change.
 - **Missing IDs return success.** `UpdateSchool`, `UpdateZone`, and `DeleteZone` run `:exec` statements without a row count check, so a wrong ID returns 200.
 - **API accepts a single coordinate.** `UpdateSchool` checks latitude and longitude independently. The "both or neither" rule is only in the dashboard.
@@ -518,4 +512,4 @@ A dry run returns the report with the issues listed. An apply fails with `prefli
 - **Archive doesn't refresh user sessions.** `ArchiveCommunity` rewrites `Users.community_id` in SQL but doesn't invalidate user profile caches. The cache outbox only clears community keys.
 - **Reconciliation stops on the first error.** `communityMaintenanceWorker` returns on the first failed `UpdateCommunity`, and the candidate query orders by ID, so one failing community can block the rest of the batch.
 - **Bundled review files go stale with the data.** A renamed school, a changed domain list, or a new IPEDS release that changes a pinned name, website, or year makes `sync-school-catalog` fail before it plans anything, in dry-run mode too. Re-review the entry and update the JSON file. See [Bundled review files](#bundled-review-files).
-- **Legacy community service writes are unused.** `CommunityService.CreateCommunity`, `UpdateCommunity`, `AddCommunitySchool`, and `RemoveCommunitySchool` in `internal/service/community/community.go` have no callers. The dashboard uses `DashboardService`.
+- **Legacy community service writes are unused.** `CommunityService.CreateCommunity` and `UpdateCommunity` in `internal/service/community/community.go` have no callers. The dashboard uses `DashboardService`.

@@ -28,7 +28,7 @@ The engine has no endpoints of its own. It runs inside these flows:
 
 | Flow | Entry point | Pricing call |
 | --- | --- | --- |
-| Quote (v1 and v2 ride create) | `CreateRide`, `CreateRideV2` in `internal/service/ride/rider.go` | `buildVehicleOptions` and its v2 twin call `resolveRidePrices` |
+| Quote (ride create) | `CreateRideV2` in `internal/service/ride/rider.go` | `buildVehicleOptionsV2` calls `resolveRidePrices` |
 | Confirm | `ConfirmRide` | `determineEffectiveRidePrice` calls `determineRidePriceAndFleet` |
 | Cancellation fee | `RideService.Cancel` and cancel-intent | `pricing.GetCancellationFee`, documented in [Cancellations](/concepts/cancellations) |
 | Dashboard preview and overview | `/dashboard/pricing/*` | See [Pricing configuration](/engineering/domains/pricing-configuration) |
@@ -197,7 +197,7 @@ A config with base $4.00, one open tier at $2.00/mile, and $0.50/minute. A zone 
 
 ## Quote cache
 
-`buildVehicleOptions` (v1) and the v2 path in `CreateRideV2` share the same logic:
+`buildVehicleOptionsV2`, called from `CreateRideV2`, follows these steps:
 
 <Steps>
   <Step title="Load inputs">
@@ -266,7 +266,7 @@ Every downstream consumer reads `RideDetails.GetEffectivePrice()`: `discounted_p
 | Zone overrides | `internal/models/zone_pricing.go`, `internal/models/zone.go` | `ZonePricing`, `ResolveZone` |
 | Discount | `internal/models/discount.go` | `Discount` |
 | Fallback constants | `internal/utilities/config/constants.go` | `DefaultBasePrice`, `DefaultPricePerMile`, `DefaultPricePerMinute` |
-| Quote orchestration | `internal/service/ride/rider.go` | `buildVehicleOptions`, `resolveRidePrices`, `buildZoningContext`, `buildPricesFromCache`, `getActiveSurgeMultiplier` |
+| Quote orchestration | `internal/service/ride/rider.go` | `buildVehicleOptionsV2`, `resolveRidePrices`, `buildZoningContext`, `buildPricesFromCache`, `getActiveSurgeMultiplier` |
 | Confirm pricing | `internal/service/ride/rider.go` | `determineEffectiveRidePrice`, `determineRidePriceAndFleet`, `selectConfiguredRidePrice`, `determineFallbackRidePrice` |
 | Quote cache | `internal/data/redis/price_cache.go` | `PriceCache`, `CachedVehiclePrice`, `priceCacheKey` |
 | Config load | `internal/data/repository/community.go` | `sqlCommunityRepository.GetRidePriceParameters` |
