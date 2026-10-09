@@ -40,7 +40,7 @@ flowchart LR
 
 | Stripe object | Account | Created by | Yelo storage |
 | --- | --- | --- | --- |
-| Customer | Platform | `RideService.ensureStripeCustomerSetup` on `CreateRideV2`, only when `Users.stripe_customer_id` is empty | `Users.stripe_customer_id` |
+| Customer | Platform | The `stripe_customer_provision` River job after signup. `RideService.ensureStripeCustomerSetup` on `CreateRideV2` is the fallback when `Users.stripe_customer_id` is still empty. Both go through `CustomerProvisioner` | `Users.stripe_customer_id` |
 | Ephemeral key | Platform | `Client.NewEphemeralKey`, on every `CreateRideV2`, pinned to Stripe version `2024-06-20` | Not stored. Returned as `ephemeral_key` |
 | SetupIntent | Platform | `Client.NewSetupIntent`, on every `CreateRideV2` | Not stored. Only the client secret is returned |
 | PaymentMethod (original) | Platform | Mobile PaymentSheet, by confirming the SetupIntent | `Rides.payment_method_id` at confirm |
@@ -103,7 +103,8 @@ Calls use one of three wrappers. They are not applied consistently, so check thi
 | `ExecuteRideCapture`, `ExecuteRideVoid` | No | None in the client. Reads the intent before writing, and again after a failed write | `ride_operation/{operationID}/{stepName}` |
 | `InspectRideAuthorization`, `InspectExistingRideAuthorization`, `InspectLegacyRideTip` | No | None | n/a, read-only |
 | `AllowPaymentMethodRedisplay` | No | None | None |
-| `NewCustomer`, `NewEphemeralKey`, `NewSetupIntent` | Yes | None | None |
+| `NewCustomerForUser` | Yes | None in the client. The `stripe_customer_provision` job retries up to 5 times | `yelo-customer-v1-{userID}` |
+| `UpdateCustomerContact`, `NewEphemeralKey`, `NewSetupIntent` | Yes | None | None |
 | `CreateExpressAccount`, `CreateFleetExpressAccount`, `DeleteAccount` | Yes | None | None |
 | `GetExpressAccount` | Yes. 400, 404, 429, and caller cancellation are excluded from breaker accounting | None | n/a |
 | Account links, login links | Yes | None | None |
@@ -175,7 +176,7 @@ The provider exposes methods with no production callers on `main`. Don't assume 
 
 ## Gotchas and edge cases
 
-- **Two customers for one rider.** `ensureStripeCustomerSetup` checks `stripe_customer_id` and then creates a customer without a lock or idempotency key. Two concurrent `CreateRideV2` calls for a new rider can create two customers. The last `SetStripeCustomerId` wins, and PaymentMethods saved against the other customer can't be cloned later.
+- **Concurrent customer creation.** The signup job and a first `CreateRideV2` can both try to create the rider's customer. Both send the idempotency key `yelo-customer-v1-<user id>`, and `ClaimUserStripeCustomerID` keeps whichever ID is stored first, so the rider ends up with one customer. If the account was deleted during the Stripe call, the new customer is deleted. If that delete fails, a `stripe_customer_provision` job with `cleanup_customer_id` retries it.
 - **Orphaned SetupIntents.** Every `CreateRideV2`, including abandoned quotes, creates a SetupIntent and an ephemeral key. Nothing cancels unused SetupIntents.
 - **Clones are not attached.** `ExecuteRideClone` creates a PaymentMethod on the connected account from the platform customer and payment method. It doesn't create a customer on the connected account, so the clone is single-purpose. Tips reuse `cloned_payment_method_id` rather than cloning again.
 - **Deleted customers.** `UserService.Delete` deletes the Stripe customer first. If Stripe fails, account deletion fails.

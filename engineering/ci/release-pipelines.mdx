@@ -446,14 +446,14 @@ flowchart TD
   RP --> VR["validate-republished"]
   VR --> SL["Slack"]
   SKIP --> CAT
-  VR --> CAT["vehicle-catalog.mjs publish-ota"]
+  VR --> CAT["vehicle-catalog.mjs publish-ota<br/>(runs from main only)"]
 ```
 
 - **Promote by commit.** The job reads the latest group per platform on `staging` and retries up to five times, 5 seconds apart, until they match `source_commit`.
 - **Promote or roll back by group.** Pass `group_id`, plus `second_group_id` when iOS and Android have different runtimes. At most two groups are allowed, and they must share one source commit.
 - **Idempotency.** Each republish message starts with `[source-group:<id>]`. A platform whose latest production update already carries that marker is skipped.
 - **Rollback** uses `production` as the source branch, so you can only restore a group that was already on `production`.
-- **Catalog.** `vehicle-catalog.mjs publish-ota` runs after every promote or rollback, even when the republish was skipped. It authenticates to the API with a GitHub OIDC token.
+- **Catalog.** `vehicle-catalog.mjs publish-ota` runs after a promote or rollback dispatched from `main`, even when the republish was skipped. It authenticates to the API with a GitHub OIDC token, which the API accepts only from this workflow on `refs/heads/main`. A run dispatched from a release branch republishes and alerts as usual, skips the catalog step, and writes "Vehicle catalog publish skipped" to the run summary. The last catalog published from `main` stays in place.
 
 ### Release branches and backports
 

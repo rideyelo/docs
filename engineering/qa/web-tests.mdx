@@ -9,7 +9,7 @@ description: "How yelo-web runs Vitest, node --test, worker, and shell tests, th
 
 | Runner | Environment | Used for | Scripts |
 | --- | --- | --- | --- |
-| Vitest 5 with `@testing-library/react` | Node by default. Files opt into jsdom with `// @vitest-environment jsdom` (53 files). | React components, pages, hooks, contexts | `test:components`, plus the Vitest halves of `test:notifications` and `test:auth-v3` |
+| Vitest 5 with `@testing-library/react` | Node by default. Files opt into jsdom with `// @vitest-environment jsdom` (57 files). | React components, pages, hooks, contexts | `test:components`, plus the Vitest halves of `test:notifications` and `test:auth-v3` |
 | Vitest with `workers/og/vitest.config.ts` | Node, with the `h` JSX factory | OG image worker | `test:og` |
 | `node --experimental-strip-types --test` | Node 22 | Pure TypeScript modules | `test:schools`, `test:auth-v3`, `test:delete-account`, `test:signup-shared`, `test:invite`, `test:notifications`, `test:experience-router`, `test:world-cup-router` |
 | Bash | n/a | Slack deploy message formatter | `test:deploy-slack` |
@@ -24,7 +24,7 @@ A new test file doesn't run until you add it, or a glob that matches it, to the 
 
 ## Per-site coverage
 
-89 test files on `main`: 88 TypeScript files (`*.test.ts`, `*.test.tsx`, `*.spec.ts`, `*.spec.tsx`) and one shell test, `scripts/format-deploy-slack.test.sh`. To recount the TypeScript files:
+94 test files on `main`: 93 TypeScript files (`*.test.ts`, `*.test.tsx`, `*.spec.ts`, `*.spec.tsx`) and one shell test, `scripts/format-deploy-slack.test.sh`. To recount the TypeScript files:
 
 ```bash
 git ls-tree -r --name-only origin/main | grep -cE '\.(test|spec)\.tsx?$'
@@ -32,13 +32,13 @@ git ls-tree -r --name-only origin/main | grep -cE '\.(test|spec)\.tsx?$'
 
 | Area | What's tested | Runner |
 | --- | --- | --- |
-| Dashboard shell (`src/sites/dashboard`, 24 files) | `App.test.tsx` renders every route as `admin`, `intern`, and `fleet` and checks where each lands. `DashboardTitle`, `RecentViews`, search index, and pages: `FleetsPage`, `ManageFleetsPage`, `LeadsPage`, `UsersPage`, `CommunitiesPage`, `LocationsPage`, `ContactSyncPage`, `TelemetryPage`, `InventoryPage`. Components: pricing sheets, the pricing parity tab and its math, `RidesExplorerMap`, `RidesKpisTab`, `ActivityTable`, `MarketingSegments`, ride map status. | Vitest |
-| Shared dashboard components (`src/components`, 36 files) | Communities, schools, fleets, vehicles, calendars, users, leads, live map, community map, KPI helpers, zones, feed, notifications, silent ride cancel, route boundaries | Vitest, and `node --test` for `notification-utils` |
+| Dashboard shell (`src/sites/dashboard`, 26 files) | `App.test.tsx` renders every route as `admin`, `intern`, and `fleet` and checks where each lands. `DashboardTitle`, `RecentViews`, search index, and pages: `FleetsPage`, `ManageFleetsPage`, `LeadsPage`, `UsersPage`, `CommunitiesPage`, `LocationsPage`, `ContactSyncPage`, `TelemetryPage`, `InventoryPage`, `LinksPage`. Components: `CommunityExperiments`, pricing sheets, the pricing parity tab and its math, `RidesExplorerMap`, `RidesKpisTab`, `ActivityTable`, `MarketingSegments`, ride map status. | Vitest |
+| Shared dashboard components (`src/components`, 37 files) | Communities, schools, fleets, vehicles, calendars, users, leads, live map, community map, KPI helpers, zones, feed, notifications, silent ride cancel, route boundaries | Vitest, and `node --test` for `notification-utils` |
 | Hooks and contexts (`src/hooks`, `src/contexts`, 4 files) | `useDriverLeads`, `useIssueRows`, `useRides`, `CommunityProvider` | Vitest |
 | Library (`src/lib`, 4 files) | API error mapping, table helpers, telemetry, school management | Vitest and `node --test` |
-| Signup (`src/sites/signup/auth-v3`, `delete-account`, 6 files) | Auth v3 state, request secret, web intent, and delete account with `node --test`. `authV3Client.spec.ts` and `AuthV3Page.spec.tsx` with Vitest. | Both |
+| Signup (`src/sites/signup/auth-v3`, `delete-account`, 7 files) | Auth v3 state, request secret, web intent, and delete account with `node --test`. `authV3Client.spec.ts`, `analytics.spec.ts`, and `AuthV3Page.spec.tsx` with Vitest. | Both |
 | Shared signup (`src/shared/signup`, 1 file) | Deleted-account handling | `node --test` |
-| Invite landing (`src/sites/signup/invite`, 2 files) | App link building and referral hand-off. The `invite` site itself has no tests | `node --test` |
+| Invite and event landings (`src/sites/signup/invite`, `event`, 3 files) | App link building, referral hand-off, and event landing helpers (`eventLanding.test.ts`). `test:invite` runs both directories. The `invite` site itself has no tests | `node --test` |
 | E2E viewer and product inventory (`src/sites/maestro`, 5 files) | Evidence log parsing and the workflow coverage panel. For the inventory: catalog and evidence schemas, status classification and coverage math (`inventory.test.ts`), the inventory UI (`ProductInventory.test.tsx`), and lazy preview loading (`previewPerformance.test.tsx`) | Vitest |
 | Build tooling (`tools/vite/dashboard`, 1 file) | Dashboard search index extraction | Vitest |
 | OG worker (`workers/og`, 3 files) | URL signing, gallery links, and per-template SVG file snapshots in `src/templates/__snapshots__` | Vitest |
@@ -62,7 +62,7 @@ Ten of the 34 modules under `src/sites/dashboard/pages/` have a sibling test fil
 | --- | --- | --- |
 | Format | `pnpm format:check` | `oxfmt --check .` with `.oxfmtrc.json` |
 | Lint | `pnpm lint` | `oxlint --deny-warnings .`, then `eslint .` |
-| Type-aware lint | `pnpm lint:type-aware` | `oxlint --type-aware --type-check` with `.oxlintrc.typeaware.json` |
+| Type-aware lint | `pnpm lint:type-aware` | `oxlint --type-aware --type-check` with `.oxlintrc.typeaware.json`, then `node scripts/check-api-payloads.mjs`. See [API payload check](#api-payload-check) |
 | Typecheck | `pnpm typecheck` | `tsc -b` over `tsconfig.app.json` (`src/`) and `tsconfig.node.json` (Vite config and tools) |
 
 ### oxlint
@@ -70,6 +70,10 @@ Ten of the 34 modules under `src/sites/dashboard/pages/` have a sibling test fil
 `.oxlintrc.json` sets the `correctness`, `suspicious`, and `perf` categories to `error`, with the `react`, `react-perf`, `typescript`, `unicorn`, `jsx-a11y`, `import`, `promise`, `node`, and `oxc` plugins. `--deny-warnings` turns any remaining warning into a failure. It ignores `src/generated`, `dist`, and `node_modules`.
 
 The type-aware config turns on rules such as `await-thenable`, `no-misused-promises` (with `checksVoidReturn: false`), `no-base-to-string`, `restrict-template-expressions`, `unbound-method`, and `no-duplicate-type-constituents`. `no-floating-promises` is off here, unlike in `yelo-frontend`.
+
+### API payload check
+
+`scripts/check-api-payloads.mjs` runs after the type-aware oxlint pass. The API decodes JSON bodies with `DisallowUnknownFields`, so a body with a field its request schema lacks gets a `400`. TypeScript doesn't catch that, because excess-property checks skip spreads and non-literal values. The script uses the type checker to fail any expression that is wider than the generated request type it is used as: a direct endpoint call, `mutate({ data })`, a prebuilt variable, or form state, including models nested in a request. Query parameter types (`*Params`) and array elements are skipped. To fix a failure, list the request fields explicitly instead of spreading a record.
 
 ### ESLint
 
@@ -108,13 +112,13 @@ To fix drift, run `make openapi orval` against a `yelo-api` checkout and commit 
 
 <Steps>
   <Step title="Install and restore cache">
-    `pnpm install --frozen-lockfile`, then restore `.nx/cache` keyed by the lockfile hash and commit.
+    `pnpm install --frozen-lockfile`, then restore `.nx/cache` keyed by the lockfile hash and commit. Restore keys fall back to the newest cache for the same lockfile, then for any lockfile, so task results carry over between commits.
   </Step>
   <Step title="Find affected sites">
     `nrwl/nx-set-shas` sets the base and head. Nx lists affected projects tagged `firebase-site` with a `build` target. The step fails if the set of Nx site projects differs from `sites.config.json`.
   </Step>
   <Step title="Run quality gates">
-    `pnpm nx run workspace-quality:ci --parallel=2`. The `ci` target is a no-op that depends on `format`, `lint`, `lint-types`, `typecheck`, `test`, and `firebase-config`, each of which depends on `api-contract`. All are Nx-cached.
+    `pnpm nx run workspace-quality:ci --parallel=2`. The `ci` target is a no-op that depends on `format`, `lint`, `lint-types`, `typecheck`, `test`, and `firebase-config`. Every one except `firebase-config` depends on `api-contract`. All are Nx-cached.
   </Step>
   <Step title="Check build variables">
     `scripts/require-site-env.mjs` fails if any affected site's `metadata.requiredBuildEnv` names a repository variable that isn't set.
@@ -127,7 +131,11 @@ To fix drift, run `make openapi orval` against a `yelo-api` checkout and commit 
   </Step>
 </Steps>
 
-The `workspace-quality` project's root is the whole repository, so its Nx cache key covers every file. A change anywhere reruns the gates. The cache still helps on reruns of the same commit.
+The `workspace-quality` project's root is the whole repository, but each target declares its own cache inputs in `project.json`:
+
+- `format`, `lint`, `lint-types`, and `typecheck` take every workspace file as input, so a change anywhere reruns them.
+- `test` takes `src/**` except `src/sites/home/**`, plus `workers/`, `scripts/`, `tools/`, the Vite and TypeScript configs, `sites.config.json`, and the package and Nx files. A change only to the home site or to docs reuses the cached test result.
+- `api-contract` takes the pinned spec, the lock, `src/generated`, the Orval config, the `Makefile`, and the two API transports. `firebase-config` takes the per-site and root `firebase.json` files and the generator script.
 
 `firebase.yml` deploys affected sites on pushes to `main`. It checks the Firebase config and builds, but doesn't rerun tests or lint.
 
@@ -146,7 +154,7 @@ pnpm test:og -u                    # accept intended OG snapshot changes
 ## Gotchas and edge cases
 
 - **The chain stops early.** `pnpm test` uses `&&`, so a failure in `test:components` hides failures in later scripts. Run the later script directly to see them.
-- **Worker checks aren't in CI.** `worker:og:check`, `worker:experience-router:check`, and `worker:world-cup:check` type-check and dry-run deploy the Cloudflare workers, but no workflow runs them. `tsc -b` doesn't include `workers/`. Run them by hand when you change a worker.
+- **Worker checks run in a separate workflow.** `worker:og:check`, `worker:experience-router:check`, and `worker:world-cup:check` type-check and dry-run deploy the Cloudflare workers. `tsc -b` and `ci.yml` don't include `workers/`. The **Workers** workflow (`workers.yml`) runs all three, plus `scripts/og-worker-smoke.sh`, on pull requests and pushes to `main` that touch `workers/**`, `package.json`, `pnpm-lock.yaml`, the smoke script, or the workflow file. The worker unit tests still run from `pnpm test` in `ci.yml`. See [Workers](/engineering/ci/workflows#workers-workersyml).
 - **`.spec` files count as production input.** Nx's `production` input excludes `*.test.ts` and `*.test.tsx` but not `*.spec.*`, so editing `authV3Client.spec.ts` or `AuthV3Page.spec.tsx` marks the signup site as affected and rebuilds it.
 - **jsdom is opt-in.** A component test without the `@vitest-environment jsdom` comment runs in Node and fails on the first DOM access.
 - **The ESLint `fetch` ban has an allowlist.** Code outside `src/components`, `src/hooks`, and `src/sites/dashboard` can still call `fetch`. The maestro viewer does, on purpose, to read public artifacts.
@@ -160,6 +168,6 @@ pnpm test:og -u                    # accept intended OG snapshot changes
 | OG worker tests | `yelo-web/workers/og/vitest.config.ts`, `workers/og/src/**/*.test.ts` |
 | Quality target | `yelo-web/project.json` (`workspace-quality`) |
 | Nx inputs | `yelo-web/nx.json` |
-| Lint config | `yelo-web/.oxlintrc.json`, `.oxlintrc.typeaware.json`, `eslint.config.js`, `.oxfmtrc.json` |
+| Lint config | `yelo-web/.oxlintrc.json`, `.oxlintrc.typeaware.json`, `eslint.config.js`, `.oxfmtrc.json`, `scripts/check-api-payloads.mjs` |
 | Contract check | `yelo-web/Makefile` (`api-check`), `scripts/check-openapi-lock.sh`, `docs/openapi.lock.json` |
-| CI | `yelo-web/.github/workflows/ci.yml`, `firebase.yml`, `scripts/require-site-env.mjs`, `sites.config.json` |
+| CI | `yelo-web/.github/workflows/ci.yml`, `firebase.yml`, `workers.yml`, `scripts/require-site-env.mjs`, `sites.config.json` |

@@ -22,21 +22,27 @@ Every other `IncrementCounter`, `RecordHistogram`, or `SetGauge` call in `intern
 
 | Event | Source | When fired | Properties |
 | --- | --- | --- | --- |
-| `authv3.step` | `internal/server/http/authv3/telemetry.go:106` | Once per Auth v3 handler call, through a deferred finisher (`handler.step`). Logs success or failure. | `step`, `stage`, `operation` (all the same step name), `outcome` (`ok` or the error type), `result` (`success` or `failure`), `failure_reason` (empty on success), `count` |
+| `authv3.step` | `internal/server/http/authv3/telemetry.go:133` | Once per Auth v3 handler call, through a deferred finisher (`handler.step`). Logs success or failure. A successful `callback`, `phone_verify`, or `resume` that issues a redirect fires one more event, `handoff_issued` or `phone_continuation_issued`. | `step`, `stage`, `operation` (all the same step name), `outcome` (`ok` or the error type), `result` (`success` or `failure`), `failure_reason` (empty on success; on failure the error type, or a phone validation reason), `count` |
 
 `enqueueCapture` (`internal/utilities/metrics/posthog.go:73`) adds these properties to every `authv3.step` event:
 
 | Property | Value |
 | --- | --- |
-| `event_schema_version` | `2` |
+| `event_schema_version` | `3` |
+| `classification_state` | `unknown` until the request resolves a user or a reserved test phone, then `known` |
 | `surface` | `api` |
 | `platform` | `server` |
 | `environment` | `cfg.App.Environment` |
 | `transaction_id` | Auth v3 transaction, from the funnel carrier |
 | `request_id` | Request context ID |
-| `client_id`, `channel`, `attempt_id`, `provider`, `auth_surface`, `is_test`, `is_internal` | Set through `metrics.SetFunnelProperty` in `internal/server/http/authv3/telemetry.go:145-155` and `internal/service/authv3/telemetry.go:103-135`. They appear only when the handler resolves them. |
+| `$insert_id` | `authv3:<request_id>:<step>`, set when the request has an ID |
+| `client_id`, `channel`, `attempt_id`, `provider`, `auth_surface` | Set through `metrics.SetFunnelProperty` in `internal/server/http/authv3/telemetry.go:170-196` and `internal/service/authv3/telemetry.go:88-137`. They appear only when the handler resolves them. |
+| `is_test`, `is_internal` | Booleans, set by `recordUserClassification` (`internal/service/authv3/telemetry.go:129`). `is_test` is also true for a reserved `+1 555` test phone. They appear only after the user or test phone is resolved. |
+| `phone_country` | Phone send and verify only. The numbering-plan region of the submitted number, or `unknown`. Never the number itself |
 
-The distinct ID is chosen in this order: the authenticated user ID, then the transaction ID, then `yelo-api`. The last two set `$process_person_profile: false`.
+The distinct ID for `authv3.step` is the transaction ID whenever the request has one, including authenticated requests. Without a transaction it is the authenticated user ID, then `yelo-api`. The transaction ID and `yelo-api` cases set `$process_person_profile: false`. Join server and browser events on `transaction_id`, not on distinct ID.
+
+Phone send and verify failures replace `failure_reason` with a closed validation reason: `phone_parse_failed`, `phone_impossible`, `phone_invalid`, `phone_non_us`, or `phone_code_format` (`internal/service/authv3/phone/policy.go:47`, `phone_orchestration.go:242`).
 
 The `step` values and where each is recorded:
 
@@ -48,15 +54,16 @@ The `step` values and where each is recorded:
 | `accept` | `Accept`, `handler.go:377` |
 | `resume` | `Resume`, `resume_handler.go:23` |
 | `provider_start` | `startProvider`, `handler.go:429`; `nativeAppleStart`, `handler.go:487` |
-| `callback` | `nativeAppleCallback`, `handler.go:519`; `GoogleCallback`, `handler.go:547`; `AppleCallback`, `handler.go:587` |
-| `token` | `Token`, `handler.go:688` |
-| `phone_send` | `SendPhone`, `handler.go:730` |
-| `phone_verify` | `VerifyPhone`, `handler.go:781` |
+| `callback` | `nativeAppleCallback`, `handler.go:519`; `GoogleCallback`, `handler.go:548`; `AppleCallback`, `handler.go:588` |
+| `token` | `Token`, `handler.go:690` |
+| `phone_send` | `SendPhone`, `handler.go:732` |
+| `phone_verify` | `VerifyPhone`, `handler.go:783` |
 | `status` | `OnboardingStatus`, `onboarding_handler.go:17` |
 | `profile` | `FinishProfile`, `onboarding_handler.go:39` |
 | `community_resolve` | `ResolveAuthenticatedCommunity`, `community_handler.go:19` |
+| `handoff_issued`, `phone_continuation_issued` | Emitted by the finisher itself (`telemetry.go:141-150`) after a successful `callback`, `phone_verify`, or `resume`. `handoff_issued` means the validated redirect carries a handoff code. `phone_continuation_issued` means it continues to the phone step |
 
-`StepSessionRefresh` (`session_refresh`, `telemetry.go:35`) is declared but no handler records it.
+`StepSessionRefresh` (`session_refresh`, `telemetry.go:40`) is declared but no handler records it.
 
 ### Auth v2 direct events
 
@@ -84,44 +91,50 @@ The community email OTP, community OAuth, and profile setup events (`auth.v2.com
 
 ## Web (signup Auth v3)
 
-Only `src/sites/signup/auth-v3/analytics.ts` imports `posthog-js`. Nothing else in `yelo-web/src` captures events. Every event goes through `captureAuthV3Event` (line 200) or `captureAuthV3Abandonment` (line 211). Both return early unless capture is enabled.
+Only `src/sites/signup/auth-v3/analytics.ts` imports `posthog-js`. Nothing else in `yelo-web/src` captures events. Every event goes through `captureAuthV3Event` (line 235). `captureAuthV3Abandonment` (line 270) calls it too. Both return early unless capture is enabled.
 
-Capture is enabled only when all of these hold (`shouldCaptureAuthV3`, line 104):
+Capture is enabled only when all of these hold (`shouldCaptureAuthV3`, line 127):
 
 - `VITE_POSTHOG_KEY` is set.
 - The environment is `production`.
 - The context is not an emulator or a test account (`is_test` comes from the API's `analyticsExcluded` flag).
 - The context email does not end in `@rideyelo.com`.
 
-If a later context update makes capture disallowed, `updateAuthV3AnalyticsContext` stops session recording and turns capture off.
+If a later context update makes capture disallowed, `updateAuthV3AnalyticsContext` stops session recording and turns capture off. A context update never erases a known ID with an absent value. API error envelopes also update `request_id`, `transaction_id`, and `attempt_id`. When the URL carries a `transaction_id` or `attempt_id` that differs from the stored one, the stored context is dropped, so an earlier test account can't suppress a later real sign-in.
 
-Every event carries `stage`, `operation`, and `outcome`, plus the safe context: `attempt_id`, `transaction_id`, `request_id`, `client_id`, `channel`, `distribution`, `app_version`, `app_build`, `is_emulator`, `is_test`, and the attribution fields `has_referral`, `has_link_click`, `utm_source`, `utm_medium`, and `utm_campaign`. `has_referral` and `has_link_click` are presence flags for an invite code and a Dub click ID, set from the captured attribution in `AuthV3Page.tsx`. The code and click ID themselves are never sent. The table lists only the extra fields. All sources are in `src/sites/signup/auth-v3/AuthV3Page.tsx`.
+Every event carries `stage`, `operation`, and `outcome`, plus the safe context: `attempt_id`, `transaction_id`, `request_id`, `client_id`, `channel`, `distribution`, `app_version`, `app_build`, `is_emulator`, `is_test`, and the attribution fields `has_referral`, `has_link_click`, `utm_source`, `utm_medium`, and `utm_campaign`. `has_referral` and `has_link_click` are presence flags for an invite code and a Dub click ID, set from the captured attribution in `AuthV3Page.tsx`. The code and click ID themselves are never sent.
+
+Every event also carries `analytics_flow_id` (a UUID kept in `sessionStorage` for the tab), `client_event_sequence` (a counter that survives the provider redirect), `client_event_time`, and `$insert_id` (`<analytics_flow_id>:<client_event_sequence>`), so you can order and deduplicate a flow's events. Events are sent immediately instead of batched. The events that precede a navigation use `sendBeacon`: `auth_v3_provider_redirect_started`, `auth_v3_otp_verification_completed`, `auth_v3_handoff_attempted`, `auth_v3_handoff_retry_tapped`, and `auth_v3_abandoned`.
+
+The table lists only the extra fields. Sources are in `src/sites/signup/auth-v3/AuthV3Page.tsx` unless the row names `analytics.ts`.
 
 | Event | Source | When fired | Stage, operation, outcome, and extra properties |
 | --- | --- | --- | --- |
-| `auth_v3_page_viewed` | `:561` | Page mounts | `entry`, `page_rendered`, `viewed` |
+| `auth_v3_browser_opened` | `analytics.ts:211` | Analytics initializes on page load. It shows the hosted page's JavaScript ran, whether or not the native session returns | `entry`, `hosted_page_loaded`, `viewed` |
+| `auth_v3_page_viewed` | `:571` | Page mounts | `entry`, `page_rendered`, `viewed` |
 | `auth_v3_entry_viewed` | `:213` | `EntryWithoutTransaction` renders, either during bootstrap or after a bootstrap error | `entry`, `bootstrap` or `bootstrap_failed`, `viewed` or `failed`; `failure_reason: web_bootstrap` |
-| `auth_v3_step_viewed` | `:569` | `view` changes | `method`, `phone`, `otp`, or `handoff`; `{view}_viewed`; `viewed` |
-| `auth_v3_legal_screen_viewed` | `:575` | Providers view shown | `legal`, `legal_copy_viewed`, `viewed` |
-| `auth_v3_methods_displayed` | `:580` | Providers view shown | `method`, `methods_displayed`, `viewed` |
-| `auth_v3_configuration_requested` | `:733` | First config fetch starts | `configuration`, `load`, `started` |
-| `auth_v3_configuration_loaded` | `:747` | Config fetch returns valid data | `configuration`, `load`, `succeeded`; `request_id` |
-| `auth_v3_configuration_failed` | `:769` | Config fetch fails | `configuration`, `load`, `failed`; `failure_reason`, `request_id` |
-| `auth_v3_legal_acceptance_requested` | `:795` | First method tap triggers terms acceptance | `legal`, `accept`, `started` |
-| `auth_v3_legal_acceptance_completed` | `:810` | Acceptance succeeds | `legal`, `accept`, `succeeded`; `request_id`, `duration_ms` |
-| `auth_v3_legal_acceptance_failed` | `:821` | Acceptance fails | `legal`, `accept`, `failed`; `failure_reason`, `request_id`, `duration_ms` |
-| `auth_v3_method_selected` | `:896`, `:924`, `:1055` | Google or Apple tapped (`:896`), phone button tapped (`:1055`), or phone send started (`:924`) | `method` or `phone`; `method_selected` or `phone-send`; `started`; `provider`, `is_retry` |
-| `auth_v3_provider_redirect_started` | `:909` | Safe provider URL received, just before redirect | `provider`, `redirect`, `succeeded`; `provider`, `request_id`, `duration_ms` |
-| `auth_v3_otp_resend_requested` | `:924` | Resend code tapped | `phone`, `phone-resend`, `started`; `provider: phone`, `is_retry: true` |
-| `auth_v3_otp_requested` | `:938` | SMS send succeeds | `phone`, `phone-send` or `phone-resend`, `succeeded`; `request_id`, `duration_ms`, `is_retry` |
-| `auth_v3_otp_verification_requested` | `:965` | Code submitted | `otp`, `verify`, `started`; `provider: phone` |
-| `auth_v3_otp_verification_completed` | `:982`, `:995` | Code accepted, before the web or app redirect | `otp`, `verify`, `succeeded`; `request_id`, `duration_ms` |
-| `auth_v3_handoff_attempted` | `:263`, `:1005` | Web completion screen (`web_completion`), or app handoff after phone verify (`app_open`) | `handoff`, `succeeded`; `provider`, `request_id` |
-| `auth_v3_handoff_retry_tapped` | `:1267` | "Try again" tapped on the handoff screen | `handoff`, `app_open_retry`, `started`; `is_retry: true` |
-| `auth_v3_back_tapped` | `:1101`, `:1113` | Back from OTP (`change_phone`) or from phone entry (`back`) | `otp` or `phone`, `cancelled`; `duration_ms` on the view |
-| `auth_v3_operation_failed` | `:875` | Any provider, phone send, or phone verify action throws | `provider`, `phone`, or `otp`; the action name; `failed`; `provider`, `failure_reason`, `request_id` |
+| `auth_v3_step_viewed` | `:579` | `view` changes | `method`, `phone`, `otp`, or `handoff`; `{view}_viewed`; `viewed`. The phone view adds `entry_reason`: `direct`, `social_continuation` (Google or Apple needs a phone number), or `resumed` (resume returned `needs_phone`) |
+| `auth_v3_legal_screen_viewed` | `:586` | Providers view shown | `legal`, `legal_copy_viewed`, `viewed` |
+| `auth_v3_methods_displayed` | `:591` | Providers view shown | `method`, `methods_displayed`, `viewed` |
+| `auth_v3_configuration_requested` | `:746` | First config fetch starts | `configuration`, `load`, `started` |
+| `auth_v3_configuration_loaded` | `:760` | Config fetch returns valid data | `configuration`, `load`, `succeeded`; `request_id` |
+| `auth_v3_configuration_failed` | `:782` | Config fetch fails | `configuration`, `load`, `failed`; `failure_reason`, `request_id` |
+| `auth_v3_legal_acceptance_requested` | `:808` | First method tap triggers terms acceptance | `legal`, `accept`, `started` |
+| `auth_v3_legal_acceptance_completed` | `:823` | Acceptance succeeds | `legal`, `accept`, `succeeded`; `request_id`, `duration_ms` |
+| `auth_v3_legal_acceptance_failed` | `:834` | Acceptance fails | `legal`, `accept`, `failed`; `failure_reason`, `request_id`, `duration_ms` |
+| `auth_v3_phone_submitted` | `:946` | First phone send starts, just before `auth_v3_method_selected`. Resends don't fire it | `phone`, `phone-send`, `started`; `provider: phone` |
+| `auth_v3_method_selected` | `:917`, `:952`, `:1083` | Google or Apple tapped (`:917`), phone button tapped (`:1083`), or phone send started (`:952`) | `method` or `phone`; `method_selected` or `phone-send`; `started`; `provider`, `is_retry` |
+| `auth_v3_provider_redirect_started` | `:930` | Safe provider URL received, just before redirect | `provider`, `redirect`, `succeeded`; `provider`, `request_id`, `duration_ms` |
+| `auth_v3_otp_resend_requested` | `:952` | Resend code tapped | `phone`, `phone-resend`, `started`; `provider: phone`, `is_retry: true` |
+| `auth_v3_otp_requested` | `:966` | SMS send succeeds | `phone`, `phone-send` or `phone-resend`, `succeeded`; `request_id`, `duration_ms`, `is_retry` |
+| `auth_v3_otp_verification_requested` | `:993` | Code submitted | `otp`, `verify`, `started`; `provider: phone` |
+| `auth_v3_otp_verification_completed` | `:1010`, `:1023` | Code accepted, before the web or app redirect | `otp`, `verify`, `succeeded`; `request_id`, `duration_ms` |
+| `auth_v3_handoff_attempted` | `:263`, `:1033` | Web completion screen (`web_completion`), or app handoff after phone verify (`app_open`) | `handoff`, `succeeded`; `provider`, `request_id` |
+| `auth_v3_handoff_retry_tapped` | `:1295` | "Try again" tapped on the handoff screen | `handoff`, `app_open_retry`, `started`; `is_retry: true` |
+| `auth_v3_back_tapped` | `:1129`, `:1141` | Back from OTP (`change_phone`) or from phone entry (`back`) | `otp` or `phone`, `cancelled`; `duration_ms` on the view |
+| `auth_v3_operation_failed` | `:895` | Any provider, phone send, or phone verify action throws | `provider`, `phone`, or `otp`; the action name; `failed`; `provider`, `failure_reason`, `request_id`. `failure_reason` is the API error envelope's `metadata.failure_reason` when present, otherwise the client error kind |
 | `auth_v3_error_viewed` | `:286` | `TerminalError` renders | `error`, `terminal_error`, `failed`; `failure_reason`, `request_id` |
-| `auth_v3_abandoned` | `analytics.ts:213` (registered on `pagehide` at `AuthV3Page.tsx:562`) | Page hides before handoff succeeds or before navigation is expected | `stage` is the last stage seen, `operation: leave`, `outcome: abandoned` |
+| `auth_v3_abandoned` | `analytics.ts:272` (registered on `pagehide` at `AuthV3Page.tsx:573`) | Page hides before handoff succeeds or before navigation is expected | `stage` is the last stage seen, `operation: leave`, `outcome: abandoned` |
 
 The web client never calls `identify`, `group`, or `alias`. Events stay anonymous and are linked to the API through `attempt_id` and `transaction_id`.
 
@@ -130,15 +143,15 @@ The web client never calls `identify`, `group`, or `alias`. Events stay anonymou
 Mobile events go through the `EventRecorder` interface (`lib/analytics/types.ts`). Its PostHog implementation is `lib/analytics/recorder/posthog.ts`. Hooks in `lib/analytics/events/` call `analytics.track`. Auth v3 events use `trackAuthV3` in `lib/auth/analytics.ts:170`. A few screens call `usePostHog().capture` directly.
 
 <AccordionGroup>
-<Accordion title="Auth v3 (40 fired, 41 defined)">
+<Accordion title="Auth v3 (41 fired, 42 defined)">
 
-All Auth v3 events go through `AuthV3Provider.track` (`providers/AuthV3Provider.tsx:316`), which calls `trackAuthV3`. `trackAuthV3` drops the event when `shouldExcludeAuthV3Analytics()` (staging, development, or emulator builds) or `isResolvedAccountAnalyticsExcluded()` (test or `@rideyelo.com` account) is true.
+All Auth v3 events go through `AuthV3Provider.track` (`providers/AuthV3Provider.tsx:319`), which calls `trackAuthV3`. `trackAuthV3` drops the event when `shouldExcludeAuthV3Analytics()` (staging, development, or emulator builds) or `isResolvedAccountAnalyticsExcluded()` (test or `@rideyelo.com` account) is true.
 
 Every event includes:
 
 - `stage`
-- Build properties from `authV3BuildProperties()`: `event_schema_version` (2), `environment`, `deployment_channel`, `distribution`, `platform`, `app_version`, `app_build`, `runtime_version`, `is_device`, `is_emulator`, `analytics_excluded`
-- The attempt context: `attempt_id`, `transaction_id`, `attempt_number`, `is_retry`
+- Build properties from `authV3BuildProperties()`: `event_schema_version` (3), `environment`, `deployment_channel`, `distribution`, `platform`, `app_version`, `app_build`, `runtime_version`, `is_device`, `is_emulator`, `analytics_excluded`
+- The attempt context: `attempt_id`, `transaction_id`, `attempt_number`, `is_retry`. When an Auth v3 API error carries `metadata.transaction_id`, `failFlow` adopts it, so the failure event carries the server's transaction ID. A new authorization never inherits the previous draft's `transaction_id`.
 
 | Event | Source | When fired | Extra properties |
 | --- | --- | --- | --- |
@@ -150,13 +163,14 @@ Every event includes:
 | `auth_v3_method_viewed` | `app/(auth-v3)/method.tsx:24` | Method screen mounts | none |
 | `auth_v3_method_selected` | `app/(auth-v3)/method.tsx:69`, `providers/AuthV3Provider.tsx:1070` | Phone tapped, or Google or Apple started | `method` |
 | `auth_v3_accept_completed` | `providers/AuthV3Provider.tsx:1017` | Terms accepted | none |
-| `auth_v3_phone_submitted` | `providers/AuthV3Provider.tsx:1133` | Phone number submitted | none |
+| `auth_v3_phone_viewed` | `app/(auth-v3)/phone.tsx:38` | Phone screen gains focus with a live transaction | `entry_reason` (`direct`, `social_continuation` after a provider callback that needs a phone, or `resumed` after a resumed transaction needs a phone) |
+| `auth_v3_phone_submitted` | `providers/AuthV3Provider.tsx:1148` | Phone number submitted | none |
 | `auth_v3_phone_code_sent` | `providers/AuthV3Provider.tsx:1138` | Send-code call returns | `outcome` |
 | `auth_v3_phone_resend_requested` | `app/(auth-v3)/phone-confirm.tsx:69` | Resend tapped | none |
 | `auth_v3_phone_verified` | `providers/AuthV3Provider.tsx:1182` | Verify-code call returns | `outcome` |
 | `auth_v3_phone_failed` | `providers/AuthV3Provider.tsx:1154`, `:1159`, `:1185`, `:1206` | Send or verify fails. Terminal errors also go through `failFlow`. | `operation`, `failure_reason`, and from `failFlow`: `request_id`, `duration_ms` |
 | `auth_v3_browser_launch_requested` | `providers/AuthV3Provider.tsx:770`, `:1052` | Before the hosted or provider auth session opens | none |
-| `auth_v3_browser_opened` | `providers/AuthV3Provider.tsx:780`, `:1057` | Auth session returns | none |
+| `auth_v3_browser_session_returned` | `providers/AuthV3Provider.tsx:791`, `:1072` | Auth session returns | `outcome` (the browser result type, such as `success`, `cancel`, or `dismiss`) |
 | `auth_v3_browser_cancelled` | `providers/AuthV3Provider.tsx:783`, `:1060` | User cancels or dismisses the browser | none |
 | `auth_v3_browser_failed` | `providers/AuthV3Provider.tsx:777`, `:787`, `:875`, `:1064` | Browser fails to open, returns a non-success result, or falls back to native | `failure_reason`, `fallback` |
 | `auth_v3_native_recovery` | `providers/AuthV3Provider.tsx:877`, `:884` | Hosted flow falls back to native screens | `reason`, `fallback`, `consecutive_cancellations`, `previous_attempt_id`, `previous_transaction_id`, `outcome` (`requested`, `completed`, or `failed`) |
@@ -355,7 +369,7 @@ Every Fare Finder UI event from `useRideAggregatorAnalytics` also carries `quote
 
 | Platform | Call | Source | Distinct ID | Person properties |
 | --- | --- | --- | --- | --- |
-| API | none | — | User ID, transaction ID, or `yelo-api` for `authv3.step`; masked phone, masked email, or user ID for Auth v2 | None. The API never sends `$set` or `Identify`. |
+| API | none | — | Transaction ID, then user ID, then `yelo-api` for `authv3.step`; masked phone, masked email, or user ID for Auth v2 | None. The API never sends `$set` or `Identify`. |
 | Web | none | — | Anonymous `posthog-js` ID | None |
 | Mobile | `analytics.identify` | `api/helpers/authUser.ts:91` (in `useCurrentUser`, after every successful `currentUser` fetch) | `user.id` | `name`, `email`, `phone`, `community_id`, `home_community_id`, `is_test`, `email_domain`, `analytics_excluded` |
 | Mobile | `analytics.reset` | `providers/SessionProvider.tsx:221`, `api/helpers/authUser.ts:134`, `:145` | Clears identity and super properties | — |
@@ -373,7 +387,7 @@ The API and web client never call `group` or `GroupIdentify`.
 
 | Platform | Property | Source | Value |
 | --- | --- | --- | --- |
-| Web | `event_schema_version`, `environment`, `platform`, `surface` | `src/sites/signup/auth-v3/analytics.ts:172` (`loaded` callback) | `2`, `production`, `web`, `auth_v3` |
+| Web | `event_schema_version`, `environment`, `platform`, `surface` | `src/sites/signup/auth-v3/analytics.ts:201` (`loaded` callback) | `3`, `production`, `web`, `auth_v3` |
 | Web | Analytics context fields | `analytics.ts:177`, `:191` | Registered at init and again on each context update, with `email: undefined` |
 | Mobile | `ota_update_id`, `ota_runtime_version`, `ota_is_embedded` | `lib/analytics/AnalyticsProvider.tsx:32` | From `expo-updates`: `Updates.updateId` (`embedded` when null), `Updates.runtimeVersion` (`unknown` when null), and `Updates.isEmbeddedLaunch` |
 | Mobile | `glass_usable`, `glass_liquid_available`, `glass_effect_api_available` | `lib/analytics/AnalyticsProvider.tsx:32` | From `glassCapability()` |

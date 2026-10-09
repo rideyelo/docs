@@ -37,7 +37,6 @@ For environment variables that override some of these values, see [Environment v
     | `activeRideBufferSeconds` | 120 s | `service/ride/ride.go:625` | Buffer added to remaining active-ride time |
     | Ride board refresh key | 10 s | `service/ride/ride_board_redis.go:91,116` | Redis refresh marker |
     | Command rollback context | 3 s | `data/repository/ride_lifecycle.go:29` and others | Detached rollback timeout |
-    | Queued authorization cleanup | 10 s | `service/ride/driver.go:258,1131` | Releases the PaymentIntent after cancel or requeue |
   </Accordion>
   <Accordion title="Driver options and ETAs (API)">
     | Name | Value | Where | Effect |
@@ -149,7 +148,7 @@ For environment variables that override some of these values, see [Environment v
     | `TipBuffer` | $5.00 | `models/tip.go:13` | Extra pre-authorization on tip-enabled rides |
     | `MaxTip` | $100 | `models/tip.go:16`, validated in `service/ride/ride.go:851` | In-app tip ceiling |
     | Tip presets | $2, $5, $10 | `models/tip.go:22` | Returned by tip options. Mobile falls back to the same (`app/(app)/ride-complete/index.tsx:34`) |
-    | Tip window | 24 h | `service/ride/driver.go:575` | Capture is deferred after completion |
+    | Tip window | 24 h | `data/repository/ride_completion_operation.go:137,234` | Capture is deferred after completion |
     | Tip capture loop | Every 5 min, batch 50 | `main.go:608`, `service/ride/tip_capture.go:13` | Captures when the window expires |
     | Stuck tip alert | 1 h past window | `tip_capture.go:32` | Error log |
     | QR tip min, max, preset | $1, $500, $5 | `service/tipping/tipping.go:17-21` | Guest tipping through `pay.yelo.link` |
@@ -308,7 +307,7 @@ For environment variables that override some of these values, see [Environment v
     | Heatmap | Defaults 0.0005° cells, at least 3 users (floor), 60 days, 500 cells; key 15 min | `models/map_heat_settings.go`, `service/maplayer/heatmap.go` | Admin-editable in `MapHeatSettings`, globally or per community |
     | Friends layer | Positions 7 days, 500 rows, 100 spots, moves 24 h | `service/maplayer/friends_layer.go:17-23` | |
     | Map layer TTLs | Vehicles 60 s, community 300 s; 20 top locations, 25 events, 2000 routes | `service/maplayer/maplayer.go:20-24` | |
-    | Community moves window | 168 h default, 1 to 720 h | `migrations/000276`, `server/http/community/requests/community.go:74` | |
+    | Community moves window | 168 h default, 1 to 720 h | `migrations/000276`, `server/http/community/requests/community.go:77` | |
     | Mobility feeds | Poll every 1 min; backoff 2^n min to 1 h; 10 MiB live, 20 MiB GTFS | `main.go:623`, `service/maplayer/mobility.go:19-23`, `data/mobility/client.go:15-18` | |
     | Map heat loop | 5 min | `main.go:617` | |
     | `HotIndexWindow` | 6 h | `service/location/location.go:22` | |
@@ -343,7 +342,7 @@ For environment variables that override some of these values, see [Environment v
 | Contact sync lease | 120 s, renewed every 30 s | `service/contactsync/service.go:15,122` | |
 | Contact sync jobs | Dispatch 5 s, scan 1 min, 90 s timeout, 10 attempts | `service/contactsync/jobs.go` | |
 | Marketing segments | 20 per account | `data/repository/marketing_segments.go:178-184` | |
-| Contact uploads | 30 per hour per user, 5000 numbers each | `service/user/contacts.go:23,41` | |
+| Contact uploads | 30 per hour per user, 10000 numbers each | `service/user/contacts.go:20`, `server/http/user/requests/contacts.go:15` | |
 | Contact match debounce (mobile) | 800 ms; refresh after 15 min in foreground | `yelo-frontend` `components/ContactMatchSync.tsx:28-29` | |
 
 See [Contact sync](/administration/contact-sync).

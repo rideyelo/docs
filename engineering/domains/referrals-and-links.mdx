@@ -113,6 +113,8 @@ The Dub client (`internal/data/dub/dub.go`) builds a new SDK client per call fro
 
 Dub's upsert matches an existing link by destination URL, not by key. Changing the destination of an existing key (for example, after `INVITE_LANDING_BASE_URL` changes) makes Dub return a duplicate-key conflict. On that conflict, `UpsertLink` looks the link up by domain and key with `Links.Get` and rewrites it in place with `Links.Update`, sending the URL, title, description, image, `TrackConversion`, and `Proxy`.
 
+A request with `MoveKey` handles the other conflict: the external ID already owns a link under a different key, so `Links.Get` finds nothing at the new key. `UpsertLink` then updates the link by `ext_<external id>` and also sets the new domain and key. Fleet join links and fleet payout onboarding links set `MoveKey`. Referral links don't, so for them a missing key is still an error.
+
 ### Background creation and refresh
 
 | Function | Trigger | Context | Retries | On success |

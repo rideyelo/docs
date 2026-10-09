@@ -11,9 +11,9 @@ Five `yelo-web` sites need no sign-in: `event`, `invite`, `world-cup`, `home`, a
 | --- | --- | --- | --- | --- | --- |
 | `event` | `renderSite({ query, router, toaster })` | React Router: `/:slug` | `GET /public/events/slug/{slug}` | None; static `<title>Yelo Event</title>`, runtime `document.title` | None |
 | `invite` | `renderSite({ query, router, dubAnalytics })` | None. `/:code` and `/fleet/:code` redirect in `index.html` before the bundle runs; anything else renders "Invite not found" | None | Static `og:*` in `index.html` | Dub |
-| `world-cup` | `renderSite(<LandingV5 />)`, no providers | None | `GET /world-cup/standings`, `GET /world-cup/activity` through `/world-cup/api` | `<meta name="description">` only | None |
-| `home` | Plain `createRoot` | Custom pathname switch | None | Full `og:*` and `twitter:*`, plus per-route static HTML | None |
-| `maestro` | `renderSite(<App />, {})`, no providers | Query params: `?view=screens\|flows\|runs`, `?run=` | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
+| `world-cup` | `renderSite(<LandingV5 />)`, no providers | None | `GET /world-cup/standings`, `GET /world-cup/activity` through `/world-cup/api` (offline: the Worker now redirects that path) | `<meta name="description">` only | None |
+| `home` | Plain `createRoot` | Custom pathname switch | None, except `POST /authv3/attribution/touch` on attributed visits | Full `og:*` and `twitter:*`, plus per-route static HTML | None |
+| `maestro` | `renderSite(<App />, {})`, no providers | Query params: `?view=screens\|flows\|runs\|previews`, `?run=` | Supabase Storage JSON | None | None (the Auth v3 entry reuses signup's PostHog gating) |
 
 ## event
 
@@ -66,7 +66,7 @@ The `emit-site-app-associations` plugin in `tools/vite/base/config.ts` copies th
 
 ## world-cup
 
-A single-page campus race built for the `/world-cup` path on `rideyelo.com` and `joinyelo.com`. `tools/vite/base/config.ts` sets `base: '/world-cup/'` and nests output in `dist/world-cup/world-cup/`.
+A single-page campus race built for the `/world-cup` path on `rideyelo.com` and `joinyelo.com`. The campaign is offline: the `world-cup-router` Worker now redirects `/world-cup*`, including `/world-cup/api`, to `https://joinyelo.com/`, so the page and its data loop below aren't reachable on the public domains. See [Edge and routing](/engineering/web/edge-and-routing#world-cup-router). `tools/vite/base/config.ts` sets `base: '/world-cup/'` and nests output in `dist/world-cup/world-cup/`.
 
 ### Data loop
 
@@ -74,7 +74,7 @@ A single-page campus race built for the `/world-cup` path on `rideyelo.com` and 
 
 | Step | Call | Detail |
 | --- | --- | --- |
-| Standings | `worldCupGetStandings` with `url: ${BASE_URL}api/standings` and `baseURL: ''` | Same-origin, so it goes through the `world-cup-router` Worker to `api.rideyelo.com/world-cup/standings`. The API sets `Cache-Control: public, max-age=10, stale-while-revalidate=30`. |
+| Standings | `worldCupGetStandings` with `url: ${BASE_URL}api/standings` and `baseURL: ''` | Same-origin. While the campaign ran, the `world-cup-router` Worker proxied it to `api.rideyelo.com/world-cup/standings`. The Worker now redirects the path instead. The API sets `Cache-Control: public, max-age=10, stale-while-revalidate=30`. |
 | Backlog drain | `worldCupGetActivity` with `after` cursor, `limit=50` | Runs once, up to 60 pages. Seeds the ticker without firing map pings. The cursor commits only after the full drain succeeds. |
 | Live poll | Same activity call from the saved cursor | Every 15 s and on `visibilitychange` to visible. Skipped while hidden or while another fetch is in flight. API cache header: `max-age=5, stale-while-revalidate=15`. |
 | Staleness | — | Two consecutive failures set `isStale`. |
@@ -126,7 +126,7 @@ An internal viewer for the product inventory and for end-to-end runs. It reads s
 | File | Role |
 | --- | --- |
 | `types.ts` | `ARTIFACT_ROOT` is `VITE_E2E_ARTIFACT_BASE_URL` or `VITE_SUPABASE_URL/storage/v1/object/public/e2e`. Runs live at `runs/<id>/`. |
-| `App.tsx` | Picks the view from the query string: `?run=<id>` renders `RunViewer`, `?view=runs` renders the run list, and anything else renders `Inventory` on `screens` or `flows`. Fetches `index.json` with a 15-second timeout. The run list filters by `passed` or `failed` and sorts pinned runs first. Pins persist in `localStorage` key `e2e-report:pins`. |
+| `App.tsx` | Picks the view from the query string: `?run=<id>` renders `RunViewer`, `?view=runs` renders the run list, `?view=previews` renders `LinkPreviews` (the `og` Worker's committed card snapshots), and anything else renders `Inventory` on `screens` or `flows`. Fetches `index.json` with a 15-second timeout. The run list filters by `passed` or `failed` and sorts pinned runs first. Pins persist in `localStorage` key `e2e-report:pins`. |
 | `ViewerHost.tsx` | Context with `embedded` and `navigate`. Standalone, `navigate` calls `history.pushState` or `replaceState`. The dashboard's `InventoryPage` supplies React Router's `navigate` and sets `embedded`, which stops the viewer from setting `document.title` and hides the footer theme toggle. |
 | `useInventory.ts` | Fetches `inventory/catalog.json` from `ARTIFACT_ROOT`. A `404` falls back silently to the bundled `product-catalog.json`; any other failure falls back with a **Using bundled inventory** notice. Then loads every run manifest, four at a time. |
 | `evidenceCache.ts` | Caches parsed run manifests for five minutes in memory and in Cache Storage (`yelo-maestro-evidence-v1`, at most 100 entries). The key includes the run's status, start time, duration, commit, and counts from the index. **Refresh evidence** bypasses it. |
@@ -154,7 +154,7 @@ An internal viewer for the product inventory and for end-to-end runs. It reads s
 Within one screen state, role, and platform, the newest run wins, so an older passing run can't hide a newer failure. Redirect screens are excluded from coverage totals. With an `api` filter set, runs against any other API revision are dropped before classification.
 
 <Note>
-The catalog schema pins `source.repository` to `rideyelo/yelo-frontend`, and `src/sites/maestro/README.md` describes a registry and publish target in that repository. Neither exists on `yelo-frontend` `main`, and no script there writes `inventory/catalog.json` or `inventoryEvidence`. Until one does, the viewer shows the bundled snapshot, and a run produced from `yelo-frontend` `main` can classify as `historical` or `failed` but not `current`.
+The catalog schema pins `source.repository` to `rideyelo/yelo-frontend`, and `src/sites/maestro/README.md` describes a registry and publish target in that repository. Both exist on `yelo-frontend` `main`: the registry is `e2e/inventory/product.json`, `make inventory-publish` uploads `inventory/catalog.json`, and each run manifest carries `inventoryEvidence`. Publishing is a manual step, and no workflow runs it. Until someone publishes a catalog, the viewer shows the bundled snapshot, and a run can classify as `historical` or `failed` but not `current`. See [Product inventory](/engineering/qa/e2e#product-inventory).
 </Note>
 
 The second entry, `auth/v3/index.html`, mounts the signup `AuthV3Page`. The Nx build target sets `VITE_API_URL=$VITE_E2E_API_URL` and `VITE_AUTH_V3_APP_SCHEME=com.rideyelo.e2e` so E2E app builds sign in against the E2E API and return to the E2E app.

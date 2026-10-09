@@ -49,6 +49,8 @@ All three call `authorizeFleet` in `internal/server/http/fleetjoin/handler.go`: 
   </Step>
   <Step title="Publish to Dub first">
     Calls `dub.UpsertLink` with key `fleet-<new code>`, `ExternalID` `fleet-driver-join:<fleet_id>`, the `fleet-driver` tag, `cfg.Dub.FleetFolderID` (`DUB_FLEET_FOLDER_ID`, falling back to `DUB_SYSTEM_FOLDER_ID`), `TrackConversion: true` so Dub forwards its click ID to the landing page, the title `Join <fleet name> on Yelo`, a description that depends on the payment model, the signed fleet invitation card as the image, and `Proxy` on. See [Link previews](#link-previews).
+
+    The request also sets `MoveKey`. A rotation reuses the fleet's external ID under a new key, which Dub rejects as a conflict. `UpsertLink` then updates the link that owns the external ID (`ext_fleet-driver-join:<fleet_id>`) and sets its domain, key, and URL to the new values. Each fleet keeps one Dub link, and its key moves with each rotation.
   </Step>
   <Step title="Compare and set">
     `SetFleetJoinCode` updates only if `driver_join_code IS NOT DISTINCT FROM` the old code. Zero rows means another instance rotated first, and the call fails with `ErrorTypeFleetJoinBusy` (409, **Invitation Changed**).
@@ -193,7 +195,6 @@ The `FleetDriverWhitelist` table still exists. Nothing creates entries or enroll
 | Whitelist deactivation on archive | `DisableArchivedFleetWhitelist` in `yelo-api/internal/data/repository/queries/fleet_archive.sql` |
 | Error types | `ErrorTypeFleetJoinBusy`, `ErrorTypeFleetPayoutUnavailable` in `yelo-api/internal/utilities/errors/error.go`, both mapped to 409 in `internal/server/http/httperrors/errors.go` |
 | Mobile | `yelo-frontend/app/fleet-join/[code].tsx`, `lib/storage/fleetJoinIntent.ts`, `components/FleetJoinIntentObserver.tsx`, `app/+native-intent.tsx` |
-| Design notes | `yelo-api/docs/owner-operator-fleet-joins.md`, `docs/admin-fleet-transfers.md` |
 
 ## Gotchas and edge cases
 

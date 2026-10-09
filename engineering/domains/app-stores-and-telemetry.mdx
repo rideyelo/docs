@@ -201,13 +201,13 @@ The `/internal/e2e` group is mounted only when `config.Load().E2E.Enabled` is tr
 
 ### Scenarios
 
-`POST /internal/e2e/runs` takes `scenario` and `idempotency_key` (required, at most 200 characters), plus an optional `benchmark` object that only `auth_existing_rider` accepts. See [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-benchmark-replays). A repeated key returns the existing run. Before creating, the handler expires up to 100 active runs past `expires_at`.
+`POST /internal/e2e/runs` takes `scenario` and `idempotency_key` (required, at most 200 characters), plus an optional `benchmark` object that only `auth_existing_rider` accepts and an optional `payment_fixture` that only `ride_confirmed_rider` accepts. See [Ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-benchmark-replays) and [Create a run](/engineering/qa/e2e#create-a-run). A repeated key returns the existing run. Before creating, the handler expires up to 100 active runs past `expires_at`.
 
 | Scenario | Creates |
 | --- | --- |
 | `auth_existing_rider` | Rider only |
 | `auth_rider_driver_pair` | Rider and an activated driver with a vehicle and fleet membership |
-| `ride_confirmed_rider` | Rider plus a free `confirmed` ride |
+| `ride_confirmed_rider` | Rider plus a free `confirmed` ride. With `payment_fixture`, a driver and a paid ride backed by the run's own Stripe test resources |
 | `ride_queued_pair` | Rider, driver, confirmed ride, an online driver session, and a second active rider and ride |
 | `ride_notification_rider` | Rider only. The ride is created later by `prepare` |
 
@@ -227,8 +227,11 @@ Each run creates its own test community (`is_test`), owner-operator fleet with v
 | `accept` | `auth_rider_driver_pair` | Calls the production `RideService.AcceptRide` as the driver |
 | `auto_assign` | `auth_rider_driver_pair` | Calls `RideService.AutoAssignRide` |
 | `recover_idle_queue` | `auth_rider_driver_pair` | Calls `RideService.RecoverIdleQueue` |
+| `prepare_driver_acceptance`, `publish_assignment`, `observe_accept` | `auth_rider_driver_pair` | Seed a waiting ride that stays off the fleet board, publish it to the board, then check that the real driver's accept queued it |
 
 Before calling a production service, the handler checks that the ride is free (`price=0`, no payment intent) and either `confirmed` and unassigned, or `queued` to this driver for `recover_idle_queue`.
+
+The group also has fault-injection and observation routes for paid fixtures and owned riders. See [Fixture API](/engineering/qa/e2e#fixture-api).
 
 `DELETE /internal/e2e/runs/{id}` removes the run's rides, auth rows, sessions, vehicles, users, school, fleet, and community in one transaction, then marks the run `cleaned`. Expired sweeps mark it `expired`. Both are idempotent.
 

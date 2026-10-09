@@ -52,16 +52,15 @@ Stage names are static strings. A dot marks a sub-step, and `parent_id` gives th
 
 | Stage | Sub-stages |
 | --- | --- |
-| `prepare` | Wraps everything from `community` to `cancel_draft` |
+| `prepare` | Wraps everything from `community` to `stripe` |
 | `community` | None |
 | `locations` | `locations.pickup`, `locations.destination`, `locations.reverse_address` |
 | `route` | `route.distance` and `route.geometry`, run in parallel |
 | `classification` | `classification.pickup` and `classification.destination`, run in parallel |
 | `discount` | None |
 | `history` | None |
-| `stripe` | `stripe.customer` and `stripe.customer_persist` for a rider with no Stripe customer, then `stripe.ephemeral_key` and `stripe.setup_intent` in parallel |
-| `cancel_draft` | None |
-| `persist_draft` | None |
+| `stripe` | `stripe.customer_lookup`, `stripe.customer`, and `stripe.customer_persist` for a rider with no Stripe customer, then `stripe.ephemeral_key` and `stripe.setup_intent` in parallel |
+| `persist_draft` | None. One transaction supersedes the rider's previous draft and inserts the new one. A failure keeps the previous draft |
 | `rider_lock` | Recorded wherever a rider command opens its transaction |
 | `options` | `options.fleet`, `options.types`, `options.pricing_inputs`, `options.price_cache_get`, `options.zones`, `options.price_cache_set`, `options.pickup_times`, `options.drivers` |
 | Driver options | `drivers.presence`, `drivers.queue_summaries`, `drivers.profiles`, `drivers.profile_query`, `drivers.route_etas` |
@@ -155,7 +154,7 @@ The benchmark runs as the **Benchmark isolated E2E API** workflow (`.github/work
 | `baseline_image` | Required | Baseline image digest. It must already include the instrumentation, because the replay needs `X-Request-ID` and the completion log |
 | `candidate_image` | Required | Candidate image digest, compatible with the current E2E schema |
 | `manifest` | `scripts/ride-replay/manifest.benchmark.json` | Repository path to a manifest |
-| `iterations` | `50` | Iterations per case and revision, 1 to 200 |
+| `iterations` | `10` | Iterations per case and revision, 1 to 200 |
 | `concurrency` | `1` | Concurrent measured requests, 1 to 20 |
 
 <Steps>
@@ -226,6 +225,7 @@ python3 scripts/ride-replay/replay.py compare baseline.jsonl candidate.jsonl --o
 | `session.json` | Session ID, tags, revision names, the original traffic signature, pinned secret versions, each revision's URL, image, fingerprint, and resources, and whether cleanup ran |
 | `baseline-client.jsonl`, `candidate-client.jsonl` | One record per measured request, appended as it completes: `case`, `cohort`, `iteration`, `workload_id`, `request_id`, `client_ms`, `status`, `valid`, `revision` |
 | `baseline-logs.jsonl`, `candidate-logs.jsonl` | The matching Cloud Logging entries, and nothing else from the service's logs |
+| `baseline-logs-normalization.json`, `candidate-logs-normalization.json` | Written only when an older instrumented image logged a doubled `request_id` (the same UUID twice). Lists each `original_request_id`, the normalized `request_id`, the log `insert_id`, and the revision |
 | `baseline.jsonl`, `candidate.jsonl` | Client records joined with the server summary (`server`) and `trace_id` |
 | `comparison.json` | The comparison |
 

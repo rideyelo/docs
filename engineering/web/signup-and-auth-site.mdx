@@ -28,6 +28,8 @@ On every path that is not `/auth/v3`, the main entry (`main.tsx`) also calls `re
 | `isDeleteAccountPath()`: `/delete-account`, case-insensitive | `DeleteAccountPage` (lazy) |
 | `/i/fleet/<code>`, optional trailing slash | `FleetInvitePage` (not lazy, because under the `joinyelo.com` proxy only assets referenced by the HTML are namespaced) |
 | `inviteCodeFromPath()`: `/i/<code>`, optional trailing slash | `InvitePage` (not lazy, for the same reason) |
+| `/e/<slug>`, optional trailing slash | `EventLandingPage` (not lazy). Loads the event with `GET /public/events/slug/{slug}` |
+| `/get`, trailing slashes ignored | `GetAppPage` (not lazy). Sends phones to their store and shows store and web links on other devices |
 | Dev build and `?preview=all` or `?preview=<step>` | `PreviewGallery` or a single step. Stubs `GET /tips/*` with sample data. |
 | A `tip` path segment followed by a slug, and `?status=success` | `TipComplete` |
 | A `tip` segment with a slug | `TipStep`, authenticated if `?auth=complete` |
@@ -150,7 +152,9 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 
 ## World Cup claim
 
-`/world-cup/claim` (proxied from `joinyelo.com/world-cup/claim`) first runs the web flow with `intent=world-cup`. With `?auth=complete`, `WorldCupClaimFlow` shows `EduClaimStep`, which validates `*.edu` in the browser and calls `worldCupClaimEducationEmail` → `PUT /world-cup/education-claim`, behind the presignup-token middleware. **Skip for now** asks for confirmation, then both paths end at `Handoff`, which links back to `https://rideyelo.com/world-cup`.
+The World Cup campaign is offline. The `world-cup-router` Worker redirects `joinyelo.com/world-cup/claim` to the home page, so this flow is only reachable on the site's own origin. See [Edge and routing](/engineering/web/edge-and-routing#world-cup-router).
+
+`/world-cup/claim` first runs the web flow with `intent=world-cup`. With `?auth=complete`, `WorldCupClaimFlow` shows `EduClaimStep`, which validates `*.edu` in the browser and calls `worldCupClaimEducationEmail` → `PUT /world-cup/education-claim`, behind the presignup-token middleware. **Skip for now** asks for confirmation, then both paths end at `Handoff`, which links back to `https://rideyelo.com/world-cup`.
 
 ## Account deletion
 
@@ -166,6 +170,8 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 | `yelo.auth-v3.web-pending` | `sessionStorage` | `webFlow.ts` | PKCE `state`, `codeVerifier`, redirect URI, and return search |
 | `yelo_signup_jwt` | `sessionStorage` | `signupTokenStore.ts` | Presignup or full JWT for `/authv2/`, `/user/`, `/world-cup/`, and `/tips/` requests |
 | `yelo.auth-v3.analytics-context` | `sessionStorage` | `analytics.ts` | Correlation IDs for PostHog, without email |
+| `yelo.auth-v3.analytics-flow`, `yelo.auth-v3.analytics-sequence` | `sessionStorage` | `analytics.ts` | The flow UUID and event counter behind `analytics_flow_id` and `client_event_sequence`. They survive the provider redirect and are removed by `resetAuthV3Analytics()`. |
+| `yelo_attr` | Cookie, 90 days, `.joinyelo.com`, `SameSite=Lax`, `Secure` | `experience-router` Worker (response cookie) | The entry click, campaign, and referral code as a query string. `attribution.ts` reads it at sign-up to fill attribution fields the sign-up URL lacks. |
 | `yelo_anon_id` | Cookie, 90 days, `SameSite=Lax`, `Secure` on HTTPS | `attribution.ts` | Anonymous ID sent in link touches and legal-acceptance attribution. Scoped to `.joinyelo.com` on that domain. |
 | `dub_id` | Cookie, 90 days, `SameSite=Lax`, `Secure` on HTTPS | `attribution.ts` (from `?dub_id=`, written synchronously), Dub | Dub click ID. Fallback when `?dub_id=` is absent. Scoped to `.joinyelo.com` on that domain. |
 | Dub analytics cookie | Cookie, `.joinyelo.com`, 90 days | `renderSite({ dubAnalytics })` | Main bundle only |
@@ -174,7 +180,7 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 
 ## Analytics
 
-`initializeAuthV3Analytics()` initializes PostHog only when `VITE_POSTHOG_KEY` is set, `VITE_APP_ENV` (or Vite mode) is `production`, and the context is not an emulator, a test account, or an `@rideyelo.com` email. Pageview, pageleave, and autocapture are off; session replay masks inputs and anything with `ph-no-capture`. Events are the `auth_v3_*` set in `analytics.ts` with `event_schema_version: 2`. The analytics context (`AuthV3AnalyticsContext`) adds attribution dimensions so you can cut the funnel by how the visitor arrived: `has_referral`, `has_link_click`, `utm_source`, `utm_medium`, and `utm_campaign`. The invite code and Dub click ID are never sent, only their presence flags. On a `pagehide` before completion, the page sends `auth_v3_abandoned` with the last stage.
+`initializeAuthV3Analytics()` initializes PostHog only when `VITE_POSTHOG_KEY` is set, `VITE_APP_ENV` (or Vite mode) is `production`, and the context is not an emulator, a test account, or an `@rideyelo.com` email. Pageview, pageleave, and autocapture are off; session replay masks inputs and anything with `ph-no-capture`. Events are the `auth_v3_*` set in `analytics.ts` with `event_schema_version: 3`. Each event carries `analytics_flow_id`, `client_event_sequence`, and `client_event_time`, and is sent immediately. `auth_v3_browser_opened` fires when analytics initializes, so you can tell that the hosted page loaded even if the app never hears back. See [Analytics events](/reference/analytics-events#web-signup-auth-v3). The analytics context (`AuthV3AnalyticsContext`) adds attribution dimensions so you can cut the funnel by how the visitor arrived: `has_referral`, `has_link_click`, `utm_source`, `utm_medium`, and `utm_campaign`. The invite code and Dub click ID are never sent, only their presence flags. On a `pagehide` before completion, the page sends `auth_v3_abandoned` with the last stage.
 
 ## Where this lives in code
 
@@ -183,6 +189,7 @@ Custom amounts show preset buttons for $5, $10, $15, and the config's preset, fi
 | Main router | `yelo-web/src/sites/signup/App.tsx` |
 | Entries | `src/sites/signup/main.tsx`, `src/sites/signup/auth/v3/main.tsx` |
 | Invite landing | `src/sites/signup/invite/` (`InvitePage.tsx`, `FleetInvitePage.tsx`, `appLink.ts`, `referralHandoff.ts`, `api.ts`) |
+| App and event landings | `src/sites/signup/get/GetAppPage.tsx`, `src/sites/signup/event/` (`EventLandingPage.tsx`, `eventLanding.ts`) |
 | Auth v3 page and helpers | `src/sites/signup/auth-v3/` (`AuthV3Page.tsx`, `requestSecret.ts`, `webFlow.ts`, `webIntent.ts`, `redirects.ts`, `authV3Fetch.ts`, `attribution.ts`, `touch.ts`, `analytics.ts`) |
 | Recovery notes | `src/sites/signup/auth-v3/README.md` |
 | Shared steps | `src/shared/signup/steps/` (`TipStep`, `EduClaimStep`, `Handoff`, `OtpStep`, `PhoneStep`, `OAuthStep`) |

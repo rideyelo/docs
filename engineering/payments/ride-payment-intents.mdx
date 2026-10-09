@@ -34,7 +34,8 @@ stateDiagram-v2
   <Step title="Request: customer, ephemeral key, SetupIntent">
     `RideService.CreateRideV2` calls `ensureStripeCustomerSetup` (`internal/service/ride/rider.go`).
 
-    - If `Users.stripe_customer_id` is empty, `Customers.New` with the trimmed email and full name. The ID is saved with `SetStripeCustomerId`.
+    - `CustomerProvisioner.Ensure` (`internal/service/payment/customer.go`) returns the rider's Stripe customer. Most riders already have one, because the `stripe_customer_provision` job creates it after signup. See [On-demand jobs](/engineering/api/background-jobs#on-demand-jobs).
+    - If the loaded user has no `stripe_customer_id`, `Ensure` re-reads the column in case the job finished meanwhile. If it is still empty, it calls `Customers.New` with only `metadata.yelo_user_id` and the idempotency key `yelo-customer-v1-<user id>`, then saves the ID with `ClaimUserStripeCustomerID`. That query keeps an ID another request already stored and never writes to a deleted user. `Ensure` then enqueues the job to set the customer's email and name.
     - Then, in parallel through an `errgroup`: `EphemeralKeys.New` for the customer with `stripe_version=2024-06-20`, and `SetupIntents.New` with `customer` and `automatic_payment_methods.enabled=true`, `allow_redirects=never`.
     - The response carries `stripe_customer_id`, `ephemeral_key`, and `setup_intent_client_secret`. Nothing is written to the ride.
   </Step>
@@ -56,7 +57,7 @@ stateDiagram-v2
     6. The executor reads the intent back with `InspectRideAuthorization`. Finalization accepts that evidence only when it's at most 30 seconds old, then `AddRidePaymentIntent` writes `payment_intent_id`, `payment_intent_client_secret`, `pre_auth_amount`, `cloned_payment_method_id`, and `stripe_merchant_id` in the transaction that finishes the operation.
   </Step>
   <Step title="Capture or void">
-    Every capture is `ExecuteRideCapture`, which calls `PaymentIntents.Capture` with `amount_to_capture` and `final_capture=true`. Every release is `ExecuteRideVoid`, which calls `PaymentIntents.Cancel`. See [Capture paths](#capture-paths).
+    Every capture is `ExecuteRideCapture`, which calls `PaymentIntents.Capture` with `amount_to_capture` only. It doesn't send `final_capture`, because standard authorizations reject that multicapture field. The default capture is final and releases the uncaptured remainder. Every release is `ExecuteRideVoid`, which calls `PaymentIntents.Cancel`. See [Capture paths](#capture-paths).
   </Step>
 </Steps>
 

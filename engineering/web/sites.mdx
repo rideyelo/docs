@@ -16,7 +16,7 @@ There are no `pay` or `drive` sites. Both folders were removed from `yelo-web`, 
 | `dashboard` | Admins, interns, fleet managers | Clerk | Bespoke `main.tsx` | `@/generated/dashboard` | `yelo-dashboard-v2` | Live |
 | `signup` | Riders and drivers signing up, opening personal invite links, tipping, or deleting accounts | Auth v3 and phone OTP, no Clerk | `renderSite` | `@/generated/signup`, `@/generated/auth-v3` | `yelo-signup` | Live |
 | `event` | Anyone with an older shared event link | Public | `renderSite` | `@/generated/event` | `yelo-event` | Live. Event short links now use the `signup` site's `/e/<slug>` landing |
-| `home` | Marketing visitors | Public | Plain `createRoot` | None | `yelo-home` | Live |
+| `home` | Marketing visitors | Public | Plain `createRoot` | None, except one attribution touch (`POST /authv3/attribution/touch`) on attributed visits | `yelo-home` | Live |
 | `maestro` | Engineers reviewing the product inventory and E2E runs | Public viewer | `renderSite` | Supabase Storage JSON | `yelo-maestro` | Internal |
 | `invite` | Anyone opening an `invite.yelo.link` link shared before invites moved to `joinyelo.com/i` | Public | `renderSite` | None | `yelo-invite` | Live |
 | `world-cup` | Students in the World Cup campus race | Public | `renderSite` | `@/generated/dashboard` (world-cup functions) | `yelo-world-cup` | Offline. Its public routes redirect to `joinyelo.com` |
@@ -37,7 +37,7 @@ Implementation details are in [Dashboard architecture](/engineering/web/dashboar
 
 ## signup
 
-The public web entry point for account creation and several one-off flows. It has two HTML entries: `index.html` for the main bundle, and `auth/v3/index.html` for Auth v3, so the sign-in page ships without the guest signup bundle.
+The public web entry point for account creation and several one-off flows. It has two HTML entries: `index.html` for the main bundle, and `auth/v3/index.html` for Auth v3, so the sign-in page ships without the main bundle's router, React Query, axios, sonner, and Dub.
 
 `src/sites/signup/App.tsx` chooses a flow from the URL path rather than route definitions:
 
@@ -88,7 +88,7 @@ Read [Home site](/engineering/web/home-site) before you change this site.
 
 An internal viewer for the product inventory and for end-to-end test runs. The hostname is historical: no Maestro runs anywhere.
 
-- **Views:** The default view is the product inventory: app screens and their states, joined to test captures. `?view=screens` (the default), `?view=flows`, and `?view=runs` pick the screen gallery, the flow list, and the run list. `?run=<run-id>` opens one run with video, screenshots, and a synchronized action log.
+- **Views:** The default view is the product inventory: app screens and their states, joined to test captures. `?view=screens` (the default), `?view=flows`, and `?view=runs` pick the screen gallery, the flow list, and the run list. `?view=previews` opens **Link previews**, a gallery of every `og` Worker card template and fixture. It shows the SVG snapshots that the worker's tests commit under `workers/og/src/templates/__snapshots__`, so it needs no signing secret or worker call, and remote photos inside a card don't load. A **No card yet** list names shared links that have no card of their own. `?run=<run-id>` opens one run with video, screenshots, and a synchronized action log.
 - **Data:** Reads the run index, per-run manifests, and an optional `inventory/catalog.json` as JSON from Supabase Storage, at `VITE_SUPABASE_URL` + `/storage/v1/object/public/e2e`, or from `VITE_E2E_ARTIFACT_BASE_URL` if set. When the bucket has no catalog, the viewer uses the bundled `product-catalog.json`. It does not call the Yelo API.
 - **Auth:** None in the viewer. It stores pinned runs and the theme in `localStorage`.
 - **Dashboard embed:** The dashboard mounts the same `App` at `/inventory` behind Clerk sign-in and the `admin` role. The artifact bucket and this standalone site stay public. See [Inventory](/dashboard/inventory) and [Public sites](/engineering/web/public-sites#maestro).
