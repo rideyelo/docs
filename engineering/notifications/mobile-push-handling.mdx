@@ -1,6 +1,6 @@
 ---
 title: "Mobile push handling"
-description: "How the Yelo app registers push tokens, displays foreground notifications, turns push payloads into React Query invalidations, handles taps and open tracking, and what Live Activities do today."
+description: "How the Yelo app registers push tokens, displays foreground notifications, turns push payloads into React Query invalidations, handles taps and open tracking, and how Live Activities receive background updates."
 ---
 
 The app treats most pushes as two things at once: a message for the user and a signal that cached server data is stale. This page traces both paths through `yelo-frontend`. For the server side of each `data.type`, see [Notification catalog](/engineering/notifications/catalog). For the app's polling fallbacks, see [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#polling-and-push).
@@ -147,10 +147,10 @@ Friend bump pushes carry `destination_poi_id` and coordinates, and the seed comm
 
 ## Live Activities
 
-`widgets/RiderRideActivity.tsx` and `widgets/DriverOnlineActivity.tsx` define Live Activities with `expo-widgets` (`createLiveActivity`). The app starts, updates, and ends both locally. Push plays no part. See [Live Activities](/engineering/mobile/live-activities).
+`widgets/RiderRideActivity.tsx` and `widgets/DriverOnlineActivity.tsx` define Live Activities with `expo-widgets` (`createLiveActivity`). The app starts both locally and updates or ends them while it runs. In the background, `yelo-api` updates and ends the rider activity over APNs. See [Live Activities](/engineering/mobile/live-activities).
 
 - `widgets/index.ts` loads them only when the `ExpoWidgets` native module exists, so older binaries don't crash.
-- `hooks/useLiveActivity.ts` syncs each activity from data the app already fetched. No push-to-start or activity push tokens are requested or sent to the API, and the server has no Live Activity sender.
+- `hooks/useLiveActivity.ts` syncs each activity from data the app already fetched and uploads each activity's push token to `PUT /live-activity/token`. The API sends rider updates directly to APNs, not through Expo. Driver tokens are stored but not pushed to, and no push-to-start token is requested. See [Background updates over APNs](/engineering/mobile/live-activities#background-updates-over-apns).
 - `app.json` enables `enablePushNotifications` on the widgets plugin. `app.config.ts` (`withProductionAps`) forces `aps-environment` back to `production` because the plugin overwrites it with `development`.
 
 ## Where this lives in code

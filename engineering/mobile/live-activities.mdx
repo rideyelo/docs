@@ -1,9 +1,9 @@
 ---
 title: "Live Activities"
-description: "How the rider and driver iOS Live Activities start, update, and end: the sync hook, how props derive from ride status and shift state, the Lock Screen and Dynamic Island layouts, the dev preview route, and platform gating."
+description: "How the rider and driver iOS Live Activities start, update, and end: the sync hook, activity push token upload, background APNs updates from the API, how props derive from ride status and shift state, the Lock Screen and Dynamic Island layouts, the dev preview route, and platform gating."
 ---
 
-The app shows two iOS Live Activities. `RiderRideActivity` follows a rider's confirmed ride. `DriverOnlineActivity` follows a driver's shift. Both are driven entirely from the app's JavaScript: a hook turns data the app already has into props, and one shared hook starts, updates, or ends the activity to match.
+The app shows two iOS Live Activities. `RiderRideActivity` follows a rider's confirmed ride. `DriverOnlineActivity` follows a driver's shift. While the app runs, its JavaScript drives both: a hook turns data the app already has into props, and one shared hook starts, updates, or ends the activity to match. The shared hook also uploads each activity's ActivityKit push token to `yelo-api`. The API then pushes rider ride changes to the Lock Screen over APNs while the app is backgrounded. See [Background updates over APNs](#background-updates-over-apns).
 
 For the widget extension target and its bundle IDs, see [Widgets, experiments, and client toggles](/engineering/mobile/widgets-and-experiments#native-target) and [Native configuration](/engineering/mobile/native-config). For the queries that feed the props, see [Rider and driver flows](/engineering/mobile/rider-and-driver-flows#polling-and-push).
 
@@ -13,7 +13,7 @@ For the widget extension target and its bundle IDs, see [Widgets, experiments, a
 | --- | --- | --- |
 | Layouts | `widgets/RiderRideActivity.tsx`, `widgets/DriverOnlineActivity.tsx` | `createLiveActivity(name, layout)` for each activity, plus the props types |
 | Guarded exports | `widgets/index.ts` | Exports each factory, or `undefined` when the `ExpoWidgets` native module is missing |
-| Sync hook | `hooks/useLiveActivity.ts` | Keeps one activity per factory showing the given props |
+| Sync hook | `hooks/useLiveActivity.ts` | Keeps one activity per factory showing the given props, and uploads its push token |
 | Rider wiring | `hooks/ride/useRiderLiveActivity.ts`, called from `app/(app)/_layout.tsx` | Reads user status, ride details, and map details |
 | Driver wiring | `hooks/drive/useDriverLiveActivity.ts`, called from `app/(app)/drive/_layout.tsx` | Reads `useDriveSession()` |
 | Props builders | `lib/ride/riderLiveActivity.ts`, `lib/ride/driverLiveActivity.ts` | Pure functions from API data to props, each with a `.test.ts` beside it |
@@ -21,7 +21,7 @@ For the widget extension target and its bundle IDs, see [Widgets, experiments, a
 
 ## Lifecycle
 
-`useLiveActivity(factory, props, tag)` takes one of three kinds of `props`:
+`useLiveActivity(factory, props, kind, rideId?)` takes one of three kinds of `props`. `kind` is `rider` or `driver`. `rideId` is the ride a rider activity follows. `useRiderLiveActivity` passes `current_ride_id`, and the driver hook passes none.
 
 | `props` | Meaning | Result |
 | --- | --- | --- |
@@ -42,15 +42,95 @@ flowchart TD
   Null -- "no" --> Has{"an instance exists?"}
   Has -- "yes" --> Update["End extra instances, then update(props) on the first"]
   Has -- "no" --> Start["factory.start(props)"]
+  Update --> Register["Register for push tokens"]
+  Start --> Register
 ```
 
 - **Syncs run one at a time.** Each sync awaits the previous one through a module-level `pending` promise. Two overlapping syncs could otherwise both see no activity and start two. The chain is shared by the rider and driver activities.
 - **Every end is immediate.** The only dismissal policy used is `end('immediate')`.
 - **Duplicates are cleaned up.** When more than one instance exists, the hook keeps the first and ends the rest.
-- **Failures are logged, not thrown.** A failed sync logs `liveActivity.syncFailed` at info level with the `activity` tag (`rider` or `driver`) and the error. The code comment names two expected causes: Live Activities disabled in Settings, and a start attempted while the app is in the background.
+- **Failures are logged, not thrown.** A failed sync logs `liveActivity.syncFailed` at info level with the `activity` kind (`rider` or `driver`) and the error. The code comment names two expected causes: Live Activities disabled in Settings, and a start attempted while the app is in the background.
 - **Nothing ends on unmount.** The effect has no cleanup function. An activity ends only when a later sync receives `null`.
 
-No code requests an activity push token or a push-to-start token, and `yelo-api` has no Live Activity sender. Content changes only when the hook's effect runs in the app.
+### Push token upload
+
+After every update or start, the hook registers the activity for push updates and sends its ActivityKit push token to [`PUT /live-activity/token`](#token-endpoint):
+
+- **On start and rotation.** The hook adds one push token listener per activity ID. The first token arrives a moment after start, and iOS may rotate it later. Each event uploads the new token.
+- **On an activity that outlived the JS runtime.** The hook also calls `getPushToken()` on every sync. An activity that survived an app restart already has a token, so no listener event fires for it.
+- **Deduplicated per kind.** A module-level map remembers the last token and ride ID uploaded for each kind. An unchanged pair is not sent again.
+- **Retried on the next sync.** A failed upload logs `liveActivity.tokenUploadFailed` at info level with the `activity` kind and the error. It is not recorded as uploaded, so the next sync tries again.
+
+The app never requests a push-to-start token. The API can update or end an activity the app started, but it can't start one.
+
+## Background updates over APNs
+
+`yelo-api` keeps the rider activity current while the app is backgrounded. It stores the push token the app uploads and, when a ride transition touches that rider, sends fresh content straight to APNs. Expo's push service doesn't relay Live Activity updates, so the API uses its own APNs client.
+
+```mermaid
+flowchart TD
+  App["useLiveActivity"] -- "PUT /live-activity/token" --> Store[("LiveActivityTokens")]
+  Ride["Ride transition commits"] --> Enqueue["Enqueue live_activity_refresh per affected user with a token"]
+  Enqueue --> Worker["Worker reads current ride state"]
+  Worker --> Phase{"Ride has a live phase?"}
+  Phase -- "yes" --> Update["APNs event: update"]
+  Phase -- "no" --> End["APNs event: end, then delete the token"]
+  Update --> Gone{"APNs reports the token gone?"}
+  Gone -- "yes" --> Delete["Delete the token"]
+```
+
+### Token endpoint
+
+`PUT /live-activity/token` is an authenticated route that stores the push token of the activity the app started, or the token iOS just rotated.
+
+```json
+{
+  "kind": "rider",
+  "ride_id": "8b7f6c1e-2a4d-4f0e-9c3b-5d1a7e2f9b60",
+  "token": "80f1a3c4..."
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `kind` | `rider` or `driver` |
+| `ride_id` | Required when `kind` is `rider`. The ride must be one the caller is the rider on. Ignored and stored as `NULL` for `driver`. |
+| `token` | Non-empty hex string of at most 512 characters |
+
+The API keeps one token per user and kind in [`LiveActivityTokens`](/reference/database/growth-notifications-and-messaging#liveactivitytokens). A new upload replaces the previous token of the same kind. A successful call returns `200` with `{"success": true}`. A validation failure returns `400`. A rider token for a ride the caller can view but isn't the rider on returns `403`. A ride with an assigned driver that the caller has no part in returns `401`, and an unknown ride returns `404`.
+
+### Refresh job
+
+When a ride transition commits, the ride revision finalizer enqueues one `live_activity_refresh` River job for each affected user that has a stored token. The insert runs in the ride transaction, so the job exists only if the ride change commits. It runs even for a silent cancellation, because the Lock Screen follows the ride whether or not a push notification is sent. A process without a River client skips the enqueue rather than failing the ride command.
+
+The job carries only the user ID and has at most 3 attempts. The worker reads the ride's current state when it runs, so a late, duplicate, or reordered job is harmless, and the next transition enqueues a fresh one.
+
+For each rider token, the worker builds the same props the app builds:
+
+| Ride status | APNs event | Content |
+| --- | --- | --- |
+| `confirmed`, `queued`, `driver_en_route`, `driver_waiting`, `in_progress`, `pending_rider_rating` | `update` | The [phase](#phases) and [props](#props) for that status |
+| Any other status | `end` with an immediate dismissal date | `phase: "completed"`, then the API deletes the token |
+
+For `driver_en_route` and `in_progress`, the worker reads map details for the ETA. If routing fails, it sends the update without an ETA rather than holding back the phase change. A `queued` ride uses the ride's `queue_eta_minutes` and `queue_position`. Unlike the app, the worker doesn't fall back to the map's queue position.
+
+### When the API deletes a token
+
+The API deletes a stored rider token when:
+
+- It sends an `end` event because the ride no longer has a live phase.
+- APNs responds with status `410`.
+- APNs responds with reason `Unregistered`, `BadDeviceToken`, `DeviceTokenNotForTopic`, or `ExpiredToken`.
+
+Any other APNs failure fails the job attempt, and River retries it.
+
+<Warning>
+  Driver tokens are stored but never pushed to. The worker skips every `driver` token, so the driver activity still updates only while the app runs.
+</Warning>
+
+### Configuration
+
+Pushes need an APNs token-based (`.p8`) credential set through `APNS_PRIVATE_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, and `APNS_HOST`. When `APNS_PRIVATE_KEY` is empty, the API still stores tokens, but every refresh job does nothing and activities update only while the app is open. See [Configuration](/engineering/api/configuration#environment-variables).
 
 ## Rider activity
 
@@ -244,7 +324,7 @@ Each row has the test ID `live-activity-<scenario>`, and the status line has `li
 | --- | --- |
 | Layouts and props types | `yelo-frontend/widgets/RiderRideActivity.tsx`, `widgets/DriverOnlineActivity.tsx` |
 | Native module guard | `yelo-frontend/widgets/index.ts` |
-| Sync hook | `yelo-frontend/hooks/useLiveActivity.ts` |
+| Sync hook and token upload | `yelo-frontend/hooks/useLiveActivity.ts` |
 | Rider hook and props | `yelo-frontend/hooks/ride/useRiderLiveActivity.ts`, `lib/ride/riderLiveActivity.ts` |
 | Driver hook and props | `yelo-frontend/hooks/drive/useDriverLiveActivity.ts`, `lib/ride/driverLiveActivity.ts` |
 | Props tests | `yelo-frontend/lib/ride/riderLiveActivity.test.ts`, `lib/ride/driverLiveActivity.test.ts` |
@@ -252,12 +332,19 @@ Each row has the test ID `live-activity-<scenario>`, and the status line has `li
 | Registration at startup | `yelo-frontend/app/_layout.tsx` |
 | Dev preview | `yelo-frontend/app/live-activity-preview.tsx` |
 | Driver data sources | `yelo-frontend/providers/DriveProvider.tsx` |
+| Token endpoint | `yelo-api/internal/server/http/liveactivity/handler.go` |
+| Token storage and refresh | `yelo-api/internal/service/liveactivity/liveactivity.go`, `rider.go` |
+| APNs client | `yelo-api/internal/utilities/notification/apns.go` |
+| Refresh job and worker | `yelo-api/internal/notify/jobs.go`, `internal/notify/queue/queue.go` |
 
 ## Gotchas and edge cases
 
 <AccordionGroup>
-  <Accordion title="Content goes stale in the background">
-    Nothing updates an activity by push. The driver queries that feed the props (ride board, queue detail, map details) all set `refetchIntervalInBackground: false`. An activity on the Lock Screen keeps its last content until the app runs a sync again.
+  <Accordion title="Driver content goes stale in the background">
+    The API pushes only rider activities. The driver queries that feed the driver props (ride board, queue detail, map details) all set `refetchIntervalInBackground: false`. A driver activity on the Lock Screen keeps its last content until the app runs a sync again. Rider activities also stay stale in the background when `APNS_PRIVATE_KEY` is unset.
+  </Accordion>
+  <Accordion title="The server props must match the layout">
+    The API builds rider props itself to mirror `riderLiveActivityProps`. The layouts ship over the air, so field names and phases are a contract: only ever add fields.
   </Accordion>
   <Accordion title="The driver ETA depends on the drive map being visible">
     `DriveProvider` polls map details only while the path is `/drive` and the screen is presented. On other drive screens, `etaMinutes` comes from whatever map details are cached, or from `pickup_duration` and `destination_duration` on the ride.
