@@ -58,18 +58,65 @@ flowchart LR
 | `top_locations` | `Location.GetTopLocations` | 20 |
 | `events` | `Event.GetUpcoming` with `uuid.Nil` as viewer, so no per-user viewed flag | 25 |
 | `spot` | `Spot.GetActiveByCommunity` | 1 |
-| `heatmap`, `heatmap_max_weight` | `maplayer:heat:{c}` | Up to 500 cells |
+| `heatmap`, `heatmap_max_weight` | `maplayer:heat:{c}` | Up to `max_cells` (default 500) |
 | `moves` | Bumps and public ride destinations | 50 |
 
 ### Heatmap
 
-`RefreshHeatmaps` in `heatmap.go` runs in the `MapHeat` loop every 5 minutes, and once immediately at startup (`backgroundCleanupImmediately`). For every active, non-hidden community:
+`RefreshHeatmaps` in `heatmap.go` runs in the `MapHeat` loop every 5 minutes, once immediately at startup (`backgroundCleanupImmediately`), and once after every save of the heat settings. It reads the settings once per run, then for every active, non-hidden community:
 
-1. Read last-known positions from Postgres with `ListFreshCommunityCoordinates`: users in the community, not deleted, `share_location_with_friends = TRUE`, `location_updated_at` within 60 days, non-zero coordinates, at most 10,000 rows.
-2. Bin into a grid of 0.0005 degrees (about 50 m of latitude) using `floor(coordinate / 0.0005)`. Each cell reports its center.
-3. Drop cells with fewer than 3 users (`heatMinUsers`, a k-anonymity floor).
-4. Keep the 500 heaviest cells (`heatMaxCellsCap`).
-5. Write `maplayer:heat:{c}` with a 15-minute TTL, then invalidate the community layer cache.
+1. Pick the community's values: its entry in `communities` if it has one, otherwise the platform-wide values (`MapHeatSettings.For`).
+2. Read last-known positions from Postgres with `ListFreshCommunityCoordinates`: users in the community, not deleted, `share_location_with_friends = TRUE`, `location_updated_at` within `position_max_age_days`, non-zero coordinates, at most 10,000 rows.
+3. Bin into a grid of `cell_degrees` using `floor(coordinate / cell_degrees)`. Each cell reports its center.
+4. Drop cells with fewer than `min_users` users. The floor never goes below 3 (`MapHeatMinUsersFloor`, a k-anonymity floor).
+5. Keep the `max_cells` heaviest cells.
+6. Write `maplayer:heat:{c}` with a 15-minute TTL, then invalidate the community layer cache.
+
+#### Heat settings
+
+The binning inputs live in the `MapHeatSettings` singleton table (migration 000357), not in constants. The `settings` JSONB column holds the platform-wide values plus optional per-community overrides keyed by community ID. Per-community values replace the platform-wide set as a whole. They don't merge field by field. If the row can't be read, the refresh logs a warning and uses the defaults.
+
+| Field | Default | Valid range | Meaning |
+| --- | --- | --- | --- |
+| `cell_degrees` | `0.0005` (about 50 m of latitude) | 0.0002 to 0.02 | Grid cell size in degrees |
+| `min_users` | `3` | 3 to 1000 | Cells with fewer people are dropped |
+| `max_cells` | `500` | 1 to 2000 | Cells kept per community, heaviest first |
+| `position_max_age_days` | `60` | 1 to 365 | Positions older than this are ignored |
+
+```json
+{
+  "cell_degrees": 0.0005,
+  "min_users": 3,
+  "max_cells": 500,
+  "position_max_age_days": 60,
+  "communities": {
+    "3f6c1d2e-8a4b-4c1f-9e2d-1a2b3c4d5e6f": {
+      "cell_degrees": 0.001,
+      "min_users": 5,
+      "max_cells": 300,
+      "position_max_age_days": 30
+    }
+  }
+}
+```
+
+Admins edit the settings from **Map settings** on the dashboard **Map** page. See [Map settings](/dashboard/community-map#map-settings). The routes are mounted on the `/dashboard` group and need the platform `admin` role. Responses send `Cache-Control: no-store`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/dashboard/map/heat-settings` | Read the platform-wide values and per-community overrides |
+| `PUT` | `/dashboard/map/heat-settings` | Replace the whole settings document. Returns `400` when a value is out of range or a `communities` key isn't a community ID. On success, starts a detached `RefreshHeatmaps` run instead of waiting for the next tick. |
+| `POST` | `/dashboard/map/heat-settings/preview` | Bin live positions with unsaved values. Publishes nothing. |
+
+The preview request carries a `community_id`, the draft `settings`, and up to 32 `sweep_cell_degrees`. The response has `cells` for that community, plus one row per active, non-hidden community with `eligible_users`, `live_cells` (what the app shows now), and `sweep_cells` (the cell count at each sweep size, capped at `max_cells`). Every preview count keeps the floor of 3.
+
+```json
+{
+  "community_id": "3f6c1d2e-8a4b-4c1f-9e2d-1a2b3c4d5e6f",
+  "settings": { "cell_degrees": 0.0005, "min_users": 3, "max_cells": 500, "position_max_age_days": 60 },
+  "sweep_cell_degrees": [0.00025, 0.0005, 0.001]
+}
+```
 
 The heatmap reads Postgres only. Merging presence would double-count online users and leak users who turned off location sharing.
 
@@ -178,6 +225,7 @@ The request structs carry no validation tags. `service/mobilityfeed` validates `
 
 | Concern | Path |
 | --- | --- |
+| Heat settings | `yelo-api/internal/models/map_heat_settings.go`, `internal/server/http/dashboard/mapheat/routes.go` |
 | Layer service | `yelo-api/internal/service/maplayer/maplayer.go`, `heatmap.go`, `community_moves.go`, `friends_layer.go`, `mobility.go`, `bump_retention.go` |
 | Layer cache | `yelo-api/internal/data/redis/map_layer_cache.go` |
 | Presence reads | `yelo-api/internal/data/redis/presence_cache.go` (`GetVehiclePresences`, `GetPresenceBatch`) |
@@ -203,10 +251,13 @@ The request structs carry no validation tags. `service/mobilityfeed` validates `
     Vehicles from a feed in backoff vanish on the next tick. A GTFS schedule keeps serving from its 24-hour per-feed key even while the feed is failing.
   </Accordion>
   <Accordion title="The heatmap is not live presence">
-    It uses last-known Postgres positions up to 60 days old. A campus that emptied out for break still shows heat. The dashboard labels it presence.
+    It uses last-known Postgres positions up to `position_max_age_days` old (60 by default). A campus that emptied out for break still shows heat. The dashboard labels it presence.
   </Accordion>
   <Accordion title="Grid edges split groups">
     Cells use `floor`, so three people standing across a cell boundary can fall below the floor of 3 in both cells and disappear from the heatmap.
+  </Accordion>
+  <Accordion title="Saving for all communities drops the selected override">
+    `PUT /dashboard/map/heat-settings` replaces the whole document. When an admin saves for **All communities**, the dashboard removes the selected community's own entry, so that community follows the platform-wide values again. Other communities keep their overrides.
   </Accordion>
   <Accordion title="Friends appear online from location uploads alone">
     `is_online` only checks for a presence hash. A driver's background task creates or refreshes that hash through `POST /user/location` even when no heartbeat was sent.

@@ -127,13 +127,15 @@ No API behavior branches on `PUT /user/app-version`, telemetry `app_version`, or
 
 | Name | Where defined | Default | What it changes | Who can change it |
 | --- | --- | --- | --- | --- |
+| `map-hints` | `lib/experiments/index.ts` | off | Edge hints for live friends and pinned destinations on the map tab | Admin and Self |
+| `heat-cell-control-panel` | `lib/experiments/index.ts` | off | Profile dock bubble and live tuning panel for the community heat layer | Admin and Self |
 | `glass_lab` | `lib/experiments/index.ts:12` | off | Settings row and Glass Lab screen (`app/(app)/profile/settings.tsx:61,241`, `profile/glass-lab.tsx:113`) | Admin (community list) and Self (user list) |
 | `color-lab` | `lib/experiments/index.ts:14` | off | Color Lab screen | Admin and Self |
 | `design-system-lab` | `lib/experiments/index.ts:16` | off | Design System Lab screen | Admin and Self |
 
 - `rideshare-price-aggregator` is retired. It graduated to Fare Finder, which is on for all riders and controlled by `Communities.fare_finder_disabled` (see [Per-entity flags](#per-entity-flags)). Communities keep the key so older app versions still honor it. Current builds hide it from **Settings > Experiments** (`lib/experiments/index.ts:19-26`).
 - An experiment is on only when `user.active_experiments` **and** `community.active_experiments` both contain the key (`lib/experiments/index.ts:43-52`). The client evaluates this; the API only stores and returns the lists (`Users.active_experiments`, `Communities.active_experiments`, migration 000265).
-- Admins edit the community list as free text in the community editor (`src/components/CommunityEditor.tsx:72-73,160,177-186`, `PATCH /dashboard/manage/{id}`).
+- Admins grant or revoke a key on the dashboard **Communities** > **Experiments** tab (`src/sites/dashboard/components/CommunityExperiments.tsx`, `PUT /dashboard/experiments`). The endpoint changes one key across up to 500 communities and leaves other keys alone. The community editor no longer sends `active_experiments`.
 - Users opt in on **Settings > Experiments** (`app/(app)/profile/experiments.tsx`, `PUT /user/experiments`). The row appears only when the community has at least one experiment besides the retired key.
 
 ## Admin-editable settings
@@ -160,6 +162,7 @@ No API behavior branches on `PUT /user/app-version`, telemetry `app_version`, or
     | `NotificationTemplates` (`is_active`, `silent`, cooldowns, quiet hours) and variants | Migrations 000237, 000250, 000293 | Seeded insert-if-missing | Inactive templates are skipped (`notify/queue/orchestrate.go:406`). `silent` sends data-only pushes (`notify/queue/send.go:248`) | Admin, `/dashboard/notifications/templates` (`router.go:642`) |
     | `NotificationPolicies`, `ReferralRewards`, `PromoBanners`, `PromoBars`, `RideDemandCurves` | Migrations 000250, 000142, 000085, 000144, 000129 | | Read at runtime | SQL |
     | `GoogleCalendarOwner` | Migration 000317 | | Operating-hours calendar source | Admin, `/dashboard/calendar-owner/*` |
+    | `MapHeatSettings.settings` (singleton JSON: `cell_degrees`, `min_users`, `max_cells`, `position_max_age_days`, optional `communities` overrides) | Migration 000357; `models/map_heat_settings.go` | 0.0005, 3, 500, 60 | Presence heatmap binning (`service/maplayer/heatmap.go`). `min_users` never drops below 3 | Admin, `PUT /dashboard/map/heat-settings` (`server/http/dashboard/mapheat/routes.go`); web **Map settings** on `/map` |
 
     See [Activation](/dashboard/activation), [Operating hours](/admin/operating-hours), and [Notification templates](/dashboard/notification-templates).
   </Accordion>

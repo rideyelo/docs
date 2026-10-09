@@ -51,7 +51,7 @@ Experiments are opt-in features that a community makes available and a user turn
 
 An experiment is on when both of these are true:
 
-1. The community's `active_experiments` contains the key. Admins edit this list in the dashboard community editor (`CommunityEditor.tsx`, **Experimental Features**).
+1. The community's `active_experiments` contains the key. Admins grant keys on the dashboard **Communities** > **Experiments** tab, a community-by-key grid backed by `PUT /dashboard/experiments`. See [Manage experiments](/dashboard/communities#manage-experiments).
 2. The user's `active_experiments` contains the key. Users edit this list on **Settings** > **Experiments**.
 
 ```mermaid
@@ -73,6 +73,8 @@ sequenceDiagram
 
 | Constant | Key | Gates | Read in |
 | --- | --- | --- | --- |
+| `mapHints` | `map-hints` | Map Hints: live friends and pinned destinations tracked along the map's side edges, with flyover haptics | `app/(app)/(tabs)/map/_layout.tsx` (`EdgeMapHints`) |
+| `heatCellControlPanel` | `heat-cell-control-panel` | Heat Cell Control Panel: a third profile dock bubble that opens live sliders for the community heat layer (cell merge, people floor, cell cap, weight, radius, intensity, opacity, color ramp). Users outside the experiment keep the shipped heat style. | `components/home/ProfileDriveBubble.tsx`, `components/map/layout/MapAboveSheetOverlays.tsx` |
 | `glassLab` | `glass_lab` | **Settings** > **Glass Lab**, a Liquid Glass diagnostic harness | `app/(app)/profile/settings.tsx`, `glass-lab.tsx` |
 | `colorLab` | `color-lab` | **Settings** > **Color Lab** | `settings.tsx`, `color-lab.tsx` |
 | `designSystemLab` | `design-system-lab` | **Settings** > **Design System Lab** | `settings.tsx`, `design-system-lab.tsx` |
@@ -183,7 +185,7 @@ The last five aren't gated by `__DEV__`. They stay off only because no EAS envir
 
 | Constant | File | Value | Effect |
 | --- | --- | --- | --- |
-| `EDGE_POINTERS_ENABLED` | `components/map/edgePointers/constants.ts` | `false` | Hides off-screen edge pointers on the map tab (`app/(app)/(tabs)/map/_layout.tsx`) |
+| `EDGE_POINTERS_ENABLED` | `components/map/edgePointers/constants.ts` | `false` | No longer read. The map tab now shows edge hints through the `map-hints` experiment instead. |
 
 Ride creation also sends a capability header, `X-Features: tips,driver-options`. It describes what the client can render, not a user toggle. See [State and data](/engineering/mobile/state-and-data#x-features-header).
 
@@ -209,5 +211,5 @@ The app doesn't read PostHog feature flags.
 - **Dismissing the first dialog skips the store prompt.** Dismissing **Thoughts on the app?** calls `reset()`, not `finish()`, so `maybeRequestReview` never runs. The feedback cooldown has already started.
 - **Prompt state is per device.** Both state machines live in AsyncStorage. A reinstall or new device resets cadence, cooldowns, and one-shot flags. The iOS system also rate-limits `requestReview()` on its own.
 - **Unknown experiment keys still show up.** The Experiments screen lists every community key, including ones no build gates. Users can toggle them with no visible effect.
-- **Experiment keys are a cross-repo contract.** The dashboard stores free-text keys. A typo in the community editor silently makes the experiment unavailable.
+- **Experiment keys are a cross-repo contract.** The dashboard **Experiments** tab lists the keys the app reads and any key a community already has, but **Add experiment** accepts any valid key. A typo there silently makes the experiment unavailable. When you add a key to `EXPERIMENTS`, also add it to the dashboard's known list so it shows up before any community has it.
 - **The widget module guard hides import errors.** If `ExpoWidgets` is missing, both factories are `undefined` with no log line, and no Live Activity starts. The dev route `/live-activity-preview` reports it.

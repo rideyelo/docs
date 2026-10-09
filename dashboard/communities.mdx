@@ -1,6 +1,6 @@
 ---
 title: "Communities"
-description: "Create and configure communities, draw service areas, control availability and ride settings, remove communities, and review community metrics and operating hours."
+description: "Create and configure communities, draw service areas, control availability and ride settings, grant experiments, remove communities, and review community metrics and operating hours."
 ---
 
 A community is one Yelo market, such as a campus and the area around it. Each community has a service area, availability controls, and ride settings. This page covers the two dashboard pages for communities:
@@ -17,10 +17,11 @@ For how communities, service areas, and zones relate, see [Communities and zones
 
 ## Find a community
 
-Open **Communities** in the **Configuration** group of the sidebar. The page has two tabs:
+Open **Communities** in the **Configuration** group of the sidebar. The page has three tabs:
 
 - **Communities**: community management, described on this page.
 - **Schools**: school coordinates and automatic community mapping. See [Schools and communities](/administration/schools-and-communities). The old `/schools` URL opens this tab.
+- **Experiments**: which experiment keys each community grants. See [Manage experiments](#manage-experiments). The `?tab=experiments` URL opens this tab.
 
 The **Communities** tab starts with the **Community service areas** map. It draws each community's bounding box in one of three colors: **Active**, **Inactive**, or **Selected**. Badges above the map count active and total communities.
 
@@ -30,7 +31,7 @@ To open a community's workspace, do one of these:
 - Pick it in the community menu below the map.
 - Select its row, or **Manage**, in the **All communities** directory.
 
-The **All communities** directory lists every market, including inactive, hidden, and test communities. Use **Find a community…** to filter by name, primary vehicle type, or timezone.
+The **All communities** directory lists every market, including inactive, hidden, and test communities. Use **Find a community…** to filter by name or timezone.
 
 | Column | Description |
 | --- | --- |
@@ -39,9 +40,7 @@ The **All communities** directory lists every market, including inactive, hidden
 | **Schools** | How many schools belong to the community. |
 | **Rides** | **Enabled** or **Disabled**. |
 | **Hidden** | Shows **Hidden** when the community is hidden from listings. |
-| **Vehicle Type** | The community's primary vehicle type. |
 | **Users** | Total users, split into home users and visiting users. |
-| **Experimental Features** | Feature keys turned on for the community. |
 
 The selected community is saved in the URL as `?community=`, so you can share a link to its workspace.
 
@@ -58,7 +57,7 @@ The selected community is saved in the URL as `?community=`, so you can share a 
     Under **Geography**, select **Draw box**, then click and drag across the community area. Select **Redraw box** to start over.
   </Step>
   <Step title="Check the preview">
-    Review the automatic **Timezone** and the **Automatic school mapping** preview. See [Timezone](#timezone) and [Preview school changes](/administration/schools-and-communities#preview-school-changes-before-editing-a-community).
+    Review the automatic **Timezone**. To see how the new service area reassigns schools, select **Schools** on the map. See [Timezone](#timezone) and [Preview school changes](/administration/schools-and-communities#preview-school-changes-before-editing-a-community).
   </Step>
   <Step title="Save">
     Select **Create Community**.
@@ -69,7 +68,9 @@ New communities start inactive with rides disabled. Open the new community's wor
 
 ## Configure a community
 
-The community workspace groups every setting for one community. Select **Save Changes** to apply your edits, or **Close workspace** to leave without saving.
+The community workspace groups every setting for one community. **General**, **Controls**, and **Defaults** stack in a narrow column next to the **Geography** map. Select **Save Changes** to apply your edits, or **Close workspace** to leave without saving.
+
+To copy the community's ID, select the copy icon in the workspace header.
 
 ### General
 
@@ -84,22 +85,16 @@ The community workspace groups every setting for one community. Select **Save Ch
 | --- | --- |
 | **Active** | Turns the community on. Inactive communities don't count for automatic school mapping. |
 | **Hidden** | Hides the community from listings. |
-| **Rides Disabled** | Stops Yelo from offering rides in the community. Riders who search for a ride see no Yelo ride options and fall back to third-party options. |
+| **Rides** | Turn it off to stop Yelo from offering rides in the community. Riders who search for a ride then see no Yelo ride options and fall back to third-party options. Saving writes the inverse of this switch to `rides_disabled`. |
 | **Fare Finder** | Turns Fare Finder, the live third-party fare comparison on the rider request sheet, on or off for the community. It is on by default. Turn it off to show riders static third-party deep-link cards instead. The app picks up the change within about 60 seconds. The dashboard saves this switch only when you flip it, so saving other settings doesn't overwrite another admin's change. See [Fare Finder kill switch](/concepts/communities-and-zones#fare-finder-kill-switch). |
-| **Map activity window** | How far back, in hours, anonymized "people heading to…" activity appears on the rider map. Enter a whole number from 1 to 720. The default is 168 hours, which is 7 days. |
 
-### Ride configuration
+The **Map activity window** moved to the **Map settings** dialog on the **Map** page. See [Map settings](/dashboard/community-map#map-settings).
+
+### Defaults
 
 | Field | Description |
 | --- | --- |
-| **Primary Vehicle Type** | The community's main vehicle type. See [Vehicle types](/dashboard/vehicles). |
 | **Primary Fleet** | The community's main fleet. Its rider options sort ahead of other fleets with the same live status, and community operating hours can follow its calendar. See [Operating hours](#operating-hours). Choosing **None** doesn't clear a saved primary fleet. Archived fleets can't be selected, and a fleet can't be archived while it is a community's primary fleet. |
-
-### Experimental features
-
-Experimental features turn on in-development behavior for one community. Type a feature key, such as `feature_key`, and select **Add** or press Enter. Select the remove icon next to a key to turn it off.
-
-Only add keys that engineering has given you. The dashboard doesn't check whether a key exists.
 
 ### Geography
 
@@ -109,13 +104,40 @@ The bounding box is the community's service area. Select **Redraw box** to chang
 - The north edge must be above the south edge.
 - The east edge must be to the right of the west edge.
 
-Changing the bounding box or **Active** reassigns schools when you save. The **Automatic school mapping** panel previews which schools will move. See [Schools and communities](/administration/schools-and-communities).
+Changing the bounding box or **Active** reassigns schools when you save. Select **Schools** on the map to pin affected schools and preview which ones will move. The button shows how many schools change. See [Schools and communities](/administration/schools-and-communities#preview-school-changes-before-editing-a-community).
 
 If another admin changes the same community's service area while you edit, saving fails with "Reload the community before saving its service area." Reload the page and make your change again.
 
 ### Timezone
 
 Yelo sets each community's timezone from its service area, including daylight saving time. The **Timezone** panel updates as you draw. If it says the service area needs attention, adjust the bounding box.
+
+## Manage experiments
+
+Experiments turn on in-development app features. A user gets an experiment only when both of these are true:
+
+- Their community grants the key on the **Experiments** tab.
+- They opt in on the app's **Settings** > **Experiments** screen.
+
+The **Experiments** tab is a grid. Each row is a community, and each column is an experiment key. Inactive communities show an **inactive** label. Each column header shows how many of the listed communities have the key, such as **3 of 12**. Every change saves right away.
+
+- **Turn a key on or off for one community**: flip the switch in that community's row.
+- **Turn a key on or off for many communities**: select **All** or **None** under the key. These buttons only change the communities currently listed. To target a subset, type in **Filter communities** first.
+- **Add a new key**: type it in **new-experiment-key** and select **Add experiment**. The key appears as a column. It isn't saved until you turn it on for at least one community.
+
+Keys use 1 to 64 lowercase letters, digits, hyphens, or underscores, and start with a letter or digit. The grid always shows the keys the current app reads, plus any key a community already has. Only add keys that engineering has given you. The dashboard doesn't check whether the app uses a key.
+
+Saving a community in its workspace no longer changes its experiments.
+
+The tab calls `PUT /dashboard/experiments`, which grants or revokes one key across up to 500 communities and leaves every other key alone. It requires the platform `admin` role.
+
+```json
+{
+  "key": "map-hints",
+  "community_ids": ["3f6c1d2e-8a4b-4c1f-9e2d-1a2b3c4d5e6f"],
+  "enabled": true
+}
+```
 
 ## Remove a community
 
