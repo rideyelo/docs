@@ -207,7 +207,7 @@ Chat access follows the ride's current participants. A reassigned driver immedia
 - **No status gate.** Participants can message on completed and canceled rides indefinitely. Every such message sends a push.
 - **Messages before a driver exists.** A rider message sent before assignment is stored with no push. The driver sees it once assigned, but is never notified about it.
 - **v2 service skips the upfront participant check.** `SendMessageV2`, `GetMessageDelta`, and `GetMessageHistory` rely on the repository and SQL checks. The v1 path checks in the service with `requireRideParticipant` and again in the repository.
-- **Status codes differ by path.** A missing ride returns 404 on v1 and v2 send (from `Ride.GetByID` or `LockMessageRide`). It returns 403 on delta and history (`GetMessageParticipation` returns false) and on mark-read (the `42501` from `advance_ride_message_read`).
+- **Status codes differ by path.** A missing ride returns 404 on v1 and v2 send (from `Ride.GetByID` or `LockMessageRide`). It returns 403 on delta and history (`GetMessageParticipation` returns false).
 - **Different content, same ID.** Reusing a `client_message_id` for different content returns 400. That can happen if a client retries after the user edits a failed draft without generating a new ID.
 - **Chat writes lock the ride row.** `LockMessageRide` takes `FOR UPDATE` on `Rides`. A send waits behind any in-flight lifecycle command on the same ride, and vice versa.
 - **Message content is duplicated.** `InsertMessageTimeline` copies the full text into `RideEvents.metadata`. Deleting a `RideMessages` row doesn't remove that copy.

@@ -31,6 +31,7 @@ Every claim in this section comes from tracing constructors and call sites in `y
 | Cancellation fee preview | `CancelIntent`, through `quoteFinancialCancellation` | `QuoteCancellation(rideID, actorID)`. Returns `fee_cents / 100` from the saved quote |
 | Cancel | `Cancel`, through `cancelFinancialRide` | `CancelLegacy(rideID, actorID, reason, comment)` |
 | Rider rating with tips enabled | `Rate`, through `captureTip` | `SettleTipLegacy` for a tip inside the buffer, `TipLegacy` for a dedicated tip |
+| Tip resume | `Tip` with no amount | `ConfirmTipLegacy(rideID, riderID)` |
 | Tip-window sweeper | `AutoCaptureTipWindowExpired`, through `autoCaptureSingleRide` | `SettleTipLegacy(rideID, uuid.Nil, 0, true)` |
 | Unmatched-request expiry | `CancelUnmatchedRides` | `ExpireUnmatched()` |
 
@@ -365,7 +366,7 @@ The `ride_legacy_*.go` files adapt clients that send no command ID or revision. 
 | `CompleteLegacy` | One completion per ride and driver. A stored operation supplies its original revision. |
 | `SettleTipLegacy` | One settlement per ride and actor. The automatic variant uses a nil actor. It resumes an explicit command that a newer client reserved. |
 | `TipLegacy` | The ID includes the amount. An unfinished or succeeded tip can't be replaced with a different amount. Only a `failed` (canceled) tip allows a new amount. |
-| `ConfirmTipLegacy` | No ride service caller since `POST /ride/i/{id}/confirm-tip` was removed in October 2026. Resumes the saved tip by rider and ride. It never accepts a client-supplied PaymentIntent ID and never creates a tip. With no `tip` operation and no legacy intent to adopt, it returns the input error "No tip". |
+| `ConfirmTipLegacy` | Called by `RideService.Tip` (`POST /ride/i/{id}/tip`) when the request has no amount. `POST /ride/i/{id}/confirm-tip` was removed in October 2026. Resumes the saved tip by rider and ride. It never accepts a client-supplied PaymentIntent ID and never creates a tip. With no `tip` operation and no legacy intent to adopt, it returns the input error "No tip". |
 
 ### Adopting an existing tip intent
 
