@@ -137,19 +137,19 @@ The permission string (from `app.config.ts`) is: "Yelo securely sends phone numb
 | `NSPhotoLibraryUsageDescription` | "Yelo needs access to your photos to upload profile pictures and verify driver identity for safety" | `expo-image-picker` plugin |
 | `NSContactsUsageDescription` | See [Contacts](#contacts) | `expo-contacts` in `app.config.ts` |
 | `UIBackgroundModes` | `location`, `remote-notification`. `fetch` is stripped by `withoutBackgroundFetch`. | `app.json`, `app.config.ts` |
-| `LSApplicationQueriesSchemes` | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam`, plus the `react-native-share` list (`fb`, `instagram`, `twitter`, `tiktoksharesdk`) | `app.json` |
+| `LSApplicationQueriesSchemes` | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam`, `waze`, `msauth`, `tel`, plus the `react-native-share` list (`fb`, `instagram`, `twitter`, `tiktoksharesdk`) | `app.json` |
 | `ITSAppUsesNonExemptEncryption` | `false` | `app.json` |
 | `aps-environment` | `production`. `withProductionAps` restores it after `expo-widgets` overwrites it with `development`. | `app.config.ts` |
 | Apple Pay | `com.apple.developer.in-app-payments` = `merchant.com.rideyelo.yelo` | `app.json` |
 | Sign in with Apple | `usesAppleSignIn: true` | `app.json` |
-| Associated domains | `yelo.link`, `join.yelo.link`, `invite.yelo.link` | `app.json` |
+| Associated domains | `yelo.link`, `join.yelo.link`, `joinyelo.com`, `www.joinyelo.com` | `app.json` |
 | App group (widgets) | `group.io.flutterflow.ridedesi.desirider` (E2E: `group.io.flutterflow.ridedesi.desirider.e2e`) | `expo-widgets` plugin |
 
 ### Android manifest
 
 - Declared permissions: `ACCESS_NETWORK_STATE`, `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`. Plugins add background location, foreground service, camera, contacts, and notification permissions.
 - Blocked permissions: `READ_PHONE_STATE`, `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS`.
-- `withRideProviderQueries` adds a `<queries>` intent block for `uber`, `lyft`, `waymo`, and `rideyazam` so Android 11+ package-visibility checks can see those apps.
+- `withRideProviderQueries` adds a `<queries>` intent block for `uber`, `lyft`, `waymo`, `rideyazam`, `waze`, `msauth`, and `tel` so Android 11+ package-visibility checks can see those apps.
 - Non-E2E builds add a `uberauth` intent filter for the Uber login callback.
 
 ### Config plugins
@@ -226,9 +226,9 @@ For client toggles and experiment gates that sit next to these prompts, see [Wid
 ## Gotchas and edge cases
 
 - **Drivers must find "Always" themselves.** The app never requests background location, so every new driver hits `LocationRequiredSheet` on their first **Go online** and must change the setting in the Settings app.
-- **Waze never opens on iOS.** `openNavApp` in `components/drive/CurrentRideBottomSheet.tsx` probes `waze://` with `canOpenURL`, but `waze` is not in `LSApplicationQueriesSchemes`, so iOS returns false and the app falls back to the Google Maps web URL. Android has the same issue: the manifest `<queries>` block lists only the ride-provider schemes.
+- **Waze never opens on binaries before 5.8.1.** `openNavApp` in `components/drive/CurrentRideBottomSheet.tsx` probes `waze://` with `canOpenURL`. Before 5.8.1, `waze` wasn't in `LSApplicationQueriesSchemes` or the Android `<queries>` block, so the probe returned false and the app fell back to the Google Maps web URL. 5.8.1 declares `waze` on both platforms ([#764](https://github.com/rideyelo/yelo-frontend/pull/764)).
 - **Two camera strings compete.** Both `expo-image-picker` and `expo-camera` write `NSCameraUsageDescription`. The one applied last wins at prebuild. Check the generated `Info.plist` before submitting a build.
-- **`msauth://` probe is unlisted.** `lib/auth/oAuth.ts` checks for Microsoft Authenticator with `canOpenURL('msauth://')`, which isn't in `LSApplicationQueriesSchemes`, so it always returns false on iOS.
+- **`msauth://` and `tel:` probes need 5.8.1.** `lib/auth/oAuth.ts` checks for Microsoft Authenticator with `canOpenURL('msauth://')`, which always returns false on older iOS binaries because the scheme wasn't declared. The rider call buttons (`ride/4-ride.tsx`, `components/ride-matching/DriverCard.tsx`) probe `tel:` the same way. 5.8.1 declares `msauth` and `tel` on both platforms so these probes answer truthfully.
 - **Notifications have no recovery path.** A user who denies notifications during onboarding is never asked again and never sent to Settings.
 - **Notification channels exist only after registration.** They are created inside `registerForPushNotificationsAsync`. A push that arrives before that uses the OS default channel.
 - **Ride alerts are foreground-only.** `playRideAlert` returns early unless the app is active, and `expo-audio` has background playback disabled. A backgrounded driver relies on the push sound.

@@ -174,7 +174,7 @@ The `placeIdentityBackfillWorker` River worker in `internal/notify/queue/queue.g
 
 **Written by / read by**
 
-- `internal/data/repository/locations.go` (`AddLocation`, `GetLocation`, and `GetLocationById`), called from `internal/service/location` and `internal/service/ride/rider.go` when a ride is created.
+- `internal/data/repository/locations.go` (`AddLocation`, `AddRideLocation`, `GetLocation`, and `GetLocationById`), called from `internal/service/location` and `internal/service/ride/rider.go`. Ride creation caches the destination with `AddRideLocation` (`UpsertRideCachedLocation`), which takes a `FOR KEY SHARE` lock on the rider's `Users` row first, so the write is serialized with account deletion and writes nothing when the rider row is gone.
 - Dashboard POI management through `internal/server/http/dashboard/location` (`CreateManagedLocation`, `UpdateManagedLocation`, `DeleteManagedLocation`, `UpsertManagedLocation`). Updates and deletes are scoped by the owning community.
 - `cmd/import-pois` and `cmd/backfill-categories`.
 - `ListLocationsByAddresses` joins active `"Discounts"` and events within 24 hours to decorate search results.
@@ -359,7 +359,7 @@ One row per destination a rider searched for or requested.
 | `latitude`, `longitude` | `double precision` | no | `0` | Coordinates. |
 | `graduation_year` | `integer` | no | `0` | Searcher's class year. |
 
-Indexes on `(address, graduation_year)`, `(community_id, timestamp DESC)`, and `user_id`. Written by `internal/service/mapping/analytics.go` and `internal/service/ride/rider.go`. Read by `analytics.sql` and `ride_history.sql`.
+Indexes on `(address, graduation_year)`, `(community_id, timestamp DESC)`, and `user_id`. Written by `internal/service/mapping/analytics.go` and `internal/service/ride/rider.go` through `CreateLocationSearch`, which takes a `FOR KEY SHARE` lock on the searcher's `Users` row and inserts nothing when that row doesn't exist, so a search can't race account deletion. Read by `analytics.sql` and `ride_history.sql`.
 
 ### LocationShares
 

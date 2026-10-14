@@ -47,6 +47,17 @@ When driver options are enabled, `maybeDriverOptions` appends one option per nea
 - `buildFleetMetaMap` is built from the rider-visible ride types, after the student filter. A driver whose fleet isn't in that map is skipped, so a student-only fleet's drivers are hidden from non-student riders too.
 - `buildVehicleOptionGroups` in `option_groups.go` groups options by `(vehicle_type, fleet_id)`. A fleet-wide option becomes the parent and that fleet's drivers are its children. Two fleets offering the same type stay separate groups.
 
+The fleet-wide option's `description` comes from `NewVehicleOptionsV2` and `applyDriverAvailability`:
+
+| Case | `description` |
+| --- | --- |
+| Default | `Alert drivers` |
+| No live driver options for the group, but the ride type has a live driver and a pickup range | The ETA range in whole minutes, rounded up, such as `3-7 min` |
+| Live driver options in the group, at least one directly assignable with no active or queued rides | `Available now` |
+| Live driver options in the group, all busy | `Available` |
+
+With driver children present, the parent shows availability only and the children carry the specific ETAs. The parent's `pickup_time_range` still takes the fastest driver's range.
+
 At confirm, `directDriverUnavailableReason` rejects a direct request with a reason code when the driver's current session no longer matches the priced fleet:
 
 | Reason | Condition |

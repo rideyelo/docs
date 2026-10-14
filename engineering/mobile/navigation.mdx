@@ -61,6 +61,7 @@ See [Auth and onboarding](/engineering/mobile/auth-and-onboarding) for the flow.
 | `ride-complete/index` | Rating and tip for `pending_rider_rating`. |
 | `tip/ride` | Tips or resumes the tip payment for a past ride, including card authentication. |
 | `tip/[slug]` | Opens the web tip page for a driver tip code. |
+| `e/[slug]` | Event share link landing. Connects the sharer, then opens the event. See [Event share links](#event-share-links). |
 | `drive/index` | Driver map: shift sheet, ride cards, current ride. |
 | `drive/queue/index`, `queue/[rideId]` | Driver queue and per-ride chat or detail. |
 | `drive/driver-hub/1-hub` to `6-vehicle-details` | Driver hub: photo, history, vehicle. |
@@ -143,8 +144,8 @@ For how the status cache is kept fresh, see [Rider and driver flows](/engineerin
 | --- | --- | --- |
 | Custom schemes | `com.rideyelo`, `yelo` | `app.json` `scheme` |
 | E2E schemes | `com.rideyelo.e2e`, `yelo-e2e` | `app.config.ts` when `EXPO_PUBLIC_APP_ENV=e2e` |
-| iOS universal links | `yelo.link`, `join.yelo.link`, `invite.yelo.link` | `ios.associatedDomains` |
-| Android App Links | `yelo.link` (root and `/fleet-*`), `join.yelo.link`, `invite.yelo.link` | `android.intentFilters` with `autoVerify` |
+| iOS universal links | `yelo.link`, `join.yelo.link`, `joinyelo.com`, `www.joinyelo.com` | `ios.associatedDomains` |
+| Android App Links | `yelo.link` (root, `/fleet-*`, and `/e/*`), `join.yelo.link`, `joinyelo.com` and `www.joinyelo.com` (`/i/*` and `/e/*`) | `android.intentFilters` with `autoVerify` |
 | Android Uber callback | `uberauth://` | `app.config.ts`, non-E2E builds only |
 | Auth v3 callback | `com.rideyelo://auth/v3/callback` | `lib/auth/security.ts` |
 
@@ -159,18 +160,30 @@ Changing any of these is a native change. See [Releases](/engineering/mobile/rel
 | `com.rideyelo://auth/v3/callback?...` | `/auth-return`. Ignored while an Auth v3 browser session is active, because `WebBrowser.openAuthSessionAsync` consumes it. |
 | `com.rideyelo://stripe-redirect` | Not routed. `redirectSystemPath` returns `null` so the Stripe SDK consumes its own PaymentSheet return URL and the payment screen stays mounted. |
 | `uberauth://...` | `/connect-uber`. Credentials stay out of router params. |
+| `https://yelo.link/e/<slug>`, `https://yelo.link/e/<slug>/<code>` | `/e/<slug>`, adding `?code=<code>` when a friend shared the link. See [Event share links](#event-share-links). |
 | `https://yelo.link/fleet-<code>` | `/fleet-join/<code>` |
-| `https://invite.yelo.link/fleet/<code>` | `/fleet-join/<code>` |
-| `https://join.yelo.link/<code>`, `https://invite.yelo.link/<code>` | `/invite/<code>`, or `/` without a code. Adds `?medium=<m>` when the link carries `utm_medium`, or `medium=qr` when it has `qr=1` |
-| `https://signup.yelo.link/.../tip/<slug>` | `/tip/<slug>` with the original query string |
-| `https://joinyelo.com/...` | `/` |
+| `https://joinyelo.com/i/fleet/<code>`, `https://invite.yelo.link/fleet/<code>` | `/fleet-join/<code>` |
+| `https://join.yelo.link/<code>`, `https://joinyelo.com/i/<code>`, `https://invite.yelo.link/<code>` | `/invite/<code>`, or `/` without a code. Adds `?medium=<m>` when the link carries `utm_medium`, or `medium=qr` when it has `qr=1` |
+| `https://joinyelo.com/e/<slug>?ref=<code>` | `/e/<slug>?code=<code>` |
+| `https://joinyelo.com/pay/tip/<slug>`, `https://signup.yelo.link/.../tip/<slug>` | `/tip/<slug>` with the original query string |
+| Any other `https://joinyelo.com/...` or `www.joinyelo.com` URL | `/` |
 | Any other `*.yelo.link` URL | `/` |
 
 Any other URL passes through unchanged, so `com.rideyelo://<route>` opens that route directly.
 
+`www.joinyelo.com` is rewritten the same way as `joinyelo.com`. A Dub short link on `yelo.link` or `join.yelo.link` opens the app directly. Without the app, Dub lands on `joinyelo.com`, which binaries from 5.8.1 also claim. `invite.yelo.link` and `signup.yelo.link` now only redirect to `joinyelo.com`, and their branches serve older links.
+
 <Note>
-`signup.yelo.link` is handled in `+native-intent.tsx` but is not in `ios.associatedDomains` or the Android intent filters. A tip link on that host only reaches the app if something else, such as the QR scanner, opens it.
+`signup.yelo.link` and, from 5.8.1, `invite.yelo.link` are handled in `+native-intent.tsx` but are not in `ios.associatedDomains` or the Android intent filters. A link on those hosts only reaches the app if something else, such as the QR scanner, opens it. On Android, `joinyelo.com/pay/tip/<slug>` isn't in the intent filters either.
 </Note>
+
+### Event share links
+
+`app/(app)/e/[slug].tsx` (added in [#754](https://github.com/rideyelo/yelo-frontend/pull/754)) is the landing for an event share link. It has no UI beyond a spinner:
+
+- **Signed out.** When the link carries a sharer code, it stores it with `setCapturedCode` (`@yelo/referral_code`) so the sign-up that follows credits the sharer. Then it replaces to `/`.
+- **Signed in.** When the link carries a sharer code, it calls `POST /user/friends/connect` with `referral_code`, which makes the two of you mutual friends, and invalidates the `['friends']` query. Your own link or an existing friendship returns an error, which is logged and skipped.
+- It then looks for the slug among the community's upcoming events (`useEventGetUpcoming`) and replaces to `/events/<id>`. An event outside that list opens the map instead.
 
 ### Building links
 

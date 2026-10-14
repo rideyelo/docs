@@ -49,17 +49,17 @@ The dashboard API lives under `/dashboard/communities/{id}/events`. The old `/sp
 
 ### Events in the app and on the web
 
-- **App.** Riders see upcoming events (`GET /event/upcoming`) and event detail screens (`app/(app)/events/[eventId]`). Event attendance (**Attend** and **Leave**, and the list of who's going) was retired in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
-- **Web.** Each published event has a landing page at `joinyelo.com/e/<slug>`, loaded from `GET /public/events/slug/{slug}`. Use it as the destination for event short links. For event short links, it replaces the older event site (`yelo-web/src/sites/event`), which embedded Posh checkout in an iframe.
+- **App.** Riders see upcoming events (`GET /event/upcoming`) and event detail screens (`app/(app)/events/[eventId]`). From 5.8.1, an event share link opens the app when it is installed. If you're signed in and someone shared it with their own link, you and the sharer become friends. If you're signed out, the sharer gets credit for your sign-up. The app opens the event's detail screen when the event is among your community's upcoming events, and the map otherwise. Event attendance (**Attend** and **Leave**, and the list of who's going) was retired in October 2026. See [Deprecated and legacy code](/engineering/history/deprecated-and-legacy#retired-ads-coupons-and-event-attendance).
+- **Web.** Each published event has a landing page at `joinyelo.com/e/<slug>`, loaded from `GET /public/events/slug/{slug}`. Use it as the destination for event short links. The dashboard copies share links as `https://yelo.link/e/<slug>`. The older standalone event site at `event.yelo.link`, which embedded Posh checkout in an iframe, was removed in October 2026.
 
 ### Event landing
 
-The event landing at `joinyelo.com/e/<slug>` shows the event photo, name, date and time in the visitor's timezone, venue and address, tags, and description. Two buttons sit at the bottom:
+The event landing at `joinyelo.com/e/<slug>` shows the event photo, name, date and time in the visitor's timezone, venue and address, tags, and description. A Yelo pill in the top-left corner links to the `joinyelo.com` home page, and the tab title is `<event name> on Yelo`. Two one-line buttons stick to the bottom:
 
 - **Get tickets** opens the event's ticket URL in a new tab. Yelo doesn't sell event tickets itself. The button only appears when the ticket URL is an `http` or `https` link.
-- **Get a ride** goes to the app landing at `joinyelo.com/get`, keeping the visit's query string, including the Dub click ID. If the link has no `utm_campaign`, the landing sets it to `event-<slug>`.
+- **Open in Yelo** goes to the app landing at `joinyelo.com/get`, keeping the visit's query string, including the Dub click ID. If the link has no `utm_campaign`, the landing sets it to `event-<slug>`.
 
-For example, a visitor to `joinyelo.com/e/spring-formal?dub_id=abc` who taps **Get a ride** goes to:
+For example, a visitor to `joinyelo.com/e/spring-formal?dub_id=abc` who taps **Open in Yelo** goes to:
 
 ```text
 /get?dub_id=abc&utm_campaign=event-spring-formal
@@ -67,9 +67,11 @@ For example, a visitor to `joinyelo.com/e/spring-formal?dub_id=abc` who taps **G
 
 If the event isn't found or isn't published, the page shows "This event isn't available" with a **Get Yelo** button to the same `/get` link.
 
-The `experience-router` Worker serves the landing, so it sets the `yelo_attr` and `yelo_anon_id` attribution cookies like other link landings. See [Growth features](/concepts/growth-features#attribution-cookies).
+On iOS, `joinyelo.com/e/*` is a universal link path. Tapping a `joinyelo.com/e/<slug>` link directly opens app 5.8.1 or later when it's installed. A `yelo.link/e/<slug>` short link still lands on this page, because Dub's redirect into `joinyelo.com` doesn't trigger the universal link. The `experience-router` Worker serves the landing, so it sets the `yelo_attr` and `yelo_anon_id` attribution cookies like other link landings. See [Growth features](/concepts/growth-features#attribution-cookies).
 
-An event short link's preview card comes from Dub. The `og` Worker has an `event` card template: the event photo fills the left square, with the name, date, and venue on black beside it. Without a photo, the details fill the card. When the page URL is shared directly, crawlers see a static fallback titled "Event on Yelo".
+An event short link's preview card comes from Dub. The `og` Worker has an `event` card template: the event photo fills the left square, with the name, date, and venue on black beside it. Without a photo, the details fill the card. A link a person shares carries their first name, and the card adds "`<name>` shared an event with you" above the event name. When the page URL is shared directly, crawlers see a static fallback titled "Event on Yelo".
+
+The API creates the event's link, `yelo.link/e/<slug>`, when the event is published, and refreshes its card after every edit and photo upload. When someone shares the event from the app, `GET /event/{id}/share-link` gives them their own link, `yelo.link/e/<slug>/<referral code>`, whose landing carries their referral code. A sign-up from it is credited to them, and a visitor whose browser Yelo already knows becomes their friend. See [Share links](/engineering/domains/events-and-feed#share-links).
 
 ## The Spot
 
@@ -166,7 +168,6 @@ The API lives under `/dashboard/qr/` and only returns fleets the caller can acce
 | Events | `yelo-api/internal/service/event/`, `internal/models/event.go` |
 | Event dashboard API | `yelo-api/internal/server/http/dashboard/event/` |
 | Event landing | `yelo-web/src/sites/signup/event/` |
-| Older event site | `yelo-web/src/sites/event/` (`CheckoutModal.tsx`, `lib/poshCheckout.ts`) |
 | The Spot | `yelo-api/internal/service/spot/spot.go`, `internal/models/spot.go` |
 | Community feed | `yelo-api/internal/service/community/` (`feed_logic.go`, `feed_cache_redis.go`) |
 | QR payments | `yelo-api/internal/service/qrpayment/qrpayment.go`, `internal/models/qr_payment*.go` |

@@ -84,7 +84,7 @@ When a release is required on the Cloud Build backend, `resolve-release-build.sh
     - Network `yelo-network-prod`, subnet `yelo-network-prod`, egress `private-ranges-only`.
     - One task, up to two retries, and a 10-minute task timeout.
 
-    It then runs `gcloud run jobs execute --wait`. Inside the job, `run-migrations.sh` appends `application_name=yelo-api-migration-<execution>` to the DSN, runs `migrate up` with a 60-second lock timeout, fails if the state is dirty, and fails unless the final version equals `EXPECTED_MIGRATION_VERSION`.
+    It then runs `gcloud run jobs execute --wait`. Inside the job, `run-migrations.sh` rewrites a Supabase pooler DSN from port 6543 to 5432, appends `application_name=yelo-api-migration-<execution>`, runs `migrate up` with a 60-second lock timeout, fails if the state is dirty, and fails unless the final version equals `EXPECTED_MIGRATION_VERSION`.
   </Step>
   <Step title="Deploy candidate">
     Deploys the image by digest to `yelo-api-testflight` with `--no-traffic`, `--max-instances=2`, and a revision suffix of `<short_sha>-<first segment of the build ID>`. It tags the revision `candidate-<short_sha>` and labels it `managed-by=cloud-build`, `commit-sha`, `gcb-build-id`, and `migration-version`. Runtime settings are merged with `--update-env-vars` and `--update-secrets`.
@@ -300,15 +300,13 @@ flowchart LR
 ```
 
 - **Affected range.** `nrwl/nx-set-shas` sets `NX_BASE` to the last successful **Firebase** run on `main`. A failed deploy leaves its changes in the next range, so the next push retries them.
-- **Registry check.** The Nx projects tagged `firebase-site` must equal `sites.config.json` (`dashboard`, `signup`, `home`, `event`, `maestro`, `invite`, `world-cup`). A mismatch fails CI and deploy.
+- **Registry check.** The Nx projects tagged `firebase-site` must equal `sites.config.json` (`dashboard`, `signup`, `home`, `maestro`, `world-cup`). A mismatch fails CI and deploy.
 - **Required variables.** `scripts/require-site-env.mjs` reads `metadata.requiredBuildEnv` from each affected site's `project.json` and fails if a listed variable is empty:
 
   | Site | Required build variables |
   | --- | --- |
   | `dashboard` | `VITE_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_MAPBOX_API_KEY`, `VITE_SUPABASE_URL` |
   | `signup` | `VITE_API_URL`, `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID` |
-  | `event` | `VITE_API_URL`, `VITE_MAPBOX_API_KEY` |
-  | `invite` | `VITE_API_URL` |
   | `maestro` | `VITE_SUPABASE_URL`, `VITE_E2E_API_URL` |
   | `home`, `world-cup` | None |
 

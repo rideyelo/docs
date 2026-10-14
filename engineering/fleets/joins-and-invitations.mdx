@@ -48,7 +48,7 @@ All three call `authorizeFleet` in `internal/server/http/fleetjoin/handler.go`: 
     `GetFleetJoinCode` (filters deleted fleets).
   </Step>
   <Step title="Publish to Dub first">
-    Calls `dub.UpsertLink` with key `fleet-<new code>`, `ExternalID` `fleet-driver-join:<fleet_id>`, the `fleet-driver` tag, `cfg.Dub.FleetFolderID` (`DUB_FLEET_FOLDER_ID`, falling back to `DUB_SYSTEM_FOLDER_ID`), `TrackConversion: true` so Dub forwards its click ID to the landing page, the title `Join <fleet name> on Yelo`, a description that depends on the payment model, the signed fleet invitation card as the image, and `Proxy` on. See [Link previews](#link-previews).
+    Calls `dub.UpsertLink` with key `fleet-<new code>`, `ExternalID` `fleet-driver-join:<fleet_id>`, the `fleet-driver` tag, the Dub folder named `fleet` (`dub.FolderFleet`, looked up by name), `TrackConversion: true` so Dub forwards its click ID to the landing page, the title `Join <fleet name> on Yelo`, a description that depends on the payment model, the signed fleet invitation card as the image, and `Proxy` on. See [Link previews](#link-previews).
 
     The request also sets `MoveKey`. A rotation reuses the fleet's external ID under a new key, which Dub rejects as a conflict. `UpsertLink` then updates the link that owns the external ID (`ext_fleet-driver-join:<fleet_id>`) and sets its domain, key, and URL to the new values. Each fleet keeps one Dub link, and its key moves with each rotation.
   </Step>
@@ -170,7 +170,7 @@ The dashboard surface is the **Fleet membership** section of the admin user shee
 
 | Step | Code | Behavior |
 | --- | --- | --- |
-| Link capture | `app/+native-intent.tsx` | On host `yelo.link`, a first path segment starting with `fleet-` rewrites to `/fleet-join/<code>`. On host `invite.yelo.link`, a path `/fleet/<code>` does the same. |
+| Link capture | `app/+native-intent.tsx` | On host `yelo.link`, a first path segment starting with `fleet-` rewrites to `/fleet-join/<code>`. On `joinyelo.com` or `www.joinyelo.com`, a path `/i/fleet/<code>` does the same, as does `/fleet/<code>` on the legacy `invite.yelo.link`. 5.8.1 binaries claim `joinyelo.com` as an associated domain, so a `joinyelo.com/i/fleet/<code>` link opens the app when it is installed. |
 | Pending intent | `setPendingFleetJoinCode` | Stores the normalized code under `@yelo/fleet_join_code` in AsyncStorage when the user must sign in first. |
 | Restore | `components/FleetJoinIntentObserver.tsx` | After a JWT is available, navigates once per session to the pending code, unless it is already on a `/fleet-join/` route. |
 | De-duplication | `markFleetJoinCodeHandled`, `hasHandledFleetJoinCode` | Keeps the last 20 handled codes under `@yelo/fleet_join_handled_codes_v1`. A handled pending code is cleared without navigating. |

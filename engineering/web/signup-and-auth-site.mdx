@@ -3,7 +3,7 @@ title: "Signup and Auth v3 site"
 description: "How the signup site's two bundles, the hosted Auth v3 page, the referral invite landing, tip links, World Cup claims, and account deletion work in the browser: routing, storage keys, cookies, redirects, and API calls"
 ---
 
-The `signup` site (`src/sites/signup/`) is the browser half of Yelo sign-in. It hosts the Auth v3 transaction page that the app opens in a browser, runs a web-only PKCE flow for people who arrive without the app, serves the personal referral invite landing at `/i/<code>` and the fleet driver invite landing at `/i/fleet/<code>`, and carries three intent flows: tipping, World Cup claims, and account deletion. The API side of Auth v3 is covered in [Identity overview](/engineering/identity/overview) and [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions). This page covers what the browser does.
+The `signup` site (`src/sites/signup/`) is the browser half of Yelo sign-in. It hosts the Auth v3 transaction page that the app opens in a browser, runs a web-only PKCE flow for people who arrive without the app, serves the personal referral invite landing at `/i/<code>` the fleet driver invite landing at `/i/fleet/<code>`, and the event landing at `/e/<slug>`, and carries three intent flows: tipping, World Cup claims, and account deletion. The API side of Auth v3 is covered in [Identity overview](/engineering/identity/overview) and [Auth v3 transaction lifecycle](/engineering/identity/auth-v3-transactions). This page covers what the browser does.
 
 ## Two bundles, one site
 
@@ -113,7 +113,7 @@ People who reach `/auth/v3` without a request secret, for example from a tip lin
 
 ## Referral invite landing
 
-Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on this site (see [Public sites](/engineering/web/public-sites#fleet-driver-invites)). `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect here too. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
+Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`. The `experience-router` Worker proxies that path unchanged to this site's `/i/<code>`, so the attribution cookies are first-party to the `joinyelo.com` sign-up page. Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on this site (see [Fleet driver invite landing](#fleet-driver-invite-landing)). The `invite.yelo.link` forwarder site was removed in October 2026. On iOS, `/i/*` on `joinyelo.com` is a universal link path, so a direct tap on a `joinyelo.com/i/...` link opens app 5.8.1 or later instead of this page. A short link that redirects here through Dub still loads the page. See [Edge and routing](/engineering/web/edge-and-routing) and [Referrals and links](/engineering/domains/referrals-and-links#invite-landing-page).
 
 `InvitePage` (`src/sites/signup/invite/InvitePage.tsx`) loads the inviter preview with `GET /referral/invite/{code}`, which returns the inviter's first name, photo, and user ID. Without a photo, the avatar color comes from an FNV-1a hash of the user ID over a five-color palette. The app and `ogcard.DeterministicColor` in `yelo-api/internal/utilities/ogcard/color.go` implement the same function, and all three must agree. The page then branches on the device:
 
@@ -124,6 +124,14 @@ Personal invite links (`join.yelo.link/<code>`) land on `joinyelo.com/i/<code>`.
 | Anything else | The primary button, **Continue → App Store**, links to the App Store with `&ct=<code>` |
 
 The page leads with the store. On every device, a secondary **Continue → web** link goes to `/auth/v3` through `authV3EntryPath()` with the landing's allowlisted attribution parameters plus `code=<code>`, so the Dub click ID and `utm_*` parameters reach sign-up along with the code. `qr=1` is not forwarded. Store URLs live in `src/sites/signup/invite/referralHandoff.ts`.
+
+### Fleet driver invite landing
+
+The site matches `/i/fleet/<code>` before the personal invite route and renders `FleetInvitePage` (`src/sites/signup/invite/FleetInvitePage.tsx`). It calls `useFleetJoinGetPreview` → `GET /fleet-join/{code}` with `retry: false`. The service returns `404` for codes that fail `joinCodePattern` before touching the database (`service/fleetjoin/fleet_join.go`). When `available` is true, the page shows the fleet logo or initial, explains whether the fleet manages payouts, links to `yelo:///fleet-join/<code>` (`appLink.ts`), and shows an App Store badge. Otherwise it asks the driver to get a current link from the fleet manager. Crawlers get the static `i/fleet/index.html` that `scripts/emit-signup-html.mjs` writes, titled "Fleet invitation on Yelo".
+
+## Event landing
+
+`EventLandingPage` (`src/sites/signup/event/`) renders `/e/<slug>`, which `experience-router` proxies from `joinyelo.com/e/<slug>`. It loads `GET /public/events/slug/{slug}` and sets the tab title to `<event name> on Yelo`. A fixed Yelo pill in the top-left corner links to `/`; its logo loads from `https://joinyelo.com/yelo-white.svg` because the `home` site owns that file. The sticky footer holds one-line buttons: **Get tickets**, shown only for an `http` or `https` ticket URL, and **Open in Yelo**, which links to `/get` with the visit's query string and `utm_campaign=event-<slug>` when none is set (`rideURL()` in `eventLanding.ts`). It replaces the standalone event site, removed in October 2026. See [Event landing](/concepts/events-and-feed#event-landing).
 
 ## Link landing touches
 
@@ -158,7 +166,7 @@ The World Cup campaign is offline. The `world-cup-router` Worker redirects `join
 
 ## Account deletion
 
-`/delete-account` runs Auth v2 phone OTP (`POST /authv2/phone/request-otp`, `/verify-otp`). Only a response with `status: 'authenticated'` and a token can continue (`classifyVerifyResponse`), so Auth v3 accounts without an email (phone sign-ups) or without a phone (web Google or Apple sign-ups) can't delete here. The page then loads `GET /user/current-user`, shows a masked email or last four phone digits, requires the word `DELETE`, and calls `DELETE /user/i/{id}`. A `401` or `404` on that call is treated as already deleted, because the identity transaction can commit `is_deleted` and a later step (the legacy scrub or the response) can still fail. The comment in `deleteAccount.ts` says `is_deleted` is committed before details are wiped, but each scrub sets both in one `UPDATE`.
+The page is public at `joinyelo.com/delete-account`. `experience-router` proxies that path to this site's `/delete-account` and, unlike link landings, plants no attribution cookies on it. `/delete-account` runs Auth v2 phone OTP (`POST /authv2/phone/request-otp`, `/verify-otp`). Only a response with `status: 'authenticated'` and a token can continue (`classifyVerifyResponse`), so Auth v3 accounts without an email (phone sign-ups) or without a phone (web Google or Apple sign-ups) can't delete here. The page then loads `GET /user/current-user`, shows a masked email or last four phone digits, requires the word `DELETE`, and calls `DELETE /user/i/{id}`. A `401` or `404` on that call is treated as already deleted, because the identity transaction can commit `is_deleted` and a later step (the legacy scrub or the response) can still fail. The comment in `deleteAccount.ts` says `is_deleted` is committed before details are wiped, but each scrub sets both in one `UPDATE`.
 
 ## Browser storage and cookies
 

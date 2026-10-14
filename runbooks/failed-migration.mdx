@@ -40,7 +40,7 @@ Production migrations run inside **Release API**, before the new revision is dep
     ROLLBACK;
     ```
 
-    - `dirty = false` at the previous version: the job failed before it applied the file, for example on the lock timeout or the connection.
+    - `dirty = false` at the previous version: the job failed before it applied the file, for example on the lock timeout or the connection. Lock and prepared statement errors used to come from the Supabase transaction pooler on port 6543, which can hand each statement to a different backend. Since October 2026 `run-migrations.sh` rewrites a `*.pooler.supabase.com:6543` DSN to the session-mode port 5432, so check the DSN if these errors return.
     - `dirty = true` at the failing file's version: golang-migrate marks a version dirty before running its file and clears the flag only on success. Check which statements actually took effect before you do anything else.
   </Step>
   <Step title="Look for non-transactional leftovers">

@@ -31,14 +31,14 @@ flowchart LR
 
 | Path | Component | `data-page` | Runtime title | Nav |
 | --- | --- | --- | --- | --- |
-| `/` and any unmatched path | `NewLanding` with `RIDER` | `landing`, `data-variant="rider"` | `Yelo \| Get Out There` | `rider` on `/`, `none` on an unmatched path |
-| `/drivers` | `NewLanding` with `DRIVER` from `content/driver.tsx` | `landing`, `data-variant="driver"` | `Yelo \| Driver` | `driver` |
-| `/partner` | `partner/PartnerPage` | `partner` | `Yelo \| Partner` | `none` |
-| `/fleets` | `fleets/FleetsPage` | `fleets` | `Yelo \| Fleets` | `none` |
-| `/safety` | `safety/SafetyPage` | `safety` | `Yelo \| Safety` | `none`, dark |
-| `/vision` | `vision/VisionPage` | `vision` | `Yelo \| Vision` | `none` |
-| `/privacy` | `legal/LegalPage` with `document="privacy"` | `legal` | `Privacy Policy \| Yelo` | Not rendered |
-| `/tos`, `/terms` | `legal/LegalPage` with `document="terms"` | `legal` | `Terms of Service \| Yelo` | Not rendered |
+| `/` and any unmatched path | `NewLanding` with `RIDER` | `landing`, `data-variant="rider"` | `Get out there with Yelo` | `rider` on `/`, `none` on an unmatched path |
+| `/drivers` | `NewLanding` with `DRIVER` from `content/driver.tsx` | `landing`, `data-variant="driver"` | `Drive with Yelo and keep 100% of every fare` | `driver` |
+| `/partner` | `partner/PartnerPage` | `partner` | `Fill your venue with Yelo` | `none` |
+| `/fleets` | `fleets/FleetsPage` | `fleets` | `Yelo for Fleets` | `none` |
+| `/safety` | `safety/SafetyPage` | `safety` | `How Yelo keeps rides safer` | `none`, dark |
+| `/vision` | `vision/VisionPage` | `vision` | `The vision behind Yelo` | `none` |
+| `/privacy` | `legal/LegalPage` with `document="privacy"` | `legal` | `Yelo Privacy Policy` | Not rendered |
+| `/tos`, `/terms` | `legal/LegalPage` with `document="terms"` | `legal` | `Yelo Terms of Service` | Not rendered |
 
 `/farefinder` is not a route. It is a static page in `public/farefinder/` that Firebase serves before the catch-all rewrite. See [Sites](/engineering/web/sites#home).
 
@@ -49,7 +49,7 @@ A route is registered in up to five places. They are not derived from each other
 | `main.tsx` (`prepareRoute`, `Route`) | Page component, `data-page`, runtime title and description | The path renders the rider landing |
 | `navigation.ts` (`HOME_ROUTES`) | Paths that navigate client-side | Links to the path do a full page load |
 | `components/Nav.tsx` (`PAGE_PREFETCHERS`, `ALL_LINKS`) | Chunk prefetch on hover, focus, and pointer down; header and menu links | No prefetch, and no header link |
-| `scripts/emit-partner-html.mjs` (`PAGES`) | Crawler-visible title, description, and `og:url` | Readers are unaffected; shared links preview as the rider landing |
+| `scripts/emit-partner-html.mjs` (`PAGES`) | Crawler-visible title, description, `og:url`, and optional `image` | Readers are unaffected; shared links preview as the rider landing |
 | `firebase.json` (rewrites and the `no-cache` header glob) | Mapping from the path to its emitted `index.html` | Firebase serves the root `index.html`, so crawlers get the landing's tags |
 
 `HOME_ROUTES` contains `/`, `/drivers`, `/safety`, `/vision`, `/fleets`, and `/partner`. The legal paths are not in it, so every link to `/privacy` or `/tos` reloads the page.
@@ -167,7 +167,9 @@ To add or replace an image:
 
 ## Build and link previews
 
-The `build` target in `src/sites/home/project.json` runs `SITE=home pnpm exec vite build && node scripts/emit-partner-html.mjs`. The second step copies `dist/home/index.html` into `dist/home/<route>/index.html` for each entry in `PAGES` and rewrites `<title>`, `description`, `og:title`, `og:description`, and `og:url`. Each substitution is asserted, so a renamed meta tag fails the build. [Public sites](/engineering/web/public-sites#link-previews) explains why crawlers need this.
+The `build` target in `src/sites/home/project.json` runs `SITE=home pnpm exec vite build && node scripts/emit-partner-html.mjs`. The second step copies `dist/home/index.html` into `dist/home/<route>/index.html` for each entry in `PAGES` and rewrites `<title>`, `description`, `og:title`, `og:description`, and `og:url`. An entry with an `image` also rewrites `og:image` and `twitter:image`. Each substitution is asserted, so a renamed meta tag fails the build.
+
+Share images come from the `og` Worker, not from static files. `index.html` points at the `page` card for `home`, the `partner`, `fleets`, `safety`, and `vision` entries point at their `page` cards, `drivers` points at the `drive` card, and `public/farefinder/index.html` points at the `farefinder` card. Each URL carries a precomputed `sig`. The worker draws the art from `public/card-art/` (JPEG and PNG copies, because resvg doesn't decode WebP), fetched from `joinyelo.com/card-art/`. See [og](/engineering/web/edge-and-routing#og). [Public sites](/engineering/web/public-sites#link-previews) explains why crawlers need this.
 
 `scripts/build-partner.mjs` wraps the same two steps. Like the Nx target, it runs no `tsc -b`. Its header describes it as a Vercel build command, but the repository has no `vercel.json` and nothing else references the script.
 
@@ -250,7 +252,7 @@ The date line is not in `legalContent.ts`. `HOSTED_DATE` in `LegalPage.tsx` feed
     Add the path to `HOME_ROUTES` in `navigation.ts` and a loader to `PAGE_PREFETCHERS` in `components/Nav.tsx`. Add an entry to `ALL_LINKS` if it belongs in the header.
   </Step>
   <Step title="Emit its static document">
-    Add a `PAGES` entry in `scripts/emit-partner-html.mjs` with the same title and description as `prepareRoute()`. Add `preload` only if the page has a hero image worth preloading, as `/safety` does.
+    Add a `PAGES` entry in `scripts/emit-partner-html.mjs` with the same title and description as `prepareRoute()`. Write the title as a subject line, such as "Fill your venue with Yelo", not `Yelo | <Page>`. For a custom share image, add a page to `PAGES` in `workers/og/src/templates/page.tsx`, sign its URL, and set it as `image`. Add `preload` only if the page has a hero image worth preloading, as `/safety` does.
   </Step>
   <Step title="Add the Hosting rewrite">
     In `src/sites/home/firebase.json`, add a rewrite from `/<name>{,/}` to `/<name>/index.html` above the `**` rule, and add the name to the `no-cache` header glob. Then run `pnpm firebase:config` and commit the regenerated root `firebase.json`.

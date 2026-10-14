@@ -338,9 +338,11 @@ Error branches in the sheet:
 `components/map/request/RideOptions.tsx` renders server groups (`vehicle_option_groups`) or groups options locally. The first parent option auto-selects. Each `RideOptionCard` shows:
 
 - The vehicle image, or the driver's photo for a driver-specific option.
-- Title, seat count pill, and a description (fallback: "[Vehicle] just for your group!").
-- Badges from `badges`: `verified_student`, `fleet` (with `fleet_name`), `cheapest`, `fastest`. The API sends at most one badge per option and omits `fleet` for the community's primary fleet. See [Rider option ordering and badges](/engineering/fleets/isolation#rider-option-ordering-and-badges).
+- The title, then one row with the seat count pill (hidden when `seats` is null) and the server's `description` beside it, up to two lines. The fallback is "[Vehicle] just for your group!". The API now writes availability and pickup ETAs into `description` (for example "Available now" or "3-6 min"), so the row reads as seats plus status ([yelo-api#360](https://github.com/rideyelo/yelo-api/pull/360)).
+- Badges from `badges`: `verified_student`, `fleet` (with `fleet_name`), `cheapest`, `fastest`. All badges use the smaller `IconBadge` size (`small`). The API sends at most one badge per option and omits `fleet` for the community's primary fleet. See [Rider option ordering and badges](/engineering/fleets/isolation#rider-option-ordering-and-badges).
 - Price: **Free** at 0, a strikethrough with a shiny tag when discounted, otherwise `$0.00` format.
+
+Driver-specific options nest under their vehicle type as `CompactRideOptionCard` rows (`RideOptionGroup.tsx`). A driver listed in `VERIFIED_DRIVER_IDS` (`lib/ride/verifiedDrivers.ts`) gets a blue filled seal check after their name. The list is a hardcoded set of driver IDs with a `TODO: make database driven`.
 
 The floating `RideActionBar` has **Fastest** and **Cheapest** segments that jump the selection, plus a bump button. The CTA caption "You'll save about 30% on average vs. Uber & Lyft" hides when every option is free.
 

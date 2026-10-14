@@ -10,7 +10,8 @@ Every public web property except the marketing site on Framer is a site in `yelo
 | PR | What it shows |
 | --- | --- |
 | [yelo-web#27](https://github.com/rideyelo/yelo-web/pull/27) | Registers `src/sites/home/` in `sites.config.json` so the standard `SITE=home make dev`, `make build-site`, and `make deploy-home` targets work. Switches its Hosting config to the SPA rewrite. The Firebase site and domain were unchanged. |
-| [yelo-web#130](https://github.com/rideyelo/yelo-web/pull/130) | A Hosting-only change: `src/sites/invite/firebase.json` redirects, regenerated into the root `firebase.json`. |
+| [yelo-web#130](https://github.com/rideyelo/yelo-web/pull/130) | A Hosting-only change: `src/sites/invite/firebase.json` redirects, regenerated into the root `firebase.json`. The `invite` site was removed later, in [yelo-web#212](https://github.com/rideyelo/yelo-web/pull/212). |
+| [yelo-web#211](https://github.com/rideyelo/yelo-web/pull/211) | Removing a site: delete `src/sites/event/`, drop it from `sites.config.json` and `.firebaserc`, and regenerate `firebase.json`. Disable the Hosting site in Firebase afterward. |
 | [yelo-web#20](https://github.com/rideyelo/yelo-web/pull/20) | A new Cloudflare Worker (`workers/og`) with its own `wrangler.jsonc`, deployed separately from any site. |
 
 ## Recipe
@@ -31,12 +32,12 @@ Every public web property except the marketing site on Framer is a site in `yelo
     The template renders through `renderSite(<App />, { query: true, toaster: true })`: a public page with React Query and a toaster. For auth, wrap the app in `ClerkAuth` and pass `router: true`. See [Dashboard roles](/administration/dashboard-roles) for Clerk.
   </Step>
   <Step title="Declare build variables">
-    In `src/sites/widgets/project.json`, list every `VITE_*` variable the site reads in `metadata.requiredBuildEnv` and as `{ "env": "..." }` build inputs. The invite site's `project.json` is a minimal example with `VITE_API_URL`.
+    In `src/sites/widgets/project.json`, list every `VITE_*` variable the site reads in `metadata.requiredBuildEnv` and as `{ "env": "..." }` build inputs. The `maestro` site's `project.json` is a short example with `VITE_SUPABASE_URL` and `VITE_E2E_API_URL`.
 
     The deploy workflow's **Require affected site build variables** step fails when a listed variable is empty. Add any new variable as a GitHub repository variable, and to the top-level `env` blocks in both `.github/workflows/ci.yml` and `.github/workflows/firebase.yml`.
   </Step>
   <Step title="Give it an API client, if it calls the API">
-    Call the API through a generated client. ESLint blocks importing `@/lib/api-client` anywhere under `src/`, and blocks raw `fetch` in `src/components`, `src/hooks`, and the dashboard site. Either import from an existing generated client, or add a narrow one to `orval.config.ts` with an `include` tag filter, as `event` does:
+    Call the API through a generated client. ESLint blocks importing `@/lib/api-client` anywhere under `src/`, and blocks raw `fetch` in `src/components`, `src/hooks`, and the dashboard site. Either import from an existing generated client, or add a narrow one to `orval.config.ts` with an `include` tag filter, as the `event` client does for the signup event landing:
 
     ```ts
     widgets: {

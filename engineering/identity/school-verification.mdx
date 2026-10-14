@@ -96,6 +96,10 @@ A signed-in caller always gets a full user JWT back, scoped to their current `co
 
 StudID verifies an institutional login through a third party. It is enabled by `AUTH_V3_STUDID_ENABLED=true`, and the API refuses to start without a valid redirect URL (default `com.rideyelo://student-verification`).
 
+When StudID is disabled, the API still builds the student service from the repository alone (`NewRepositoryService`). Listing and disconnecting education connections keep working, while StudID start and complete return a provider-unavailable error ("Sign-in Unavailable").
+
+A successful complete or disconnect invalidates the user's cached profile after the write commits, so `GET /user/current-user` shows the new account type and school right away. A cache failure is logged and doesn't fail the request.
+
 ```mermaid
 sequenceDiagram
   participant App
@@ -150,7 +154,7 @@ The app ignores the callback's parameters and completes with the server-created 
 
 ## Gotchas and edge cases
 
-- **The mobile disconnect copy is wrong for the last proof.** The **Accounts** screen says disconnecting "removes the linked proof but does not remove your existing student status" (`accounts.tsx`). The API downgrades the account to `community`, clears `school_id`, and clears `graduation_year` when the last proof is removed.
+- **Disconnecting the last proof downgrades the account.** The API sets `account_type` to `community` and clears `school_id` and `graduation_year`. Since [yelo-frontend#753](https://github.com/rideyelo/yelo-frontend/pull/753), the **Accounts** screen says so: "Disconnecting removes this proof. If no other verified school account remains, your student verification and school association are removed." After a disconnect, the app refetches the proof list and both profile caches (`currentUser` and `/authv2/status`) through `refreshStudentVerificationQueries`. `listEducationConnections` throws unless the response has `success: true` and a `connections` array.
 - **Legacy students have no ledger row.** Users verified before `EducationVerifications` existed may have `account_type = 'student'` with no proof row (migration 280 only backfilled Google). They can't disconnect, and disconnecting a newer proof may drop them to `community` even though they were verified earlier.
 - **Proofs outlive deleted accounts.** Account deletion doesn't delete `EducationVerifications`. Because provider subjects are unique per provider, the same school Google account, Microsoft account, or StudID identity can't verify a new Yelo account later. It fails with `identity_conflict`. Email code proofs have no subject and don't block.
 - **StudID with no affiliations passes.** `studentAffiliationAllowed` returns true for an empty list. Only a non-empty list without `student` or `member` is rejected.

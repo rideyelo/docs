@@ -5,7 +5,7 @@ description: "How the API generates referral codes, publishes Dub share links an
 
 Referrals connect three systems: a code on `Users.referral_code`, a Dub short link on `join.yelo.link`, and a `Referrals` row written at sign-up. Rewards are computed at read time from `ReferralRewards` and `ReferralPayouts`. Nothing is paid out automatically.
 
-This page covers the API side. For the product view, see [Growth features](/concepts/growth-features). For how a code is bound to an Auth v3 sign-in, see [Auth v3 transactions](/engineering/identity/auth-v3-transactions). Fleet join and payout onboarding links also use Dub and are filed in the fleet folder (`DUB_FLEET_FOLDER_ID`); see [Joins and invitations](/engineering/fleets/joins-and-invitations).
+This page covers the API side. For the product view, see [Growth features](/concepts/growth-features). For how a code is bound to an Auth v3 sign-in, see [Auth v3 transactions](/engineering/identity/auth-v3-transactions). Fleet join and payout onboarding links also use Dub and are filed in the `fleet` folder; see [Joins and invitations](/engineering/fleets/joins-and-invitations).
 
 ## Data touched
 
@@ -24,7 +24,7 @@ This page covers the API side. For the product view, see [Growth features](/conc
 | Postgres | `ShortenedLinks` (`encoded_path` PK, `original_path` `VARCHAR(255)`) | Legacy in-house path shortener. Read-only since October 2026 |
 | Postgres | `ReferralLookup` | Table exists (migration 000146). No Go code reads or writes it. |
 | Dub | Links on `join.yelo.link` | Referral share links, keyed by referral code |
-| Dub | Links on `yelo.link`, `pay.yelo.link`, `event.yelo.link` | Hand-made campaign links and API-created fleet links, listed and edited on the dashboard **Links** page |
+| Dub | Links on `yelo.link` and `pay.yelo.link` | Hand-made campaign links, API-created fleet links, and event share links (`yelo.link/e/...`), listed on the dashboard **Links** page |
 | Cloudflare Worker | `yelo-og` at `OG_IMAGE_BASE_URL/og/invite` | Signed share-card image |
 
 For column types, see [Users and identity](/reference/database/users-and-identity).
@@ -101,7 +101,7 @@ A name or photo change alters the request hash. A configuration change alters th
 | `Key` | The referral code |
 | `ExternalID` | The user ID |
 | `URL` | `INVITE_LANDING_BASE_URL + "/" + code`. `INVITE_LANDING_BASE_URL` defaults to `https://joinyelo.com/i`, the first-party landing page. |
-| `FolderID` | `DUB_SYSTEM_FOLDER_ID` |
+| `Folder` | `system`, resolved to a Dub folder ID by name |
 | `Title` | `Join <first name> on Yelo` |
 | `Description` | `<first name> invited you to Yelo — tap to get the app and ride together.` |
 | `Image` | Signed OG card URL (below) |
@@ -190,6 +190,13 @@ The API validates the snapshot, stores it as an `AttributionTouches` row with no
 
 When an Auth v3 transaction resolves to a user, `AssociateAuthV3TransactionAttribution` claims the transaction's own touches plus any unclaimed anonymous touches that share one of the transaction's `anonymous_id` values and were recorded within 90 days of `authenticated_at`. Claimed touches join the user's first-touch and last-touch attribution. A click made before the app was installed still reaches the account, as long as the sign-up runs in the same browser cookie jar.
 
+Opening someone's share link also makes you friends with them, with source `referral`:
+
+- **Known browser.** When an anonymous touch carries a referral code and an earlier touch under the same `anonymous_id` was already claimed by a user, `CreateAttributionTouch` befriends that user and the code's owner right away (`BefriendAuthV3KnownBrowser`). No new sign-in is needed.
+- **At sign-in.** After `AssociateTransactionAttribution` claims a browser's touches, the user is befriended with the owner of every referral code on their claimed touches made outside an auth transaction (`BefriendAuthV3ClaimedTouches`). Touches inside a transaction are left to the referral they bind.
+
+Both skip self-links and deleted or banned owners, match codes case-insensitively, and do nothing when the friendship already exists.
+
 ### Dub lead tracking
 
 Auth v3 reports signups to Dub. After `FinishProfile` completes, the API reads the most recent `dub_click_id` from the user's claimed touches (`GetAuthV3UserDubClickID`). If one exists, `authV3DubLeadTracker` sends `Track.Lead` with event name `Sign Up`, the Dub click ID, and the user ID as the customer external ID, on a detached 10-second context. A failure only logs "[authv3] Dub TrackLead failed".
@@ -242,7 +249,7 @@ Driver leads have a separate referrer (`DriverLeads.referrer_user_id` or `referr
 
 `GetInvitePreview` calls `GetInviterCard`, which resolves the code with `GetAuthUserByReferralCode` and then loads the user. Unknown codes return 404. The response echoes the path `code`, not the user's current code.
 
-`UserService.ConnectFriend` resolves the same way and calls `Friendship.AddMutual` with source `referral`. It rejects unknown codes ("This invite link is invalid or has expired.") and self-invites.
+`UserService.ConnectFriend` resolves the same way and calls `Friendship.AddMutual` with source `referral`. It rejects unknown codes ("This invite link is invalid or has expired.") and self-invites. The app calls it from the invite screen and, without a prompt, when a signed-in user opens a friend's event share link (`yelo.link/e/<slug>/<code>` or `joinyelo.com/e/<slug>?ref=<code>`). For a signed-out user, that event link stores the code in `@yelo/referral_code` instead. See [Event share links](/engineering/mobile/navigation#event-share-links).
 
 On the client side, `ReferralCaptureObserver` in `yelo-frontend` calls Dub `trackOpen` 750 ms after the app becomes interactive. It stores the link key as the captured code in AsyncStorage (`@yelo/referral_code`) and the Dub click ID in `@yelo/referral_click`. `normalizeInviteCode` uppercases only codes matching the generated format.
 
@@ -260,7 +267,7 @@ Personal invite links land on `joinyelo.com/i/<code>`, served by the signup site
 - Leads with the store for the device. The primary button reads **Continue → App Store**, or **Continue → Google Play** on Android. On Android it links to Google Play with `referrer=deepLink=https://join.yelo.link/<code>`, which the Dub SDK reads on first open.
 - Shows a secondary **Continue → web** link that forwards the code and the allowlisted attribution parameters (`dub_id`, `utm_*`, `source_channel`, `channel`, `ref`, `referral_code`) to `/auth/v3`. Other parameters, including `qr` and `v`, are dropped.
 
-Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on the same site. `invite.yelo.link` only forwards links shared before the move: `invite.yelo.link/<code>` and `invite.yelo.link/fleet/<code>` redirect to the matching `https://joinyelo.com/i/...` path with the query string preserved, and the root `invite.yelo.link/` returns a 302 to `https://joinyelo.com/`.
+Fleet driver invites land on `joinyelo.com/i/fleet/<code>` on the same site. The `yelo-web` invite site that forwarded old `invite.yelo.link` links was removed in October 2026 ([yelo-web#212](https://github.com/rideyelo/yelo-web/pull/212)). Per that pull request, a Cloudflare redirect outside the repository now sends `invite.yelo.link/<code>` to `joinyelo.com/i/<code>`.
 
 ## Dashboard short links
 
@@ -281,20 +288,20 @@ Validation errors (bad key, non-https destination, unknown folder, taken key) re
 | `archived` | `true` includes archived links. |
 | `fresh` | `true` skips the per-instance cache and asks Dub now. |
 
-The response carries `links`, `total` (across all pages), `page`, `page_size`, and `folders`. Each folder has `id`, `name`, and `count`. The system folder (`DUB_SYSTEM_FOLDER_ID`) is left out because it holds one referral link per user. Links in no folder appear last as `unsorted` with ID `root`. The list and the count run concurrently.
+The response carries `links`, `total` (across all pages), `page`, `page_size`, and `folders`. Each folder has `id`, `name`, and `count`. Every Dub folder is listed, including `system`, which holds one referral link per user. Its count tells the dashboard to page and search it on the server. Links in no folder appear last as `unsorted` with ID `root`. The list and the count run concurrently.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
   "$API_BASE_URL/dashboard/links?folder=all&search=ndflyer&sort=clicks"
 ```
 
-Each link has `id`, `domain`, `key`, `short_link`, `url`, `folder` (`campaigns`, `fleet`, `system`, or empty), `created_at`, `last_clicked`, `tags`, `clicks`, `leads`, `track_conversion`, `archived`, and `managed`.
+Each link has `id`, `domain`, `key`, `short_link`, `url`, `folder` (the lower-cased Dub folder name, such as `campaigns`, `fleet`, `system`, or `events`, or empty), `created_at`, `last_clicked`, `tags`, `clicks`, `leads`, `track_conversion`, `archived`, and `managed`.
 
 `managed` is `true`, making the link read-only, when any of these holds:
 
 - The link has a Dub external ID, so the API owns it. This covers referral, fleet join, and fleet payout onboarding links.
 - The key is `_root`, the domain root.
-- The domain isn't `yelo.link`, `pay.yelo.link`, or `event.yelo.link`. This covers referral links on `join.yelo.link`.
+- The domain isn't `yelo.link` or `pay.yelo.link`. This covers referral links on `join.yelo.link`.
 
 ### Create and edit links
 
@@ -309,10 +316,10 @@ Each link has `id`, `domain`, `key`, `short_link`, `url`, `folder` (`campaigns`,
 }
 ```
 
-- `domain` defaults to `yelo.link`. It must be `yelo.link`, `pay.yelo.link`, or `event.yelo.link`.
+- `domain` defaults to `yelo.link`. It must be `yelo.link` or `pay.yelo.link`. `event.yelo.link` was retired in October 2026.
 - `key` must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 - `url` must be an `https` address.
-- `folder` is `campaigns` (default) or `fleet`. It maps to `DUB_CAMPAIGNS_FOLDER_ID` or `DUB_FLEET_FOLDER_ID`. When the mapped ID is empty, the link is created in no folder.
+- `folder` is `campaigns` (default) or `fleet`. The API looks the folder up by name in Dub. When Dub has no folder with that name, the link is created in no folder.
 
 `PATCH /dashboard/links/{id}` takes any of `key`, `url`, `folder`, and `archived`. The API reads the link from Dub first and returns 403 "This link is managed by the API and cannot be edited here" for a managed link. A link can move between `campaigns` and `fleet` but not back to the root.
 
@@ -322,7 +329,7 @@ Writes empty the Dub listing cache on the instance that handled them. See [Dub](
 
 `GET /dashboard/links/preview?url=<short link>` fetches the short link the way a link-preview crawler does and returns the card it would build.
 
-- The URL must be `https`, on `yelo.link`, `pay.yelo.link`, `event.yelo.link`, or `join.yelo.link` (`dub.ShortDomains`), with no user info. Otherwise the API returns 400 "url must be an https short link on a Yelo short domain". Editing stays limited to the first three domains.
+- The URL must be `https`, on `yelo.link`, `pay.yelo.link`, or `join.yelo.link` (`dub.ShortDomains`), with no user info. Otherwise the API returns 400 "url must be an https short link on a Yelo short domain". Editing stays limited to the first two domains.
 - The fetch uses `mobility.NewGuardedHTTPClient`, so every dial and redirect hop goes through the SSRF guard. The destination is whatever an admin typed into Dub.
 - The request sends the user agent `facebookexternalhit/1.1 (compatible; YeloLinkPreview/1.0)`, because Dub only serves a link's own card to crawlers.
 - It times out after 8 seconds, follows at most 5 redirects, stops at any non-`https` redirect, and reads at most 512 KB of HTML.

@@ -127,6 +127,8 @@ Pushes are the source of freshness. Every interval below is a safety net for a m
 `/user/status` and `/community/current` are polled only in `QueryPollers`. React Query runs one timer per observer, so adding `refetchInterval` to another observer of the same key doubles the requests.
 </Warning>
 
+`QueryPollers` also watches `current_ride_id` and `current_ride_status` from the status poll. When the ride ends (`didRideEnd` in `lib/ride/historyFreshness.ts`: the ride ID changes, or the status moves to `complete` or `pending_rider_rating`), it invalidates ride and drive history and both profile caches (`currentUser` and `/authv2/status`). This recovers a missed completion push without another polling timer, so profile ride counters stay current.
+
 ## Heartbeat
 
 `providers/HeartbeatProvider.tsx` sends `POST /heartbeat/` with the last known position, `app_state`, screen name, battery, network type, heading, speed, and (for online drivers) `vehicle_id` and `auto_queue`. The response carries online user and driver counts.

@@ -150,10 +150,21 @@ A `PostgresGate` per credential paces calls (at least 125 ms apart) across repli
 | | |
 | --- | --- |
 | Package | `internal/data/dub` (Dub Go SDK) |
-| Config | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID`, `DUB_FLEET_FOLDER_ID`, `DUB_CAMPAIGNS_FOLDER_ID`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET` |
-| Used for | Referral, invite, fleet-join, and QR payment short links (`CreateLink`, `UpsertLink`, `UpdateLinkDestination`), lead tracking (`TrackLead`), and the dashboard **Links** page (`ListLinks`, `Folders`, `GetLink`, `CreateCampaignLink`, `UpdateLink`) |
+| Config | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `INVITE_LANDING_BASE_URL`, `EVENT_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET` |
+| Used for | Referral, invite, fleet-join, event, and QR payment short links (`CreateLink`, `UpsertLink`, `UpdateLinkDestination`), lead tracking (`TrackLead`), and the dashboard **Links** page (`ListLinks`, `Folders`, `GetLink`, `CreateCampaignLink`, `UpdateLink`) |
 
-Links are filed in three Dub folders. Referral links and QR payment links (`CreateLink`) go in `DUB_SYSTEM_FOLDER_ID`. Fleet driver join links and fleet payout onboarding links go in `DUB_FLEET_FOLDER_ID`. Links created from the dashboard go in `DUB_CAMPAIGNS_FOLDER_ID` unless the admin picks the fleet folder.
+Links are filed in Dub folders that the client finds by name. Each write reads the cached `/folders` list and maps lower-cased folder names to IDs, so a new folder works as soon as it exists in Dub. A folder Dub doesn't have, or a failed lookup, files the link in no folder rather than failing the write.
+
+| Folder | Links |
+| --- | --- |
+| `system` | Referral links and QR payment links (`CreateLink`) |
+| `fleet` | Fleet driver join links and fleet payout onboarding links |
+| `events` | Event share links on `yelo.link/e/...` |
+| `campaigns` | Links created from the dashboard, unless the admin picks the fleet folder |
+
+When `E2E_ENABLED` is set, `dub.NewProvider` returns `dub.Fake` instead of the client. The fake never calls Dub: every write succeeds and returns the short link Dub would have minted (`https://<domain>/<key>`), so E2E runs without `DUB_API_KEY`. It is stateless, so conflicts never fire and the links don't resolve.
+
+Dub sometimes answers an update by key with a 200 whose body the SDK's decoder rejects. The write has landed, so `updateLinkByKey` reads the link back with `Links.Get` and returns it instead of an error.
 
 The dashboard listing reads (`/links`, `/links/count`, `/folders`) call Dub's REST API directly and go through a per-instance cache on the `Client`:
 

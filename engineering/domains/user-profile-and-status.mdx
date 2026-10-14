@@ -44,7 +44,7 @@ All routes are registered in `internal/server/http/user/user_routes.go` under th
 
 ## The status poll
 
-`GET /user/status` is the hot path. The app polls it from several hooks. `UserService.GetUserStatus` calls `sqlUserRepository.GetStatus` in `internal/data/repository/user_driver.go`, which runs one pool query with no explicit transaction: `GetUserDriverStatus` in `queries/user_driver.sql`.
+`GET /user/status` is the hot path. The app polls it from several hooks. `UserService.GetUserStatus` calls `sqlUserRepository.GetStatus` in `internal/data/repository/user_driver.go`, which runs one pool query with no explicit transaction: `GetUserDriverStatus` in `queries/user_driver.sql`. A token can outlive its user row. When the row is missing, the call returns 404 "User not found" instead of a 500.
 
 ### Response fields
 
@@ -137,6 +137,11 @@ Rules inside the snapshot:
 ## Profile reads and writes
 
 `GET /user/current-user` returns `{ user, signup_status }`. `user` comes from `UserProfileCache.Get`, which falls back to `sqlUserRepository.GetByID` (`GetUserProfileByID`). That query adds `school_name`, average rider and driver ratings, `drive_count` and `ride_count` (completed, not cancelled), `driver_application_status` (`complete` when `DriverApplications.is_active`), `queue_length`, `next_available_latitude`/`longitude`, and `active_fleet_id`.
+
+Because the cached profile carries derived values, writers outside the user service also invalidate it:
+
+- **Ride completion and rating.** Ride counts and ratings change, so the rider's and driver's profiles are invalidated. HTTP completion (`refreshCompletedRideProfiles`) and `Rate` do it before returning, and a failed invalidation fails the request. Ride operation effects (`ReconcileRideOperation`) repeat it for rides in `pending_rider_rating` or `completed`, which covers failures and late delivery.
+- **Education verification.** StudID `Complete` and education `Disconnect` invalidate the user's profile after the write commits. A cache failure is logged and never fails the verification. When StudID is disabled, the API still builds a repository-only service, so existing education connections can be listed and disconnected, while `Start` and `Complete` return a provider-unavailable error.
 
 `signup_status` is read directly from Postgres by `GetUserSignupStatus`, not from the cache:
 
