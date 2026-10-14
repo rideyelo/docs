@@ -27,6 +27,8 @@ The Expo config plugin in `app.json` sets `merchantIdentifier: merchant.com.ride
 | `ephemeral_key` | New ephemeral key secret for that customer |
 | `setup_intent_client_secret` | New SetupIntent with automatic payment methods, no redirects |
 
+When every quoted option is free, the API skips payment setup and all three fields are empty strings. See [Ride PaymentIntent lifecycle](/engineering/payments/ride-payment-intents#step-by-step).
+
 The request always sends `X-Features: tips,driver-options`, so every ride created from the app has `tips_enabled = true`.
 
 ## PaymentSheet configuration
@@ -53,7 +55,7 @@ The request always sends `X-Features: tips,driver-options`, so every ride create
 }
 ```
 
-- The fare is `discounted_price` when the selected option `is_discounted`, otherwise `price`.
+- The fare comes from `resolveYeloOptionPrice` (`components/map/request/selectionHelpers.ts`): `discounted_price` when the selected option `is_discounted` and `discounted_price` is not null, otherwise `price`. A `discounted_price` of `0` counts, so a 100% discounted quote is a free ride. Before [#750](https://github.com/rideyelo/yelo-frontend/pull/750), the payment screen treated `0` as missing, fell back to the full `price`, and required the payment sheet and a payment method for a ride the API quoted as free.
 - `TIP_AUTHORIZATION_BUFFER = 5` mirrors `models.TipBuffer` on the API. Change both together.
 - **Apple Pay is suppressed** only when `Device.isDevice` is false and the key is live. Stripe's SDK crashes on a simulator's dummy token under live keys. Test keys work on the simulator.
 - `returnURL` is the bare scheme link `com.rideyelo://stripe-redirect`. `app/+native-intent.tsx` returns `null` for it, so the Stripe SDK consumes the link and the request screen stays mounted.

@@ -188,10 +188,10 @@ All web sites live in the Firebase project `yelo-dashboard-v2`. `.firebaserc` ma
 | `dashboard` | `yelo-dashboard-v2` | `yelo-dashboard-v2.web.app` |
 | `signup` | `yelo-signup` | `yelo-signup.web.app` |
 | `home` | `yelo-home` | `yelo-home.web.app` |
-| `event` | `yelo-event` | `yelo-event.web.app` |
 | `maestro` | `yelo-maestro` | `yelo-maestro.web.app` |
-| `invite` | `yelo-invite` | `yelo-invite.web.app` |
 | `world-cup` | `yelo-world-cup` | `yelo-world-cup.web.app` |
+
+The `event` and `invite` targets were removed from `.firebaserc` in October 2026 with their sites. Removing a target doesn't delete the Hosting site in Firebase.
 
 Add a site with `make new-site NAME=<name>`, which updates the registry, and commit the resulting `.firebaserc` target. CI fails when the Nx site list and `sites.config.json` disagree. See [Sites](/engineering/web/sites) and [Multisite](/engineering/web/multisite).
 
@@ -201,8 +201,8 @@ Three Workers in `yelo-web/workers/` run on the zones `rideyelo.com` and `joinye
 
 | Worker (`name`) | Directory | Routes | Vars |
 | --- | --- | --- | --- |
-| `yelo-experience-router` | `workers/experience-router` | `joinyelo.com/*` and `www.joinyelo.com/*`. It proxies `/auth/v3`, `/pay/tip*`, `/i/*`, `/get`, `/e/*`, and `/_yelo/signup/*`, and passes every other path through to the home site | `SIGNUP_ORIGIN=https://yelo-signup.web.app` |
-| `yelo-og` | `workers/og` | `rideyelo.com/og/*`, `www.rideyelo.com/og/*` | `ENVIRONMENT=production`. CPU limit raised to 30,000 ms for PNG rendering |
+| `yelo-experience-router` | `workers/experience-router` | `joinyelo.com/*` and `www.joinyelo.com/*`. It proxies `/auth/v3`, `/pay/tip*`, `/i/*`, `/get`, `/e/*`, `/delete-account`, and `/_yelo/signup/*`, and passes every other path through to the home site | `SIGNUP_ORIGIN=https://yelo-signup.web.app` |
+| `yelo-og` | `workers/og` | `joinyelo.com/og/*`, `www.joinyelo.com/og/*`, `rideyelo.com/og/*`, `www.rideyelo.com/og/*` | `ENVIRONMENT=production`. CPU limit raised to 30,000 ms for PNG rendering |
 | `yelo-world-cup-router` | `workers/world-cup-router` | `rideyelo.com`, `www.rideyelo.com`, `joinyelo.com`, `www.joinyelo.com`: `/world-cup*`. The campaign is offline, so it redirects these paths to `https://joinyelo.com/` | `WORLD_CUP_ORIGIN=https://yelo-world-cup.web.app`, `WORLD_CUP_API_ORIGIN=https://api.rideyelo.com` (set but no longer read) |
 
 The `yelo-web` **Workers** workflow deploys a worker when a merge to `main` changes that worker's own directory. A change to only shared dependencies is verified but not deployed, and you ship it with **Actions → Workers → Run workflow**. `pnpm worker:<name>:deploy` still works by hand. See [GitHub Actions workflows](/engineering/ci/workflows) for the workflow and [Edge and routing](/engineering/web/edge-and-routing) for behavior and the `OG_SIGNING_SECRET` Wrangler secret.

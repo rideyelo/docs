@@ -32,7 +32,7 @@ stateDiagram-v2
 
 <Steps>
   <Step title="Request: customer, ephemeral key, SetupIntent">
-    `RideService.CreateRideV2` calls `ensureStripeCustomerSetup` (`internal/service/ride/rider.go`).
+    `RideService.CreateRideV2` prices the vehicle options first, then calls `prepareQuotedRidePayment` (`internal/service/ride/quoted_payment.go`) before it saves the draft. When every quoted option is free, it skips payment setup: no customer, ephemeral key, or SetupIntent is created, and the three Stripe fields in the response are empty. An option counts as free only when it is `per_ride`, its `price` is 0, its discounted price (when set) is 0, and any `price_max` is 0. An empty quote, a flagged discount with no discounted price, or a mix of free and paid options keeps the paid path. Otherwise it calls `ensureStripeCustomerSetup` (`internal/service/ride/rider.go`).
 
     - `CustomerProvisioner.Ensure` (`internal/service/payment/customer.go`) returns the rider's Stripe customer. Most riders already have one, because the `stripe_customer_provision` job creates it after signup. See [On-demand jobs](/engineering/api/background-jobs#on-demand-jobs).
     - If the loaded user has no `stripe_customer_id`, `Ensure` re-reads the column in case the job finished meanwhile. If it is still empty, it calls `Customers.New` with only `metadata.yelo_user_id` and the idempotency key `yelo-customer-v1-<user id>`, then saves the ID with `ClaimUserStripeCustomerID`. That query keeps an ID another request already stored and never writes to a deleted user. `Ensure` then enqueues the job to set the customer's email and name.

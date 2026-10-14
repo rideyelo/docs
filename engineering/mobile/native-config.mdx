@@ -47,7 +47,7 @@ Settings that are the same in both identities:
 | Orientation, appearance | `portrait`, `userInterfaceStyle: light`. It was `automatic` before 5.8.0. See [Architecture](/engineering/mobile/architecture#theming). |
 | iOS tablets | `supportsTablet: true` |
 | iOS deployment target | `16.4` (`expo-build-properties`) |
-| Associated domains | `applinks:yelo.link`, `applinks:join.yelo.link`, `applinks:invite.yelo.link` |
+| Associated domains | `applinks:yelo.link`, `applinks:join.yelo.link`, `applinks:joinyelo.com`, `applinks:www.joinyelo.com`. 5.8.1 added the two `joinyelo.com` hosts and dropped `invite.yelo.link`, which is now only a redirect. |
 | Expo experiments | `typedRoutes: true`, `reactCompiler: true` |
 | `extra.router.origin` | `false` |
 
@@ -84,7 +84,7 @@ Every other `EXPO_PUBLIC_*` value comes from the EAS environment named in the pr
 | Key | Value | Set by |
 | --- | --- | --- |
 | `CFBundleURLTypes` | `google-oauth` with the reversed Google iOS client ID, and `com.rideyelo.yelo` with `yelo` | `app.json` `ios.infoPlist`. Expo adds the `scheme` entries on top. |
-| `LSApplicationQueriesSchemes` | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam` | `app.json`. `react-native-share` adds `fb`, `instagram`, `twitter`, `tiktoksharesdk`. |
+| `LSApplicationQueriesSchemes` | `snapchat`, `instagram`, `tiktok`, `uber`, `lyft`, `waymo`, `rideyazam`, `waze`, `msauth`, `tel` | `app.json`. `react-native-share` adds `fb`, `instagram`, `twitter`, `tiktoksharesdk`. |
 | `UIBackgroundModes` | `location`, `remote-notification` | `app.json`. `withoutBackgroundFetch` removes the `fetch` mode that `expo-task-manager` adds. |
 | `NSAppTransportSecurity` | `localhost` allows insecure HTTP loads | `app.json` |
 | `ITSAppUsesNonExemptEncryption` | `false` | `app.json` |
@@ -97,7 +97,7 @@ Every other `EXPO_PUBLIC_*` value comes from the EAS environment named in the pr
 | --- | --- | --- |
 | `aps-environment` | `production` | `app.json`, then `withProductionAps` in `app.config.ts` |
 | `com.apple.developer.in-app-payments` | `merchant.com.rideyelo.yelo` | `app.json` and the Stripe plugin's `merchantIdentifier` |
-| `com.apple.developer.associated-domains` | The three `applinks:` domains | `ios.associatedDomains` |
+| `com.apple.developer.associated-domains` | The four `applinks:` domains | `ios.associatedDomains` |
 | Sign in with Apple | Enabled | `ios.usesAppleSignIn: true` and `expo-apple-authentication` |
 | App groups | The variant's app group | `expo-widgets` |
 
@@ -118,21 +118,21 @@ Every other `EXPO_PUBLIC_*` value comes from the EAS environment named in the pr
 | `permissions` | `ACCESS_NETWORK_STATE`, `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION` | `app.json` |
 | Plugin-added permissions | Background location and foreground service (`expo-location`), camera (`expo-camera`, `expo-image-picker`), contacts (`expo-contacts`), notifications (`expo-notifications`) | Plugins |
 | `blockedPermissions` | `READ_PHONE_STATE`, `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS` | `app.json`. These are stripped even when a dependency declares them. |
-| `<queries>` | One intent block with `VIEW` for `uber`, `lyft`, `waymo`, `rideyazam` | `withRideProviderQueries` in `app.config.ts` |
+| `<queries>` | One intent block with `VIEW` for `uber`, `lyft`, `waymo`, `rideyazam`, `waze`, `msauth`, `tel` | `withRideProviderQueries` in `app.config.ts` |
 | Adaptive icon | Foreground and monochrome `android-foreground.png`, background `#F7FB32` | `app.json` |
 
-`withRideProviderQueries` removes any existing `<queries>` entry for those schemes before adding its own, so reruns don't duplicate it. Keep `RIDE_PROVIDER_SCHEMES` in sync with the iOS `LSApplicationQueriesSchemes` list, or install probes for ride providers break on one platform.
+`withRideProviderQueries` removes any existing `<queries>` entry for those schemes before adding its own, so reruns don't duplicate it. Despite its name, `RIDE_PROVIDER_SCHEMES` also covers driver navigation (`waze`), Microsoft Authenticator (`msauth`), and phone calls (`tel`). Keep it in sync with the iOS `LSApplicationQueriesSchemes` list, or `canOpenURL` probes answer wrongly on one platform.
 
 ### Intent filters
 
 | Filter | `autoVerify` | Data | Variant |
 | --- | --- | --- | --- |
-| App Links | Yes | `https://yelo.link/` and `https://yelo.link/fleet-*` | Both |
+| App Links | Yes | `https://yelo.link/`, `https://yelo.link/fleet-*`, and `https://yelo.link/e/*` | Both |
 | App Links | Yes | `https://join.yelo.link` (any path) | Both |
-| App Links | Yes | `https://invite.yelo.link` (any path) | Both |
+| App Links | Yes | `/i/*` and `/e/*` on `https://joinyelo.com` and `https://www.joinyelo.com` | Both |
 | Uber login callback | No | `uberauth:` | Production identity only |
 
-On `yelo.link`, only the root path and paths starting with `/fleet-` open the app. Other `yelo.link` paths open in the browser on Android even though iOS claims the whole domain. For how incoming URLs are rewritten, see [Navigation](/engineering/mobile/navigation#url-schemes-and-domains).
+On `yelo.link`, only the root path and paths starting with `/fleet-` or `/e/` open the app. On `joinyelo.com`, only `/i/` and `/e/` paths do. Other paths on those hosts open in the browser on Android even though iOS claims the whole domain. For how incoming URLs are rewritten, see [Navigation](/engineering/mobile/navigation#url-schemes-and-domains).
 
 The `uberauth` filter exists because Android Custom Tabs can't intercept an unregistered callback scheme the way iOS `ASWebAuthenticationSession` can. Uber's first-party login returns to `uberauth://`.
 

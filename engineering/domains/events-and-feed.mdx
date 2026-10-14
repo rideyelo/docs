@@ -14,7 +14,7 @@ Two neighbors own the deeper internals of shared pieces:
 
 | Store | Object | Written by | Read by |
 | --- | --- | --- | --- |
-| Postgres | `"Events"` | Dashboard event CRUD, `ArchivePastEvents` | App, public event site, community layer, Spot hydration |
+| Postgres | `"Events"` | Dashboard event CRUD, `ArchivePastEvents` | App, the `joinyelo.com/e/<slug>` event landing, community layer, Spot hydration |
 | Postgres | `"EventAttendees"` | Nothing since October 2026 | Nothing. The table still exists, but no code reads or writes it. |
 | Postgres | `"EventStoryViews"` | `POST /event/{id}/view` (upsert) | `viewed` flag on app event reads |
 | Postgres | `"EventShares"`, `"TicketPurchases"` | Not written by this domain | `metrics.shares`, `metrics.tickets_sold` |
@@ -27,6 +27,7 @@ Two neighbors own the deeper internals of shared pieces:
 | Redis | `feed:refresh:lock:{communityID}` | `SetNX` in `initCommunityFeed` and `RefreshFeed` | Same |
 | Process memory | `FeedCache.communityFeedPages` | `FeedCache.RefreshFeed` | Fallback when Redis fails |
 | Supabase Storage | `event_photos/{eventID}/{uuid}{ext}`, `spot_photos/{spotID}/{uuid}{ext}` (public bucket) | Photo upload endpoints | `photo_url`, `image_url` |
+| Dub | `yelo.link/e/<slug>` and `yelo.link/e/<slug>/<code>` in the `events` folder | Event publish, edit, and photo upload; `GET /event/{id}/share-link` | Share sheets and link previews |
 
 Table definitions live in the [database reference](/reference/database/overview). `"MobilityFeeds"` is in [Markets, communities, and zones](/reference/database/markets-communities-and-zones), and the top-location tables are in [Locations and places](/reference/database/markets-locations-and-places).
 
@@ -39,6 +40,7 @@ Table definitions live in the [database reference](/reference/database/overview)
 | `GET` | `/event/upcoming?limit=` | JWT, role `user` | `GetUpcoming`. Published events in the caller's community where `release_time` is before now and `close_time` is after now, ordered by `start_time`. `limit` defaults to 20, max 100. |
 | `GET` | `/event/{id}` | JWT, role `user` | `GetEventByID`. Published event plus metrics. |
 | `POST` | `/event/{id}/view` | JWT, role `user` | `ViewEvent`. Upserts `"EventStoryViews"` with `viewed_at = now`. |
+| `GET` | `/event/{id}/share-link` | JWT, role `user` | `GetShareLink`. Returns `{ "url": ... }`, the caller's own short link for a published event. 404 when the event isn't published or has no slug. See [Share links](#share-links). |
 | `GET` | `/public/events/slug/{slug}` | Public | `GetPublicEventBySlug`. Case-insensitive slug match on published events, trimmed to `PublicEvent`. |
 | `GET` | `/community/feed?page=` | JWT, role `user` | `CommunityHandler.GetFeed`. Cached feed page for the caller's community. `page` must be 0 or more. |
 
@@ -118,6 +120,31 @@ Any other pair returns 400 `cannot transition from 'X' to 'Y'`.
 | Community layer | `GetUpcoming(uuid.Nil, community, 25)` | Cached for 300 seconds per community. |
 
 `getEventMetrics` issues two `COUNT` queries per event (`"TicketPurchases"` and `"EventShares"`). `GetUpcoming` calls it once per returned event, so 20 events cost 40 extra queries.
+
+### Share links
+
+A published event with a slug gets a Dub short link, built by `shareLinkRequest` in `internal/service/event/share_link.go`.
+
+| Field | Event link | Sharer link |
+| --- | --- | --- |
+| Short link | `yelo.link/e/<slug>` | `yelo.link/e/<slug>/<referral code>` |
+| Destination | `EVENT_LANDING_BASE_URL/<slug>` (default `https://joinyelo.com/e/<slug>`) | Same, plus `?ref=<referral code>` |
+| External ID | `event:<event id>` | `event:<event id>:<user id>` |
+| Card | `ogcard.EventCardURL`: name, start time, venue, photo | Same, plus the sharer's first name (`s`) |
+
+Every link goes in the `events` Dub folder with tag `event`, `Proxy` and `TrackConversion` on, and `MoveKey` set so a renamed slug moves the existing link to its new key. The title is the event name. The description is the start time and venue joined with ` · `. The start time is formatted as `Mon, Jan 2 · 3:04 PM` in the community's timezone, and falls back to UTC when the timezone is unknown. The venue is the venue name, else the event's `location_name`.
+
+`syncShareLink` upserts the event's own link after these writes, and only when the event is published:
+
+- `UpdateEventStatus` to `published`.
+- `UpdateEvent`.
+- `UploadEventPhoto`, because the card embeds the photo URL.
+
+The sync is best effort. A Dub failure logs "[event] failed to sync share link" and never fails the write. An edit to an unpublished event makes no Dub call and no community lookup.
+
+`GET /event/{id}/share-link` builds the caller's sharer link and upserts it on every call, which also refreshes the card after an edit. When Dub fails or isn't configured, it returns the landing URL with `?ref=<code>` instead, so sharing never fails on Dub. A sign-up from the link carries the sharer's referral code. See [Anonymous link touches](/engineering/domains/referrals-and-links#anonymous-link-touches) for how opening it makes a known visitor the sharer's friend.
+
+With the app installed (5.8.1 and later), both link forms open `app/(app)/e/[slug].tsx` instead of the landing. A signed-in user is connected to the sharer through `POST /user/friends/connect`, then sent to the event's detail screen. A signed-out user has the sharer's code stored for sign-up. See [Event share links](/engineering/mobile/navigation#event-share-links).
 
 ## The Spot
 

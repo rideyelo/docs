@@ -30,7 +30,7 @@ Every variable below is read in `internal/utilities/config/*.go` unless the **Wh
     | `API_VERSION` | No | Sentry release name | `config.go:262` |
     | `APP_URL_SCHEME`, `APP_STORE_URL` | No | `/redirect` targets | `config.go:258-259` |
     | `YELO_WEBSITE_URL`, `YELO_DASHBOARD_URL` | No | Links in emails and Stripe | `config.go:260-261` |
-    | `CORS_TRUSTED_ORIGINS` | No | Overrides the built-in CORS list | `config.go:729` |
+    | `CORS_TRUSTED_ORIGINS` | No | Overrides the built-in CORS list | `config.go:766` |
     | `SWAGGER_ENABLED` | No | Swagger in `dev` | `config.go:263` |
     | `ACTIVATION_ENABLED` | No | Driver activation loop | `config.go:265` |
     | `RIDE_STATE_SNAPSHOT_ENABLED` | No | Ride state protocol | `config.go:253` |
@@ -101,12 +101,11 @@ Every variable below is read in `internal/utilities/config/*.go` unless the **Wh
     | `QUO_ACCOUNT_KEY`, `RESEND_ACCOUNT_KEY`, `RESEND_CONTACTS_API_KEY` | No | Contact sync accounts | `contact_sync.go:18-20` |
     | `RESEND_REQUEST_INTERVAL`, `RESEND_CONTACT_REQUEST_INTERVAL`, `CONTACT_SYNC_RECONCILE_INTERVAL`, `CONTACT_SYNC_RESEND_ENABLED` | No | Contact sync pacing and toggle | `contact_sync.go:21-24` |
     | `CONTACT_HASH_PEPPER` | No | Contact hash pepper. Read with `os.Getenv` on each use. The loaded `Config.HashPepper` field is never read | `config.go:381`, `internal/service/user/contacts.go:176`, `internal/data/repository/dashboard.go:2103` |
-    | `DUB_API_KEY`, `DUB_WORKSPACE_ID`, `DUB_SYSTEM_FOLDER_ID` | No | Dub short links | `config.go:385-387` |
-    | `DUB_FLEET_FOLDER_ID` | No | Dub folder for fleet join and payout onboarding links. Falls back to `DUB_SYSTEM_FOLDER_ID` | `config.go:388` |
-    | `DUB_CAMPAIGNS_FOLDER_ID` | No | Dub folder for links created on the dashboard **Links** page | `config.go:389` |
-    | `INVITE_LANDING_BASE_URL` | No | Destination base for personal (`<base>/<code>`) and fleet (`<base>/fleet/<code>`) invite Dub links. Defaults to `https://joinyelo.com/i` so the Dub click lands first-party to sign-up | `config.go:364` |
-    | `OG_IMAGE_BASE_URL` | No | OG card worker base. Defaults to `https://rideyelo.com` | `config.go:368` |
-    | `OG_SIGNING_SECRET` | Yes | Signs OG card URLs. Must match the `og` Worker secret | `config.go:370` |
+    | `DUB_API_KEY`, `DUB_WORKSPACE_ID` | No | Dub short links. Folders are looked up by name in Dub, so there are no folder ID variables. Ignored when `E2E_ENABLED` is set, which swaps in a fake Dub client | `config.go:381-382`, `internal/data/dub/fake.go` |
+    | `EVENT_LANDING_BASE_URL` | No | Destination base for event short links (`yelo.link/e/<slug>` lands on `<base>/<slug>`). Defaults to `https://joinyelo.com/e` | `config.go:383` |
+    | `INVITE_LANDING_BASE_URL` | No | Destination base for personal (`<base>/<code>`) and fleet (`<base>/fleet/<code>`) invite Dub links. Defaults to `https://joinyelo.com/i` so the Dub click lands first-party to sign-up | `config.go:384` |
+    | `OG_IMAGE_BASE_URL` | No | OG card worker base. Defaults to `https://rideyelo.com`. The `og` Worker also serves `joinyelo.com/og/*` since October 2026, and [yelo-web#212](https://github.com/rideyelo/yelo-web/pull/212) asks for this to be set to `https://joinyelo.com` in production | `config.go:388` |
+    | `OG_SIGNING_SECRET` | Yes | Signs OG card URLs. Must match the `og` Worker secret | `config.go:390` |
     | `STORAGE_URL`, `STORAGE_TOKEN`, `STORAGE_PUBLIC_BUCKET_ID`, `STORAGE_PRIVATE_BUCKET_ID` | No | Supabase Storage | `config.go:318-321` |
     | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_SYNC_ENABLED`, `GOOGLE_CALENDAR_OWNER_EMAIL`, `GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET`, `GOOGLE_CALENDAR_CALLBACK_URL`, `GOOGLE_CALENDAR_DASHBOARD_URL`, `GOOGLE_CALENDAR_TOKEN_KEYS` | Cond. | Operating-hours calendar | `calendar.go:25-26` |
     | `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED`, `GOOGLE_PLAY_PACKAGE_NAME`, `GOOGLE_PLAY_TRACKS`, `GOOGLE_PLAY_CONSOLE_URL` | Cond. | Play release monitor. Package and tracks required when enabled | `config.go:352-355,720` |
@@ -116,15 +115,15 @@ Every variable below is read in `internal/utilities/config/*.go` unless the **Wh
   <Accordion title="E2E mode">
     | Name | Required | Purpose | Where |
     | --- | --- | --- | --- |
-    | `E2E_ENABLED` | E2E | Enables E2E mode | `config.go:384` |
-    | `E2E_CONTROL_API_KEY` | E2E | `X-E2e-Key` secret, at least 32 bytes | `config.go:385` |
-    | `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` | E2E | Database isolation checks | `config.go:386-388` |
-    | `E2E_FIXTURE_TTL`, `E2E_BACKGROUND_JOBS_ENABLED` | No | Fixture lifetime. Jobs must stay off | `config.go:389-390` |
+    | `E2E_ENABLED` | E2E | Enables E2E mode. Also swaps the Dub client for a stateless fake, so E2E never needs `DUB_API_KEY` | `config.go:407`, `internal/data/dub/fake.go` |
+    | `E2E_CONTROL_API_KEY` | E2E | `X-E2e-Key` secret, at least 32 bytes | `config.go:408` |
+    | `E2E_DATABASE_NAME`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF` | E2E | Database isolation checks | `config.go:409-411` |
+    | `E2E_FIXTURE_TTL`, `E2E_BACKGROUND_JOBS_ENABLED` | No | Fixture lifetime. Jobs must stay off | `config.go:412-413` |
   </Accordion>
 </AccordionGroup>
 
 <Note>
-These variables are read in code but missing from `.env.example`: `APP_STORE_WEBHOOK_SECRET`, `CONTACT_HASH_PEPPER`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID`, `GOOGLE_PLACES_BIAS_RADIUS_METERS`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET`, `QUO_REQUEST_INTERVAL_SECONDS`, and `RIDE_STATE_SNAPSHOT_ENABLED`. `PHOTON_*` and `TWILIO_EVENTS_WEBHOOK_*` appear only as commented-out lines. `OG_SIGNING_SECRET` is required, so a fresh `.env` copied from the example fails `Validate()`.
+These variables are read in code but missing from `.env.example`: `APP_STORE_WEBHOOK_SECRET`, `CONTACT_HASH_PEPPER`, `E2E_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `EARNINGS_DEV_OVERRIDE_MERCHANT_ID`, `EVENT_LANDING_BASE_URL`, `GOOGLE_PLACES_BIAS_RADIUS_METERS`, `INVITE_LANDING_BASE_URL`, `OG_IMAGE_BASE_URL`, `OG_SIGNING_SECRET`, `QUO_REQUEST_INTERVAL_SECONDS`, and `RIDE_STATE_SNAPSHOT_ENABLED`. `PHOTON_*` and `TWILIO_EVENTS_WEBHOOK_*` appear only as commented-out lines. `OG_SIGNING_SECRET` is required, so a fresh `.env` copied from the example fails `Validate()`.
 </Note>
 
 ## yelo-api deploy and CI
@@ -136,7 +135,7 @@ These variables are read in code but missing from `.env.example`: `APP_STORE_WEB
     | `_RUNTIME_ENV_VARS`, `_RUNTIME_SECRET_REFS` | Cloud Build substitution | Production runtime env and Secret Manager refs. Set on the manual release trigger. The build fails if either is empty | `cloudbuild.yaml:15-21,40-41` |
     | `_AR_HOSTNAME`, `_AR_PROJECT_ID`, `_AR_REPOSITORY`, `_DEPLOY_REGION`, `_SERVICE_NAME`, `_MAX_INSTANCES`, `_GITHUB_REPOSITORY` | Cloud Build substitution | Image registry and Cloud Run target | `cloudbuild.yaml:22-30` |
     | `_GIT_SHA`, `_API_IMAGE`, `_SERVICE_ACCOUNT`, `_DATABASE_PROJECT_REF`, `_PRODUCTION_DATABASE_PROJECT_REF`, `_DATABASE_NAME`, `_REGION`, `_SERVICE_NAME`, `_API_ORIGIN` | Cloud Build substitution (E2E) | E2E convergence deploy | `cloudbuild.e2e.yaml:24-120` |
-    | `MIGRATION_DSN` | Cloud Run Job secret | Migration DSN, bound from Secret Manager | `cloudbuild.yaml`, `cloudbuild.e2e.yaml:88` |
+    | `MIGRATION_DSN` | Cloud Run Job secret | Migration DSN, bound from Secret Manager. The job rewrites a Supabase pooler DSN from port 6543 (transaction mode) to 5432 (session mode), so `golang-migrate` keeps its advisory lock and prepared statements on one session | `cloudbuild.yaml`, `cloudbuild.e2e.yaml:88`, `scripts/release/run-migrations.sh` |
     | `EXPECTED_MIGRATION_VERSION` | Cloud Run Job env | Latest migration the job must reach | `scripts/release/run-migrations.sh` |
     | `E2E_BOOTSTRAP_SUPABASE_SECONDARY_DATABASE`, `E2E_EXPECTED_DATABASE_NAME`, `E2E_EXPECTED_DATABASE_PROJECT_REF`, `E2E_PRODUCTION_DATABASE_PROJECT_REF`, `E2E_BOOTSTRAP_SQL_PATH`, `E2E_SEED_SQL_PATH` | Cloud Run Job env (E2E) | E2E database bootstrap and seed | `cloudbuild.e2e.yaml:89`, `scripts/release/run-migrations.sh` |
     | `SMOKE_ATTEMPTS`, `SMOKE_DEEP_ATTEMPTS`, `SMOKE_DELAY_SECONDS`, `SMOKE_CONNECT_TIMEOUT_SECONDS`, `SMOKE_REQUEST_TIMEOUT_SECONDS`, `SMOKE_ALLOW_HTTP` | Release script | Candidate smoke test tuning | `scripts/release/smoke-candidate.sh:11-20` |
@@ -165,9 +164,9 @@ Vite inlines `VITE_*` values at build time. CI takes them from GitHub repository
   <Accordion title="Build-time VITE variables">
     | Name | Required by | Purpose | Where |
     | --- | --- | --- | --- |
-    | `VITE_API_URL` | dashboard, event, invite, signup | API base. Relative values fall back to `https://api.joinyelo.com` in production builds | `src/lib/api-client.ts:6-10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:2-3` |
+    | `VITE_API_URL` | dashboard, signup | API base. Relative values fall back to `https://api.joinyelo.com` in production builds | `src/lib/api-client.ts:6-10`, `src/sites/signup/auth-v3/authV3BaseURL.ts:2-3` |
     | `VITE_CLERK_PUBLISHABLE_KEY` | dashboard | Clerk | `src/shared/bootstrap/ClerkAuth.tsx:4` |
-    | `VITE_MAPBOX_API_KEY` | dashboard, event | Mapbox GL and static maps | `src/components/CommunityMap.tsx:10`, `src/sites/event/lib/staticMap.ts:1` |
+    | `VITE_MAPBOX_API_KEY` | dashboard | Mapbox GL | `src/components/CommunityMap.tsx:10` |
     | `VITE_SENTRY_DSN` | Optional | Dashboard Sentry | `src/sites/dashboard/main.tsx:60` |
     | `VITE_GOOGLE_WEB_CLIENT_ID`, `VITE_APPLE_SERVICES_ID` | signup | Web OAuth | `src/shared/signup/webOAuth.ts:50,84` |
     | `VITE_APPLE_REDIRECT_URI` | Optional | Apple return URL. Default `https://signup.yelo.link` | `src/shared/signup/webOAuth.ts:74-77` |

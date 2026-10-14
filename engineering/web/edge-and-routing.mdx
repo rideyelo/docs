@@ -9,24 +9,24 @@ Requests for Yelo web properties pass through up to three layers: a Cloudflare W
 
 | Hostname | Served by | Evidence in code |
 | --- | --- | --- |
-| `joinyelo.com`, `www.joinyelo.com` | Firebase `home` site, proxied through Cloudflare. `experience-router` runs on every path and proxies the signup-owned ones. | `home/index.html` `og:url`; `docs/authv3-web-native.md` ("Unmatched requests continue to the Firebase home origin") |
+| `joinyelo.com`, `www.joinyelo.com` | Firebase `home` site, proxied through Cloudflare. `experience-router` runs on every path and proxies the signup-owned ones. The `og` Worker owns `/og/*`. | `home/index.html` `og:url`; `docs/authv3-web-native.md` ("Unmatched requests continue to the Firebase home origin") |
 | `rideyelo.com`, `www.rideyelo.com` | Framer, proxied through Cloudflare. Worker routes intercept `/world-cup*` and `/og/*`. | `workers/world-cup-router/README.md` |
 | `yelo-signup.web.app` | Firebase `signup` site | `experience-router` `SIGNUP_ORIGIN` |
 | `yelo-world-cup.web.app` | Firebase `world-cup` site | `world-cup-router` `WORLD_CUP_ORIGIN` |
 | `api.joinyelo.com`, `api.rideyelo.com` | Cloud Run API (both names) | `src/lib/api-client.ts`, `authV3BaseURL.ts`, `JobsPage.tsx`, signup CSP |
-| `signup.yelo.link`, `invite.yelo.link`, `event.yelo.link`, `join.yelo.link`, `pay.yelo.link`, `yelo.link` | Short-link hosts. `docs/authv3-web-native.md` calls `yelo.link` Dub-managed; the repo does not record which subdomains are Firebase custom domains. | `invite/firebase.json`, `invite/index.html`, `EventFormSheet.tsx`, `referralHandoff.ts`, `QRConfigCards.tsx`, `openApp.ts` |
+| `signup.yelo.link`, `join.yelo.link`, `pay.yelo.link`, `yelo.link` | Short-link hosts. `docs/authv3-web-native.md` calls `yelo.link` Dub-managed; the repo does not record which subdomains are Firebase custom domains. `invite.yelo.link` and `event.yelo.link` no longer have a Firebase site behind them, and [yelo-web#214](https://github.com/rideyelo/yelo-web/pull/214) describes `signup.yelo.link` as a Cloudflare redirect. Those redirects live outside the repository. | `webOAuth.ts`, `EventFormSheet.tsx` (`yelo.link/e/<slug>`), `referralHandoff.ts`, `QRConfigCards.tsx`, `openApp.ts`, the generated `createLinkRequest.ts` |
 
-Firebase Hosting site IDs come from `.firebaserc`: `yelo-dashboard-v2`, `yelo-signup`, `yelo-event`, `yelo-home`, `yelo-maestro`, `yelo-invite`, and `yelo-world-cup`, all in project `yelo-dashboard-v2`.
+Firebase Hosting site IDs come from `.firebaserc`: `yelo-dashboard-v2`, `yelo-signup`, `yelo-home`, `yelo-maestro`, and `yelo-world-cup`, all in project `yelo-dashboard-v2`. The `yelo-event` and `yelo-invite` targets were removed with their sites in October 2026.
 
 ```mermaid
 flowchart LR
   U["Browser"] --> CF{"Cloudflare zone"}
   CF -->|"joinyelo.com/*"| ER["experience-router"]
   CF -->|"joinyelo.com/world-cup*, rideyelo.com/world-cup*"| WR["world-cup-router"]
-  CF -->|"rideyelo.com/og/*"| OG["og"]
+  CF -->|"joinyelo.com/og/*, rideyelo.com/og/*"| OG["og"]
   ER -->|"other paths"| HOME["yelo-home (Firebase)"]
   CF -->|"other rideyelo.com paths"| FR["Framer"]
-  ER -->|"/auth/v3, /pay/tip, /i/*, /get, /e/*, /_yelo/signup/*"| SU["yelo-signup.web.app"]
+  ER -->|"/auth/v3, /pay/tip, /i/*, /get, /e/*, /delete-account, /_yelo/signup/*"| SU["yelo-signup.web.app"]
   WR -->|"302"| HOMEURL["https://joinyelo.com/"]
 ```
 
@@ -51,6 +51,7 @@ The Worker runs for every request on `joinyelo.com`, except the paths that `worl
 | `/i/<code>` (anything longer than `/i/`) | `invite` | `SIGNUP_ORIGIN/i/<code>` (same path, so attribution cookies are first-party to the `joinyelo.com` sign-up page) | `experience-invite` |
 | `/get` or `/get/` | `get` | `SIGNUP_ORIGIN/get` | `experience-get` |
 | `/e/<slug>` (anything longer than `/e/`) | `event` | `SIGNUP_ORIGIN/e/<slug>` (same path) | `experience-event` |
+| `/delete-account` or `/delete-account/` | `delete-account` | `SIGNUP_ORIGIN/delete-account` | `experience-delete-account` |
 | `/_yelo/signup/<path>` | Asset | `SIGNUP_ORIGIN/<path>` | `experience-assets` |
 | Anything else | None | Passed through with `fetch(request)` to the zone origin, which is the `home` site | — |
 
@@ -64,7 +65,7 @@ Request handling:
 
 Response handling:
 
-- **Attribution cookies.** On a `GET` that returns HTML, the Worker appends `Set-Cookie` headers for `yelo_attr` (the entry click: `dub_id`, `utm_*`, `source_channel`, and `referral_code`) and `yelo_anon_id`, both with `Domain=.joinyelo.com; Path=/; Max-Age=7776000; SameSite=Lax; Secure`. Proxied experiences other than `auth-v3` always get a `yelo_anon_id` when the visitor has none, and a `yelo_attr` when the URL carries attribution. Pass-through pages get both only when the request has a query string that carries attribution. A pass-through request with no query string, or a method other than `GET`, is forwarded untouched. If planting cookies fails, the page is served anyway. See [Attribution cookies](/concepts/growth-features#attribution-cookies).
+- **Attribution cookies.** On a `GET` that returns HTML, the Worker appends `Set-Cookie` headers for `yelo_attr` (the entry click: `dub_id`, `utm_*`, `source_channel`, and `referral_code`) and `yelo_anon_id`, both with `Domain=.joinyelo.com; Path=/; Max-Age=7776000; SameSite=Lax; Secure`. Proxied experiences other than `auth-v3` and `delete-account` always get a `yelo_anon_id` when the visitor has none, and a `yelo_attr` when the URL carries attribution. Pass-through pages get both only when the request has a query string that carries attribution. A pass-through request with no query string, or a method other than `GET`, is forwarded untouched. If planting cookies fails, the page is served anyway. See [Attribution cookies](/concepts/growth-features#attribution-cookies).
 - **Location rewriting.** A same-origin `Location` from Firebase is mapped back to the public path: `/auth/v3/` becomes `/auth/v3`, and `/tip/...` becomes `/pay/tip/...`. Requesting `/auth/v3/` directly exists to avoid Firebase's trailing-slash `301` bouncing back to the same public URL in a loop.
 - **HTML asset namespacing.** For `GET` responses with `Content-Type: text/html`, `namespaceSignupAssets()` rewrites `src` and `href` attributes that start with `/assets/`, `/fonts/`, `/favicon-`, `/apple-touch-icon`, or `/app-store-badge` to `/_yelo/signup/...`, then drops `Content-Encoding`, `Content-Length`, and `ETag`.
 - **Missing assets.** If an `/_yelo/signup/*` request comes back as HTML, which is Firebase's SPA fallback for a missing file, the Worker returns `404 Asset not found` with `Cache-Control: no-store`. This prevents the edge from caching `index.html` as a JS or image file while a new Firebase release propagates.
@@ -91,7 +92,7 @@ The Vite dev server still has a `/world-cup/api` proxy that rewrites to `/world-
 
 ### og
 
-`workers/og/src/index.ts` renders 1200×630 PNG link-preview cards for invite, fleet, event, and tip links on `rideyelo.com/og/*` and `www.rideyelo.com/og/*`.
+`workers/og/src/index.ts` renders 1200×630 PNG link-preview cards on `joinyelo.com/og/*`, `www.joinyelo.com/og/*`, `rideyelo.com/og/*`, and `www.rideyelo.com/og/*`. `joinyelo.com` is the host new card URLs in `yelo-web` use, and the `rideyelo.com` routes keep older card URLs working. On `joinyelo.com`, the `/og/*` route is more specific than `experience-router`'s `joinyelo.com/*`, so card requests never reach the home site. The API still builds its card URLs on `OG_IMAGE_BASE_URL`, which defaults to `https://rideyelo.com`.
 
 | Path | Production | Development |
 | --- | --- | --- |
@@ -108,7 +109,21 @@ Security and failure handling:
 - `limits.cpu_ms` is `30000` because rasterizing costs about 250 ms of CPU, well above the plan default.
 - `OG_SIGNING_SECRET` is a Wrangler secret shared with the API. `ENVIRONMENT` other than `production` enables the dev endpoints.
 
-The templates are `invite`, `fleet`, `fleet-payouts`, `event`, and `tip` (`src/templates/invite.tsx`, `fleet.tsx`, `event.tsx`, `tip.tsx`). Adding one means writing the `.tsx` file and registering it in `src/templates/index.ts`. For the fleet cards, see [Link previews](/engineering/fleets/joins-and-invitations#link-previews). To browse every template's fixtures without running the worker, open the inventory viewer's **Link previews** view. See [Sites](/engineering/web/sites#maestro).
+The worker has eight templates, registered in `src/templates/index.ts`:
+
+| Template | File | Params | Used by |
+| --- | --- | --- | --- |
+| `invite` | `invite.tsx` | `n`, `l`, `p`, `c` | Personal invite links, signed by the API |
+| `fleet`, `fleet-payouts` | `fleet.tsx` | `n` (fleet name) | Fleet join links, signed by the API |
+| `drive` | `fleet.tsx` | None | `joinyelo.com/drivers` ("You've been invited to drive on Yelo") |
+| `event` | `event.tsx` | `n` (name), `d` (date), `v` (venue), `p` (photo), `s` (sharer's first name) | Event short links, signed by the API (`ogcard.EventCardURL`). With `s`, the card adds "`<s>` shared an event with you" above the name. The event's own link leaves `s` empty |
+| `page` | `page.tsx` | `r`: `home`, `get`, `partner`, `fleets`, `safety`, or `vision`. Unknown values render `home` | The `home` site's landing pages and the `/get` app landing |
+| `farefinder` | `page.tsx` | None | `joinyelo.com/farefinder` |
+| `tip` | `tip.tsx` | `n`, `f`, `p`, `c` | Tip links on `pay.yelo.link`, signed by the API |
+
+The `page` cards reuse each page's hero copy and art. The worker fetches the art from `joinyelo.com/card-art/`, which the `home` site serves from `src/sites/home/public/card-art/`. The static pages embed fixed card URLs with precomputed signatures, such as `https://joinyelo.com/og/page?r=home&sig=...`. A template with no params always has the same signature. If you change `OG_SIGNING_SECRET`, re-sign the URLs in `src/sites/home/index.html`, `public/farefinder/index.html`, `scripts/emit-partner-html.mjs`, and `scripts/emit-signup-html.mjs`.
+
+Adding one means writing the `.tsx` file and registering it in `src/templates/index.ts`. For the fleet cards, see [Link previews](/engineering/fleets/joins-and-invitations#link-previews). To browse every template's fixtures without running the worker, open the inventory viewer's **Link previews** view. See [Sites](/engineering/web/sites#maestro).
 
 The `invite` card mirrors the invite landing page at `joinyelo.com/i/<code>`, and the two should change together:
 
@@ -130,15 +145,11 @@ Each site owns `src/sites/<site>/firebase.json`; `pnpm firebase:config` merges t
 | --- | --- | --- | --- | --- |
 | `dashboard` | `**`: `no-cache, no-store, must-revalidate`. `/assets/**`: `public, max-age=31536000, immutable`. | `**` → `/index.html` | — | `**/.*` (no `.well-known` deployed) |
 | `signup` | `.well-known` files: JSON, 1 h. `/`: no-store. `/assets/**`: immutable 1 y. `/fonts/**`: 7 d. `/auth/v3{,/**}`: `no-store`, `Referrer-Policy: no-referrer`, `nosniff`, `X-Frame-Options: DENY`, `Permissions-Policy` (camera, microphone, geolocation off), CSP. `/delete-account{,/}`: `no-store`, no-referrer, nosniff, DENY. `/world-cup`, `/i/**`, `/e/**`, `/get`, `/tip/**`, `/web/tip/**`: no-store. | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `/i/fleet/**` → `/i/fleet/index.html`; `/e/**` → `/e/index.html`; `/get{,/}` → `/get-app.html`; `**` → `/index.html` | — | `firebase.json`, `node_modules` |
-| `event` | `/.well-known/apple-app-site-association`: JSON | `**` → `/index.html` | — | `firebase.json`, `node_modules` |
 | `home` | `.well-known`: JSON, 1 h. `/`: `no-cache`. `/assets/**`: immutable 1 y. Media and fonts by extension: 30 d. Named routes: `no-cache`. | `/partner`, `/drivers`, `/vision`, `/fleets`, `/safety`, `/privacy`, `/tos`, `/terms` (each `{,/}`) → `/<route>/index.html`; `/drive{,/}` → `/drivers/index.html`; `**` → `/index.html` | — | `firebase.json`, `node_modules` |
-| `invite` | `.well-known`: JSON, 1 h | `**` → `/index.html` | `/` and `/index.html` → `https://joinyelo.com/` (`302`). Personal invite paths redirect client-side; see below. | `firebase.json`, `node_modules` |
 | `maestro` | `**`: `no-cache, max-age=0, must-revalidate`. `/assets/**`: `public, max-age=31536000, immutable`. `/auth/v3{,/**}`: same security set as signup with a different CSP | `/auth/v3{,/,/callback}` → `/auth/v3/index.html`; `**` → `/index.html` | — | `**/.*` |
 | `world-cup` | `/world-cup{,/}`: no-store | `/world-cup{,/**}` → `/world-cup/index.html` | `/` → `/world-cup` (`302`) | `**/.*` |
 
-The `invite` site has no Firebase redirect for personal invites. An inline script in `src/sites/invite/index.html` runs before the bundle and, for any single-segment path `/<code>` without a dot, calls `location.replace('https://joinyelo.com/i/<code>')` with the original query string. `/fleet/<code>` is matched the same way and goes to `https://joinyelo.com/i/fleet/<code>`. The site renders no invite page itself; any other path shows "Invite not found".
-
-Every site except `dashboard`, `maestro`, and `world-cup` sets `appAssociation: "NONE"`, so Firebase serves the committed `.well-known` files instead of generating its own.
+`signup` and `home` set `appAssociation: "NONE"`, so Firebase serves the committed `.well-known` files instead of generating its own.
 
 ### Content Security Policies
 
@@ -153,14 +164,15 @@ Every site except `dashboard`, `maestro`, and `world-cup` sets `appAssociation: 
 
 ## App association files
 
-The shared `public/.well-known/apple-app-site-association` registers the iOS app ID `6CUL8VB632.io.flutterflow.ridedesi.desirider` for `webcredentials`, and its `applinks` components only **exclude** `/tip/*` and `/web/tip/*`. `assetlinks.json` delegates `handle_all_urls` to Android package `com.rideyelo` with two certificate fingerprints.
+The shared `public/.well-known/apple-app-site-association` registers the iOS app ID `6CUL8VB632.io.flutterflow.ridedesi.desirider` for `webcredentials`. Its `applinks` components, in order, exclude `/pay/tip/*` and include `/i/*` and `/e/*`. On `joinyelo.com`, a direct tap on an invite, fleet invite, or event landing opens the iOS app (5.8.1 or later, which claims `applinks:joinyelo.com`). A Dub short link that redirects into `joinyelo.com` still lands on the web page. The public tip page and every other path stay in the browser. Apple's CDN can take up to a day to pick up a changed file. `assetlinks.json` delegates `handle_all_urls` to Android package `com.rideyelo` with two certificate fingerprints.
 
 | Site | Source of `.well-known` | Effect |
 | --- | --- | --- |
-| `signup`, `event` | Shared `public/` copied as the public dir | Tip paths stay in the browser |
-| `home` | `emit-site-app-associations` plugin (the site has its own `public/`) | Same as shared |
-| `invite` | Plugin, with `{"/": "/auth/*", "exclude": true}` and `{"/": "/*"}` appended | Every invite path except `/auth/*` opens the app |
+| `signup` | Shared `public/` copied as the public dir | Served at `yelo-signup.web.app` |
+| `home` | `emit-site-app-associations` plugin (the site has its own `public/`) | Served at `joinyelo.com`. `experience-router` passes `/.well-known/*` through to `home` |
 | `dashboard`, `maestro`, `world-cup` | Not deployed (`ignore: **/.*` or no shared `public/`) | — |
+
+The plugin in `tools/vite/base/config.ts` still has an `isInvite` branch that appends `/auth/*` and `/*` components. No site is named `invite` anymore, so the branch never runs.
 
 ## Where this lives in code
 

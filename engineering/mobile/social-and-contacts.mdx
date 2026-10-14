@@ -13,10 +13,10 @@ This page covers the social and growth surfaces of `yelo-frontend`. For the prod
 | --- | --- | --- | --- |
 | Friend list | `GET /user/friends` | `FriendsProvider` (query key `['friends', jwt]`) | 60 s stale time, 5-minute convergence poll |
 | Friend map positions | `GET /map/friends` | `useFriendLocations({ poll: true })` in the map layout | 60 s, only while the map is focused |
-| Add a friend by invite code | `POST /user/friends/connect` with `referral_code` | `invite/[code]` | On tap |
+| Add a friend by invite code | `POST /user/friends/connect` with `referral_code` | `invite/[code]`, `e/[slug]` | On tap in `invite/[code]`. Automatically when a signed-in user opens a shared event link. |
 | Location sharing toggle | `PUT /user/location-sharing` | `components/profile/LocationSharingRow.tsx` | On toggle |
 
-Friendships come from three places: accepting an invite link, mutual contact matches (see [Contacts sync](#contacts-sync)), and the first bump to a reachable user (see [Friend bumps](#friend-bumps)). There is no in-app friend request or accept flow. For invites and contact matches, the other user gets a `friend_joined` push ("[Name] is on Yelo 👋") that opens the map. Bump-created friendships skip that push, because the bump itself notifies the recipient.
+Friendships come from four places: accepting an invite link, opening a friend's event share link (see [Event share links](/engineering/mobile/navigation#event-share-links)), mutual contact matches (see [Contacts sync](#contacts-sync)), and the first bump to a reachable user (see [Friend bumps](#friend-bumps)). There is no in-app friend request or accept flow. For invites and contact matches, the other user gets a `friend_joined` push ("[Name] is on Yelo 👋") that opens the map. Bump-created friendships skip that push, because the bump itself notifies the recipient.
 
 `FriendsProvider` also keeps three per-user AsyncStorage records:
 
@@ -103,7 +103,7 @@ A bump tells friends where you're heading. `components/bottom-sheets/BumpFriends
 
 ### Invite links
 
-`https://join.yelo.link/<code>` and `https://invite.yelo.link/<code>` rewrite to `/invite/<code>` (see [Navigation](/engineering/mobile/navigation#deep-links)). `app/(app)/invite/[code].tsx`:
+`https://join.yelo.link/<code>`, `https://joinyelo.com/i/<code>`, and `https://invite.yelo.link/<code>` rewrite to `/invite/<code>` (see [Navigation](/engineering/mobile/navigation#deep-links)). `app/(app)/invite/[code].tsx`:
 
 | State | UI |
 | --- | --- |
