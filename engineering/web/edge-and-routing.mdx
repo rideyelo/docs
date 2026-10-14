@@ -14,7 +14,7 @@ Requests for Yelo web properties pass through up to three layers: a Cloudflare W
 | `yelo-signup.web.app` | Firebase `signup` site | `experience-router` `SIGNUP_ORIGIN` |
 | `yelo-world-cup.web.app` | Firebase `world-cup` site | `world-cup-router` `WORLD_CUP_ORIGIN` |
 | `api.joinyelo.com`, `api.rideyelo.com` | Cloud Run API (both names) | `src/lib/api-client.ts`, `authV3BaseURL.ts`, `JobsPage.tsx`, signup CSP |
-| `signup.yelo.link`, `join.yelo.link`, `pay.yelo.link`, `yelo.link` | Short-link hosts. `docs/authv3-web-native.md` calls `yelo.link` Dub-managed; the repo does not record which subdomains are Firebase custom domains. `invite.yelo.link` and `event.yelo.link` no longer have a Firebase site behind them, and [yelo-web#214](https://github.com/rideyelo/yelo-web/pull/214) describes `signup.yelo.link` as a Cloudflare redirect. Those redirects live outside the repository. | `webOAuth.ts`, `EventFormSheet.tsx` (`yelo.link/e/<slug>`), `referralHandoff.ts`, `QRConfigCards.tsx`, `openApp.ts`, the generated `createLinkRequest.ts` |
+| `signup.yelo.link`, `join.yelo.link`, `pay.yelo.link`, `yelo.link` | Short-link hosts. `yelo.link`, `join.yelo.link`, and `pay.yelo.link` are Dub domains. `signup.yelo.link`, `invite.yelo.link`, and `event.yelo.link` only redirect, through Cloudflare rules outside the repository. See [Legacy host redirects](/engineering/web/edge-and-routing#legacy-host-redirects). | `webOAuth.ts`, `EventFormSheet.tsx` (`yelo.link/e/<slug>`), `referralHandoff.ts`, `QRConfigCards.tsx`, `openApp.ts`, the generated `createLinkRequest.ts` |
 
 Firebase Hosting site IDs come from `.firebaserc`: `yelo-dashboard-v2`, `yelo-signup`, `yelo-home`, `yelo-maestro`, and `yelo-world-cup`, all in project `yelo-dashboard-v2`. The `yelo-event` and `yelo-invite` targets were removed with their sites in October 2026.
 
@@ -29,6 +29,26 @@ flowchart LR
   ER -->|"/auth/v3, /pay/tip, /i/*, /get, /e/*, /delete-account, /_yelo/signup/*"| SU["yelo-signup.web.app"]
   WR -->|"302"| HOMEURL["https://joinyelo.com/"]
 ```
+
+### Legacy host redirects
+
+These retired hosts redirect through a single-redirect ruleset (`http_request_dynamic_redirect`) on the `yelo.link` Cloudflare zone. It isn't in any repository. Cloudflare evaluates the rules in this order, and the first match wins:
+
+| Host and path | Redirects to |
+| --- | --- |
+| `event.yelo.link/` | `https://joinyelo.com/` |
+| `event.yelo.link/<slug>` | `https://yelo.link/e/<slug>` |
+| `invite.yelo.link/` | `https://joinyelo.com/` |
+| `invite.yelo.link/i/<code>` | `https://joinyelo.com/i/<code>` |
+| `invite.yelo.link/<path>`, including `/fleet/<code>` | `https://joinyelo.com/i/<path>` |
+| `drive.yelo.link/*` | `https://joinyelo.com/drive` |
+| `events.yelo.link`, `safe.yelo.link`, `content.yelo.link` | `https://joinyelo.com/` |
+| `signup.yelo.link/tip` and `/tip/*` | `https://joinyelo.com/pay/tip/*` |
+| `signup.yelo.link/<path>` | `https://joinyelo.com/<path>` |
+
+Every hop is a `302`. The DNS records stay in place so the proxied hostnames still resolve. `signup.yelo.link` and `invite.yelo.link` still have CNAMEs to their Firebase sites, but the redirect fires first. `event.yelo.link` points at Dub. The `yelo-event` and `yelo-invite` Hosting sites still exist in project `yelo-dashboard-v2` and return `404`.
+
+To change a redirect, edit the rule in the Cloudflare dashboard under **Rules** > **Redirect Rules** for `yelo.link`, then check it with `curl -sI https://<host>/<path>`.
 
 ## Cloudflare Workers
 
