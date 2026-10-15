@@ -94,7 +94,7 @@ Auth v3 is the primary sign-up and sign-in surface under `/authv3`, used by the 
 
 <AccordionGroup>
   <Accordion title="Public routes">
-    `GET /authv3/config`, `POST /authv3/authorize`, `/transaction/resume`, `/transaction/accept`, provider start and callback routes for Google and Apple, `/providers/apple/native`, `/providers/phone/send`, `/providers/phone/verify`, `POST /authv3/token` (exchange a handoff code), `/session/refresh`, and `/session/logout`.
+    `GET /authv3/config`, `GET /authv3/student/studid/callback` (excluded in E2E), `POST /authv3/authorize`, `/transaction/resume`, `/transaction/accept`, provider start and callback routes for Google and Apple, `/providers/apple/native`, `/providers/phone/send`, `/providers/phone/verify`, `POST /authv3/token` (exchange a handoff code), `/session/refresh`, and `/session/logout`.
 
     `FunnelContextMiddleware` runs on the whole `/authv3` group.
   </Accordion>
@@ -105,6 +105,14 @@ Auth v3 is the primary sign-up and sign-in surface under `/authv3`, used by the 
     Mounted under `/authv3/user` with the standard JWT and `user` role middleware: `/link/authorize`, `/identities`, `/community/resolve`, and StudID student verification (`/student/studid/start`, `/student/studid/complete`, `/student/connections`, `DELETE /student/connections/{provider}`).
   </Accordion>
 </AccordionGroup>
+
+### Student verification
+
+StudID receives an HTTPS callback at `AUTH_V3_API_CALLBACK_ORIGIN/authv3/student/studid/callback` by default. `GET /authv3/student/studid/callback` accepts exactly one nonzero UUID `verificationId` and redirects to the fixed native URI `com.rideyelo://student-verification`. The bridge grants no verification. Authenticated completion checks the stored attempt's user binding and provider proof.
+
+The exact legacy override `com.rideyelo://student-verification` maps to the HTTPS bridge on configuration load. Other explicit redirects must use HTTPS; localhost and loopback HTTP are allowed for local development. Redirects cannot contain credentials, a query, or a fragment. Remove the legacy override to use the derived default. Status checks send the server-held credential as a bearer header, never in URLs.
+
+Ship the callback route and configuration normalization together. No database migration or backfill is required. A synthetic provider session verifies create/status transport; verify a real institution login and the native browser handoff separately before claiming end-to-end coverage. The bridge and live verification services are excluded from E2E; use [owned education fixtures](/engineering/qa/e2e#stored-education-proof-fixtures).
 
 ### Tokens and sessions
 

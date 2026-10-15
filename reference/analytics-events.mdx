@@ -22,7 +22,7 @@ Every other `IncrementCounter`, `RecordHistogram`, or `SetGauge` call in `intern
 
 | Event | Source | When fired | Properties |
 | --- | --- | --- | --- |
-| `authv3.step` | `internal/server/http/authv3/telemetry.go:133` | Once per Auth v3 handler call, through a deferred finisher (`handler.step`). Logs success or failure. A successful `callback`, `phone_verify`, or `resume` that issues a redirect fires one more event, `handoff_issued` or `phone_continuation_issued`. | `step`, `stage`, `operation` (all the same step name), `outcome` (`ok` or the error type), `result` (`success` or `failure`), `failure_reason` (empty on success; on failure the error type, or a phone validation reason), `count` |
+| `authv3.step` | `internal/server/http/authv3/telemetry.go:133` | Once per Auth v3 handler call, through a deferred finisher (`handler.step`). Logs success or failure. A successful `callback`, `phone_verify`, or `resume` that issues a redirect fires one more event, `handoff_issued` or `phone_continuation_issued`. | `step`, `stage`, `operation` (all the same step name), `outcome` (`ok` or the error type), `result` (`success` or `failure`), `failure_reason` (empty on success; on failure the error type, a phone validation reason, or a bounded StudID provider reason), `count` |
 
 `enqueueCapture` (`internal/utilities/metrics/posthog.go:73`) adds these properties to every `authv3.step` event:
 
@@ -38,16 +38,21 @@ Every other `IncrementCounter`, `RecordHistogram`, or `SetGauge` call in `intern
 | `$insert_id` | `authv3:<request_id>:<step>`, set when the request has an ID |
 | `client_id`, `channel`, `attempt_id`, `provider`, `auth_surface` | Set through `metrics.SetFunnelProperty` in `internal/server/http/authv3/telemetry.go:170-196` and `internal/service/authv3/telemetry.go:88-137`. They appear only when the handler resolves them. |
 | `is_test`, `is_internal` | Booleans, set by `recordUserClassification` (`internal/service/authv3/telemetry.go:129`). `is_test` is also true for a reserved `+1 555` test phone. They appear only after the user or test phone is resolved. |
+| `$session_id` | UUID forwarded in `X-POSTHOG-SESSION-ID`; correlation only, never identity or authorization |
+| `provider_operation`, `provider_http_status`, `provider_failure_kind` | Safe StudID diagnostics: `create`, `check`, or `entity`; numeric status; bounded failure kind. No credentials, URLs, bodies, or academic identity attributes |
 | `phone_country` | Phone send and verify only. The numbering-plan region of the submitted number, or `unknown`. Never the number itself |
 
 The distinct ID for `authv3.step` is the transaction ID whenever the request has one, including authenticated requests. Without a transaction it is the authenticated user ID, then `yelo-api`. The transaction ID and `yelo-api` cases set `$process_person_profile: false`. Join server and browser events on `transaction_id`, not on distinct ID.
 
 Phone send and verify failures replace `failure_reason` with a closed validation reason: `phone_parse_failed`, `phone_impossible`, `phone_invalid`, `phone_non_us`, or `phone_code_format` (`internal/service/authv3/phone/policy.go:47`, `phone_orchestration.go:242`).
 
+StudID failures use `failure_reason=studid_<kind>`, with kind limited to `disabled`, `transport`, `timeout`, `canceled`, `http_status`, `invalid_json`, or `invalid_response`. Provider properties remain event/log context and do not become counter labels.
+
 The `step` values and where each is recorded:
 
 | `step` | Handler (`internal/server/http/authv3/`) |
 | --- | --- |
+| `student_start`, `student_complete` | `StartStudIDVerification`, `CompleteStudIDVerification`, `handler.go` |
 | `configuration` | `PublicConfiguration`, `handler.go:225` |
 | `authorize` | `Authorize`, `handler.go:309` |
 | `authorize_link` | `AuthorizeLink`, `handler.go:344` |
