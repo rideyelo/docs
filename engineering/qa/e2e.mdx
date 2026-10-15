@@ -48,7 +48,7 @@ The process refuses to start in E2E mode unless every check in `Config.validateE
 | Integrations | `CONTACT_SYNC_RESEND_ENABLED` and `GOOGLE_PLAY_RELEASE_MONITORING_ENABLED` false. Twilio, Resend, Photon, Quo, Dub, Slack webhook, and Google or Apple Auth v3 credentials must all be unset. In E2E mode the API uses `dub.Fake` instead of the Dub client, which answers every link write with the short link Dub would have minted, so referral, fleet, event, and tip flows don't fail. |
 | Auth v3 | See [Test, E2E, and internal auth paths](/engineering/identity/test-and-internal-auth#e2e-mode) |
 
-`cmd/api/main.go` skips River UI and mutating background tasks while E2E is enabled. It still starts the River client, restricted to ride commands: `registerRideOperations` in `internal/notify/queue/queue.go` replaces the queue map with `ride_operations` alone and the periodic jobs with `ride_operation_recovery` alone, and startup logs "E2E mode: isolated ride command workers enabled". Ride accepts, completions, cancellations, and tips therefore finish their ride board and driver queue effects in E2E. Notification jobs are still inserted, and no worker consumes them. Ride expiry, auto-queue tickers, and push delivery don't run on their own. The fixture API invokes the few production commands a test needs, such as `CancelUnmatchedRides`.
+`cmd/api/main.go` skips River UI and mutating background tasks while E2E is enabled. When `RIVER_WORKERS_ENABLED=true`, it starts the River client restricted to ride commands: `registerRideOperations` in `internal/notify/queue/queue.go` replaces the queue map with `ride_operations` alone and the periodic jobs with `ride_operation_recovery` alone, and startup logs "E2E mode: isolated ride command workers enabled". With those workers enabled, ride accepts, completions, cancellations, and tips finish their ride board and driver queue effects in E2E. Notification jobs are still inserted, and no worker consumes them. Ride expiry, auto-queue tickers, and push delivery don't run on their own. The fixture API invokes the few production commands a test needs, such as `CancelUnmatchedRides`.
 
 ### Deployed configuration
 
@@ -62,6 +62,29 @@ The process refuses to start in E2E mode unless every check in `Config.validateE
 | Auth v3 origin | `AUTH_V3_PUBLIC_WEB_ORIGIN` and `AUTH_V3_CORS_ORIGINS` are `https://yelo-maestro.web.app` |
 | Redirect allowlist | `yelo-ios` and `yelo-android`, each only `com.rideyelo.e2e://auth/v3/callback` |
 | Secrets | `DSN`, `KEY`, `REDIS_URL`, `E2E_CONTROL_API_KEY`, `STRIPE_API_KEY`, `STRIPE_PUBLISHABLE_KEY`, `GOOGLE_MAPS_API_KEY`, `MAPBOX_API_KEY`, and the five `AUTH_V3_*` key secrets |
+
+### Runtime isolation
+
+`E2E_ENABLED=true` selects the account-read and external-provider policy in the
+API composition root; cloud deployment does not need separate cache or image
+warming flags. Auth status and user profiles read PostgreSQL directly, so fixture
+creation/deletion cannot reuse cached account state. Redis stays enabled in the
+existing isolated logical database for rate limits, presence, queues and fixture
+coordination. Production retains its normal account caches; cache regressions
+remain covered by their dedicated tests.
+
+Dub uses its stateless fake and referral image warming is disabled. Fake links
+must not fetch production OG image URLs or receive production signing secrets.
+Live StudID is rejected at startup in E2E, and school email/OAuth verification
+services are not wired; education tests use owned fixtures.
+Existing restrictions on messaging, OAuth credentials and Stripe test keys still
+apply. `RIVER_WORKERS_ENABLED=true` remains explicit in the cloud deployment;
+local processes leave workers off unless deliberately enabled.
+
+The HTTPS StudID callback bridge is absent in E2E. It is a production integration
+that forwards only a verification ID to the production app URI.
+No database migrations, backfills or new E2E environment settings are required.
+
 
 ## Database and baseline seed
 
@@ -99,7 +122,7 @@ Don't add scenario rows to the seed. Rows that no run owns leak across tests and
 
 The request body is `{"scenario": "...", "idempotency_key": "..."}`. The key is required and at most 200 characters. A repeated key returns the existing run instead of creating a new one.
 
-An optional `payment_fixture` turns a `ride_confirmed_rider` run into a paid ride. Values are `cancel_hold`, `cancel_fee`, `buffered_tip`, `late_tip`, `late_tip_auth`, and `review_tip_auth`. It is rejected with any other scenario or with `benchmark`. The run gets a driver and its own Stripe test customer, connected account, saved card, and manual authorization on a $12 fare. Setup progress is stored in `E2ERuns.metadata`. The response adds `payment_ready`. While Stripe is still verifying the test account it is `false`, so repeat the same request until it is `true` before you start the device. See `internal/server/http/e2econtrol/README.md` in `yelo-api`.
+An optional `payment_fixture` turns a `ride_confirmed_rider` run into a paid ride. Values are `cancel_hold`, `cancel_fee`, `buffered_tip`, `late_tip`, `late_tip_auth`, and `review_tip_auth`. It is rejected with any other scenario or with `benchmark`. The run gets a driver and its own Stripe test customer, connected account, saved card, and manual authorization on a $12 fare. Setup progress is stored in `E2ERuns.metadata`. The response adds `payment_ready`. While Stripe is still verifying the test account it is `false`, so repeat the same request until it is `true` before you start the device. See [Paid ride fixture contracts](#paid-ride-fixture-contracts).
 
 An optional `benchmark` object (`fleets` 1 to 6, `drivers_per_fleet` 0 to 10, `pricing_tiers` 1 to 8, `varied_pricing`) is accepted only with `auth_existing_rider`. It adds fleets, online drivers, and tiered pricing to the run's community for the [ride replay benchmark](/engineering/qa/ride-replay-benchmark#what-the-benchmark-replays). Deleting the run also removes the extra fleets and drivers.
 
@@ -118,6 +141,389 @@ Creation runs in one transaction. Every scenario gets:
 Pair scenarios add a driver: `E2E Driver`, with a complete and active `DriverApplications` row, a 2025 Yelo E2E `Vehicles` row of type `x` with plate `E2E<4 hex>` in CA, and `FleetDrivers` and `FleetVehicles` rows.
 
 Phones are deterministic: `+1555` plus seven digits from an FNV-32a hash of the run ID and role (`testPhoneForRole`). The response returns `run_id`, `api_revision`, `scenario`, `status`, `created_at`, `expires_at`, `actors.rider`, `actors.driver` when present, and `fixtures` (`community_id`, `school_id`, `fleet_id`, `vehicle_id`).
+
+### Paid ride fixture contracts
+
+The isolated control plane accepts `payment_fixture` with
+`scenario=ride_confirmed_rider`: `cancel_hold`, `cancel_fee`, `buffered_tip`, or
+`late_tip`. Startup still requires an isolated database, Redis namespace and
+Stripe test keys. No production routes, schema migrations, or new environment
+variables are introduced.
+
+Each run owns its Stripe test customer, Custom connected account, saved card,
+connected clone and manual authorization. Resource attempts and receipts are
+persisted privately in `E2ERuns.metadata`; creation keys include the run and step.
+Setup resumes after response loss within a 23-hour creation window. Unknown
+creation outside that window preserves the run for reconciliation. Session
+advisory locks serialize setup and deletion without consuming the query pool.
+
+An account undergoing Stripe test verification returns `payment_ready=false`
+on the idempotency-keyed creation response. Repeat the same creation request
+until `payment_ready=true` before device execution. Provider errors expose only
+type/code classifications, never PaymentIntent bodies or client secrets.
+
+Fixtures use a $12 fare. `cancel_fee` starts at driver waiting and uses the real
+75% cancellation policy. `buffered_tip` starts in pending rider rating with the
+normal $5 authorization buffer. `late_tip` starts completed with its $12 fare
+already captured by setup; that baseline capture is not a runtime journal step.
+Fixture setup does not establish device coverage of a missing late-tip UI.
+
+Deletion first requires terminal financial operations and effect receipts.
+It resolves unknown customer/account/card creation using the original keys,
+deletes the owned connected account and customer, and detaches the platform
+card. Stripe does not delete detached PaymentMethod objects. Partial setup
+cleanup never completes or creates an authorization. Provider cleanup failure
+rolls back database deletion, retaining resource identities for retry. Every
+provider deletion checks run ownership; missing resources allow idempotent retry.
+
+### Payment and response recovery controls
+
+Active, prepared payment runs can arm `tip_create_loss`, `tip_confirm_loss`, or
+`tip_receipt_failure` through `POST /runs/{id}/payment-fault`. Provider losses
+occur after a real successful Stripe response on the run's connected account;
+the original command retains its idempotency keys. Confirmation loss also hides
+subsequent observations until release. The receipt barrier installs a trigger
+only in the isolated E2E database and rejects the actual settlement receipt write
+while armed. No production migration or additional environment setting is needed.
+Release requires recorded provider boundary hits and never writes settlement.
+
+`GET /runs/{id}/provider-observation` returns only charge counts, cents and payout.
+`POST /runs/{id}/replay-fare-success` reads the owned captured fare from Stripe and
+calls the production repository success callback twice, asserting payout is
+unchanged. This verifies callback ownership, not signed webhook HTTP delivery.
+
+`POST /runs/{id}/response-fault` accepts `arm`, `inspect`, or `release` for `status`
+or `details`. It captures a real successful authenticated response and replays it
+only to the same reserved rider and exact ride while the handler continues to run.
+A hit requires a changed ride-state signature, not a changed timestamp. Snapshots
+remain private in fixture metadata and disappear with fixture deletion. These
+controls exercise stale HTTP responses, not APNs delivery or the exact production
+render-loop trigger. Their evidence never substitutes for runtime-error capture.
+
+Paired UI acceptance uses `prepare_driver_acceptance` to seed the waiting rider
+and active driver trip with the offer deferred from the fleet board. After the
+real driver finishes native authentication and navigation setup, its retained
+checkpoint allows `publish_assignment` to expose that owned free waiting ride
+to the run's fleet. Publication does not assign the driver, modify the request
+countdown, or invoke payment work. It is idempotent while the ride is waiting;
+foreign, paid, assigned, expired or cleaned fixtures are rejected. `observe_accept`
+only verifies assignment already committed through the real driver control.
+
+### Owned rider response observation
+
+`GET /internal/e2e/runs/{id}/rider-responses` uses existing disabled-by-default E2E registration, dedicated control-key middleware, and startup isolation rules. Only the run id is accepted, never an actor, URL, credential, or query. A locked active, unexpired `auth_existing_rider` must own a test rider with the deterministic reserved phone and matching test current/home community. Shared run/user/community locks make deletion wait; cleaned or expired runs cannot generate observations.
+
+An unserved in-process Fuego mux executes six fixed GETs using the existing production handlers, error handler, services, serialization, and derived `user` context. No socket, login, JWT issuance/export, fixture mutation, or response fault is involved. Construction happens only in the E2E registration branch. Production GET semantics and caching remain unchanged.
+
+The returned source is `in-process-production-get`. Inner statuses are actual production-handler HTTP statuses, distinct from the observer's outer HTTP 200. Serialized bodies are hashed before reduction. Only run/rider/community/revision joins, timestamps, schema status, explicit collection counts, current-community equality, and spot-null status leave the process. No phone, raw body, error text, or credentials are exposed or stored. Missing/null arrays, absent spot, unsuccessful envelopes, or non-200 statuses fail schema validation. This validates collection and identity shape, not every nonempty item attribute.
+
+No raw-body artifacts or database observation records are required. Reduction happens in memory, so there is no server evidence to purge during existing fixture deletion, and no schema migration or backfill.
+
+This proves successful serialized backend responses in a control-plane-authorized owned-rider context. It does not intercept device axios requests or prove every app request succeeded. Samples corroborate real UI guards. The normal `/map/community` cache remains active. `/user/friends` deliberately maps reachable-lookup failures to `[]`; observation proves its public serialized contract, not success of that best-effort subquery.
+
+The coupled frontend harness declares the six-GET requirement only for the combined map/social variant. Its real unconfigured Dub QR error remains a separate positive UI assertion, not a backend-empty claim.
+
+Deploy the matching API and frontend harness to the isolated E2E environment. Source tests alone do not establish deployed revision or live coverage.
+
+### Owned signup prerequisites
+
+`GET /internal/e2e/runs/{id}/signup-prerequisites` shares the rider observer's
+control-key authorization, fixture TTL, reserved actor checks, and run/user/community
+`FOR SHARE` locks. It accepts only a run ID for `auth_existing_rider` and reads
+`/user/current-user`, `/community/current`, `/vehicle/`, `/user/status`, and
+`/vehicle-types` through the real production GET handlers with the owned actor
+context. It returns hashes, statuses, schema validity, identity equality, vehicle
+and queue counts, no-active-ride and vehicle-null flags, and active type seat fields.
+Missing/error schemas fail closed; valid present vehicles/rides remain distinguishable
+from valid empty results. Production legacy status explicitly serializes an empty
+queue as null; a missing queue is invalid.
+
+Vehicle types are global active configuration read under the matching owned
+community context, not per-community configuration. Their `max_seats` is rider
+capacity, not the signup picker's ceiling. No profile bodies, phones, actor tokens,
+or raw errors are returned. This is handler response proof, not device Axios
+success, request pinning, or a statement that the global database is empty.
+
+### Offline fleet vehicle picker fixture
+
+`POST /internal/e2e/runs` accepts optional `fleet_fixture` only with
+`scenario=auth_rider_driver_pair`, without `actor_preset`, `benchmark` or
+`payment_fixture`:
+
+```json
+{"scenario":"auth_rider_driver_pair","idempotency_key":"capture-fleet-picker-unique-run","fleet_fixture":"fleet_managed"}
+```
+
+`fleet_managed` is the only accepted value. Omission retains the original
+owner-operator fixture. Unknown values and unsupported combinations are input
+errors. The existing `Run` response supplies the reserved `actors.driver.phone`
+and owned `fixtures.fleet_id` / `fixtures.vehicle_id`; no app fields or session
+tokens are added. The mode is retained in run metadata: idempotent retries must
+keep the scenario and mode, including after cleanup, and never reset device
+mutations.
+
+This fixture uses production `payment_model=fleet_merchant`,
+`has_owner_operators=false`, `has_custom_payouts=true`, an active driver membership,
+and an approved default fleet-owned vehicle (`Vehicles.driver_id=NULL`). The
+original driver selects that vehicle and remains approved, offline and idle.
+Its payout source is the owned fleet with `stripe_status=pending` and no connected
+account; personal Stripe is also pending. No Stripe resources are created or
+fabricated. Production driver status exposes that active fleet and no current
+ride; the vehicle list exposes one selected `Yelo E2E` vehicle with the fleet ID,
+default flag, approved status and no occupancy by another driver.
+
+After real native phone authentication and required permissions/navigation,
+use the real first-drive promo tile (zero drives, offline) in the Driver Profile
+to open `Ready to drive?`. The main Go Online button is disabled because the
+production signup contract reports pending payouts. In the confirmation sheet,
+the fleet's real vehicle tile is enabled with a chevron. Opening it supports the
+`Select vehicle` sheet and its one current vehicle row while offline. This fixture
+proves neither an alternate-vehicle switch nor online/ride coverage. Fleet payout
+readiness is false and the
+production go-online repository rejects the driver; do not continue an online
+journey. No readiness flag is fabricated in the fixture response.
+
+The existing isolated E2E startup checks and auth configuration apply. Adoption
+requires an API binary containing this option; the running old binary must not be
+treated as supporting it. No schema migration, backfill, native dependency or new
+configuration is required. Existing run deletion and expiry cleanup remove the
+owned membership, fleet mapping, vehicle, driver application, actors and fleet.
+The integration test uses a disposable migrated testcontainer to verify ownership,
+default compatibility, production status/vehicle/application contracts, offline
+selection and online rejection, retry preservation and isolated repeated deletion.
+
+### Stored education proof fixtures
+
+`POST /internal/e2e/runs` accepts optional `education_fixture` with only
+`scenario=auth_existing_rider`, without `actor_preset`, `fleet_fixture`,
+`payment_fixture` or `benchmark`:
+
+```json
+{"scenario":"auth_existing_rider","idempotency_key":"capture-education-unique-run","education_fixture":"email_otp"}
+```
+
+`email_otp` seeds one recorded school-email proof; `multiple_proofs` seeds school
+email and Google proofs. Omission preserves successful empty connections and
+existing actor defaults. These are synthetic preexisting records in the owned
+school and rider, not email delivery, OAuth, StudID authorization or verification
+completion. No provider calls or login identities are created.
+
+After real native phone authentication, production
+`GET /authv3/user/student/connections` returns the actual proof IDs, provider,
+owned school name/ID, synthetic `education-<run-id>@e2e.invalid` email,
+student affiliation and verified timestamp. Subject fields remain private.
+The real Accounts controls can inspect and disconnect a proof through
+`DELETE /authv3/user/student/connections/{provider}`. Removing email from the
+multiple-proof mode preserves Google. Existing student status is preserved by
+the production disconnect contract.
+
+The mode is stored in run metadata and forms part of idempotency identity.
+Retries read current state: they never restore disconnected proofs. Changed,
+omitted or unsupported modes reject reuse; cleaned/expired run retries never
+recreate actors or proofs. Existing deletion and expiry cleanup remove proofs
+through owned-user cascading before deleting the owned school, leaving other
+runs intact. No migrations, external configuration or provider credentials are
+required. This option requires a new local API binary; an already running older
+binary does not support it.
+
+### Terminal free ride history fixture
+
+`POST /internal/e2e/runs` accepts optional `history_fixture=terminal_free` only
+with `scenario=auth_rider_driver_pair`. It cannot be combined with actor,
+education, fleet, payment or benchmark options:
+
+```json
+{"scenario":"auth_rider_driver_pair","idempotency_key":"capture-terminal-history-unique-run","history_fixture":"terminal_free"}
+```
+
+The response returns backend-validated identities in
+`fixtures.history_ride_ids.completed` and
+`fixtures.history_ride_ids.rider_canceled_after_match`. `run.ride` remains absent;
+these terminal records do not replace or create an active ride. Both belong to
+this run's original reserved rider, driver, community, fleet and vehicle. The
+newer canceled record appears before the completed record in production rider
+and driver history. Select details by these exact IDs, not by an arbitrary row.
+
+Both rides have zero price and payout, disabled tips, and no payment or tip
+intent. The completed record has pickup/completion times and an existing rider
+rating. The canceled record retains its assigned driver, has no pickup time and
+uses production rider cancellation semantics: `status=complete`,
+`cancel_phase=driver_waiting`, `cancel_user=rider`. History DTOs do not expose a
+canceled badge; do not infer cancellation from a screenshot. This fixture does
+not prove live matching, completion, cancellation, review submission or payment
+journeys. No payment method brand is fabricated; the current detail UI may show
+its ordinary Card fallback for absent payment metadata.
+
+The mode is part of idempotency identity. Retries read the same exact records;
+changed or omitted mode rejects reuse. Cleaned/expired retries never recreate
+rides or actors. Common cleanup validates a bounded two-UUID metadata array and
+exact original actor/community/fleet/vehicle ownership before selecting either
+ride. Foreign IDs, malformed metadata or changed ownership fail closed. Existing
+unresolved operation effect guards also apply. Cleanup deletes owned ride
+messages, operation records and notification jobs before rides and actors;
+other runs survive deletion and expiry. No migrations, external configuration,
+provider calls or financial resources are required. The serving local API must
+be rebuilt and activated separately before using this option.
+
+### Populated saved places fixture
+
+`POST /internal/e2e/runs` accepts `likes_fixture=populated` only with
+`scenario=auth_existing_rider`, exclusive of actor, education, fleet, history,
+payment and benchmark options. The response exposes `fixtures.saved_places.cafe`
+and `.park`, each containing `location_id`, `yelo_place_id`, `mapbox_id`, `name`,
+`address`, coordinates, categories and optional current `like_id`. Consume the
+returned snapshots; names, addresses and Mapbox IDs contain the full run UUID.
+The initial production liked-place order is park then cafe. No ride or driver
+is created, and no session or app state is supplied.
+
+The records are real repository-owned Locations and LikedLocations. Production
+GET likes, unlike and re-like preserve canonical place identity. A re-like has
+its actual new UUID; an unlike leaves `like_id` absent. Idempotent replay reads
+current persisted state and never restores likes. Changed or omitted mode
+rejects key reuse. Cleanup and expiry never resurrect cleaned data.
+
+Cleanup validates two bounded deterministic location IDs, two initial like IDs,
+the original reserved test actor/community and exact snapshot identity. It
+accepts actual heart-created rows only for these two canonical places, with the
+original name, Mapbox ID and geometry; provider-derived category/address changes
+are allowed. Unexpected original-actor likes, foreign metadata, reassigned seed
+rows or changed location ownership fail closed. Cleanup deletes exact current
+owned likes before deleting owned locations and users. Another actor's like is
+never deleted. Shared canonical PlaceIdentities and aliases remain normal global
+catalog data, including identities referenced by other actors.
+
+This fixture proves stored saved-place state and real heart mutation persistence,
+not provider enrichment. Opening production POI details can still initiate its
+ordinary external enrichment; snapshot content and the real heart remain
+available without successful enrichment. No external provider data is seeded.
+No migrations or external configuration are required; activate a rebuilt local
+API separately before using this option.
+
+### Existing rider onboarding presets
+
+`POST /internal/e2e/runs` accepts optional `actor_preset` only with
+`scenario=auth_existing_rider`, without `benchmark` or `payment_fixture`:
+
+```json
+{"scenario":"auth_existing_rider","idempotency_key":"capture-profile-unique-run","actor_preset":"incomplete_profile"}
+```
+
+The other accepted value is `school_unverified`. Omission preserves all existing
+scenario defaults. Unsupported values or combinations return an input error.
+The response retains the existing `Run` shape: use `actors.rider.id` and
+`actors.rider.phone`. No session token, signup actor, or app state is provided.
+The preset is stored in run metadata; retries with the same key must retain the
+same scenario and preset, including after cleanup. A retry reads current state
+and never resets a profile completed by the device.
+
+Both presets seed the run-owned rider with a verified auth-v3 `phone` identity,
+`is_verified=false`, and an empty email. `is_verified` is school/account
+verification, not proof of phone ownership. An unverified legacy row without an
+identity is excluded by direct candidate matching and can produce a new user;
+these presets deliberately represent established auth-v3 phone users. They keep
+the run's synthetic school, active/home community, and reserved non-dialable
+`+1555` phone. `incomplete_profile` retains the student account type;
+`school_unverified` uses the production `community` account type so the profile
+offers school verification rather than the durable student badge. `incomplete_profile` additionally sets
+`profile_completed=false` and clears both names. `school_unverified` keeps the
+completed `E2E Rider` profile. No schema migration or backfill is required.
+
+Drive real native auth v3 controls: authorize with PKCE and the native phone
+step, accept the current legal versions, send/verify the returned phone with
+OTP `12345`, and exchange the callback. `incomplete_profile` returns
+`needs_profile`, blank name prefill, and an onboarding token; onboarding status
+and finish-profile operate on the original rider. The FE reaches
+`/(auth-v3)/finish-profile`, then permission onboarding when device permissions
+require it. `school_unverified` returns `authenticated` and skips finish-profile;
+it likewise may show permission onboarding before the app. Both remain school
+unverified after phone auth/profile completion. The signed-in profile's real
+school-verification controls can reach `/(app)/verify/1-oauth` and its email
+entry screen. This is not an automatic school-verification redirect. Live school email, Google/Microsoft, and StudID completion are disabled in E2E.
+Use stored education proof fixtures for connection controls. The synthetic
+`e2e.invalid` school cannot receive email.
+
+Prerequisites are the existing isolated E2E startup safety checks, migrated
+fixture database, dedicated control credential (`X-E2e-Key`), isolated Redis and
+configured auth-v3 keys/legal versions, plus an app pointed at that API with the
+native E2E auth path. Runtime adoption requires a build containing this change;
+fixture requests to an older binary do not establish preset coverage. No new
+configuration is required.
+
+Use `DELETE /internal/e2e/runs/{run_id}` with the same control credential. The
+existing cleanup owns the original rider and its phone attempts/transactions,
+attribution, cascading phone identities, handoff codes and legal acceptances,
+as well as its synthetic school/community/fleet/pricing. Repeated deletion is
+safe; the expiry sweep uses the same cleanup. The auth integration test verifies
+identity retention, both exchange statuses, real profile completion, unchanged
+school verification, idempotent retries, and cleanup without touching another
+run. It uses `testutils.SetupTestDB` (a disposable migrated testcontainer), never
+the running E2E database.
+
+### Original driver personal vehicle inventory
+
+`vehicle_fixture: "personal_owned"` is accepted only for `auth_rider_driver_pair`
+and cannot be combined with actor, education, fleet, history, likes, payment or
+benchmark presets. Omission preserves the existing fixture. The fixture adds one
+original-driver-owned `Vehicles` row without a `FleetVehicles` relation. Existing
+`fixtures.vehicle_id`, the driver's active vehicle and the primary fleet-linked
+queue vehicle remain unchanged.
+
+`fixtures.personal_vehicle` exposes the exact `vehicle_id`, make/model/color,
+year, plate/state, seat count, vehicle type and application status. The added
+vehicle is a complete Blue 2024 Toyota Camry, four seats, CA, type `x`, with a
+run-derived plate. Production `GET /driver/vehicle` returns both vehicles; the
+personal row has no `fleet_id` JSON property and is not active, so the real
+personal vehicle Edit control is available. No provider or payment setup is
+performed. Opening the editor, checking its original inputs and navigating back
+are supported. Submitting backend edits or selecting this vehicle as the active
+vehicle is outside this fixture contract: cleanup refuses changed snapshots or
+selected/session/ride references rather than discarding those mutations.
+
+The personal vehicle UUID is derived from the full original run UUID and stored
+in a bounded, exactly one-item metadata array. Observation and cleanup validate
+the active run, both original reserved test phone identities, original test
+community, primary driver/vehicle ownership and fleet link, exact personal
+snapshot and absence of archive/fleet/default/session/ride/run references. Missing
+all personal metadata still detects the deterministic row and fails closed.
+Cleanup locks the owned rows and deletes only the exact original personal vehicle
+before deleting actors. Foreign references are never removed. Idempotent replay
+returns the original current fixture without reseeding; cleanup and expiry share
+this bounded contract and cleaned replay cannot recreate the vehicle. No database
+migration is required.
+
+### Multi-friend social count capability
+
+The independent `social: {"friends": 1..24}` option creates mutual friends in
+`auth_existing_rider` and retains `POST /runs/{id}/social-presence`. It is
+exclusive of benchmark, payment, actor, education, fleet, history, likes,
+vehicle, paired-friends and UI-created-ride modes. This is distinct from the
+original-pair `friends_fixture` contract; neither substitutes for the other.
+
+The integrated count capability derives friend UUIDs from the original run and
+index, retains the requested count and exact IDs, rejects changed-count replay,
+and validates reserved phone/email identities, original school/community and
+friendship ownership before presence writes or cleanup. Missing/tampered
+metadata and foreign references fail closed. Scoped deletion runs before the
+original actor and community cleanup. Cleaned replay never creates new friends.
+The production presence contract and final-two-offline behavior are retained.
+
+Native captures require a new integrated runner/API freeze and actual owned
+proof. Existing source-only or miniredis test results are not real Redis/native
+coverage. No provider results or route-cache geometry are seeded here.
+
+### Refuse surviving participant references
+
+Before deleting original actors, ride cleanup validates that every surviving
+ride involving their rider/driver identities or owned community belongs to the
+exact admitted deletion set. Foreign run references also block cleanup. UI
+binding applies the same refusal to cross-community rider rides and foreign
+rider rides assigned the original driver. No additional ride is admitted or
+deleted by this guard. Counted social presence and cleanup validate the original
+viewer as well as the friend set, rejecting any unauthored friendship or
+ride/run reference. Terminal history with retained IDs but no mode is invalid;
+removing both keys cannot silently discard complete rides because they remain
+unadmitted and block actor deletion. Cleaned replay retains historical metadata
+and does not reseed removed data.
 
 ### Scenarios
 
@@ -450,7 +856,7 @@ Follow the [E2E environment reset](/runbooks/e2e-environment-reset) runbook. In 
 - **Idempotency keys are forever.** A repeated key returns the old run, even if it's `cleaned`. Use a unique key per attempt.
 - **Assignment transitions on the wrong run return 500.** `transitionAssignment` wraps `pgx.ErrNoRows` in `fmt.Errorf` when the run isn't an active pair (`assignment_transition.go:34`). The expiry path maps the same case to 404.
 - **Fixture coordinates are fixed.** Riders are inserted at latitude and longitude 0, drivers at the fixture school (37.3349, -122.0090), and fixture rides run between `1 Test Way` and `2 Test Way` near that point.
-- **In-repo docs lag the code.** `yelo-api` no longer ships `docs/E2E_CONTROL_PLANE.md`; only `internal/server/http/e2econtrol/README.md` remains, and it covers paid fixtures and observers only. `yelo-frontend/E2E.md` lists three scenarios and old migration numbers. `e2e/README.md`'s suite example uses `ride_rider_driver_pair`, which the API rejects. Trust `Handler.Create` and the constraint migrations.
+- **Check the serving revision.** This guide is the canonical fixture reference. Confirm that the deployed API contains an option before using it; `Handler.Create` and the constraint migrations define the accepted contract.
 
 ## Where this lives in code
 

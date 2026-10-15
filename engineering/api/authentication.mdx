@@ -106,6 +106,14 @@ Auth v3 is the primary sign-up and sign-in surface under `/authv3`, used by the 
   </Accordion>
 </AccordionGroup>
 
+### Student verification
+
+StudID receives an HTTPS callback at `AUTH_V3_API_CALLBACK_ORIGIN/authv3/student/studid/callback` by default. `GET /authv3/student/studid/callback` accepts exactly one nonzero UUID `verificationId` and redirects to the fixed native URI `com.rideyelo://student-verification`. The bridge grants no verification. Authenticated completion checks the stored attempt's user binding and provider proof.
+
+The exact legacy override `com.rideyelo://student-verification` maps to the HTTPS bridge on configuration load. Other explicit redirects must use HTTPS; localhost and loopback HTTP are allowed for local development. Redirects cannot contain credentials, a query, or a fragment. Remove the legacy override to use the derived default. Status checks send the server-held credential as a bearer header, never in URLs.
+
+Ship the callback route and configuration normalization together. No database migration or backfill is required. A synthetic provider session verifies create/status transport; verify a real institution login and the native browser handoff separately before claiming end-to-end coverage. The bridge and live verification services are excluded from E2E; use [owned education fixtures](/engineering/qa/e2e#stored-education-proof-fixtures).
+
 ### Tokens and sessions
 
 `internal/service/authv3/jwt.go` defines `JWTIssuer`, which signs with two separate keys:

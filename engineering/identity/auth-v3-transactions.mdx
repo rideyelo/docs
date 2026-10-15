@@ -260,13 +260,13 @@ Steps along the lifecycle on this page:
 | `resume` | `Resume` | [Resume](#resume) |
 | `profile` | `FinishProfile` | [Finish profile](#finish-profile) |
 
-The other recorded steps are `configuration`, `authorize_link`, `status`, and `community_resolve`.
+The other recorded steps are `configuration`, `authorize_link`, `status`, `community_resolve`, `student_start`, and `student_complete`.
 
 Two more steps record an issued redirect. After a successful `callback`, `phone_verify`, or `resume`, the finisher emits `handoff_issued` when the validated redirect carries a handoff code, or `phone_continuation_issued` when it continues to the phone step. `recordCallbackIssued` sets the disposition and never records the code.
 
 The finisher also writes one info log line, `authv3 step completed`, with `event`, `step`, `request_id`, `event_id` (`authv3:<request_id>:<step>`), `outcome`, `result`, `failure_reason`, `duration_ms`, and the carrier properties.
 
-`StepSessionRefresh` (`session_refresh`) is declared, but no handler records it. `RecordTouch`, `RefreshSession`, `LogoutSession`, and the connected-identity and student-verification handlers don't call `handler.step`.
+`StepSessionRefresh` (`session_refresh`) is declared, but no handler records it. `RecordTouch`, `RefreshSession`, `LogoutSession`, and the connected-identity handlers don't call `handler.step`.
 
 A handler built without `WithMetrics` uses `noopFunnelMetrics` and counts nothing. `internal/server/http/router.go` passes `WithMetrics(s.service.Metrics)` to the public, onboarding, and authenticated route sets.
 
@@ -297,7 +297,7 @@ The transaction ID and attempt ID also go onto the span as `authv3.transaction_i
 
 The distinct ID is the transaction ID whenever the request has one, including authenticated requests. Without a transaction it is the authenticated user ID, and with neither it is the shared server identity. The transaction and shared-identity cases set `$process_person_profile: false`, so one sign-in's steps share an ID without creating a person.
 
-The carrier properties reach PostHog and the step log line. They never become counter labels, except a phone validation reason, which replaces `failure_reason`.
+The carrier properties reach PostHog and the step log line. They never become counter labels, except bounded phone validation or StudID failure reasons, which replace `failure_reason`.
 
 Responses on `/authv3` routes also read the carrier. See [Response envelopes](/engineering/api/request-lifecycle#response-envelopes).
 
@@ -347,3 +347,25 @@ The resolver never reads forwarding headers to decide trust, and it never reads 
 - **Web sessions start before the profile exists.** A web exchange that returns `needs_profile` still creates a web refresh session. Refreshing that session mints a full `user` token even though the profile isn't complete, because `RefreshWebSession` doesn't check `profile_completed`.
 - **Expired status is rarely written.** Most expired transactions stay in their last live status. `expired` is only written when resolution happens after expiry. Cleanup finds stale rows by `expires_at`, not by status.
 - **Accepting twice is safe, changing versions isn't.** Re-accepting with the same versions is idempotent. Request versions that differ from the current config fail validation with 400. A 401 `auth transaction could not be accepted` only happens when the config versions changed after the first accept, because `AcceptAuthV3Transaction` refuses to rewrite existing acceptance.
+
+### Interpret conversion and missing events
+
+Use server `phone_send` and `phone_verify` successes grouped by transaction for authoritative conversion. Browser submission records intent; an accepted send, delivery callback, and verified code are separate outcomes. Investigate delivery callbacks without a matched persisted attempt.
+
+Browser events send immediately and navigation-sensitive events use `sendBeacon`. Both browser delivery and the server PostHog SDK queue are best effort. Reconcile missing events against structured logs and persisted transaction/phone-attempt state before calling a flow abandoned. There is no durable analytics outbox or automatic replay.
+
+Exclude whole test/internal transaction or attempt cohorts when any event supplies known classification. Treat unknown classification separately. Early requests cannot know a future account, and requests rejected before authentication cannot safely claim a transaction. Pre-authorization client failures can have an attempt ID without a transaction ID.
+
+Compare schema version 3 separately from historical events: classification properties are booleans, and native launch requests, hosted page initialization, and native session returns describe separate observations. A launch request does not prove an OS sheet rendered.
+
+### Student verification diagnostics
+
+
+Student start and completion emit `authv3.step` with `student_start` and
+`student_complete`. Provider diagnostics contain only `provider_operation`
+(`create`, `check`, `entity`), numeric `provider_http_status`, and bounded
+`provider_failure_kind` values. Credentials, provider bodies, URLs and academic
+identity attributes are excluded. The existing request ID and authenticated
+user attribution join these events to logs. Clients can forward a UUID in
+`X-POSTHOG-SESSION-ID` to attach `$session_id`; the header never supplies identity
+or authorization.
